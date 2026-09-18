@@ -12,8 +12,9 @@
 //! line declares, the board [`Revision`] and the policies read from it, the
 //! reset cause and the boot record, the last words a run leaves for the next
 //! boot, the [`Rollcall`] that earns the watchdog its feed, the lamp's
-//! [`Pattern`], the module rail's [`RailSequencer`], and the contract
-//! [`Feedback`] is read under. The tables,
+//! [`Pattern`], the module rail's [`RailSequencer`], the contract
+//! [`Feedback`] is read under, and the FRAM [`Record`] with the [`map`] that
+//! places every one of them in the part. The tables,
 //! the behaviours and the link-local state machines arrive with the
 //! milestones that name them.
 
@@ -21,8 +22,10 @@
 
 mod fail_state;
 mod feedback;
+mod fram;
 mod lamp;
 mod last_words;
+pub mod map;
 mod rail;
 mod reset;
 mod revision;
@@ -31,6 +34,7 @@ mod tick;
 
 pub use fail_state::*;
 pub use feedback::*;
+pub use fram::*;
 pub use lamp::*;
 pub use last_words::*;
 pub use rail::*;

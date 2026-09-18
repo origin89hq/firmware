@@ -583,7 +583,7 @@ means the link is wrong (#2).
 
 | | Part | Holds | Layout |
 |---|---|---|---|
-| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters (P-081, P-105), the dedup table (P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130) | A `const` map with a budget assertion; each slot `[magic \| seq \| body \| crc32]`, pointer flip last |
+| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters (P-081, P-105), the dedup table (P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the CRC written last, the higher valid sequence current |
 | NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a
@@ -606,9 +606,12 @@ link.
 **A/B answers multi-word atomicity; the part answers power loss.** FRAM has
 no erase cycle and no write latency, so a single word survives a cut by
 itself; what it cannot do is make six words land together. Configuration and
-the client table live in A/B slots with a sequence number and a CRC, switched
-by an atomic pointer flip, and it is the same machinery the bootloader needs,
-so it is built once. The PVD discipline above is the other half: no
+the client table live in A/B slots with a sequence number and a CRC; a write
+goes to the slot that is not current with the CRC last, and the slot whose
+CRC holds with the higher sequence is the record. The CRC landing is the
+switch, so there is no pointer word to tear. It is the same machinery the
+bootloader needs, so it is built once. The PVD discipline above is the other
+half: no
 transaction starts on a falling supply. Every FRAM write path runs crashing
 at every step on the host, and the invariant after recovery is asserted.
 
