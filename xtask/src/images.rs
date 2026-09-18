@@ -205,6 +205,12 @@ pub fn record(repo: &Repo, measured: &[Measured]) -> Result<()> {
         .current_dir(repo.root())
         .output()
         .context("running git rev-parse")?;
+    if !sha.status.success() {
+        bail!(
+            "git rev-parse failed ({}): a row with no commit is a row nobody can trace",
+            sha.status
+        );
+    }
     let sha = String::from_utf8(sha.stdout).context("git output is not UTF-8")?;
     let path = repo.root().join("docs").join("sizes.tsv");
     let mut rows = String::new();
