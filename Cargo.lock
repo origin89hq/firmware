@@ -390,6 +390,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "serde",
+ "syn",
  "toml",
 ]
 

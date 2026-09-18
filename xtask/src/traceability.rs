@@ -3,21 +3,21 @@
 //!
 //! The denominator is read from the documents — `**F-nnn**` in
 //! `docs/REQUIREMENTS.md`, and KM43's `P-`/`L-` from the pinned index — so it
-//! moves when the documents move. The numerator is read from the sources: a
-//! test named `f_012_...`, `p_004_...` or `l_110_...` whose body carries an
-//! assertion, or a `//! cites:` header on a file that has an asserting test
-//! in it. A test that cannot fail is not a test, and a citation on a body
-//! with no assertion is the failure mode of every traceability matrix ever
-//! built, so the assertion is what is looked for.
+//! moves when the documents move, and a number allocated twice is refused.
+//! The numerator is read from the sources as Rust syntax: a `#[test]` function
+//! named `f_012_...`, `p_004_...` or `l_110_...` whose body invokes an
+//! assertion macro, or a `//! cites:` header on a file that has such a test.
+//! A test that cannot fail is not a test, and a citation on a body with no
+//! assertion is the failure mode of every traceability matrix ever built, so
+//! the assertion is what is looked for — and a comment, a string, or a helper
+//! that merely carries the name is not one.
 //!
-//! `F` rules ratchet: the uncovered count may not rise, and may not fall
-//! without the number in `traceability.toml` falling with it. KM43 rules are
-//! reported, because which of them bind this controller rather than a client
-//! is what origin89hq/km43#31 will say.
-//!
-//! The scanner reads text, not syntax: a string literal that looks like a
-//! test declaration counts. That is the price of not parsing Rust here, and
-//! it errs towards refusing.
+//! `F` rules ratchet by identity, not by count. `traceability.toml` lists the
+//! uncovered rules by name: a rule leaves the list when its test lands, joins
+//! it only when the rule itself is added, and a rule that loses its test is a
+//! failure the count alone would hide. KM43 rules are reported, because which
+//! of them bind this controller rather than a client is what
+//! origin89hq/km43#31 will say.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -25,15 +25,30 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use syn::visit::Visit;
+use syn::{Attribute, Expr, ExprLit, Item, Lit, Meta};
 
 use crate::repo::Repo;
 
 /// The checks of the gate an untestable rule may nominate as its test.
 const GATE_CHECKS: &[&str] = &["cross", "deps", "images", "traceability"];
 
+/// The macros whose invocation makes a test able to fail.
+const ASSERTIONS: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "assert_matches",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+];
+
 #[derive(Deserialize)]
 struct Declared {
-    uncovered_at_most: usize,
+    /// The rules with neither a test nor a declaration, by name.
+    #[serde(default)]
+    uncovered: Vec<String>,
     #[serde(default)]
     untestable: Vec<Untestable>,
 }
@@ -66,26 +81,41 @@ fn is_rule_id(word: &str) -> bool {
         && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Collect identifiers, refusing one that appears twice.
+fn unique(ids: impl Iterator<Item = String>, what: &str) -> Result<BTreeSet<String>> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        ensure!(
+            seen.insert(id.clone()),
+            "{id} is allocated twice in {what}: two obligations under one number are one test covering both"
+        );
+    }
+    Ok(seen)
+}
+
 /// Every `**X-nnn**` at the start of a line in a document.
-fn rules_in_markdown(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .filter_map(|line| {
+fn rules_in_markdown(text: &str, what: &str) -> Result<BTreeSet<String>> {
+    unique(
+        text.lines().filter_map(|line| {
             let rest = line.strip_prefix("**")?;
             let end = rest.find("**")?;
             let id = rest.get(..end)?;
             is_rule_id(id).then(|| id.to_owned())
-        })
-        .collect()
+        }),
+        what,
+    )
 }
 
 /// The identifiers in the pinned KM43 index.
-fn rules_in_index(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .filter(|line| !line.starts_with('#') && !line.starts_with("id\t"))
-        .filter_map(|line| line.split('\t').next())
-        .filter(|id| is_rule_id(id))
-        .map(str::to_owned)
-        .collect()
+fn rules_in_index(text: &str, what: &str) -> Result<BTreeSet<String>> {
+    unique(
+        text.lines()
+            .filter(|line| !line.starts_with('#') && !line.starts_with("id\t"))
+            .filter_map(|line| line.split('\t').next())
+            .filter(|id| is_rule_id(id))
+            .map(str::to_owned),
+        what,
+    )
 }
 
 /// A test function name's rule citation: `f_012_the_failure` cites `F-012`.
@@ -104,26 +134,22 @@ fn cited_by_name(name: &str) -> Option<String> {
     Some(format!("{letter}-{digits}"))
 }
 
-/// The body of the function that starts at `open`, by brace counting.
-fn body_after(source: &str, open: usize) -> Option<&str> {
-    let mut depth = 0usize;
-    let mut started = false;
-    for (offset, ch) in source.get(open..)?.char_indices() {
-        match ch {
-            '{' => {
-                depth = depth.saturating_add(1);
-                started = true;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if started && depth == 0 {
-                    return source.get(open..open.saturating_add(offset));
-                }
-            }
-            _ => {}
+/// Whether a function body invokes an assertion macro anywhere in it.
+struct Asserts(bool);
+
+impl<'ast> Visit<'ast> for Asserts {
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if let Some(last) = node.path.segments.last()
+            && ASSERTIONS.contains(&last.ident.to_string().as_str())
+        {
+            self.0 = true;
         }
+        syn::visit::visit_macro(self, node);
     }
-    None
+}
+
+fn is_test(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
 /// What one source file cites: by test name with an assertion, and by header.
@@ -140,46 +166,73 @@ impl Citations {
         self.header.extend(other.header);
         self.hollow.extend(other.hollow);
     }
+
+    fn visit_items(&mut self, items: &[Item], any_asserting_test: &mut bool) {
+        for item in items {
+            match item {
+                Item::Fn(function) if is_test(&function.attrs) => {
+                    let mut asserts = Asserts(false);
+                    asserts.visit_block(&function.block);
+                    *any_asserting_test |= asserts.0;
+                    if let Some(id) = cited_by_name(&function.sig.ident.to_string()) {
+                        if asserts.0 {
+                            self.asserting.insert(id);
+                        } else {
+                            self.hollow.insert(id);
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        self.visit_items(items, any_asserting_test);
+                    }
+                }
+                // `Item` is `#[non_exhaustive]` and not ours; nothing else
+                // declares a test.
+                _ => {}
+            }
+        }
+    }
 }
 
-fn citations_in(source: &str) -> Citations {
+/// The `cites:` identifiers in a file's inner doc comments.
+fn header_cites(attrs: &[Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(value) => match &value.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(text),
+                    ..
+                }) => Some(text.value()),
+                _ => None,
+            },
+            Meta::Path(_) | Meta::List(_) => None,
+        })
+        .filter_map(|line| line.trim().strip_prefix("cites:").map(str::to_owned))
+        .flat_map(|cites| {
+            cites
+                .split(',')
+                .map(|word| word.trim().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .filter(|id| is_rule_id(id))
+        .collect()
+}
+
+/// Parse a source and read what it cites.
+fn citations_in(source: &str) -> Result<Citations> {
+    let file = syn::parse_file(source).context("parsing a Rust source")?;
     let mut found = Citations::default();
-    let mut any_asserting_fn = false;
-    let mut search = 0;
-    while let Some(at) = source.get(search..).and_then(|rest| rest.find("fn ")) {
-        let at = search.saturating_add(at).saturating_add(3);
-        search = at;
-        let Some(rest) = source.get(at..) else { break };
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        let asserts = body_after(source, at).is_some_and(|body| body.contains("assert"));
-        any_asserting_fn |= asserts;
-        if let Some(id) = cited_by_name(&name) {
-            if asserts {
-                found.asserting.insert(id);
-            } else {
-                found.hollow.insert(id);
-            }
-        }
-    }
+    let mut any_asserting_test = false;
+    found.visit_items(&file.items, &mut any_asserting_test);
     // A header is a claim by a whole file, and it stands only over a file
     // that has a test which can fail.
-    if source.contains("#[test]") && any_asserting_fn {
-        for line in source.lines() {
-            let Some(cites) = line.strip_prefix("//! cites:") else {
-                continue;
-            };
-            for word in cites.split(',') {
-                let id = word.trim();
-                if is_rule_id(id) {
-                    found.header.insert(id.to_owned());
-                }
-            }
-        }
+    if any_asserting_test {
+        found.header.extend(header_cites(&file.attrs));
     }
-    found
+    Ok(found)
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -214,7 +267,7 @@ fn citations_in_repo(repo: &Repo) -> Result<(Citations, BTreeMap<String, PathBuf
     for file in &files {
         let source =
             fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let found = citations_in(&source);
+        let found = citations_in(&source).with_context(|| format!("reading {}", file.display()))?;
         for id in &found.hollow {
             hollow_in.insert(id.clone(), file.clone());
         }
@@ -260,6 +313,38 @@ fn declarations(docs: &Path, f_rules: &BTreeSet<String>, cited: &Citations) -> R
     Ok(declared)
 }
 
+/// The ratchet: every uncovered rule is listed by name, and only by name.
+fn ratchet(
+    f_rules: &BTreeSet<String>,
+    covered: &BTreeSet<String>,
+    untestable: &BTreeSet<String>,
+    listed: &[String],
+) -> Result<()> {
+    let listed: BTreeSet<&String> = listed.iter().collect();
+    for id in &listed {
+        ensure!(
+            f_rules.contains(*id),
+            "traceability.toml lists {id} as uncovered, and REQUIREMENTS.md does not name it"
+        );
+        ensure!(
+            !untestable.contains(*id),
+            "{id} is listed as uncovered and declared untestable; it is one or the other"
+        );
+        ensure!(
+            !covered.contains(*id),
+            "{id} has a test named after it now: take it off the uncovered list, which only shrinks"
+        );
+    }
+    for id in f_rules {
+        if !covered.contains(id) && !untestable.contains(id) && !listed.contains(id) {
+            bail!(
+                "{id} has no test and no declaration and is not on the uncovered list: if the rule is new, list it, and if it had a test, the test went missing"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn list(ids: &[&String]) -> String {
     ids.iter()
         .map(|id| id.as_str())
@@ -272,14 +357,14 @@ pub fn check(repo: &Repo) -> Result<()> {
     let docs = repo.root().join("docs");
     let requirements =
         fs::read_to_string(docs.join("REQUIREMENTS.md")).context("reading docs/REQUIREMENTS.md")?;
-    let f_rules = rules_in_markdown(&requirements);
+    let f_rules = rules_in_markdown(&requirements, "docs/REQUIREMENTS.md")?;
     ensure!(
         !f_rules.is_empty(),
         "docs/REQUIREMENTS.md names no **F-nnn** rule"
     );
     let index = fs::read_to_string(docs.join("km43").join("requirements.tsv"))
         .context("reading docs/km43/requirements.tsv")?;
-    let km43_rules = rules_in_index(&index);
+    let km43_rules = rules_in_index(&index, "docs/km43/requirements.tsv")?;
     ensure!(!km43_rules.is_empty(), "the KM43 index names no rule");
 
     let (cited, hollow_in) = citations_in_repo(repo)?;
@@ -299,15 +384,18 @@ pub fn check(repo: &Repo) -> Result<()> {
         );
     }
     let declared = declarations(&docs, &f_rules, &cited)?;
-    let untestable: BTreeSet<&String> = declared.untestable.iter().map(|e| &e.id).collect();
-    let is_covered = |id: &String| cited.asserting.contains(id) || cited.header.contains(id);
-
-    let covered: Vec<&String> = f_rules.iter().filter(|id| is_covered(id)).collect();
-    let uncovered: Vec<&String> = f_rules
+    let untestable: BTreeSet<String> = declared.untestable.iter().map(|e| e.id.clone()).collect();
+    let covered: BTreeSet<String> = f_rules
         .iter()
-        .filter(|id| !is_covered(id) && !untestable.contains(id))
+        .chain(km43_rules.iter())
+        .filter(|id| cited.asserting.contains(*id) || cited.header.contains(*id))
+        .cloned()
         .collect();
-    let km43_cited: Vec<&String> = km43_rules.iter().filter(|id| is_covered(id)).collect();
+    let f_covered: Vec<&String> = f_rules.iter().filter(|id| covered.contains(*id)).collect();
+    let km43_cited: Vec<&String> = km43_rules
+        .iter()
+        .filter(|id| covered.contains(*id))
+        .collect();
     let header_only: Vec<&String> = f_rules
         .iter()
         .chain(km43_rules.iter())
@@ -315,12 +403,11 @@ pub fn check(repo: &Repo) -> Result<()> {
         .collect();
 
     println!(
-        "traceability: {} F rules — {} covered, {} declared untestable, {} uncovered (at most {})",
+        "traceability: {} F rules — {} covered, {} declared untestable, {} listed uncovered",
         f_rules.len(),
-        covered.len(),
+        f_covered.len(),
         untestable.len(),
-        uncovered.len(),
-        declared.uncovered_at_most
+        declared.uncovered.len()
     );
     println!(
         "traceability: {} KM43 rules pinned — {} cited by an asserting test here: {}",
@@ -335,42 +422,37 @@ pub fn check(repo: &Repo) -> Result<()> {
             list(&header_only)
         );
     }
-    if uncovered.len() > declared.uncovered_at_most {
-        bail!(
-            "{} F rules have no test and no declaration, above the {} traceability.toml allows: {}",
-            uncovered.len(),
-            declared.uncovered_at_most,
-            list(&uncovered)
-        );
-    }
-    if uncovered.len() < declared.uncovered_at_most {
-        bail!(
-            "{} F rules are uncovered and traceability.toml still allows {}: lower `uncovered_at_most` to {} so the ratchet holds",
-            uncovered.len(),
-            declared.uncovered_at_most,
-            uncovered.len()
-        );
-    }
-    Ok(())
+    ratchet(&f_rules, &covered, &untestable, &declared.uncovered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ids(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
     // The fixtures are assembled at run time so this file's own text never
-    // reads as a citation to the scanner, which scans text and not syntax.
-    fn declaration(name: &str, body: &str) -> String {
+    // reads as a declaration to the walk, which parses every file here.
+    fn test_fn(name: &str, body: &str) -> String {
         format!("#[test]\nfn {name}() {{ {body} }}\n")
     }
 
     #[test]
     fn a_rule_is_read_from_the_start_of_a_line_only() {
         let doc = "**F-001** — first.\nSee **F-002** inline.\n**P-004** — a km43 rule.\n**F-12** — too short.\n";
-        let rules = rules_in_markdown(doc);
-        assert_eq!(rules.len(), 2);
-        assert!(rules.contains("F-001"));
-        assert!(rules.contains("P-004"));
+        let rules = rules_in_markdown(doc, "doc").expect("no duplicates");
+        assert_eq!(rules, ids(&["F-001", "P-004"]));
+    }
+
+    #[test]
+    fn a_number_allocated_twice_is_refused() {
+        let doc = "**F-001** — one obligation.\n\n**F-001** — another.\n";
+        let error = rules_in_markdown(doc, "doc").expect_err("a duplicate");
+        assert!(error.to_string().contains("F-001 is allocated twice"));
+        let index = "id\tdocument\nP-001\ta\nP-001\tb\n";
+        assert!(rules_in_index(index, "index").is_err());
     }
 
     #[test]
@@ -394,31 +476,120 @@ mod tests {
 
     #[test]
     fn f_082_a_citation_without_an_assertion_is_hollow() {
-        let source = declaration(&format!("{}_runs_low", "f_001"), "let _ = 1;")
-            + &declaration(&format!("{}_idles_high", "f_002"), "assert!(true);");
-        let found = citations_in(&source);
+        let source = test_fn(&format!("{}_runs_low", "f_001"), "let _ = 1;")
+            + &test_fn(&format!("{}_idles_high", "f_002"), "assert!(true);");
+        let found = citations_in(&source).expect("parses");
         assert!(found.hollow.contains("F-001"));
         assert!(found.asserting.contains("F-002"));
         assert!(!found.asserting.contains("F-001"));
     }
 
     #[test]
+    fn f_082_only_a_test_with_a_real_assertion_counts() {
+        // A helper carrying the name, a commented-out test, and the word in a
+        // string or a comment are the ways a text scan lies.
+        let helper = format!("fn {}_helper() {{ assert!(true); }}\n", "f_003");
+        let commented = format!(
+            "// #[test]\n// fn {}_gone() {{ assert!(true); }}\n",
+            "f_004"
+        );
+        let in_string = test_fn(&format!("{}_quoted", "f_005"), "let _ = \"assert!(x)\";");
+        let in_comment = test_fn(
+            &format!("{}_remarked", "f_006"),
+            "// assert!(x)\nlet _ = 1;",
+        );
+        let nested = format!(
+            "#[cfg(test)]\nmod tests {{\n{}}}\n",
+            test_fn(&format!("{}_deep", "f_007"), "assert_eq!(1, 1);")
+        );
+        let source = helper + &commented + &in_string + &in_comment + &nested;
+        let found = citations_in(&source).expect("parses");
+        assert_eq!(found.asserting, ids(&["F-007"]));
+        assert_eq!(found.hollow, ids(&["F-005", "F-006"]));
+    }
+
+    #[test]
     fn a_header_counts_only_on_a_file_with_an_asserting_test() {
-        let with =
-            "//! cites: P-004, L-110\n".to_owned() + &declaration("x_y", "assert_eq!(1, 1);");
+        let with = "//! cites: P-004, L-110\n".to_owned() + &test_fn("x_y", "assert_eq!(1, 1);");
         let without = "//! cites: P-004\nfn nothing() {}\n";
-        let hollow_test = "//! cites: P-004\n".to_owned() + &declaration("x_y", "let _ = 1;");
-        assert_eq!(citations_in(&with).header.len(), 2);
-        assert!(citations_in(without).header.is_empty());
-        assert!(citations_in(&hollow_test).header.is_empty());
+        let hollow_test = "//! cites: P-004\n".to_owned() + &test_fn("x_y", "let _ = 1;");
+        assert_eq!(
+            citations_in(&with).expect("parses").header,
+            ids(&["P-004", "L-110"])
+        );
+        assert!(citations_in(without).expect("parses").header.is_empty());
+        assert!(
+            citations_in(&hollow_test)
+                .expect("parses")
+                .header
+                .is_empty()
+        );
     }
 
     #[test]
     fn the_index_yields_its_identifiers_and_skips_its_comments() {
         let index =
             "# pinned\nid\tdocument\nP-001\tdocs/PROTOCOL.md\nL-010\tdocs/protocol/LINK.md\n";
-        let rules = rules_in_index(index);
-        assert_eq!(rules.len(), 2);
-        assert!(rules.contains("L-010"));
+        let rules = rules_in_index(index, "index").expect("no duplicates");
+        assert_eq!(rules, ids(&["P-001", "L-010"]));
+    }
+
+    #[test]
+    fn f_082_the_ratchet_holds_by_name() {
+        let rules = ids(&["F-001", "F-002", "F-003", "F-004"]);
+        let untestable = ids(&["F-004"]);
+        let listed = |l: &[&str]| l.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        // Consistent: F-001 covered, F-004 declared, the other two listed.
+        assert!(
+            ratchet(
+                &rules,
+                &ids(&["F-001"]),
+                &untestable,
+                &listed(&["F-002", "F-003"])
+            )
+            .is_ok()
+        );
+        // A rule lost its test and nothing else moved: the count of uncovered
+        // rules would read three against a list of two, but what the gate
+        // says is which rule.
+        let lost = ratchet(&rules, &ids(&[]), &untestable, &listed(&["F-002", "F-003"]));
+        assert!(
+            lost.expect_err("F-001 lost coverage")
+                .to_string()
+                .contains("F-001")
+        );
+        // A rule gained a test and is still listed: the list only shrinks.
+        let stale = ratchet(
+            &rules,
+            &ids(&["F-001", "F-002"]),
+            &untestable,
+            &listed(&["F-002", "F-003"]),
+        );
+        assert!(
+            stale
+                .expect_err("F-002 is stale on the list")
+                .to_string()
+                .contains("F-002")
+        );
+        // A new rule nobody listed.
+        let unlisted = ratchet(&rules, &ids(&["F-001"]), &untestable, &listed(&["F-002"]));
+        assert!(
+            unlisted
+                .expect_err("F-003 is unlisted")
+                .to_string()
+                .contains("F-003")
+        );
+        // Listed and declared at once.
+        let both = ratchet(
+            &rules,
+            &ids(&["F-001"]),
+            &untestable,
+            &listed(&["F-002", "F-003", "F-004"]),
+        );
+        assert!(
+            both.expect_err("F-004 is both")
+                .to_string()
+                .contains("F-004")
+        );
     }
 }

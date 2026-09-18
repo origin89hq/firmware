@@ -7,10 +7,12 @@ an `F-nnn`: a rule about what the firmware does on this board, each with the
 source that argued for it and the milestone in [#3][plan] that closes it.
 
 `cargo xtask check` reads every `**F-nnn**` below and refuses a rule that has
-neither a test named after it with an assertion in it (`fn f_012_...`), nor an
-entry in [`traceability.toml`](traceability.toml) saying why no test can
-reach it. The count of rules with neither is a number somebody defends at
-each audit; it goes up for exactly one reason, that a rule was added. The
+neither a `#[test]` named after it that invokes an assertion
+(`fn f_012_...`), nor an entry in [`traceability.toml`](traceability.toml)
+saying why no test can reach it, nor a place on that file's list of uncovered
+rules. The list is by name and somebody defends it at each audit: a rule
+leaves it when its test lands and joins it only when the rule is added, so a
+test that goes missing is a failure and not a number that stayed the same. The
 KM43 rules this repository's tests cite are counted the same way and reported,
 against the pinned copy in [`km43/requirements.tsv`](km43/requirements.tsv),
 until km43 ships the index itself ([km43#31][k31]).
@@ -263,9 +265,12 @@ the ELF, against its slot with a stated margin, on every commit. Source:
 depends on a crate that names a peripheral or on the allocator. Source:
 [#3][plan] §4.2, §4.4. M0.
 
-**F-082** — Every `F-nnn` has an asserting test named after it, or an entry in
-`traceability.toml` with a kind and a reason, or the gate fails; the count of
-rules with neither only goes down. Source: KM43 VERIFICATION §1. M0.
+**F-082** — Every `F-nnn` has a `#[test]` named after it that invokes an
+assertion, or an entry in `traceability.toml` with a kind and a reason, or is
+listed there as uncovered by name; a rule leaves that list when its test
+lands, joins it only in the commit that adds the rule, and a rule whose test
+goes missing fails the gate whatever the count. Source: KM43 VERIFICATION §1.
+M0.
 
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6

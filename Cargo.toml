@@ -22,6 +22,7 @@ anyhow = "1"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+syn = { version = "3", features = ["full", "visit"] }
 toml = "1"
 
 # The rules the compiler enforces. `unsafe_code` is denied at the root and
