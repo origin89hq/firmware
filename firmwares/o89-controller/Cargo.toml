@@ -15,15 +15,18 @@ publish.workspace = true
 # be asked for out loud. The build prints a warning when it is on, and an
 # image built with it must never be flashed onto a unit that will take an
 # update.
-bench = []
+bench = ["dep:panic-probe"]
 
 [dependencies]
+o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
+
 embassy-executor = { workspace = true, features = [
     "platform-cortex-m",
     "executor-thread",
     "defmt",
 ] }
 embassy-time = { workspace = true, features = ["defmt"] }
+embassy-sync = { workspace = true, features = ["defmt"] }
 
 # The part. `memory-x` is off on purpose: it would emit the part's 512 KB,
 # and the budget is one slot less the bootloader. See memory.x.
@@ -32,6 +35,10 @@ embassy-stm32 = { version = "=0.6.0", features = [
     "time-driver-any",
     "defmt",
 ] }
+# The registers the first statements and the reset cause need before the HAL
+# owns anything: the same release the HAL builds on, so the lockfile holds
+# one copy.
+stm32-metapac = { version = "=21.0.0", features = ["stm32g0b1re", "pac"] }
 cortex-m.workspace = true
 # `set-vtor`: the runtime points `VTOR` at this image's own vector table
 # before `main`. The bootloader jumps here without touching `VTOR`, and a
@@ -41,7 +48,8 @@ portable-atomic = { workspace = true, features = ["critical-section"] }
 
 defmt.workspace = true
 defmt-rtt.workspace = true
-panic-probe.workspace = true
+# Bench only: production writes the reason to the last words and resets.
+panic-probe = { workspace = true, optional = true }
 
 [lints]
 workspace = true

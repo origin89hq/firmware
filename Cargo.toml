@@ -25,6 +25,10 @@ serde = { version = "1", features = ["derive"] }
 syn = { version = "3", features = ["full", "visit"] }
 toml = "1"
 
+# `o89-core` derives `defmt::Format` behind a feature the controller turns on;
+# the same pin as the firmware workspace, so the two lockfiles agree.
+defmt = { version = "=1.1.1", default-features = false }
+
 # The rules the compiler enforces. `unsafe_code` is denied at the root and
 # opened per item with `#[expect(unsafe_code, reason = "...")]`; the domain
 # crates never need it. The clippy set is `pedantic` plus the restriction lints

@@ -18,6 +18,7 @@ use crate::{Blame, RailThroughReset, Revision};
 /// so this is a set, built from the register one flag at a time:
 /// `ResetFlags::NONE.pin(csr.pinrstf()).power(csr.pwrrstf())` and so on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ResetFlags(u8);
 
 impl ResetFlags {
@@ -86,6 +87,7 @@ impl ResetFlags {
 /// Why the part reset. One cause per boot: the most specific flag wins,
 /// because a watchdog reset also raises the pin flag on this family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResetCause {
     /// Power-on, power-down or brown-out. A sagging supply lands here.
     Power,
@@ -127,6 +129,7 @@ impl ResetCause {
 
 /// What `RCC.BDCR` selects as the RTC's clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RtcSource {
     /// No clock: the RTC is not running.
     None,
@@ -140,6 +143,7 @@ pub enum RtcSource {
 
 /// The RTC's clock, asserted from the backup domain rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RtcClock {
     /// The crystal is ready and selected.
     Lse,
@@ -168,6 +172,7 @@ impl RtcClock {
 
 /// Whether the RTC's backup domain kept its state through the reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BackupDomain {
     /// The calendar was initialised before this boot and is still running.
     Valid,
@@ -181,6 +186,7 @@ pub enum BackupDomain {
 /// The fields land in the class A boot record (`0x0601`) once KM43 fixes its
 /// body; until then this is the record the firmware holds and logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BootRecord {
     /// Why the part reset.
     pub cause: ResetCause,

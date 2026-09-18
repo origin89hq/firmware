@@ -13,6 +13,7 @@ use crate::Revision;
 
 /// An RS-485 bus, by the connector it leaves the board on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Bus {
     /// CN2: EPEver-class devices at 115200.
     One,
@@ -24,6 +25,7 @@ pub enum Bus {
 
 /// A VE.Direct port, by connector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Port {
     /// CN6.
     One,
@@ -33,6 +35,7 @@ pub enum Port {
 
 /// Every line the firmware drives, or deliberately does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Line {
     /// `RUN` to board B: the generator's maintained contact.
     Run,
@@ -58,6 +61,7 @@ pub enum Line {
 
 /// What a line is when nobody is deciding for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum FailState {
     /// Driven low, push-pull.
     DrivenLow,
@@ -98,6 +102,7 @@ impl Line {
 
 /// Whether a behaviour may drive an output yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Authority {
     /// Sense, evaluate and write down what would have been done; the output
     /// stays at its fail state and the hardware is never written.

@@ -14,6 +14,7 @@ use crate::Millis;
 
 /// Controller board A, by revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Revision {
     /// The 2026-09-09 export: the boards on the bench.
     A,
@@ -24,6 +25,7 @@ pub enum Revision {
 /// What the module rail does through a controller reset, which the board
 /// decides and the firmware can only report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RailThroughReset {
     /// The switch defaults off with the controller's pin high-impedance, so
     /// every reset reboots the module and is a switch-on event nobody chose.
@@ -36,6 +38,7 @@ pub enum RailThroughReset {
 /// The heartbeat ladder's third rung, which asks for the rail off for fifteen
 /// minutes (L-112).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ThirdRung {
     /// Cut the rail for this long, as the ladder says.
     Cut(Millis),
@@ -48,6 +51,7 @@ pub enum ThirdRung {
 
 /// Whether the part may ever enter a stop mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum StopMode {
     /// The debug header carries no `NRST`, so a part in stop mode is one the
     /// probe cannot reach again (origin89hq/hardware#29).
