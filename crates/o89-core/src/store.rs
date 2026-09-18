@@ -235,18 +235,17 @@ impl Store {
                 }),
             };
         }
-        let clients_booted = match at_boot.epoch() {
-            Some(under) => Some(clients.booted(fram, under).await),
-            None => {
-                // No epoch to take the table under, so nothing derives and
-                // nothing enrols; but the windows the table measures still
-                // restart at this boot's tick zero (P-121), in RAM only.
-                if let Some(held) = clients.present() {
-                    let rebased = held.clone().rebased();
-                    clients.rebase(rebased);
-                }
-                None
+        let clients_booted = if let Some(under) = at_boot.epoch() {
+            Some(clients.booted(fram, under).await)
+        } else {
+            // No epoch to take the table under, so nothing derives and
+            // nothing enrols; but the windows the table measures still
+            // restart at this boot's tick zero (P-121), in RAM only.
+            if let Some(held) = clients.present() {
+                let rebased = held.clone().rebased();
+                clients.rebase(rebased);
             }
+            None
         };
 
         let boot = match boots.held() {
