@@ -17,7 +17,7 @@
 # covered nor declared below. The check fails when the real count goes above
 # it, and fails when it drops below and this number was not lowered with it.
 # It started at 45 because forty-five of the forty-nine rules the plan named
-# have no code behind them yet; it goes up for exactly one reason, that a rule
+# had no code behind them when they were written; it goes up for exactly one reason, that a rule
 # was added.
 uncovered_at_most = 45
 
@@ -36,9 +36,3 @@ id = "F-080"
 kind = "spec-check"
 check = "images"
 reason = "The image measurement is a check of the gate itself; it was watched refuse a controller whose budget was lowered under its size."
-
-[[untestable]]
-id = "F-081"
-kind = "spec-check"
-check = "deps"
-reason = "The dependency boundaries are a check of the gate itself; it was watched refuse o89-core under o89-comms, cortex-m under o89-core, and alloc in o89-core's sources."
