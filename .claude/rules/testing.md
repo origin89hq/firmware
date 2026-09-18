@@ -5,7 +5,10 @@
 - **Name the failure, not the function**, and cite the rule:
   `f_005_the_rail_is_never_switched_on_after_minutes_off_on_revision_a`,
   never `test_rail`. The gate counts a rule covered only by a test named after
-  it that carries an assertion.
+  it that invokes an assertion in its own body: not in a nested `fn`, not in a
+  closure handed to an adapter, not in an `async` block nothing awaits. And a
+  test wears no `cfg` but `test`; the gate reads what rustc compiled and does
+  not evaluate predicates.
 - **A check you have not watched fail is not a check.** Break what it guards
   on purpose, see it go red, then put it back — from a `cp` you made first,
   never `git checkout -- <file>` or `git restore`, which discard every

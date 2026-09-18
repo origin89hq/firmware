@@ -1,9 +1,11 @@
 //! Where things are: the repository, the two workspaces, the toolchain's tools.
 
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use cargo_metadata::{Artifact, Message};
 
 /// The two targets, named once.
 pub const CORTEX_M0: &str = "thumbv6m-none-eabi";
@@ -36,14 +38,14 @@ impl Repo {
         self.root.join("Cargo.toml")
     }
 
-    /// The firmware workspace manifest.
-    pub fn firmware_manifest(&self) -> PathBuf {
-        self.root.join("firmwares").join("Cargo.toml")
+    /// The firmware workspace's root, which its manifest and `target` sit in.
+    pub fn firmware_root(&self) -> PathBuf {
+        self.root.join("firmwares")
     }
 
-    /// The firmware workspace's target directory.
-    pub fn firmware_target_dir(&self) -> PathBuf {
-        self.root.join("firmwares").join("target")
+    /// The firmware workspace manifest.
+    pub fn firmware_manifest(&self) -> PathBuf {
+        self.firmware_root().join("Cargo.toml")
     }
 
     /// A `cargo` invocation using the toolchain this repository pins.
@@ -104,4 +106,32 @@ pub fn run(command: &mut Command, what: &str) -> Result<()> {
         bail!("{what} failed ({status})");
     }
     Ok(())
+}
+
+/// Run a cargo build command and return every artifact it reports.
+///
+/// Diagnostics still reach the terminal rendered; only the artifact stream
+/// is read, so a check that wants to know what cargo compiled asks cargo.
+pub fn artifacts(command: &mut Command, what: &str) -> Result<Vec<Artifact>> {
+    command.arg("--message-format=json-render-diagnostics");
+    command.stdout(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {what}"))?;
+    let stdout = child.stdout.take().context("stdout is piped")?;
+    let mut found = Vec::new();
+    for message in Message::parse_stream(BufReader::new(stdout)) {
+        if let Message::CompilerArtifact(artifact) =
+            message.with_context(|| format!("reading what {what} built"))?
+        {
+            found.push(artifact);
+        }
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {what}"))?;
+    if !status.success() {
+        bail!("{what} failed ({status})");
+    }
+    Ok(found)
 }

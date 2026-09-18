@@ -10,13 +10,20 @@
 //! A test that cannot fail is not a test, and a citation on a body with no
 //! assertion is the failure mode of every traceability matrix ever built, so
 //! the assertion is what is looked for — and a comment, a string, a helper
-//! that merely carries the name, or an assertion inside a nested function the
-//! test never calls, is not one.
+//! that merely carries the name, or an assertion in code the body declares
+//! but is not known to run — a nested function, a closure that is not called
+//! where it is written, an `async` block that is not awaited where it is
+//! written — is not one.
 //!
-//! The sources are the files cargo compiles: every target root of both
-//! workspaces and every file its `mod` declarations reach. A `.rs` file
-//! outside that graph is refused rather than read, because a test nobody
-//! compiles is a citation nobody runs.
+//! Which files are compiled, and under what `cfg`, is not re-derived here:
+//! the gate builds what it validates — the host suite, the cross-compiles,
+//! the three images — and reads the dep-info rustc wrote beside each
+//! artifact, which names every file it read. A `.rs` file no artifact names
+//! is refused rather than read, because a test nobody compiles is a citation
+//! nobody runs; tests are read only from the files a test harness compiled;
+//! and a test, or a module holding one, that carries any `cfg` but `test` is
+//! refused, because whether that predicate holds is rustc's to say and it was
+//! not asked.
 //!
 //! `F` rules ratchet by identity, not by count. `traceability.toml` lists the
 //! uncovered rules by name: a rule leaves the list when its test lands, joins
@@ -30,12 +37,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::Artifact;
 use serde::Deserialize;
 use syn::visit::Visit;
-use syn::{Attribute, Expr, ExprLit, Item, Lit, Meta};
+use syn::{Attribute, Expr, ExprAsync, ExprAwait, ExprCall, ExprClosure, ExprLit, Item, Lit, Meta};
 
-use crate::repo::Repo;
+use crate::repo::{Repo, artifacts};
+use crate::{cross, images};
 
 /// The checks of the gate an untestable rule may nominate as its test.
 const GATE_CHECKS: &[&str] = &["cross", "deps", "images", "traceability"];
@@ -141,6 +149,14 @@ fn cited_by_name(name: &str) -> Option<String> {
     Some(format!("{letter}-{digits}"))
 }
 
+/// The expression under any parentheses.
+fn unparenthesised(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => unparenthesised(&paren.expr),
+        other => other,
+    }
+}
+
 /// Whether a function body invokes an assertion macro in code it runs.
 struct Asserts(bool);
 
@@ -157,31 +173,75 @@ impl<'ast> Visit<'ast> for Asserts {
     /// A function, struct or impl declared inside the body is not run by the
     /// body; an assertion in one is a declaration, not an invocation.
     fn visit_item(&mut self, _: &'ast Item) {}
+
+    /// A closure runs when something calls it, and whether anything does is
+    /// dataflow this gate does not do. The one called where it is written
+    /// is read from `visit_expr_call`; any other is not read.
+    fn visit_expr_closure(&mut self, _: &'ast ExprClosure) {}
+
+    /// An `async` block runs when something polls it. The one awaited where
+    /// it is written is read from `visit_expr_await`; any other is not read.
+    fn visit_expr_async(&mut self, _: &'ast ExprAsync) {}
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Expr::Closure(closure) = unparenthesised(&node.func) {
+            self.visit_expr(&closure.body);
+            for argument in &node.args {
+                self.visit_expr(argument);
+            }
+        } else {
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+
+    fn visit_expr_await(&mut self, node: &'ast ExprAwait) {
+        if let Expr::Async(block) = unparenthesised(&node.base) {
+            self.visit_block(&block.block);
+        } else {
+            syn::visit::visit_expr_await(self, node);
+        }
+    }
 }
 
 fn is_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
-/// The string of a `#[name = "..."]` attribute.
-fn string_attr(attrs: &[Attribute], name: &str) -> Option<String> {
-    attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident(name))
-        .find_map(|attr| match &attr.meta {
-            Meta::NameValue(value) => match &value.value {
-                Expr::Lit(ExprLit {
-                    lit: Lit::Str(text),
-                    ..
-                }) => Some(text.value()),
-                _ => None,
-            },
-            Meta::Path(_) | Meta::List(_) => None,
-        })
+/// Whether any item here, or in an inline module here, is a test.
+fn holds_a_test(items: &[Item]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Fn(function) => is_test(&function.attrs),
+        Item::Mod(module) => module
+            .content
+            .as_ref()
+            .is_some_and(|(_, inner)| holds_a_test(inner)),
+        _ => false,
+    })
+}
+
+/// A test, and anything holding one, wears no `cfg` but `test` and no
+/// `cfg_attr` at all: the gate reads the file as rustc compiled it and does
+/// not evaluate a predicate that could have taken the test out of the build.
+fn only_cfg_test(attrs: &[Attribute], what: &str) -> Result<()> {
+    for attr in attrs {
+        if attr.path().is_ident("cfg_attr") {
+            bail!("{what} carries a cfg_attr, which this gate does not evaluate");
+        }
+        if attr.path().is_ident("cfg") {
+            let predicate: Meta = attr
+                .parse_args()
+                .with_context(|| format!("parsing the cfg on {what}"))?;
+            ensure!(
+                matches!(&predicate, Meta::Path(path) if path.is_ident("test")),
+                "{what} carries a cfg other than cfg(test), which this gate does not evaluate: a test compiled out is a citation nobody runs"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// What one source file cites: by test name with an assertion, and by header.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Citations {
     asserting: BTreeSet<String>,
     header: BTreeSet<String>,
@@ -195,14 +255,16 @@ impl Citations {
         self.hollow.extend(other.hollow);
     }
 
-    fn visit_items(&mut self, items: &[Item], any_asserting_test: &mut bool) {
+    fn visit_items(&mut self, items: &[Item], any_asserting_test: &mut bool) -> Result<()> {
         for item in items {
             match item {
                 Item::Fn(function) if is_test(&function.attrs) => {
+                    let name = function.sig.ident.to_string();
+                    only_cfg_test(&function.attrs, &format!("the test `{name}`"))?;
                     let mut asserts = Asserts(false);
                     asserts.visit_block(&function.block);
                     *any_asserting_test |= asserts.0;
-                    if let Some(id) = cited_by_name(&function.sig.ident.to_string()) {
+                    if let Some(id) = cited_by_name(&name) {
                         if asserts.0 {
                             self.asserting.insert(id);
                         } else {
@@ -211,8 +273,14 @@ impl Citations {
                     }
                 }
                 Item::Mod(module) => {
-                    if let Some((_, items)) = &module.content {
-                        self.visit_items(items, any_asserting_test);
+                    if let Some((_, items)) = &module.content
+                        && holds_a_test(items)
+                    {
+                        only_cfg_test(
+                            &module.attrs,
+                            &format!("the module `{}`, which holds a test", module.ident),
+                        )?;
+                        self.visit_items(items, any_asserting_test)?;
                     }
                 }
                 // `Item` is `#[non_exhaustive]` and not ours; nothing else
@@ -220,6 +288,7 @@ impl Citations {
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -254,7 +323,10 @@ fn citations_in(source: &str) -> Result<Citations> {
     let file = syn::parse_file(source).context("parsing a Rust source")?;
     let mut found = Citations::default();
     let mut any_asserting_test = false;
-    found.visit_items(&file.items, &mut any_asserting_test);
+    if holds_a_test(&file.items) {
+        only_cfg_test(&file.attrs, "the file, which holds a test")?;
+    }
+    found.visit_items(&file.items, &mut any_asserting_test)?;
     // A header is a claim by a whole file, and it stands only over a file
     // that has a test which can fail.
     if any_asserting_test {
@@ -282,92 +354,157 @@ fn rust_files(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The source roots of a workspace: every Cargo target's file.
-fn target_roots(manifest: &Path) -> Result<Vec<PathBuf>> {
-    let metadata = MetadataCommand::new()
-        .manifest_path(manifest)
-        .no_deps()
-        .exec()
-        .with_context(|| format!("reading {}", manifest.display()))?;
-    Ok(metadata
-        .workspace_packages()
-        .iter()
-        .flat_map(|package| package.targets.iter())
-        .map(|target| target.src_path.clone().into_std_path_buf())
-        .collect())
-}
-
-/// Follow the `mod` declarations of the items under `dir`, the directory
-/// child modules of this scope live in; `declared_in` is the directory of
-/// the file itself, which a `#[path]` is relative to.
-fn follow_mods(
-    items: &[Item],
-    dir: &Path,
-    declared_in: &Path,
-    reached: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    for item in items {
-        let Item::Mod(module) = item else {
-            continue;
-        };
-        let name = module.ident.to_string();
-        if let Some((_, inner)) = &module.content {
-            follow_mods(inner, &dir.join(&name), declared_in, reached)?;
-        } else {
-            let file = if let Some(path) = string_attr(&module.attrs, "path") {
-                declared_in.join(path)
-            } else {
-                let flat = dir.join(format!("{name}.rs"));
-                if flat.is_file() {
-                    flat
-                } else {
-                    dir.join(&name).join("mod.rs")
+/// The words of a Makefile rule, with `\ ` and the other escapes undone.
+fn make_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
                 }
-            };
-            ensure!(
-                file.is_file(),
-                "`mod {name};` declared under {} names no file",
-                declared_in.display()
-            );
-            let owns_dir = file.file_name().is_some_and(|n| n == "mod.rs");
-            follow_file(&file, owns_dir, reached)?;
+            }
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
         }
     }
-    Ok(())
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
 }
 
-/// Read one file into the reached set and follow its modules. A target root
-/// or a `mod.rs` owns its directory; a `name.rs` module owns `name/`.
-fn follow_file(file: &Path, owns_dir: bool, reached: &mut BTreeSet<PathBuf>) -> Result<()> {
-    if !reached.insert(file.to_path_buf()) {
-        return Ok(());
-    }
-    let source = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let parsed = syn::parse_file(&source).with_context(|| format!("parsing {}", file.display()))?;
-    let declared_in = file.parent().context("a file has a directory")?;
-    let dir = if owns_dir {
-        declared_in.to_path_buf()
-    } else {
-        let stem = file.file_stem().context("a file has a stem")?;
-        declared_in.join(stem)
-    };
-    follow_mods(&parsed.items, &dir, declared_in, reached)
+/// The files a dep-info file says were read, resolved against the
+/// workspace root that rustc ran in.
+///
+/// rustc writes `target: file file...` then one `file:` line per file so
+/// that make survives a deletion, and cargo's copy beside an uplifted
+/// binary is the first form alone with absolute paths; both are the rule
+/// lines, and `#` lines are the environment the build read.
+fn dep_info_sources(text: &str, workspace_root: &Path) -> BTreeSet<PathBuf> {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once(": "))
+        .flat_map(|(_, files)| make_words(files))
+        .map(|file| workspace_root.join(file))
+        .collect()
 }
 
-/// The files cargo compiles, from the target roots through their modules.
-fn compiled_sources(roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
-    let mut reached = BTreeSet::new();
-    for root in roots {
-        follow_file(root, true, &mut reached)?;
+/// The dep-info files rustc wrote beside an artifact's files: `x-HASH.d`
+/// beside `x-HASH` or `libx-HASH.rlib`, and for a build script, whatever
+/// `.d` is in its directory, because cargo names the script one way and
+/// rustc names its dep-info another.
+fn dep_info_beside(custom_build: bool, files: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    let mut found = BTreeSet::new();
+    for file in files {
+        let dir = file.parent().context("an artifact has a directory")?;
+        if custom_build {
+            for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "d") {
+                    found.insert(path);
+                }
+            }
+            continue;
+        }
+        let stem = file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("an artifact has a name")?;
+        let beside = dir.join(format!("{stem}.d"));
+        let unprefixed = stem
+            .strip_prefix("lib")
+            .map(|stem| dir.join(format!("{stem}.d")));
+        if beside.is_file() {
+            found.insert(beside);
+        } else if let Some(unprefixed) = unprefixed.filter(|path| path.is_file()) {
+            found.insert(unprefixed);
+        }
     }
-    Ok(reached)
+    ensure!(
+        !found.is_empty(),
+        "no dep-info beside {}",
+        files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(found)
+}
+
+/// What the gate's builds compiled: every file, and the files a test
+/// harness compiled, both as this repository's canonical paths.
+#[derive(Default)]
+struct Compiled {
+    every: BTreeSet<PathBuf>,
+    tested: BTreeSet<PathBuf>,
+}
+
+impl Compiled {
+    /// Read the dep-info of the artifacts of this repository's own packages.
+    fn read(
+        &mut self,
+        repo_root: &Path,
+        workspace_root: &Path,
+        artifacts: &[Artifact],
+    ) -> Result<()> {
+        for artifact in artifacts {
+            let manifest = fs::canonicalize(artifact.manifest_path.as_std_path())
+                .with_context(|| format!("locating {}", artifact.manifest_path))?;
+            if !manifest.starts_with(repo_root) {
+                continue;
+            }
+            let files: Vec<PathBuf> = artifact
+                .filenames
+                .iter()
+                .map(|file| file.clone().into_std_path_buf())
+                .collect();
+            for dep_info in dep_info_beside(artifact.target.is_custom_build(), &files)? {
+                let text = fs::read_to_string(&dep_info)
+                    .with_context(|| format!("reading {}", dep_info.display()))?;
+                for source in dep_info_sources(&text, workspace_root) {
+                    if source.extension().is_none_or(|ext| ext != "rs") {
+                        continue;
+                    }
+                    let source = fs::canonicalize(&source)
+                        .with_context(|| format!("locating {}", source.display()))?;
+                    if artifact.profile.test {
+                        self.tested.insert(source.clone());
+                    }
+                    self.every.insert(source);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build what the gate validates and read what rustc compiled for it.
+fn compiled_sources(repo: &Repo) -> Result<Compiled> {
+    let repo_root = fs::canonicalize(repo.root()).context("locating the repository")?;
+    let firmware_root = fs::canonicalize(repo.firmware_root()).context("locating firmwares/")?;
+    let mut compiled = Compiled::default();
+    let host = artifacts(
+        repo.cargo()
+            .args(["test", "--locked", "--workspace", "--no-run"]),
+        "cargo test --workspace --no-run",
+    )?;
+    compiled.read(&repo_root, &repo_root, &host)?;
+    compiled.read(&repo_root, &repo_root, &cross::compile(repo)?)?;
+    compiled.read(&repo_root, &firmware_root, &images::compile(repo)?)?;
+    Ok(compiled)
 }
 
 /// Every citation in the sources, and the file each hollow one sits in.
 fn citations_in_repo(repo: &Repo) -> Result<(Citations, BTreeMap<String, PathBuf>)> {
-    let mut roots = target_roots(&repo.host_manifest())?;
-    roots.extend(target_roots(&repo.firmware_manifest())?);
-    let compiled = compiled_sources(&roots)?;
+    let compiled = compiled_sources(repo)?;
     let mut present = BTreeSet::new();
     for dir in ["crates", "firmwares", "xtask"] {
         let dir = repo.root().join(dir);
@@ -375,17 +512,24 @@ fn citations_in_repo(repo: &Repo) -> Result<(Citations, BTreeMap<String, PathBuf
             rust_files(&dir, &mut present)?;
         }
     }
-    let orphans: Vec<&PathBuf> = present.difference(&compiled).collect();
+    let mut orphans = Vec::new();
+    for file in &present {
+        let canonical =
+            fs::canonicalize(file).with_context(|| format!("locating {}", file.display()))?;
+        if !compiled.every.contains(&canonical) {
+            orphans.push(file);
+        }
+    }
     if let Some(first) = orphans.first() {
         bail!(
-            "{} Rust file(s) that no Cargo target reaches, starting with {}: a test nobody compiles is a citation nobody runs",
+            "{} Rust file(s) that none of the gate's builds compiled, starting with {}: a test nobody compiles is a citation nobody runs",
             orphans.len(),
             first.display()
         );
     }
     let mut all = Citations::default();
     let mut hollow_in = BTreeMap::new();
-    for file in &compiled {
+    for file in &compiled.tested {
         let source =
             fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let found = citations_in(&source).with_context(|| format!("reading {}", file.display()))?;
@@ -660,6 +804,85 @@ mod tests {
     }
 
     #[test]
+    fn f_082_a_deferred_body_counts_only_where_it_is_run() {
+        // A closure the body never calls, one handed to an adapter, and an
+        // `async` block nothing polls hold assertions that may never run; the
+        // closure called where it stands and the block awaited where it
+        // stands do run.
+        let unused_closure = test_fn(
+            &format!("{}_binds_a_closure", "f_010"),
+            "let check = || assert!(false); let _ = check;",
+        );
+        let handed_over = test_fn(
+            &format!("{}_hands_a_closure_over", "f_011"),
+            "[1, 2].iter().for_each(|x| assert!(*x > 0));",
+        );
+        let unpolled = test_fn(
+            &format!("{}_never_polls", "f_012"),
+            "let fut = async { assert!(false); }; let _ = fut;",
+        );
+        let invoked = test_fn(
+            &format!("{}_calls_it_in_place", "f_013"),
+            "(|x| assert!(x > 0))(1);",
+        );
+        let awaited = test_fn(
+            &format!("{}_awaits_it_in_place", "f_014"),
+            "async { assert!(true); }.await;",
+        );
+        let in_a_loop = test_fn(
+            &format!("{}_asserts_in_a_loop", "f_015"),
+            "for x in [1, 2] { assert!(x > 0); }",
+        );
+        let source = unused_closure + &handed_over + &unpolled + &invoked + &awaited + &in_a_loop;
+        let found = citations_in(&source).expect("parses");
+        assert_eq!(found.asserting, ids(&["F-013", "F-014", "F-015"]));
+        assert_eq!(found.hollow, ids(&["F-010", "F-011", "F-012"]));
+    }
+
+    #[test]
+    fn f_082_a_test_wears_no_cfg_but_test() {
+        let plain = format!(
+            "#[cfg(test)]\nmod tests {{\n#[cfg(test)]\n{}}}\n",
+            test_fn(&format!("{}_under_test", "f_020"), "assert!(true);")
+        );
+        assert_eq!(
+            citations_in(&plain).expect("cfg(test) is fine").asserting,
+            ids(&["F-020"])
+        );
+        let untested_helper_module = "#[cfg(unix)]\nmod platform { fn helper() {} }\n";
+        assert!(citations_in(untested_helper_module).is_ok());
+
+        let behind_a_feature = format!(
+            "#[cfg(feature = \"never\")]\n{}",
+            test_fn(&format!("{}_behind_a_feature", "f_021"), "assert!(true);")
+        );
+        let error = citations_in(&behind_a_feature).expect_err("a feature is not evaluated");
+        assert!(error.to_string().contains("f_021_behind_a_feature"));
+
+        let dead_module = format!(
+            "#[cfg(any())]\nmod dead {{\n{}}}\n",
+            test_fn(&format!("{}_in_a_dead_module", "f_022"), "assert!(true);")
+        );
+        let error = citations_in(&dead_module).expect_err("any() is not evaluated");
+        assert!(error.to_string().contains("`dead`"));
+
+        let attributed = format!(
+            "#[cfg_attr(unix, ignore)]\n{}",
+            test_fn(
+                &format!("{}_conditionally_attributed", "f_023"),
+                "assert!(true);"
+            )
+        );
+        assert!(citations_in(&attributed).is_err());
+
+        let dead_file = format!(
+            "#![cfg(any())]\n{}",
+            test_fn(&format!("{}_in_a_dead_file", "f_024"), "assert!(true);")
+        );
+        assert!(citations_in(&dead_file).is_err());
+    }
+
+    #[test]
     fn a_header_counts_only_on_a_file_with_an_asserting_test() {
         let with = "//! cites: P-004, L-110\n".to_owned() + &test_fn("x_y", "assert_eq!(1, 1);");
         let without = "//! cites: P-004\nfn nothing() {}\n";
@@ -686,45 +909,58 @@ mod tests {
     }
 
     #[test]
-    fn f_082_the_module_graph_reaches_what_cargo_compiles_and_nothing_else() {
-        let tree = Tree::new("modules");
-        let root = tree.file("src/lib.rs", "mod a;\nmod c;\nmod inline { mod e; }\n");
-        let a_mod = tree.file("src/a/mod.rs", "mod b;\n");
-        let a_b = tree.file("src/a/b.rs", "");
-        let c_file = tree.file("src/c.rs", "#[cfg(test)] mod d;\n");
-        let c_d = tree.file("src/c/d.rs", "");
-        let inline_e = tree.file("src/inline/e.rs", "");
-        let orphan = tree.file(
-            "src/orphan.rs",
-            &format!(
-                "#[test] fn {}_from_nowhere() {{ assert!(true); }}\n",
-                "f_099"
-            ),
-        );
-        let reached = compiled_sources(std::slice::from_ref(&root)).expect("a complete graph");
+    fn f_082_dep_info_names_what_rustc_read_in_either_form() {
+        let root = Path::new("/ws");
+        // rustc's form: the rule, the phony rule per file, the environment.
+        let from_rustc = "/ws/target/debug/deps/x-1.d: xtask/src/main.rs xtask/src/a\\ b.rs\n\n\
+                          /ws/target/debug/deps/x-1: xtask/src/main.rs xtask/src/a\\ b.rs\n\n\
+                          xtask/src/main.rs:\nxtask/src/a\\ b.rs:\n\n\
+                          # env-dep:CARGO_PKG_NAME=xtask\n";
         assert_eq!(
-            reached,
-            [root, a_mod, a_b, c_file, c_d, inline_e]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
+            dep_info_sources(from_rustc, root),
+            [
+                PathBuf::from("/ws/xtask/src/main.rs"),
+                PathBuf::from("/ws/xtask/src/a b.rs")
+            ]
+            .into_iter()
+            .collect()
         );
-        assert!(!reached.contains(&orphan));
-        let mut present = BTreeSet::new();
-        rust_files(&tree.0, &mut present).expect("a listing");
-        let orphans: Vec<_> = present.difference(&reached).collect();
-        assert_eq!(orphans, vec![&orphan]);
+        // cargo's form beside an uplifted binary: one rule, absolute paths.
+        let from_cargo = "/ws/target/debug/x: /ws/x/build.rs /ws/x/memory.x /ws/x/src/main.rs\n";
+        assert_eq!(
+            dep_info_sources(from_cargo, root),
+            ["/ws/x/build.rs", "/ws/x/memory.x", "/ws/x/src/main.rs"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert!(dep_info_sources("", root).is_empty());
     }
 
     #[test]
-    fn a_path_attribute_and_a_missing_module_are_both_read() {
-        let tree = Tree::new("paths");
-        let root = tree.file("src/main.rs", "#[path = \"elsewhere.rs\"]\nmod named;\n");
-        let elsewhere = tree.file("src/elsewhere.rs", "");
-        let reached = compiled_sources(std::slice::from_ref(&root)).expect("a complete graph");
-        assert_eq!(reached, [root, elsewhere].into_iter().collect());
-        let broken = tree.file("src/broken.rs", "mod ghost;\n");
-        let error = compiled_sources(&[broken]).expect_err("no file for ghost");
-        assert!(error.to_string().contains("mod ghost"));
+    fn dep_info_sits_beside_the_artifact_under_the_crate_name() {
+        let tree = Tree::new("dep-info");
+        let rlib = tree.file("deps/libo89_core-1.rlib", "");
+        let rmeta = tree.file("deps/libo89_core-1.rmeta", "");
+        let lib_d = tree.file("deps/o89_core-1.d", "");
+        let harness = tree.file("deps/o89_core-2", "");
+        let harness_d = tree.file("deps/o89_core-2.d", "");
+        let script = tree.file("build/o89-boot-3/build-script-build", "");
+        let script_d = tree.file("build/o89-boot-3/build_script_build-3.d", "");
+        assert_eq!(
+            dep_info_beside(false, &[rlib, rmeta]).expect("found"),
+            [lib_d].into_iter().collect()
+        );
+        assert_eq!(
+            dep_info_beside(false, &[harness]).expect("found"),
+            [harness_d].into_iter().collect()
+        );
+        assert_eq!(
+            dep_info_beside(true, &[script]).expect("found"),
+            [script_d].into_iter().collect()
+        );
+        let bare = tree.file("deps/nothing-4", "");
+        assert!(dep_info_beside(false, &[bare]).is_err());
     }
 
     #[test]

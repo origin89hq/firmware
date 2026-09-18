@@ -10,9 +10,9 @@
 use std::fs;
 
 use anyhow::{Context, Result};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{Artifact, MetadataCommand};
 
-use crate::repo::{CORTEX_M0, RISCV, Repo, run};
+use crate::repo::{CORTEX_M0, RISCV, Repo, artifacts};
 
 /// The names of the host workspace's `#![no_std]` library crates.
 pub fn no_std_crates(repo: &Repo) -> Result<Vec<String>> {
@@ -36,22 +36,33 @@ pub fn no_std_crates(repo: &Repo) -> Result<Vec<String>> {
     Ok(found)
 }
 
-/// `cargo check` each `no_std` crate for the Cortex-M0+ and the RISC-V target.
-pub fn check(repo: &Repo) -> Result<()> {
+/// `cargo check` each `no_std` crate for the Cortex-M0+ and the RISC-V
+/// target, and return what those checks compiled.
+pub fn compile(repo: &Repo) -> Result<Vec<Artifact>> {
     let crates = no_std_crates(repo)?;
     anyhow::ensure!(
         !crates.is_empty(),
         "no #![no_std] crate found in the host workspace; the gate would check nothing"
     );
+    let mut built = Vec::new();
     for name in &crates {
         for target in [CORTEX_M0, RISCV] {
-            run(
+            built.extend(artifacts(
                 repo.cargo()
                     .args(["check", "--locked", "-p", name, "--target", target]),
                 &format!("cargo check -p {name} --target {target}"),
-            )?;
+            )?);
         }
     }
-    println!("cross-compiled for both targets: {}", crates.join(", "));
+    Ok(built)
+}
+
+/// The check: every `no_std` crate compiles for both targets.
+pub fn check(repo: &Repo) -> Result<()> {
+    compile(repo)?;
+    println!(
+        "cross-compiled for both targets: {}",
+        no_std_crates(repo)?.join(", ")
+    );
     Ok(())
 }
