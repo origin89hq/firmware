@@ -23,7 +23,10 @@
 //! Reachable means linked into the part. A procedural macro and a build
 //! dependency run on the laptop and link into nothing on the target, so the
 //! walk stops at them: `defmt`'s derive pulls a parser that wants `std`, and
-//! that is the laptop's `std`, not the controller's.
+//! that is the laptop's `std`, not the controller's. A development
+//! dependency links into its own crate's tests and nothing downstream, so
+//! the walk follows one from the crate being checked, whose tests are held
+//! to the rule, and from no crate it reaches.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -55,23 +58,42 @@ const HAL_PREFIXES: &[&str] = &[
 /// The crate roots that bring an allocator with them.
 const ALLOC_ROOTS: &[&str] = &["alloc", "std"];
 
-/// Whether a dependency of these kinds links into the crate that names it.
-/// A build dependency is the build script's, and only a build dependency;
-/// a dependency that is also normal or a development one links. An empty
-/// list is an older cargo that did not say, and is taken as normal.
-fn links_into(kinds: &[DependencyKind]) -> bool {
-    // `DependencyKind` is `#[non_exhaustive]` and not ours; a kind cargo
-    // adds later is walked rather than skipped.
-    kinds.is_empty()
+/// How a dependency edge links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Links {
+    /// Into the crate, and so into everything that depends on it.
+    Always,
+    /// Into the crate's own tests, and into nothing downstream.
+    TestsOnly,
+    /// Into nothing on the part: the build script's alone.
+    Never,
+}
+
+/// How a dependency of these kinds links. An empty list is an older cargo
+/// that did not say, and is taken as normal; `DependencyKind` is
+/// `#[non_exhaustive]` and not ours, so a kind cargo adds later is walked
+/// rather than skipped.
+fn links(kinds: &[DependencyKind]) -> Links {
+    let normal = kinds.is_empty()
         || kinds
             .iter()
-            .any(|kind| !matches!(kind, DependencyKind::Build))
+            .any(|kind| !matches!(kind, DependencyKind::Build | DependencyKind::Development));
+    if normal {
+        Links::Always
+    } else if kinds
+        .iter()
+        .any(|kind| matches!(kind, DependencyKind::Development))
+    {
+        Links::TestsOnly
+    } else {
+        Links::Never
+    }
 }
 
 /// The resolved graph as adjacency by package id, with each id's name and
 /// the features it was resolved with.
 struct Graph {
-    edges: BTreeMap<PackageId, Vec<PackageId>>,
+    edges: BTreeMap<PackageId, Vec<(PackageId, Links)>>,
     names: BTreeMap<PackageId, String>,
     features: BTreeMap<PackageId, Vec<String>>,
 }
@@ -107,12 +129,16 @@ impl Graph {
                     node.deps
                         .iter()
                         .filter(|dep| !proc_macros.contains(&dep.pkg))
-                        .filter(|dep| {
+                        .filter_map(|dep| {
                             let kinds: Vec<DependencyKind> =
                                 dep.dep_kinds.iter().map(|info| info.kind).collect();
-                            links_into(&kinds)
+                            match links(&kinds) {
+                                Links::Never => None,
+                                linked @ (Links::Always | Links::TestsOnly) => {
+                                    Some((dep.pkg.clone(), linked))
+                                }
+                            }
                         })
-                        .map(|dep| dep.pkg.clone())
                         .collect(),
                 )
             })
@@ -139,7 +165,9 @@ impl Graph {
     /// Visited is kept by id: two ids can share a name — two versions of
     /// `embassy-sync` on two paths — and a walk that marked the name visited
     /// would skip the second one's subtree, and with it whatever forbidden
-    /// crate sat there.
+    /// crate sat there. A tests-only edge is followed from `from` alone:
+    /// its tests are the ones held to the rule, and a crate it reaches
+    /// links its own test helpers into nothing of ours.
     fn reachable_ids(&self, from: &PackageId) -> Vec<PackageId> {
         let mut visited = BTreeSet::from([from.clone()]);
         let mut order = Vec::new();
@@ -148,8 +176,13 @@ impl Graph {
             let Some(deps) = self.edges.get(&id) else {
                 continue;
             };
-            for dep in deps {
-                if visited.insert(dep.clone()) {
+            for (dep, linked) in deps {
+                let followed = match linked {
+                    Links::Always => true,
+                    Links::TestsOnly => id == *from,
+                    Links::Never => false,
+                };
+                if followed && visited.insert(dep.clone()) {
                     order.push(dep.clone());
                     queue.push_back(dep.clone());
                 }
@@ -353,7 +386,12 @@ mod tests {
             ("hal", vec![]),
         ]
         .into_iter()
-        .map(|(from, to)| (id(from), to.into_iter().map(id).collect()))
+        .map(|(from, to)| {
+            (
+                id(from),
+                to.into_iter().map(|to| (id(to), Links::Always)).collect(),
+            )
+        })
         .collect();
         let features = [("sync-b", vec!["alloc"])]
             .into_iter()
@@ -375,12 +413,80 @@ mod tests {
 
     #[test]
     fn f_081_only_what_links_into_the_part_is_walked() {
-        assert!(links_into(&[DependencyKind::Normal]));
-        assert!(links_into(&[DependencyKind::Development]));
-        assert!(!links_into(&[DependencyKind::Build]));
+        assert_eq!(links(&[DependencyKind::Normal]), Links::Always);
+        assert_eq!(links(&[DependencyKind::Development]), Links::TestsOnly);
+        assert_eq!(links(&[DependencyKind::Build]), Links::Never);
         // The same crate as a build dependency and a normal one links.
-        assert!(links_into(&[DependencyKind::Build, DependencyKind::Normal]));
-        assert!(links_into(&[]));
+        assert_eq!(
+            links(&[DependencyKind::Build, DependencyKind::Normal]),
+            Links::Always
+        );
+        assert_eq!(
+            links(&[DependencyKind::Build, DependencyKind::Development]),
+            Links::TestsOnly
+        );
+        assert_eq!(links(&[]), Links::Always);
+    }
+
+    /// `app` has a test helper that reaches `hal`, and a normal dependency
+    /// `lib` whose own test helper reaches `alloc-lib`.
+    fn with_test_helpers() -> Graph {
+        let names = [
+            ("app", "app"),
+            ("helper", "helper"),
+            ("hal", "embassy-stm32"),
+            ("lib", "lib"),
+            ("lib-helper", "lib-helper"),
+            ("alloc-lib", "alloc-lib"),
+        ]
+        .into_iter()
+        .map(|(repr, name)| (id(repr), name.to_owned()))
+        .collect();
+        let edges = [
+            (
+                "app",
+                vec![("helper", Links::TestsOnly), ("lib", Links::Always)],
+            ),
+            ("helper", vec![("hal", Links::Always)]),
+            ("hal", vec![]),
+            ("lib", vec![("lib-helper", Links::TestsOnly)]),
+            ("lib-helper", vec![("alloc-lib", Links::Always)]),
+            ("alloc-lib", vec![]),
+        ]
+        .into_iter()
+        .map(|(from, to)| {
+            (
+                id(from),
+                to.into_iter().map(|(to, links)| (id(to), links)).collect(),
+            )
+        })
+        .collect();
+        let features = [("alloc-lib", vec!["alloc"])]
+            .into_iter()
+            .map(|(repr, features)| (id(repr), features.into_iter().map(str::to_owned).collect()))
+            .collect();
+        Graph {
+            edges,
+            names,
+            features,
+        }
+    }
+
+    #[test]
+    fn f_081_the_checked_crates_own_test_helpers_are_walked_and_nobody_elses() {
+        let graph = with_test_helpers();
+        let reached = graph.reachable(&id("app")).expect("a complete graph");
+        // Our tests are held to the rule: the helper and what it reaches.
+        assert!(reached.contains("helper"));
+        assert!(reached.contains("embassy-stm32"));
+        // A dependency's test helpers link into nothing of ours.
+        assert!(reached.contains("lib"));
+        assert!(!reached.contains("lib-helper"));
+        assert!(!reached.contains("alloc-lib"));
+        assert_eq!(graph.alloc_feature_reachable(&id("app")), None);
+        // Checked from `lib` itself, its helper is its own.
+        let from_lib = graph.reachable(&id("lib")).expect("a complete graph");
+        assert!(from_lib.contains("alloc-lib"));
     }
 
     #[test]
