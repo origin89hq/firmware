@@ -70,8 +70,9 @@ pub enum Refused<E> {
     /// The record's sequence is at the top of its `u32`. Refused rather than
     /// wrapped: a sequence back at one would make an old slot the newer one.
     AtTheCeiling,
-    /// The bus said no, before or during the write; what landed is unknown
-    /// and the CRC is what tells the next reader.
+    /// The bus said no, before or during the write; what landed is unknown,
+    /// possibly a prefix of the bytes, and the magic and the CRC are what
+    /// tell the next reader.
     Bus(E),
 }
 
@@ -89,7 +90,12 @@ pub trait Fram {
 
     /// Write `bytes` starting at `at`, as one transaction, or refuse to
     /// start one on a falling supply. A transaction the bus starts is one
-    /// the part finishes: the discipline is about starting.
+    /// the part is expected to finish on its own energy, which is why the
+    /// discipline is about starting; a `Bus` error is the bus failing
+    /// before or during it, and what landed is then unknown. The
+    /// simulator cuts the power inside a transaction on purpose and
+    /// reports that as `Bus`, so that every prefix a cut can leave is
+    /// read back and judged by the magic and the CRC, never by trust.
     fn write(
         &mut self,
         at: Address,
@@ -187,8 +193,29 @@ pub struct Record<const N: usize> {
 
 impl<const N: usize> Record<N> {
     /// A record whose slot `A` starts at `at`; `B` follows it.
+    ///
+    /// The magic is never zero: zero is what a slot's magic is cleared to
+    /// while a new record lands over it, and a record whose magic were
+    /// zero would read as current with its sequence, body and CRC in
+    /// place and its magic not yet written. Every record is a `const`, so
+    /// a zero here is a build that fails, not a boot that does:
+    ///
+    /// ```compile_fail
+    /// use o89_core::{Address, Record};
+    ///
+    /// const ZERO: Record<4> = Record::at(0, Address(0));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// On a zero magic, which every record being a `const` makes a build
+    /// error rather than a panic at runtime.
     #[must_use]
     pub const fn at(magic: u32, at: Address) -> Self {
+        assert!(
+            magic != 0,
+            "a record's magic is never zero: zero is a slot being written"
+        );
         Self { magic, a: at }
     }
 

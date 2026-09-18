@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn every_magic_is_distinct() {
+    fn f_020_every_magic_is_distinct_and_none_is_zero() {
         let magics = [
             magic(*b"EPOC"),
             magic(*b"CHAL"),
@@ -117,6 +117,10 @@ mod tests {
             magic(*b"SHED"),
         ];
         for (i, a) in magics.iter().enumerate() {
+            // Never zero: zero is a slot's magic while a record lands over
+            // it, and a record could not tell its own slot from one being
+            // written.
+            assert_ne!(*a, 0);
             for b in &magics[i + 1..] {
                 assert_ne!(a, b);
             }
