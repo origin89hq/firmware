@@ -35,9 +35,12 @@ use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Flex, Level, Output, Speed};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Ticker};
-use o89_core::{BootRecord, Bus, FailState, LastWords, Line, ResetCause, RtcClock, Task};
+use o89_core::{
+    BootRecord, Bus, Clock, FailState, LastWords, Line, RailSequencer, ResetCause, RtcClock, Task,
+};
 
 use crate::board::{Board, REVISION};
+use crate::supervisor::Uptime;
 
 /// The level a driven line is held at, from the table `o89-core` declares.
 ///
@@ -144,15 +147,20 @@ async fn main(spawner: Spawner) {
     }
 
     // 9. The module rail sequence: the module powered with EN held low,
-    // released once the rail has settled.
-    let rail = rail::Pins::new(
+    // released once the rail has settled. The boot lines are applied here,
+    // before the task exists, so EN is held from the instant the pins are
+    // taken and the rail never rises with the module's reset released.
+    let mut rail = rail::Pins::new(
         Output::new(b.module.rail, Level::Low, Speed::Low),
         Flex::new(b.module.en),
     );
+    let mut sequencer = RailSequencer::new(REVISION);
+    rail.apply(sequencer.power_on(Uptime.now()));
+    defmt::info!("rail: powering the module, EN held low");
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
-    if let Ok(token) = rail::run(rail) {
+    if let Ok(token) = rail::run(rail, sequencer) {
         spawner.spawn(token);
     } else {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");

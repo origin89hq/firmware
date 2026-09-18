@@ -1,8 +1,10 @@
 //! The module rail and its `EN` line, driven as `o89_core`'s sequencer says.
 //!
-//! Two pins, and the whole of the rule about them is elsewhere: this task
-//! powers the module at boot, then asks the sequencer every 20 ms how the
-//! lines should be and writes only what changed. `EN` is driven low or
+//! Two pins, and the whole of the rule about them is elsewhere: `main`
+//! applies the sequencer's boot lines before this task exists, so there is
+//! no instant between the pins being taken and `EN` being held; the task
+//! then asks the sequencer every 20 ms how the lines should be and writes
+//! only what changed. `EN` is driven low or
 //! released to the board's pull-up, never driven high, and never pulled up
 //! by this part, because a pin held high into an unpowered module
 //! back-powers it (F-003). The rail on revision A is on when driven high
@@ -16,7 +18,6 @@ use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_time::{Duration, Ticker};
 use o89_core::{Clock, EnLine, Lines, RailEvent, RailLine, RailSequencer, Task};
 
-use crate::board::REVISION;
 use crate::supervisor::{Uptime, check_in};
 
 /// How often the sequencer is asked. Its phases are 100 ms and up.
@@ -46,7 +47,7 @@ impl Pins {
     /// Write what changed, `EN` before the rail on the way down and the
     /// rail before `EN` on the way up, which is the order that never lets
     /// the module see its rail without its reset held.
-    fn apply(&mut self, lines: Lines) {
+    pub fn apply(&mut self, lines: Lines) {
         if lines == self.applied {
             return;
         }
@@ -68,12 +69,10 @@ impl Pins {
     }
 }
 
-/// The rail task: the boot power-on, then the sequencer's lines.
+/// The rail task: the sequencer's lines from here on. The boot power-on
+/// was applied by `main` before this task was spawned.
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins) {
-    let mut sequencer = RailSequencer::new(REVISION);
-    pins.apply(sequencer.power_on(Uptime.now()));
-    defmt::info!("rail: powering the module, EN held low");
+pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
     let mut ticker = Ticker::every(PERIOD);
     loop {
         ticker.next().await;
