@@ -75,23 +75,6 @@ pub enum FailState {
 }
 
 impl Line {
-    /// Every line, so a test can walk the table without a wildcard.
-    pub const ALL: [Line; 13] = [
-        Line::Run,
-        Line::Kick,
-        Line::Rs485Tx(Bus::One),
-        Line::Rs485Tx(Bus::Two),
-        Line::Rs485Tx(Bus::Three),
-        Line::ModuleTx,
-        Line::ModuleRts,
-        Line::ModuleEn,
-        Line::ModuleBoot,
-        Line::ModuleRail,
-        Line::VeDirectPullUp(Port::One),
-        Line::VeDirectPullUp(Port::Two),
-        Line::Lamp,
-    ];
-
     /// The declared fail state of this line, the same on every revision the
     /// firmware supports: the board may fail to deliver it, which
     /// [`Revision`] reports, but the declaration does not move.
@@ -169,22 +152,36 @@ mod tests {
     }
 
     #[test]
-    fn f_011_every_line_declares_a_state_and_arrives_in_shadow() {
-        // The match in `fail_state` is exhaustive, so a new line without a
-        // row does not compile; this walks the table so the declarations are
-        // read once by something that fails when one is wrong.
-        for line in Line::ALL {
-            let declared = line.fail_state(Revision::A);
-            let hazardous = matches!(line, Line::Run | Line::Kick);
-            if hazardous {
-                assert_eq!(declared, FailState::DrivenLow, "{line:?}");
+    fn f_011_each_declaration_is_the_safety_architectures_and_authority_starts_in_shadow() {
+        // That every line has a row is the compiler's: the match in
+        // `fail_state` is exhaustive, so a new line without one does not
+        // build. What a test adds is that each row says what the safety
+        // architecture's table says, read line by line rather than through
+        // a list a new variant could be left off.
+        let architecture = [
+            (Line::Run, FailState::DrivenLow),
+            (Line::Kick, FailState::DrivenLow),
+            (Line::Rs485Tx(Bus::One), FailState::DrivenHigh),
+            (Line::Rs485Tx(Bus::Two), FailState::DrivenHigh),
+            (Line::Rs485Tx(Bus::Three), FailState::DrivenHigh),
+            (Line::ModuleTx, FailState::InputOrLow),
+            (Line::ModuleRts, FailState::InputOrLow),
+            (Line::ModuleEn, FailState::InputOrLow),
+            (Line::ModuleBoot, FailState::InputOrLow),
+            (Line::ModuleRail, FailState::On),
+            (Line::VeDirectPullUp(Port::One), FailState::Off),
+            (Line::VeDirectPullUp(Port::Two), FailState::Off),
+            (Line::Lamp, FailState::LeftToTheBoard),
+        ];
+        for (line, declared) in architecture {
+            for revision in [Revision::A, Revision::B] {
+                assert_eq!(
+                    line.fail_state(revision),
+                    declared,
+                    "{line:?} on revision {revision:?}"
+                );
             }
         }
-        assert_eq!(Line::ModuleRail.fail_state(Revision::A), FailState::On);
-        assert_eq!(
-            Line::VeDirectPullUp(Port::Two).fail_state(Revision::A),
-            FailState::Off
-        );
         assert_eq!(Authority::at_boot(), Authority::Shadow);
     }
 }
