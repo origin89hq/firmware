@@ -66,10 +66,10 @@ impl SimFram {
     }
 
     /// Cut the power after `step` more bytes land. Zero cuts it before the
-    /// next byte.
+    /// next byte. The count of bytes since power-up keeps counting: a cut
+    /// is scheduled from where the part is, not from a count it was not.
     pub fn cut_after(&mut self, step: usize) {
-        self.cut_at = Some(step);
-        self.written = 0;
+        self.cut_at = Some(self.written.saturating_add(step));
     }
 
     /// Power back on: the bytes stay, the bus answers again, the step counter
@@ -251,12 +251,13 @@ mod tests {
             },
         )
         .expect("the path runs uncut");
-        // A 4-byte body: 8 bytes of head, 4 of body, 4 of CRC.
-        assert_eq!(crashes.steps, 16);
+        // A 4-byte body: four bytes clearing the magic, four of sequence,
+        // four of body, four of CRC, four of magic.
+        assert_eq!(crashes.steps, 20);
     }
 
     #[test]
-    fn f_025_a_cut_before_the_crc_leaves_the_first_record_and_only_the_last_byte_flips_it() {
+    fn f_025_a_cut_before_the_magic_leaves_the_first_record_and_only_the_last_byte_flips_it() {
         let (start, first) = with_one_record();
         let crashes = crash_at_every_step(
             &start,
@@ -267,14 +268,14 @@ mod tests {
             },
             |part, step| {
                 let found = block_on(COUNTER.read(part)).expect("the part is back");
-                // Sixteen bytes; the cut is before byte `step`, so only a cut
-                // that let all sixteen land is the new record, and that one
+                // Twenty bytes; the cut is before byte `step`, so only a cut
+                // that let all twenty land is the new record, and that one
                 // is not in the loop: every cut keeps the first.
                 assert_eq!(found, first, "cut before byte {step}");
             },
         )
         .expect("the path runs uncut");
-        assert_eq!(crashes.steps, 16);
+        assert_eq!(crashes.steps, 20);
     }
 
     #[test]
@@ -320,7 +321,9 @@ mod tests {
             },
         )
         .expect("the path runs uncut");
-        assert_eq!(across_slots.steps, in_place_cuts.steps);
+        // Four more bytes than the image, clearing the magic and landing it
+        // last; and not one cut loses the record.
+        assert_eq!(across_slots.steps, in_place_cuts.steps + 4);
         assert_eq!(lost, 0);
         assert_eq!(
             first,
@@ -354,6 +357,21 @@ mod tests {
         );
         part.reboot();
         assert_eq!(block_on(COUNTER.read(&mut part)), Ok(first));
+    }
+
+    #[test]
+    fn a_cut_is_scheduled_from_the_bytes_already_landed() {
+        let mut part = SimFram::fresh();
+        block_on(part.write(Address(0), &[1, 2, 3])).expect("the supply is steady");
+        assert_eq!(part.bytes_written(), 3);
+        part.cut_after(2);
+        assert_eq!(part.bytes_written(), 3, "scheduling a cut forgets nothing");
+        assert_eq!(
+            block_on(part.write(Address(3), &[4, 5, 6])),
+            Err(Refused::Bus(SimError::PowerLost))
+        );
+        assert_eq!(part.bytes_written(), 5);
+        assert_eq!(&part.bytes()[..6], &[1, 2, 3, 4, 5, 0]);
     }
 
     #[test]
