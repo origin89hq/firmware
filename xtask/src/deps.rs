@@ -19,13 +19,18 @@
 //! features of every reachable dependency are read from cargo. A `Vec` with
 //! neither root in reach does not compile, which is the compiler holding the
 //! other half.
+//!
+//! Reachable means linked into the part. A procedural macro and a build
+//! dependency run on the laptop and link into nothing on the target, so the
+//! walk stops at them: `defmt`'s derive pulls a parser that wants `std`, and
+//! that is the laptop's `std`, not the controller's.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, PackageId};
+use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, PackageId, TargetKind};
 
 use crate::cross::no_std_crates;
 use crate::repo::Repo;
@@ -50,6 +55,19 @@ const HAL_PREFIXES: &[&str] = &[
 /// The crate roots that bring an allocator with them.
 const ALLOC_ROOTS: &[&str] = &["alloc", "std"];
 
+/// Whether a dependency of these kinds links into the crate that names it.
+/// A build dependency is the build script's, and only a build dependency;
+/// a dependency that is also normal or a development one links. An empty
+/// list is an older cargo that did not say, and is taken as normal.
+fn links_into(kinds: &[DependencyKind]) -> bool {
+    // `DependencyKind` is `#[non_exhaustive]` and not ours; a kind cargo
+    // adds later is walked rather than skipped.
+    kinds.is_empty()
+        || kinds
+            .iter()
+            .any(|kind| !matches!(kind, DependencyKind::Build))
+}
+
 /// The resolved graph as adjacency by package id, with each id's name and
 /// the features it was resolved with.
 struct Graph {
@@ -69,13 +87,33 @@ impl Graph {
             .iter()
             .map(|package| (package.id.clone(), package.name.to_string()))
             .collect();
+        let proc_macros: BTreeSet<&PackageId> = metadata
+            .packages
+            .iter()
+            .filter(|package| {
+                package
+                    .targets
+                    .iter()
+                    .any(|target| target.kind.contains(&TargetKind::ProcMacro))
+            })
+            .map(|package| &package.id)
+            .collect();
         let edges = resolve
             .nodes
             .iter()
             .map(|node| {
                 (
                     node.id.clone(),
-                    node.deps.iter().map(|dep| dep.pkg.clone()).collect(),
+                    node.deps
+                        .iter()
+                        .filter(|dep| !proc_macros.contains(&dep.pkg))
+                        .filter(|dep| {
+                            let kinds: Vec<DependencyKind> =
+                                dep.dep_kinds.iter().map(|info| info.kind).collect();
+                            links_into(&kinds)
+                        })
+                        .map(|dep| dep.pkg.clone())
+                        .collect(),
                 )
             })
             .collect();
@@ -333,6 +371,16 @@ mod tests {
         let reached = diamond().reachable(&id("app")).expect("a complete graph");
         assert!(reached.contains("embassy-stm32"));
         assert_eq!(reached.len(), 2);
+    }
+
+    #[test]
+    fn f_081_only_what_links_into_the_part_is_walked() {
+        assert!(links_into(&[DependencyKind::Normal]));
+        assert!(links_into(&[DependencyKind::Development]));
+        assert!(!links_into(&[DependencyKind::Build]));
+        // The same crate as a build dependency and a normal one links.
+        assert!(links_into(&[DependencyKind::Build, DependencyKind::Normal]));
+        assert!(links_into(&[]));
     }
 
     #[test]
