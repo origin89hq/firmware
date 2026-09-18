@@ -86,6 +86,11 @@ pub async fn run(
                         blame.task,
                         blame.overdue.as_millis()
                     );
+                }
+                // The episode starts at the first withheld feed and runs
+                // until the reset: a change of the task named in the middle
+                // updates the last words, not the clock.
+                if withheld_at.is_none() {
                     withheld_at = Some(now);
                     reported_secs = 0;
                 }
