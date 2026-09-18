@@ -75,6 +75,13 @@ end-to-end at the controller as well:
   as no message at all. Not a command that checks a flag: there is no such
   command in the protocol to find.
 
+That is the client–controller authentication: the keys, their derivation and
+the MACs are P-040–P-045, P-050–P-053 and P-085–P-088. It is not the link
+between the two chips. While they are on one board that link carries no MAC
+and shares no key (L-020): a key the untrusted peer held would authenticate
+nothing, and a compromised comms processor is assumed throughout. L-024 is the
+day the link leaves the board.
+
 The wire is [KM43](https://github.com/origin89hq/km43): one protocol on every
 transport, CBOR bodies with integer keys, request and response with sequence
 numbers, an event stream a client can detect gaps in, a version negotiated on
@@ -668,12 +675,21 @@ every two seconds is 43,200 records a day per channel. Channels emit a
 state-change event only through the deadband, minimum-interval and
 maximum-silence trio, and history is carried by 15-minute aggregates.
 
+**Never dropped is a rule about the way in.** A class A record is always
+appended; the per-session queues to the comms processor shed a session rather
+than a record (P-098). The ring itself overwrites its oldest block as it
+wraps — that is what a retention of 176 days means — and a client that asks
+for a `seq` older than the ring holds is told so rather than left believing
+the stream complete (P-099). An append never blocks on a full ring: the block
+ahead was erased one step earlier, and a controller that stalled control to
+keep an audit record would have inverted which of the two is authoritative.
+
 **A per-channel rate cap does not bound the ring.** One event a minute per
 channel, excess coalesced, stops one flapping input from filling the log. It
-does not stop forty-eight of them: 48 channels at that cap is 3.9 MB a day,
+does not stop forty-eight of them: 48 channels at that cap is 3.9 MiB a day,
 which empties the ring in under four days. What protects the ring is a
 **global byte budget**: a rolling 24-hour write-volume counter in FRAM,
-compared on every append against a configured target of 85 KB/day. Exceed it
+compared on every append against a configured target of 85 KiB/day. Exceed it
 and class B is dropped first, with a marker. Exceed it on class A alone and a
 diagnostic is raised, because a site producing that many state changes has
 something wrong with it.
@@ -682,7 +698,7 @@ something wrong with it.
 size. Every record pays the 17 bytes of framing above, so a class A event of
 about 40 bytes of CBOR is 57 framed, and a packed seven-field aggregate of 25
 bytes is 42. Twenty channels at 96 windows a day plus about a hundred class A
-records is about 2,020 records and 84 KB a day, and a 14.5 MB usable ring
+records is about 2,020 records and 84 KiB a day, and a 14.5 MiB usable ring
 holds **176 days** of it. That does not reach the winter this ring exists
 for: first frost to the first person who connects after the thaw is around
 200 days at this latitude, and the first thing a full ring overwrites is the
@@ -692,7 +708,7 @@ is a packed payload under 20 bytes at 20 channels and 15-minute windows, or
 the window or the channel count moves: twelve channels gives 281 days,
 30-minute windows give 330. Each costs something a person will notice, and
 which one is not decidable before a month of real sampling. Every figure is
-reproducible from the 17, the 14.5 MB, 100 class A records a day and 96
+reproducible from the 17, the 14.5 MiB, 100 class A records a day and 96
 windows per channel.
 
 ## Safety architecture
@@ -825,8 +841,16 @@ The invariants that make A/B what it claims:
 
 - **At no instant are there zero bootable images.** The selected bank is
   never erased, and the flip is the last step after the whole inactive bank
-  has been written and verified. A torn option-byte write falls back to the
-  part's default bank, which still holds a valid image.
+  has been written and verified, so at the instant of the flip both banks
+  hold a bootloader and a verified image: whichever bank the part selects
+  afterwards — the old, the new, or whatever it loads after an option-byte
+  write it could not verify — boots. No bank is ever empty after
+  manufacture, so the empty check that starts the system bootloader
+  (origin89hq/hardware#30) cannot fire. What the reference manual settles in
+  M7, before this is relied on, is what the part does with an option word
+  whose complement does not match — which values it loads, and whether
+  read-out protection is among them — and the bench test is an option-byte
+  write interrupted at every step.
 - **The bootloader is written at manufacture into both banks and never by an
   update.** The updater refuses a manifest that covers the first 8 KB, and
   the bootloader checks its twin at boot. Without that rule a bad release
