@@ -33,7 +33,10 @@ embassy-stm32 = { version = "=0.6.0", features = [
     "defmt",
 ] }
 cortex-m.workspace = true
-cortex-m-rt.workspace = true
+# `set-vtor`: the runtime points `VTOR` at this image's own vector table
+# before `main`. The bootloader jumps here without touching `VTOR`, and a
+# bench image at the bottom of flash needs nothing done either way.
+cortex-m-rt = { workspace = true, features = ["set-vtor"] }
 portable-atomic = { workspace = true, features = ["critical-section"] }
 
 defmt.workspace = true

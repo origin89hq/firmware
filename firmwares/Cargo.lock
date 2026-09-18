@@ -1382,6 +1382,7 @@ version = "0.0.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "stm32-metapac",
 ]
 
 [[package]]

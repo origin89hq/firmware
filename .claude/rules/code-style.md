@@ -27,9 +27,9 @@ turn the first five into build failures outside `#[cfg(test)]`.
 8. **The smallest scope that works.** No `static mut`; peripheral ownership is
    a type handed out once, not a convention.
 9. **`unsafe` is denied at every crate root** and opened per item with
-   `#[expect(unsafe_code, reason = "...")]` and a `// SAFETY:` line. Two
-   places need it: the bootloader's option-byte write and the download
-   window's register write. Never `#[allow]`.
+   `#[expect(unsafe_code, reason = "...")]` and a `// SAFETY:` line. Three
+   places need it: the bootloader's option-byte write and its jump into the
+   application, and the download window's register write. Never `#[allow]`.
 10. **Type-state where a rule must hold in an order**: a wrapper that cannot
     give up its payload before its MAC verifies, a challenge that cannot leave
     before its counter is written. A rule in a type is one the compiler
