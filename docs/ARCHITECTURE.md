@@ -131,9 +131,11 @@ docs/
 `just check` is the gate and runs what CI runs. `cargo xtask check` is the
 part of it `cargo test` cannot do because it builds for the laptop: every
 `no_std` crate cross-compiled for both targets, the three images built in
-release with their `.bin` measured against the slot and a stated margin, and
-the dependency rules below refused mechanically. Flashing, erasing and
-actuation are separate recipes that never run from `check`.
+release with their `.bin` measured against the slot and a stated margin, the
+dependency rules below refused mechanically, and every numbered rule sorted
+into covered, declared untestable or uncovered against `traceability.toml`,
+with a ratchet on the uncovered count. Flashing, erasing and actuation are
+separate recipes that never run from `check`.
 
 ## The controller
 
@@ -265,17 +267,18 @@ role; `BOARD-A.md` maps them to pins.
    The three RS-485 transmit lines driven high so the transceivers stop
    holding their buses low
    ([origin89hq/hardware#28](https://github.com/origin89hq/hardware/issues/28)).
-   The four module lines (transmit, RTS, `EN`, `BOOT`) left as inputs
-   ([origin89hq/hardware#17](https://github.com/origin89hq/hardware/issues/17)).
+   The four module lines (transmit, RTS, `EN`, `BOOT`) left as inputs, never
+   driven high ([origin89hq/hardware#17](https://github.com/origin89hq/hardware/issues/17),
+   F-003).
    The generator run reason is read from FRAM *before* the outputs move, so
    a reset inside board B's ride-through window can resume an automatic
    start ([origin89hq/hardware#18](https://github.com/origin89hq/hardware/issues/18)).
    Board B revision B budgets that window at 15 s
    ([origin89hq/hardware#51](https://github.com/origin89hq/hardware/issues/51),
    B-20), of which 3 s is the controller's: when it decides to resume, `RUN`
-   is up and the first kick sent within 3 s of the reset, FRAM read included.
-   Revision A has no window; the contact has already opened, and the boot
-   record says so.
+   is up and the first kick sent within 3 s of the reset, FRAM read included
+   (F-016). Revision A has no window; the contact has already opened, and the
+   boot record says so.
 2. **Reset cause** read and cleared; the previous image's last words from
    `.uninit` RAM, the pattern the self-test proved. Both go into the boot
    record with the RTC backup-domain state (L-143).
@@ -703,9 +706,9 @@ shows. An output without a declared fail state is not configured.
 
 | Output | Fail state | Held by | Notes |
 |---|---|---|---|
-| `RUN`, `KICK`: the generator contact, through board B | Open | Board B's run-enable monostable drops the contact when the kick stops; the firmware drives both lines low at the reset vector before anything else, and the bootloader does the same | ST's system bootloader on an empty flash can drive `RUN` high and pulse `KICK` (origin89hq/hardware#30), so there is never an empty-flash window: dual-bank swap, and `o89-boot` written at manufacture into both banks. Revision B pulls both down at the MCU (A-34). Any reset opens the contact on revision A; revision B's ride-through is 15 s (B-20), and a resumed automatic start re-raises `RUN` within 3 s |
+| `RUN`, `KICK`: the generator contact, through board B | Open | Board B's run-enable monostable drops the contact when the kick stops; the firmware drives both lines low at the reset vector before anything else, and the bootloader does the same | ST's system bootloader on an empty flash can drive `RUN` high and pulse `KICK` (origin89hq/hardware#30), so there is never an empty-flash window: dual-bank swap, and `o89-boot` written at manufacture into both banks. Revision B pulls both down at the MCU (A-34). Any reset opens the contact on revision A; revision B's ride-through is 15 s (B-20), and a resumed automatic start re-raises `RUN` within 3 s (F-016) |
 | The three RS-485 transmit lines | High, idle | Firmware, from the reset vector | Through reset the drivers float and hold the buses low (origin89hq/hardware#28). Every image configures all three USARTs |
-| The module lines: transmit, RTS, `EN`, `BOOT` | Inputs | Firmware | Inputs from before the rail drops until after it is up, so nothing back-powers an unpowered module (origin89hq/hardware#17). `EN` is held low across every rail cycle and released after the rail settles (origin89hq/hardware#14) |
+| The module lines: transmit, RTS, `EN`, `BOOT` | Inputs, or driven low; never high | Firmware | Input or low from before the rail drops until after it is up, so nothing back-powers an unpowered module (origin89hq/hardware#17, F-003). `EN` is driven low on purpose across every rail cycle and released after the rail settles (origin89hq/hardware#14) |
 | The module rail, `V3V3_ESP` | **On** (L-114) | The board, per revision (A-23); the controller once booted | Below |
 | The VE.Direct receive pull-ups | Off | Firmware | 3.3 V products only, by configuration (origin89hq/hardware#27) |
 | The lamp | Whatever the board leaves it through reset (`BOARD-A.md`) | The supervisor drives the pattern | A lamp showing nothing is a controller that has not reached its supervisor. No hazard |
@@ -728,8 +731,14 @@ it has booted and applies its policy from there:
   bank in February is not also carrying a radio nobody is using. The
   threshold and its hysteresis are configuration values that have not been
   chosen; the threshold sits above the front end's own stop threshold, or the
-  policy never runs. A bank voltage that is absent or stale is not a reason
-  to cut: unknown is not low, and the rail follows its fail state, on.
+  policy never runs. Hysteresis alone chatters, because the radio's own load
+  moves the number it is judged by: radio on, the bank sags under the
+  threshold, radio off, the bank recovers over it. So the policy also carries
+  a minimum dwell in each state; the ladder already has the shape, a cut of
+  at least 5 s and three an hour, and on revision B every re-enable is a
+  switch-on event of the kind board A's open item 9 measures. A bank voltage
+  that is absent or stale is not a reason to cut: unknown is not low, and
+  the rail follows its fail state, on.
 - Every cut is a decision by running firmware, logged as such, and never a
   reset's side effect. Two consequences to carry: a blank or crash-looping
   controller leaves the radio powered until firmware runs, so the ladder's
@@ -750,11 +759,15 @@ So on revision A a rail cycle is at most 5 s off; the ladder's third rung,
 15 minutes off, is not executed
 ([origin89hq/km43#36](https://github.com/origin89hq/km43/issues/36) says how a
 conformance claim states that): the controller stops cycling, leaves the rail
-on, raises comms unrecoverable and logs why. USART1 is configured only after
-the rail has settled, and a cold boot is treated as the same condition. The
-boot record says the radio was cycled. `BOARD-A.md` carries the whole
-revision policy table; the firmware carries a `Revision` the policies read,
-chosen at build time.
+on, raises comms unrecoverable and logs which policy it applied (F-005). The
+bank-voltage policy does not run on revision A for the same reason: a rail
+left off while the bank is low and switched on when it recovers is a
+switch-on after minutes off, the pattern origin89hq/hardware#5 forbids, so on
+revision A the radio stays on down to the front end's own stop threshold.
+USART1 is configured only after the rail has settled, and a cold boot is
+treated as the same condition. The boot record says the radio was cycled.
+`BOARD-A.md` carries the whole revision policy table; the firmware carries a
+`Revision` the policies read, chosen at build time.
 
 **The rest of the floor:**
 
