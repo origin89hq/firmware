@@ -1,0 +1,47 @@
+# The host workspace: what `cargo test` runs. The firmwares are a workspace of
+# their own under `firmwares/`, excluded here so that `cargo clippy --workspace`
+# never tries to build a Cortex-M0+ or a RISC-V crate for the laptop.
+[workspace]
+resolver = "3"
+members = ["crates/o89-core", "xtask"]
+exclude = ["firmwares"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/origin89hq/firmware"
+publish = false
+
+[workspace.dependencies]
+# The one wire format. Pinned exactly and written here once for both
+# workspaces; a member takes it with `.workspace = true` when it first needs it.
+km43 = "=0.1.0"
+
+anyhow = "1"
+cargo_metadata = "0.23"
+clap = { version = "4", features = ["derive"] }
+
+# The rules the compiler enforces. `unsafe_code` is denied at the root and
+# opened per item with `#[expect(unsafe_code, reason = "...")]`; the domain
+# crates never need it. The clippy set is `pedantic` plus the restriction lints
+# that turn the house rules into build failures: no `unwrap`, `expect`,
+# `panic!`, `[]` indexing or unchecked arithmetic outside `#[cfg(test)]`.
+# `clippy.toml` at the root lets tests keep `expect` and indexing.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# A `# Errors` heading repeating what the `Result` says is ceremony; the
+# function's doc says when it fails.
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

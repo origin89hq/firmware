@@ -1,0 +1,16 @@
+[package]
+name = "o89-boot"
+version = "0.0.0"
+description = "The controller's bootloader: the generator lines to their fail state, the selected bank verified, the trial boot counted"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cortex-m.workspace = true
+cortex-m-rt.workspace = true
+
+[lints]
+workspace = true

@@ -1,8 +1,9 @@
 # The compiler the checks run with, and both targets: the controller is a
 # Cortex-M0+ and the comms processor is a RISC-V part. rustup installs all of
-# it on the first cargo command, so nothing here is repeated in CI.
+# it on the first cargo command, so nothing here is repeated in CI. `llvm-tools`
+# is what measures an image: the gate reads the `.bin`, not the ELF.
 [toolchain]
 channel = "1.98.1"
 profile = "minimal"
-components = ["clippy", "rustfmt"]
+components = ["clippy", "rustfmt", "llvm-tools"]
 targets = ["thumbv6m-none-eabi", "riscv32imac-unknown-none-elf"]

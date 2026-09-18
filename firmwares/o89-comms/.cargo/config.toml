@@ -1,0 +1,7 @@
+# Per crate, not at `firmwares/`: the other two images are a Cortex-M0+ with a
+# different target and runner, and one shared config cannot express both.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor"

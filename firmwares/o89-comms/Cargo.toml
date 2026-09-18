@@ -1,0 +1,28 @@
+[package]
+name = "o89-comms"
+version = "0.0.0"
+description = "The comms processor: a pipe the controller does not trust, and the download window that recovers it"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# This crate must never depend on `o89-core`. It is the untrusted half, and a
+# comms processor that could reach a decision is one that could make one.
+# `cargo xtask check` refuses the dependency.
+[dependencies]
+# The part. `unstable` is what carries UART flow control, the watchdogs and
+# the register blocks the download window needs.
+esp-hal = { version = "=1.2.2", features = ["esp32c6", "unstable"] }
+# The application descriptor the ROM bootloader reads before it runs anything,
+# and later the OTA states.
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c6"] }
+# The panic and exception handler. A RISC-V fault is not a Rust panic: a
+# hand-written handler never sees one, and a chip that faults before `main`
+# boots, runs nothing and says nothing.
+esp-backtrace = { version = "=0.20.0", features = ["esp32c6", "panic-handler", "println"] }
+esp-println = { version = "=0.18.0", default-features = false, features = ["esp32c6", "uart", "critical-section"] }
+
+[lints]
+workspace = true

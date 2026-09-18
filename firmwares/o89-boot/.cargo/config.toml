@@ -1,0 +1,9 @@
+# Per crate, because cargo resolves this by walking up from the working
+# directory and the comms processor is a RISC-V part with a different runner.
+# The linker scripts are named in build.rs, not here: naming them in both
+# defines every memory region twice.
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "probe-rs run --chip STM32G0B1RETx"

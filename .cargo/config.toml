@@ -1,0 +1,4 @@
+# `cargo xtask check` is the gate. Without this alias it answers `no such
+# command: xtask`, which reads like a typo and gets stepped past.
+[alias]
+xtask = "run -q --locked -p xtask --"

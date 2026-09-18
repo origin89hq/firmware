@@ -1,0 +1,6 @@
+# The restriction lints in the workspace manifests are for production paths.
+# A test fixture that cannot be built should fail at the line that broke.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true

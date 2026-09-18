@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+description = "The gate: cross-compiles, links and measures what `cargo test` cannot"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cargo_metadata.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
