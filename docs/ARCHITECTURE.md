@@ -835,7 +835,9 @@ and no half-copied window; an interrupted copy is exactly the empty-flash
 window origin89hq/hardware#30 describes, which is why `embassy-boot`'s
 copy-based scheme is not used. The HAL erases and programs either bank but
 never writes option bytes on this part; the bootloader does that through the
-PAC in one audited function, one of the two `unsafe` sites in the firmware.
+PAC in one audited function, one of the three `unsafe` sites in the firmware,
+with the bootloader's jump into the application and the comms processor's
+download-register write.
 
 The invariants that make A/B what it claims:
 
