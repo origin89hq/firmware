@@ -11,8 +11,8 @@
 //! the reset cause read and cleared and the last words taken, both before
 //! the HAL; the clocks, with the LSE asserted; the watchdog, fed only by the
 //! rollcall; the voltage detector; every output to its declared fail state;
-//! then the control tick. The FRAM read, the buses and the module rail
-//! arrive with the milestones that name them.
+//! the module rail sequence; then the control tick. The FRAM read and the
+//! buses arrive with the milestones that name them.
 
 #![no_std]
 #![no_main]
@@ -23,12 +23,13 @@ mod first;
 mod last_words;
 mod panic;
 mod pvd;
+mod rail;
 mod reset;
 mod supervisor;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::gpio::{Flex, Level, Output, Speed};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Ticker};
 use o89_core::{BootRecord, Bus, FailState, LastWords, Line, ResetCause, RtcClock, Task};
@@ -137,6 +138,19 @@ async fn main(spawner: Spawner) {
         spawner.spawn(token);
     } else {
         defmt::error!("the supervisor did not spawn; the watchdog will reset the part");
+    }
+
+    // 9. The module rail sequence: the module powered with EN held low,
+    // released once the rail has settled.
+    let rail = rail::Pins::new(
+        Output::new(b.module.rail, Level::Low, Speed::Low),
+        Flex::new(b.module.en),
+    );
+    supervisor::check_in(Task::Rail);
+    if let Ok(token) = rail::run(rail) {
+        spawner.spawn(token);
+    } else {
+        defmt::error!("the rail task did not spawn; the module stays unpowered");
     }
 
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.

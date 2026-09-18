@@ -94,14 +94,12 @@ pub struct Module {
     #[expect(dead_code, reason = "taken in M3, the link")]
     pub cts: Peri<'static, p::PB4>,
     /// `ESP_EN`, held low across every rail cycle (F-004).
-    #[expect(dead_code, reason = "taken by the rail sequence, M1")]
     pub en: Peri<'static, p::PC2>,
     /// `ESP_BOOT`, the IO9 strap.
     #[expect(dead_code, reason = "taken in M3, the bench flashing path")]
     pub boot: Peri<'static, p::PC3>,
     /// `ESP_PWR_EN`: the rail, high is on; off with the pin high-impedance
     /// on revision A (F-014).
-    #[expect(dead_code, reason = "taken by the rail sequence, M1")]
     pub rail: Peri<'static, p::PC5>,
 }
 
@@ -202,7 +200,6 @@ pub struct Board {
     pub sel_manual: Peri<'static, p::PB15>,
 
     /// The module.
-    #[expect(dead_code, reason = "taken by the rail sequence, M1")]
     pub module: Module,
 }
 
