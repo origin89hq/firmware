@@ -133,5 +133,6 @@ reset-controller:
 # a spare board. Recovery: `just flash-boot` then `just flash-controller`.
 #
 # MASS ERASE the controller: only a spare board, nothing on board B's CN10.
+[confirm("Mass erase the connected controller? Only a spare board, with nothing on board B's CN10.")]
 erase-controller:
     probe-rs erase --chip {{chip}}

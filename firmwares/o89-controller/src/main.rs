@@ -150,10 +150,12 @@ async fn main(spawner: Spawner) {
         Flex::new(b.module.en),
     );
     supervisor::check_in(Task::Rail);
+    // The rail is on the roll from the check-in above, so a task that did
+    // not spawn is one that stops checking in: the watchdog resets the part.
     if let Ok(token) = rail::run(rail) {
         spawner.spawn(token);
     } else {
-        defmt::error!("the rail task did not spawn; the module stays unpowered");
+        defmt::error!("the rail task did not spawn; the watchdog will reset the part");
     }
 
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
