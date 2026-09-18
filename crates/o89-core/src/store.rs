@@ -237,7 +237,16 @@ impl Store {
         }
         let clients_booted = match at_boot.epoch() {
             Some(under) => Some(clients.booted(fram, under).await),
-            None => None,
+            None => {
+                // No epoch to take the table under, so nothing derives and
+                // nothing enrols; but the windows the table measures still
+                // restart at this boot's tick zero (P-121), in RAM only.
+                if let Some(held) = clients.present() {
+                    let rebased = held.clone().rebased();
+                    clients.rebase(rebased);
+                }
+                None
+            }
         };
 
         let boot = match boots.held() {
@@ -511,6 +520,42 @@ mod tests {
         assert_eq!(report.clients, None);
         assert_eq!(store.clients.present().map(ClientTable::enrolled), Some(1));
         assert_eq!(store.epoch.present(), Some(&Epoch::FIRST));
+    }
+
+    #[test]
+    fn p_121_a_boot_with_no_epoch_still_restarts_the_dedup_windows_at_tick_zero() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let id = block_on(store.clients.update(&mut part, |table| {
+            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
+        }))
+        .expect("the supply is fine")
+        .expect("room")
+        .client();
+        let late = Tick::from_millis(500_000);
+        let _ = block_on(store.clients.update(&mut part, |table| {
+            table.admit(id, Counter(1), 7, Fingerprint::of(b"start"), late)
+        }))
+        .expect("the supply is fine");
+        // Both epoch slots damaged: this boot has no epoch.
+        let _two = block_on(map::EPOCH.write(
+            &mut part,
+            Position::At {
+                seq: 1,
+                slot: crate::fram::Slot::A,
+            },
+            &epoch(2).encode(),
+        ));
+        part.bytes[8] ^= 0x01;
+        part.bytes[16 + 8] ^= 0x01;
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.epoch, EpochAtBoot::None(NoEpoch::Corrupt));
+        assert_eq!(report.clients, None);
+        // The entry lives ten minutes from this boot, not from the tick it
+        // was inserted at in the last one.
+        let table = store.clients.present().expect("the table is held");
+        assert_eq!(table.dedup().live(Tick::from_millis(599_999)), 1);
+        assert_eq!(table.dedup().live(Tick::from_millis(600_000)), 0);
     }
 
     #[test]
