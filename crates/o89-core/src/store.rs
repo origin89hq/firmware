@@ -14,8 +14,9 @@
 //! this boot's tick zero (P-121).
 //!
 //! A boot that cannot read the part returns the bus error and nothing
-//! else: there is no partial store to hold. A write the boot could not
-//! make is in the report, so the caller raises what it owes.
+//! else: there is no partial store to hold, and nothing was written, so a
+//! boot tried again on the same part counts once. A write the boot could
+//! not make is in the report, so the caller raises what it owes.
 //!
 //! cites: P-085, P-121, F-026
 
@@ -188,9 +189,25 @@ impl Store {
         fram: &mut F,
         last_words: Option<LastWords>,
     ) -> Result<(Self, BootReport<F::Error>), F::Error> {
+        // Every read first, then every write: a read that fails returns
+        // the bus error with nothing written, so a boot tried again on
+        // the same part is the same boot and not one count later.
         let secret = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
-
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
+        let mut clients =
+            Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
+        let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
+        let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
+        let mut panics =
+            Kept::<PanicRecord, PANIC_RECORD_BYTES>::read(map::PANIC_RECORD, fram).await?;
+        let challenges =
+            Kept::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>::read(map::CHALLENGE_COUNTER, fram)
+                .await?;
+        let volume = Kept::<WriteVolume, WRITE_VOLUME_BYTES>::read(map::WRITE_VOLUME, fram).await?;
+        let mut release =
+            Kept::<CommsRelease, COMMS_RELEASE_BYTES>::read(map::COMMS_RELEASE, fram).await?;
+        let network = Kept::<Network, NETWORK_BYTES>::read(map::NETWORK, fram).await?;
+
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
             Held::Absent => match epoch.write(fram, Epoch::FIRST).await {
@@ -200,9 +217,6 @@ impl Store {
             Held::Corrupt => EpochAtBoot::None(NoEpoch::Corrupt),
             Held::Malformed(malformed) => EpochAtBoot::None(NoEpoch::Malformed(malformed)),
         };
-
-        let mut clients =
-            Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
         // The stamp is a second copy of the epoch: a record behind it is
         // raised to it, and never the other way round.
         if let (Some(record), Some(table)) =
@@ -226,17 +240,12 @@ impl Store {
             None => None,
         };
 
-        let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
-
-        let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
         let boot = match boots.held() {
             Held::Present(previous) => previous.next(),
             Held::Absent | Held::Corrupt | Held::Malformed(_) => BootCount::FIRST,
         };
         let boot_recorded = boots.write(fram, boot).await;
 
-        let mut panics =
-            Kept::<PanicRecord, PANIC_RECORD_BYTES>::read(map::PANIC_RECORD, fram).await?;
         let mut panic_recorded = None;
         if let Some(words) = last_words {
             // Only under a count the part holds: a record labelled with a
@@ -255,17 +264,10 @@ impl Store {
             });
         }
 
-        let challenges =
-            Kept::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>::read(map::CHALLENGE_COUNTER, fram)
-                .await?;
-        let volume = Kept::<WriteVolume, WRITE_VOLUME_BYTES>::read(map::WRITE_VOLUME, fram).await?;
-        let mut release =
-            Kept::<CommsRelease, COMMS_RELEASE_BYTES>::read(map::COMMS_RELEASE, fram).await?;
         if let Some(held) = release.present() {
             let rebased = held.rebased();
             release.rebase(rebased);
         }
-        let network = Kept::<Network, NETWORK_BYTES>::read(map::NETWORK, fram).await?;
 
         let report = BootReport {
             epoch: at_boot,
@@ -317,6 +319,9 @@ mod tests {
     struct Part {
         bytes: [u8; PART_BYTES],
         falling: bool,
+        /// An address a read touching it is refused at, for a bus that
+        /// fails partway through a boot.
+        refuse_reads_at: Option<u16>,
     }
 
     impl Part {
@@ -324,6 +329,7 @@ mod tests {
             Self {
                 bytes: [0; PART_BYTES],
                 falling: false,
+                refuse_reads_at: None,
             }
         }
     }
@@ -333,6 +339,13 @@ mod tests {
 
         fn read(&mut self, at: Address, into: &mut [u8]) -> impl Future<Output = Result<(), ()>> {
             let start = usize::from(at.0);
+            let end = start.saturating_add(into.len());
+            if self
+                .refuse_reads_at
+                .is_some_and(|refused| (start..end).contains(&usize::from(refused)))
+            {
+                return core::future::ready(Err(()));
+            }
             into.copy_from_slice(&self.bytes[start..][..into.len()]);
             core::future::ready(Ok(()))
         }
@@ -554,6 +567,41 @@ mod tests {
         let release = store.release.present().expect("a release");
         assert!(release.admits(&Digest([9; 32]), Tick::from_millis(599_999)));
         assert!(!release.admits(&Digest([9; 32]), Tick::from_millis(600_000)));
+    }
+
+    #[test]
+    fn a_boot_whose_last_read_fails_writes_nothing_and_the_next_one_counts_once() {
+        let mut part = Part::fresh();
+        // The network record is the last one read: fail it, so every other
+        // read had succeeded before the boot gave up.
+        part.refuse_reads_at = Some(map::NETWORK.end().0.saturating_sub(1));
+        let outcome = block_on(Store::boot(
+            &mut part,
+            Some(LastWords::Panicked(PanicSite { file: 1, line: 2 })),
+        ));
+        assert!(outcome.is_err());
+        // Nothing landed: no epoch, no count, no panic record.
+        assert_eq!(
+            block_on(map::EPOCH.read(&mut part)),
+            Ok(crate::fram::Current::Empty)
+        );
+        assert_eq!(
+            block_on(map::BOOT_COUNT.read(&mut part)),
+            Ok(crate::fram::Current::Empty)
+        );
+        assert_eq!(
+            block_on(map::PANIC_RECORD.read(&mut part)),
+            Ok(crate::fram::Current::Empty)
+        );
+        // Tried again with the bus back, it is the first boot, once.
+        part.refuse_reads_at = None;
+        let (store, report) = boot(
+            &mut part,
+            Some(LastWords::Panicked(PanicSite { file: 1, line: 2 })),
+        );
+        assert_eq!(report.epoch, EpochAtBoot::First);
+        assert_eq!(report.boot, BootCount::FIRST);
+        assert_eq!(store.panics.present().map(|r| r.boot), Some(1));
     }
 
     #[test]

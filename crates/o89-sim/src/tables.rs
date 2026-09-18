@@ -234,7 +234,7 @@ fn f_041_a_mint_cut_at_any_step_hands_out_no_counter_and_the_next_mint_is_past_e
         },
     )
     .expect("the path runs uncut");
-    assert_eq!(crashes, Crashes { steps: 20 });
+    assert_eq!(crashes, Crashes { steps: 24 });
 }
 
 #[test]
@@ -271,6 +271,6 @@ fn f_008_a_boot_cut_at_any_step_leaves_a_boot_count_that_climbs_and_a_panic_reco
         },
     )
     .expect("the path runs uncut");
-    // The boot count's 16 bytes and the panic record's 36.
-    assert_eq!(crashes, Crashes { steps: 16 + 36 });
+    // The boot count's 20 bytes and the panic record's 40.
+    assert_eq!(crashes, Crashes { steps: 20 + 40 });
 }
