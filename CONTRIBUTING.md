@@ -11,15 +11,26 @@ and apply to everyone, not only to an assistant.
 - just 1.57 or newer and Python 3.9 or newer, for the recipes and the skill
   bootstrap.
 - The Rust toolchain in `rust-toolchain.toml`. rustup installs it, with the
-  `thumbv6m-none-eabi` and `riscv32imac-unknown-none-elf` targets, on first use.
-- For the bench: `probe-rs` for the STM32 and `espflash` for ESP32 images. A
-  probe attaches to board A through a Nucleo's ST-Link; see the board's README
-  in [origin89hq/hardware](https://github.com/origin89hq/hardware).
+  `thumbv6m-none-eabi` and `riscv32imac-unknown-none-elf` targets and
+  `llvm-tools`, on first use.
+- `espflash` (`cargo install espflash --locked`): the gate measures the comms
+  image with `espflash save-image`, and the bench flashes with it.
+- For the bench: `probe-rs` for the STM32. A probe attaches to board A through
+  a Nucleo's ST-Link; see the board's README in
+  [origin89hq/hardware](https://github.com/origin89hq/hardware).
 
 ## Before a pull request
 
-`just check` will run everything CI runs once there is a workspace to check.
-Until then, the README states what exists.
+`just check` runs everything CI runs: formatting, Clippy with the restriction
+lints, the host tests, and `cargo xtask check` — the cross-compiles, the
+dependency boundaries and the three images measured against their slots.
+`just test-fast` is the inner loop. A change that moves an image's size says
+so in its message; `just sizes --record` appends the row to `docs/sizes.tsv`.
+
+A new check in the gate is watched go red before it is trusted: break what it
+guards on purpose, see it fail, and put the file back from a copy you made
+first — `git checkout -- <file>` and `git restore` discard every uncommitted
+change in the file, and a hook refuses them on a dirty path.
 
 A change that can affect physical equipment needs the evidence the
 [embedded standard](https://github.com/origin89hq/engineering/blob/main/docs/embedded.md)

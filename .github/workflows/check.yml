@@ -1,0 +1,37 @@
+# The gate. Everything here is `just check`, so a red run reproduces locally
+# with one command. The toolchain, its components and both targets come from
+# rust-toolchain.toml; nothing is pinned twice.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # `espflash save-image` is how the comms image is measured: the bytes
+      # the bootloader loads, not the ELF.
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
+        with:
+          tool: cargo-binstall
+      - run: cargo binstall -y --locked espflash@4.5.0
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+        with:
+          just-version: '1.58.0'
+      - run: just check
+      - run: git diff --exit-code
