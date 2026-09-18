@@ -50,10 +50,12 @@
 /// let elapsed = Tick::from_millis(5).since(Tick::ZERO).as_millis();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Tick(u64);
 
 /// A duration in milliseconds, the unit every bound in the protocol is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Millis(u64);
 
 impl Tick {

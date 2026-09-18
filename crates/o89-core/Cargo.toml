@@ -8,7 +8,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# `defmt::Format` on every public type, for the controller's log. Off on the
+# host, where the tests read the types as Rust.
+defmt = ["dep:defmt"]
+
 [dependencies]
+defmt = { workspace = true, optional = true }
 
 [lints]
 workspace = true

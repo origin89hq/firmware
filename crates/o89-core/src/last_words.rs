@@ -30,6 +30,7 @@ const PANICKED: u32 = 2;
 /// The task that stopped checking in, and by how much, as the supervisor
 /// wrote it before withholding the feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Blame {
     /// Who was silent.
     pub task: Task,
@@ -39,6 +40,7 @@ pub struct Blame {
 
 /// Where a panic happened, as much of it as five words carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PanicSite {
     /// A hash of the source file's path, which the host resolves against
     /// the image that was running.
@@ -49,6 +51,7 @@ pub struct PanicSite {
 
 /// What the previous run said last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum LastWords {
     /// The supervisor withheld the feed and the watchdog fired.
     Starved(Blame),

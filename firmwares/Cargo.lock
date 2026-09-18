@@ -1405,9 +1405,19 @@ dependencies = [
  "defmt-rtt",
  "embassy-executor",
  "embassy-stm32",
+ "embassy-sync 0.8.0",
  "embassy-time",
+ "o89-core",
  "panic-probe",
  "portable-atomic",
+ "stm32-metapac",
+]
+
+[[package]]
+name = "o89-core"
+version = "0.0.0"
+dependencies = [
+ "defmt 1.1.1",
 ]
 
 [[package]]

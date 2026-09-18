@@ -18,6 +18,7 @@ use crate::{Blame, Millis, Tick};
 /// Every task the controller runs, each owning a peripheral and declaring
 /// how long it may go without checking in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum Task {
     /// The rollcall itself, the lamp, and the feed.
@@ -130,6 +131,7 @@ impl Task {
 /// health: a firmware that started nothing would otherwise feed forever on
 /// an empty table, which is the timer-fed watchdog wearing a different hat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "discarding this feeds the part unconditionally, which is the bug this exists to prevent"]
 pub enum Feed {
     /// Every task on the roll has checked in inside its window.
@@ -142,6 +144,7 @@ pub enum Feed {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Answer {
     /// Not started, or retired: not waited for.
     Off,
@@ -156,6 +159,7 @@ enum Answer {
 /// that has to read as either healthy, a task that never ran fed forever,
 /// or starving, a reset before the first task gets a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Rollcall {
     answers: [Answer; TASKS],
 }
