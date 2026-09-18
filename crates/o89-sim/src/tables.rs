@@ -15,7 +15,7 @@ use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH};
 use o89_core::{
     Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
     ChallengeCounter, ClientTable, EPOCH_BYTES, Fingerprint, Held, Kept, Label, LastWords, Paired,
-    PanicSite, Store, Tick,
+    PanicRecorded, PanicSite, Store, Tick,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -250,7 +250,7 @@ fn f_008_a_boot_cut_at_any_step_leaves_a_boot_count_that_climbs_and_a_panic_reco
         |part| {
             let (_, report) = block_on(Store::boot(part, Some(words))).map_err(|_| ())?;
             match (report.boot_recorded, report.panic_recorded) {
-                (Ok(()), Some(Ok(()))) => Ok(()),
+                (Ok(()), Some(PanicRecorded::Landed)) => Ok(()),
                 _ => Err(()),
             }
         },

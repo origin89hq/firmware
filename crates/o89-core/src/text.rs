@@ -14,11 +14,23 @@ use crate::body::{Malformed, Reader, Writer};
 
 /// Up to `N` bytes of UTF-8, `N` at most 255 so the length is one byte on
 /// the part.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// Two texts are equal when the bytes they hold are equal; what sits past
+/// the length is not part of the text, and a text read off the part with
+/// a stray byte there is the same text as one typed a minute ago.
+#[derive(Clone, Copy)]
 pub struct Text<const N: usize> {
     bytes: [u8; N],
     len: u8,
 }
+
+impl<const N: usize> PartialEq for Text<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl<const N: usize> Eq for Text<N> {}
 
 /// A text past its cap, carrying the length it had and the cap it hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,13 +101,17 @@ impl<const N: usize> Text<N> {
     }
 
     /// The length and the field, refusing a length past the cap and bytes
-    /// that are not UTF-8.
+    /// that are not UTF-8. Whatever sits past the length is cleared, so a
+    /// text read off the part encodes back to the bytes it was written as.
     pub(crate) fn take(reader: &mut Reader<'_>) -> Result<Self, Malformed> {
         let len = reader.u8()?;
         if usize::from(len) > N {
             return Err(reader.malformed(1));
         }
-        let bytes = reader.take::<N>()?;
+        let mut bytes = reader.take::<N>()?;
+        if let Some(tail) = bytes.get_mut(usize::from(len)..) {
+            tail.fill(0);
+        }
         let text = Self { bytes, len };
         if core::str::from_utf8(text.as_bytes()).is_err() {
             return Err(reader.malformed(N));
@@ -129,6 +145,18 @@ mod tests {
         assert!(!text.is_empty());
         assert!(Text::<8>::EMPTY.is_empty());
         assert_eq!(Text::<8>::new("exactly8").map(|t| t.len()), Ok(8));
+    }
+
+    #[test]
+    fn a_text_compares_by_the_bytes_it_holds_and_a_stray_tail_off_the_part_is_cleared() {
+        let typed = Text::<4>::new("ab").expect("fits");
+        let stray = [2, b'a', b'b', 0x55, 0x66];
+        let read = Text::<4>::take(&mut Reader::over(&stray)).expect("decodes");
+        assert_eq!(read, typed);
+        let mut back = [0u8; 5];
+        read.put(&mut Writer::over(&mut back));
+        assert_eq!(back, [2, b'a', b'b', 0, 0]);
+        assert_ne!(Text::<4>::new("abc").expect("fits"), typed);
     }
 
     #[test]

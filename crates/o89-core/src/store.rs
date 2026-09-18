@@ -150,6 +150,19 @@ impl<E: defmt::Format> defmt::Format for EpochAtBoot<E> {
     }
 }
 
+/// Whether the last words landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PanicRecorded<E> {
+    /// On the part, under this boot's count.
+    Landed,
+    /// The write did not happen.
+    Refused(Refused<E>),
+    /// Not attempted: this boot's count did not land, and a record under
+    /// a count the part does not hold would name a boot that never was.
+    WithoutABootCount,
+}
+
 /// What the boot did, for the log and for what the caller owes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -165,7 +178,7 @@ pub struct BootReport<E> {
     /// Whether that number landed on the part.
     pub boot_recorded: Result<(), Refused<E>>,
     /// Whether the last words landed, if a run left any.
-    pub panic_recorded: Option<Result<(), Refused<E>>>,
+    pub panic_recorded: Option<PanicRecorded<E>>,
 }
 
 impl Store {
@@ -226,11 +239,20 @@ impl Store {
             Kept::<PanicRecord, PANIC_RECORD_BYTES>::read(map::PANIC_RECORD, fram).await?;
         let mut panic_recorded = None;
         if let Some(words) = last_words {
-            let record = PanicRecord {
-                boot: boot.get(),
-                words,
-            };
-            panic_recorded = Some(panics.write(fram, record).await);
+            // Only under a count the part holds: a record labelled with a
+            // count that never landed names a boot that never was.
+            panic_recorded = Some(if boot_recorded.is_ok() {
+                let record = PanicRecord {
+                    boot: boot.get(),
+                    words,
+                };
+                match panics.write(fram, record).await {
+                    Ok(()) => PanicRecorded::Landed,
+                    Err(refused) => PanicRecorded::Refused(refused),
+                }
+            } else {
+                PanicRecorded::WithoutABootCount
+            });
         }
 
         let challenges =
@@ -489,7 +511,7 @@ mod tests {
         });
         let (store, second) = boot(&mut part, Some(words));
         assert_eq!(second.boot, BootCount::FIRST.next());
-        assert_eq!(second.panic_recorded, Some(Ok(())));
+        assert_eq!(second.panic_recorded, Some(PanicRecorded::Landed));
         assert_eq!(
             store.panics.present(),
             Some(&PanicRecord { boot: 2, words })
@@ -547,7 +569,12 @@ mod tests {
         assert_eq!(report.clients, None);
         assert_eq!(report.boot, BootCount::FIRST);
         assert_eq!(report.boot_recorded, Err(Refused::SupplyFalling));
-        assert_eq!(report.panic_recorded, Some(Err(Refused::SupplyFalling)));
+        // Not even attempted: a record under a count the part does not
+        // hold would name a boot that never was.
+        assert_eq!(
+            report.panic_recorded,
+            Some(PanicRecorded::WithoutABootCount)
+        );
         assert_eq!(store.epoch.held(), &Held::Absent);
         assert_eq!(store.boots.held(), &Held::Absent);
         assert_eq!(store.panics.held(), &Held::Absent);
@@ -556,6 +583,6 @@ mod tests {
         let (_, report) = boot(&mut part, Some(words));
         assert_eq!(report.epoch, EpochAtBoot::First);
         assert_eq!(report.boot_recorded, Ok(()));
-        assert_eq!(report.panic_recorded, Some(Ok(())));
+        assert_eq!(report.panic_recorded, Some(PanicRecorded::Landed));
     }
 }
