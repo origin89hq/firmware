@@ -21,7 +21,7 @@
 #![no_std]
 #![no_main]
 
-use core::ops::Range;
+use core::ops::{Range, RangeInclusive};
 use core::panic::PanicInfo;
 use core::ptr;
 
@@ -37,10 +37,41 @@ use stm32_metapac::{GPIOD, RCC};
 const APPLICATION: usize = 0x0800_2000;
 
 /// The part's RAM, which is where an initial stack pointer has to point.
-const RAM: Range<u32> = 0x2000_0000..0x2002_4000;
+/// The top is included: the runtime puts the first stack at the very end
+/// of RAM, and the first push moves below it.
+const RAM: RangeInclusive<u32> = 0x2000_0000..=0x2002_4000;
 
-/// The bank as the core sees it, which is where a reset vector has to point.
-const BANK: Range<u32> = 0x0800_0000..0x0804_0000;
+/// The application's part of the bank as the core sees it, which is where a
+/// reset vector has to point: past this image's 8 KB, inside the bank.
+const APPLICATION_FLASH: Range<u32> = 0x0800_2000..0x0804_0000;
+
+/// Whether two words could be an application's initial stack pointer and
+/// reset vector. The reset vector's Thumb bit is not judged: `bootload`
+/// sets it on the way.
+const fn plausible(stack: u32, reset: u32) -> bool {
+    let start = *RAM.start();
+    let end = *RAM.end();
+    let reset = reset & !1;
+    start <= stack
+        && stack <= end
+        && APPLICATION_FLASH.start <= reset
+        && reset < APPLICATION_FLASH.end
+}
+
+const _: () = {
+    // The real application: the stack at the top of RAM, the reset handler
+    // just past the vector table and the build-id note.
+    assert!(plausible(0x2002_4000, 0x0800_2101));
+    assert!(plausible(0x2001_0000, 0x0800_2100));
+    // A stack past the top of RAM, or below it.
+    assert!(!plausible(0x2002_4004, 0x0800_2101));
+    assert!(!plausible(0x1FFF_FFFC, 0x0800_2101));
+    // A reset vector into this image's own 8 KB, or past the bank.
+    assert!(!plausible(0x2002_4000, 0x0800_0101));
+    assert!(!plausible(0x2002_4000, 0x0804_0001));
+    // Erased flash.
+    assert!(!plausible(0xFFFF_FFFF, 0xFFFF_FFFF));
+};
 
 /// `RUN`, on `PD0`.
 const RUN: usize = 0;
@@ -74,8 +105,8 @@ fn generator_lines_low() {
     });
 }
 
-/// Jump to the application if its vector table looks like one; otherwise
-/// wait, with the generator lines low.
+/// Jump to the application if its first two words look like a vector
+/// table's; otherwise wait, with the generator lines low.
 ///
 /// The check is plausibility, not validity: a corrupt image whose first two
 /// words pass it is jumped to, faults, and lands in this image's fault
@@ -91,12 +122,12 @@ fn jump_to_the_application() -> ! {
     // mapped, readable and 4-byte aligned at this address, and the second
     // word is inside the same bank.
     let (stack, reset) = unsafe { (ptr::read_volatile(table), ptr::read_volatile(table.add(1))) };
-    if !RAM.contains(&stack) || !BANK.contains(&reset) {
+    if !plausible(stack, reset) {
         wait_for_a_probe();
     }
     // SAFETY: the table's first word is a stack pointer inside RAM and its
-    // second a reset vector inside the bank, which is what `bootload`
-    // requires; nothing of ours is live past this point.
+    // second a reset vector inside the application's flash, which is what
+    // `bootload` requires; nothing of ours is live past this point.
     unsafe { asm::bootload(table) }
 }
 
