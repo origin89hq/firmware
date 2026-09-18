@@ -2,6 +2,6 @@ commit	image	bytes	budget
 eb52d1d	o89-boot	288	8192
 eb52d1d	o89-controller	8896	253952
 eb52d1d	o89-comms	95040	2097152
-18cfd36	o89-boot	448	8192
-18cfd36	o89-controller	8912	253952
-18cfd36	o89-comms	95040	2097152
+8fabfc6	o89-boot	448	8192
+8fabfc6	o89-controller	8912	253952
+8fabfc6	o89-comms	95040	2097152

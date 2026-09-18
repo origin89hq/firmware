@@ -41,7 +41,10 @@ test-fast:
 gate:
     cargo xtask check
 
-# Build the three images and print their sizes; `--record` appends to docs/sizes.tsv.
+# Build the three images and print their sizes. `--record` appends a row per
+# image to docs/sizes.tsv named by the commit at HEAD: run it on `main` after
+# a merge, because a branch's commits are rewritten by the squash and a row
+# naming one of them names nothing. A pull request states its sizes in words.
 sizes *args:
     cargo xtask sizes {{args}}
 

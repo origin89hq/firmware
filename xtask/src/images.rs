@@ -201,6 +201,9 @@ pub fn enforce(measured: &[Measured]) -> Result<()> {
 }
 
 /// Append a row per image to `docs/sizes.tsv`, with the commit it measures.
+///
+/// Run on `main` after a merge: a branch's commits are rewritten by the
+/// squash, and a row naming one of them names nothing afterwards.
 pub fn record(repo: &Repo, measured: &[Measured]) -> Result<()> {
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
