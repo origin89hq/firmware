@@ -4,12 +4,14 @@
 //! A boot reads the part once and holds what it read: the epoch, the
 //! client table, the counters, the run reason, the panic record and the
 //! rest, each as a [`Kept`] whose RAM copy moves only when the part has
-//! moved. Three things happen on the way: a fresh unit gets its first
-//! epoch; a table that is not under the epoch the part holds is cleared,
-//! finishing a reset that was cut (F-026); the boot count climbs and the
-//! last words, if a run left any, are written down with it. Everything
-//! that measures a window on the tick is restarted at this boot's tick
-//! zero (P-121).
+//! moved. Four things happen on the way: a fresh unit gets its first
+//! epoch; an epoch record behind the table's stamp is raised to it,
+//! because the stamp is a second copy of a counter that only climbs and
+//! the higher copy is the counter; a table under an earlier epoch than
+//! the record is cleared, finishing a reset that was cut (F-026); the boot
+//! count climbs and the last words, if a run left any, are written down
+//! with it. Everything that measures a window on the tick is restarted at
+//! this boot's tick zero (P-121).
 //!
 //! A boot that cannot read the part returns the bus error and nothing
 //! else: there is no partial store to hold. A write the boot could not
@@ -62,7 +64,6 @@ pub struct Store {
 /// and `Hello` is refused until a later boot finds it or a person writes
 /// one (P-085).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum NoEpoch<E> {
     /// Both slots written and neither holds.
     Corrupt,
@@ -70,6 +71,83 @@ pub enum NoEpoch<E> {
     Malformed(Malformed),
     /// A fresh unit whose first epoch would not land.
     Refused(Refused<E>),
+    /// The record is behind the table's stamp and raising it would not
+    /// land. Deriving under the record would mint keys the move to the
+    /// table's epoch was made to invalidate, so nothing derives.
+    Regressed {
+        /// What the record holds.
+        record: Epoch,
+        /// What the table is under.
+        table: Epoch,
+        /// Why the raise did not land.
+        refused: Refused<E>,
+    },
+}
+
+#[cfg(feature = "defmt")]
+impl<E: defmt::Format> defmt::Format for NoEpoch<E> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            Self::Corrupt => defmt::write!(f, "both slots damaged"),
+            Self::Malformed(malformed) => defmt::write!(f, "malformed at {}", malformed.at),
+            Self::Refused(refused) => defmt::write!(f, "first epoch refused: {}", refused),
+            Self::Regressed {
+                record,
+                table,
+                refused,
+            } => defmt::write!(
+                f,
+                "record at {} behind the table at {}, raise refused: {}",
+                record.get(),
+                table.get(),
+                refused
+            ),
+        }
+    }
+}
+
+/// The epoch this boot runs under, and how it came to hold it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochAtBoot<E> {
+    /// Read from the record.
+    Held(Epoch),
+    /// A fresh unit: this boot wrote the first epoch.
+    First,
+    /// The record was behind the table's stamp and was raised to it.
+    Raised {
+        /// What the record held.
+        from: Epoch,
+        /// What it holds now, which is what the table is under.
+        to: Epoch,
+    },
+    /// There is none.
+    None(NoEpoch<E>),
+}
+
+impl<E> EpochAtBoot<E> {
+    /// The epoch keys derive under, if there is one.
+    #[must_use]
+    pub const fn epoch(&self) -> Option<Epoch> {
+        match self {
+            Self::Held(epoch) | Self::Raised { to: epoch, .. } => Some(*epoch),
+            Self::First => Some(Epoch::FIRST),
+            Self::None(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<E: defmt::Format> defmt::Format for EpochAtBoot<E> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            Self::Held(epoch) => defmt::write!(f, "epoch {}", epoch.get()),
+            Self::First => defmt::write!(f, "first boot, epoch 1 written"),
+            Self::Raised { from, to } => {
+                defmt::write!(f, "epoch record raised from {} to {}", from.get(), to.get());
+            }
+            Self::None(why) => defmt::write!(f, "no epoch: {}", why),
+        }
+    }
 }
 
 /// What the boot did, for the log and for what the caller owes.
@@ -78,9 +156,7 @@ pub enum NoEpoch<E> {
 #[must_use = "a boot report nobody reads is a refused write nobody raises"]
 pub struct BootReport<E> {
     /// The epoch this boot runs under, or why there is none.
-    pub epoch: Result<Epoch, NoEpoch<E>>,
-    /// Whether this boot wrote the unit's first epoch.
-    pub first_boot: bool,
+    pub epoch: EpochAtBoot<E>,
     /// What became of the client table, or nothing because there was no
     /// epoch to take it under.
     pub clients: Option<Result<Booted, Refused<E>>>,
@@ -102,25 +178,39 @@ impl Store {
         let secret = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
 
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
-        let mut first_boot = false;
-        let established = match *epoch.held() {
-            Held::Present(held) => Ok(held),
+        let mut at_boot = match *epoch.held() {
+            Held::Present(held) => EpochAtBoot::Held(held),
             Held::Absent => match epoch.write(fram, Epoch::FIRST).await {
-                Ok(()) => {
-                    first_boot = true;
-                    Ok(Epoch::FIRST)
-                }
-                Err(refused) => Err(NoEpoch::Refused(refused)),
+                Ok(()) => EpochAtBoot::First,
+                Err(refused) => EpochAtBoot::None(NoEpoch::Refused(refused)),
             },
-            Held::Corrupt => Err(NoEpoch::Corrupt),
-            Held::Malformed(malformed) => Err(NoEpoch::Malformed(malformed)),
+            Held::Corrupt => EpochAtBoot::None(NoEpoch::Corrupt),
+            Held::Malformed(malformed) => EpochAtBoot::None(NoEpoch::Malformed(malformed)),
         };
 
         let mut clients =
             Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
-        let clients_booted = match established {
-            Ok(under) => Some(clients.booted(fram, under).await),
-            Err(_) => None,
+        // The stamp is a second copy of the epoch: a record behind it is
+        // raised to it, and never the other way round.
+        if let (Some(record), Some(table)) =
+            (at_boot.epoch(), clients.present().map(ClientTable::epoch))
+            && table > record
+        {
+            at_boot = match epoch.write(fram, table).await {
+                Ok(()) => EpochAtBoot::Raised {
+                    from: record,
+                    to: table,
+                },
+                Err(refused) => EpochAtBoot::None(NoEpoch::Regressed {
+                    record,
+                    table,
+                    refused,
+                }),
+            };
+        }
+        let clients_booted = match at_boot.epoch() {
+            Some(under) => Some(clients.booted(fram, under).await),
+            None => None,
         };
 
         let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
@@ -156,8 +246,7 @@ impl Store {
         let network = Kept::<Network, NETWORK_BYTES>::read(map::NETWORK, fram).await?;
 
         let report = BootReport {
-            epoch: established,
-            first_boot,
+            epoch: at_boot,
             clients: clients_booted,
             boot,
             boot_recorded,
@@ -254,8 +343,8 @@ mod tests {
     fn p_085_a_first_boot_writes_epoch_one_and_clears_the_table_under_it() {
         let mut part = Part::fresh();
         let (store, report) = boot(&mut part, None);
-        assert_eq!(report.epoch, Ok(Epoch::FIRST));
-        assert!(report.first_boot);
+        assert_eq!(report.epoch, EpochAtBoot::First);
+        assert_eq!(report.epoch.epoch(), Some(Epoch::FIRST));
         assert_eq!(report.clients, Some(Ok(Booted::Cleared(Because::Absent))));
         assert_eq!(report.boot, BootCount::FIRST);
         assert_eq!(report.boot_recorded, Ok(()));
@@ -272,8 +361,7 @@ mod tests {
         assert_eq!(store.volume.held(), &Held::Absent);
         // The second boot is not the first.
         let (_, again) = boot(&mut part, None);
-        assert!(!again.first_boot);
-        assert_eq!(again.epoch, Ok(Epoch::FIRST));
+        assert_eq!(again.epoch, EpochAtBoot::Held(Epoch::FIRST));
         assert_eq!(again.clients, Some(Ok(Booted::Rebased)));
         assert_eq!(again.boot, BootCount::FIRST.next());
     }
@@ -290,10 +378,10 @@ mod tests {
         // The reset moves the epoch and the power goes before the table.
         let _clearing = block_on(store.epoch.advance(&mut part)).expect("the supply is fine");
         let (store, report) = boot(&mut part, None);
-        assert_eq!(report.epoch, Ok(epoch(2)));
+        assert_eq!(report.epoch, EpochAtBoot::Held(epoch(2)));
         assert_eq!(
             report.clients,
-            Some(Ok(Booted::Cleared(Because::OtherEpoch(Epoch::FIRST))))
+            Some(Ok(Booted::Cleared(Because::Earlier(Epoch::FIRST))))
         );
         let table = store.clients.present().expect("a table");
         assert!(table.is_under(epoch(2)));
@@ -320,7 +408,8 @@ mod tests {
         part.bytes[8] ^= 0x01;
         part.bytes[16 + 8] ^= 0x01;
         let (store, report) = boot(&mut part, None);
-        assert_eq!(report.epoch, Err(NoEpoch::Corrupt));
+        assert_eq!(report.epoch, EpochAtBoot::None(NoEpoch::Corrupt));
+        assert_eq!(report.epoch.epoch(), None);
         assert_eq!(report.clients, None);
         // The rows are still there, and nothing can enrol into them
         // until a person writes an epoch.
@@ -329,7 +418,64 @@ mod tests {
         let mut zero = Part::fresh();
         let _ = block_on(map::EPOCH.write(&mut zero, Position::Start, &[0; 4]));
         let (_, report) = boot(&mut zero, None);
-        assert_eq!(report.epoch, Err(NoEpoch::Malformed(Malformed { at: 0 })));
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::None(NoEpoch::Malformed(Malformed { at: 0 }))
+        );
+    }
+
+    #[test]
+    fn f_026_a_boot_raises_a_record_behind_the_tables_stamp_and_derives_nothing_if_it_cannot() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let clearing = block_on(store.epoch.advance(&mut part)).expect("the supply is fine");
+        block_on(
+            store
+                .clients
+                .write(&mut part, ClientTable::cleared(&clearing)),
+        )
+        .expect("the supply is fine");
+        let id = block_on(store.clients.update(&mut part, |table| {
+            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
+        }))
+        .expect("the supply is fine")
+        .expect("room")
+        .client();
+        // The record regresses under somebody's hand: the public write.
+        block_on(store.epoch.write(&mut part, Epoch::FIRST)).expect("the supply is fine");
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::Raised {
+                from: Epoch::FIRST,
+                to: epoch(2)
+            }
+        );
+        assert_eq!(report.clients, Some(Ok(Booted::Rebased)));
+        assert_eq!(store.epoch.present(), Some(&epoch(2)));
+        let table = store.clients.present().expect("a table");
+        assert!(table.is_under(epoch(2)));
+        assert_eq!(
+            table.row(id).map(|row| row.label().as_bytes()),
+            Some(&b"phone"[..])
+        );
+        // And when the raise will not land, nothing derives and nothing
+        // is cleared: the rows wait for a boot that can.
+        let mut store = store;
+        block_on(store.epoch.write(&mut part, Epoch::FIRST)).expect("the supply is fine");
+        part.falling = true;
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::None(NoEpoch::Regressed {
+                record: Epoch::FIRST,
+                table: epoch(2),
+                refused: Refused::SupplyFalling,
+            })
+        );
+        assert_eq!(report.clients, None);
+        assert_eq!(store.clients.present().map(ClientTable::enrolled), Some(1));
+        assert_eq!(store.epoch.present(), Some(&Epoch::FIRST));
     }
 
     #[test]
@@ -394,8 +540,10 @@ mod tests {
         part.falling = true;
         let words = LastWords::Panicked(PanicSite { file: 1, line: 2 });
         let (store, report) = boot(&mut part, Some(words));
-        assert_eq!(report.epoch, Err(NoEpoch::Refused(Refused::SupplyFalling)));
-        assert!(!report.first_boot);
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::None(NoEpoch::Refused(Refused::SupplyFalling))
+        );
         assert_eq!(report.clients, None);
         assert_eq!(report.boot, BootCount::FIRST);
         assert_eq!(report.boot_recorded, Err(Refused::SupplyFalling));
@@ -406,7 +554,7 @@ mod tests {
         // With the supply back, the same boot lands everything.
         part.falling = false;
         let (_, report) = boot(&mut part, Some(words));
-        assert!(report.first_boot);
+        assert_eq!(report.epoch, EpochAtBoot::First);
         assert_eq!(report.boot_recorded, Ok(()));
         assert_eq!(report.panic_recorded, Some(Ok(())));
     }
