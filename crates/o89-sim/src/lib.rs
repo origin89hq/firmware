@@ -9,12 +9,14 @@
 //! that runs on every commit rather than a night somebody remembers.
 //!
 //! What exists today is the storage seam: a simulated FRAM with a step
-//! counter, and the harness that runs a write path crashing at every step
-//! and asserts the recovery invariant after each (VERIFICATION §6, F-025).
-//! This crate is host-only: it is never cross-compiled, so it may hold a
-//! whole part's bytes on the heap; the rules that bind the domain crates
-//! bind what it tests, not itself.
+//! counter, the harness that runs a write path crashing at every step and
+//! asserts the recovery invariant after each (VERIFICATION §6, F-025), and
+//! the tables' write paths run through it. This crate is host-only: it is
+//! never cross-compiled, so it may hold a whole part's bytes on the heap;
+//! the rules that bind the domain crates bind what it tests, not itself.
 
 mod fram;
+#[cfg(test)]
+mod tables;
 
 pub use fram::*;
