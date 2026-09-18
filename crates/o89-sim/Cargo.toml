@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 o89-core = { path = "../o89-core" }
 embassy-futures.workspace = true
+embedded-storage-async.workspace = true
 
 [dev-dependencies]
 km43.workspace = true

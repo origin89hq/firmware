@@ -255,6 +255,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc2d050bdc5c21e0862a89256ed8029ae6c290a93aecefc73084b3002cdebb01"
 
 [[package]]
+name = "embedded-storage"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21dea9854beb860f3062d10228ce9b976da520a73474aed3171ec276bc0c032"
+
+[[package]]
+name = "embedded-storage-async"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1763775e2323b7d5f0aa6090657f5e21cfa02ede71f5dc40eead06d64dcd15cc"
+dependencies = [
+ "embedded-storage",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -352,6 +367,7 @@ dependencies = [
  "crc",
  "defmt",
  "embassy-futures",
+ "embedded-storage-async",
  "km43",
  "sha2",
 ]
@@ -361,6 +377,7 @@ name = "o89-sim"
 version = "0.0.0"
 dependencies = [
  "embassy-futures",
+ "embedded-storage-async",
  "km43",
  "o89-core",
 ]
