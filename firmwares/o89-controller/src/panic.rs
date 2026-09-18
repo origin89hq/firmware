@@ -5,13 +5,13 @@
 //! is the one failure that cannot be debugged from four hours away. The
 //! production handler writes where the panic happened to the last words,
 //! which the next boot's record carries, and resets; the reason reaches
-//! FRAM with M2. The bench build keeps `panic-probe` instead, which halts
-//! with the message on the probe.
+//! FRAM with M2. The `panic-probe` feature halts with the message on the
+//! probe instead, for chasing a panic at the bench.
 
-#[cfg(feature = "bench")]
+#[cfg(feature = "panic-probe")]
 use panic_probe as _;
 
-#[cfg(not(feature = "bench"))]
+#[cfg(not(feature = "panic-probe"))]
 mod production {
     use core::panic::PanicInfo;
 
