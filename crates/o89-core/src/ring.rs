@@ -1217,11 +1217,13 @@ mod tests {
 
     #[test]
     fn p_099_the_run_is_the_distance_in_the_ring_for_a_block_count_that_is_not_a_power_of_two() {
-        // Five blocks: a wrapping subtraction modulo two to the thirty-two
-        // is off by one for any count that does not divide it, and the walk
-        // then hands a client older records after newer ones.
+        // Six blocks: two to the thirty-two leaves four modulo six, so a
+        // wrapping subtraction makes the run four blocks too long, and the
+        // walk then hands a client the oldest records again after the
+        // newest. Five would leave one, which only revisits the erased
+        // block and shows nothing.
         let mut part: Part<ERASE> = fresh();
-        let mut ring = open_with(&mut part, 5);
+        let mut ring = open_with(&mut part, 6);
         let mut last = 0;
         for i in 0..120u64 {
             last = append(&mut ring, Some(1_790_000_000_000 + i));
@@ -1239,7 +1241,7 @@ mod tests {
         );
         // A reboot walks the same run.
         close(&mut part, ring);
-        let mut rebooted = open_with(&mut part, 5);
+        let mut rebooted = open_with(&mut part, 6);
         let (seqs, count, _) = read(&mut rebooted, 1);
         assert_eq!(seqs[0], oldest);
         assert_eq!(seqs[count - 1], last);
