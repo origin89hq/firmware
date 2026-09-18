@@ -376,7 +376,6 @@ impl ClientTable {
 
 /// What a boot did with the client table it read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a boot that cleared the table has something to log"]
 pub enum Booted {
     /// The rows are under the epoch the part holds; every dedup entry
@@ -385,6 +384,25 @@ pub enum Booted {
     /// What the part held was not a table under this epoch, and the empty
     /// table under it was written in its place.
     Cleared(Because),
+    /// The rows are under a later epoch than the record holds, which this
+    /// firmware never does by its own hand: the epoch record regressed.
+    /// The table is left as it is, because clearing it under the lower
+    /// epoch would let the next enrolment derive a key the table's epoch
+    /// was moved to invalidate. The store raises the record to the
+    /// table's epoch: the higher of two copies of a counter that only
+    /// climbs is the counter.
+    Above(Epoch),
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Booted {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            Self::Rebased => defmt::write!(f, "rebased"),
+            Self::Cleared(because) => defmt::write!(f, "cleared: {}", because),
+            Self::Above(epoch) => defmt::write!(f, "left under epoch {}", epoch.get()),
+        }
+    }
 }
 
 /// Why a boot cleared the client table.
@@ -396,10 +414,10 @@ pub enum Because {
     Corrupt,
     /// A record that held and did not decode.
     Malformed(Malformed),
-    /// The rows were enrolled under another epoch: a factory reset that
+    /// The rows were enrolled under an earlier epoch: a factory reset that
     /// was cut between moving the epoch and clearing the table, finished
     /// here.
-    OtherEpoch(Epoch),
+    Earlier(Epoch),
 }
 
 #[cfg(feature = "defmt")]
@@ -409,18 +427,19 @@ impl defmt::Format for Because {
             Self::Absent => defmt::write!(f, "never written"),
             Self::Corrupt => defmt::write!(f, "both slots damaged"),
             Self::Malformed(malformed) => defmt::write!(f, "malformed at {}", malformed.at),
-            Self::OtherEpoch(epoch) => defmt::write!(f, "enrolled under epoch {}", epoch.get()),
+            Self::Earlier(epoch) => defmt::write!(f, "enrolled under epoch {}", epoch.get()),
         }
     }
 }
 
 impl Kept<ClientTable, CLIENT_TABLE_BYTES> {
     /// Take the table as a boot does, under the epoch the boot read: rows
-    /// under that epoch are kept with their entries rebased (P-121);
-    /// anything else is replaced by the empty table under it, written so
-    /// the next boot finds it (F-026). A write that is refused leaves the
-    /// handle holding what the part holds, which is not a table this boot
-    /// can enrol into.
+    /// under that epoch are kept with their entries rebased (P-121); rows
+    /// under an earlier one, or no table at all, are replaced by the empty
+    /// table under it, written so the next boot finds it (F-026); rows
+    /// under a later one are left alone and reported. A write that is
+    /// refused leaves the handle holding what the part holds, which is
+    /// not a table this boot can enrol into.
     pub async fn booted<F: Fram>(
         &mut self,
         fram: &mut F,
@@ -432,7 +451,10 @@ impl Kept<ClientTable, CLIENT_TABLE_BYTES> {
                 self.rebase(rebased);
                 return Ok(Booted::Rebased);
             }
-            Held::Present(table) => Because::OtherEpoch(table.epoch()),
+            Held::Present(table) if table.epoch() > epoch => {
+                return Ok(Booted::Above(table.epoch()));
+            }
+            Held::Present(table) => Because::Earlier(table.epoch()),
             Held::Absent => Because::Absent,
             Held::Corrupt => Because::Corrupt,
             Held::Malformed(malformed) => Because::Malformed(*malformed),
@@ -506,7 +528,48 @@ impl Body<CLIENT_TABLE_BYTES> for ClientTable {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+
+    use embassy_futures::block_on;
+
     use super::*;
+    use crate::fram::Address;
+
+    /// Enough of the part for the client table's record.
+    const PART_BYTES: usize = 4096;
+    const _: () = assert!(crate::map::CLIENT_TABLE.end().0 as usize <= PART_BYTES);
+
+    struct Part {
+        bytes: [u8; PART_BYTES],
+    }
+
+    impl Part {
+        fn fresh() -> Self {
+            Self {
+                bytes: [0; PART_BYTES],
+            }
+        }
+    }
+
+    impl Fram for Part {
+        type Error = ();
+
+        fn read(&mut self, at: Address, into: &mut [u8]) -> impl Future<Output = Result<(), ()>> {
+            let start = usize::from(at.0);
+            into.copy_from_slice(&self.bytes[start..][..into.len()]);
+            core::future::ready(Ok(()))
+        }
+
+        fn write(
+            &mut self,
+            at: Address,
+            bytes: &[u8],
+        ) -> impl Future<Output = Result<(), Refused<()>>> {
+            let start = usize::from(at.0);
+            self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
+            core::future::ready(Ok(()))
+        }
+    }
 
     fn client(n: u32) -> ClientId {
         ClientId::new(n).expect("a nonzero client")
@@ -768,6 +831,39 @@ mod tests {
         assert_eq!(cleared.epoch(), epoch(2));
         assert!(cleared.is_under(epoch(2)));
         assert!(!cleared.is_under(Epoch::FIRST));
+    }
+
+    #[test]
+    fn f_026_a_table_under_a_later_epoch_is_left_alone_not_cleared_under_the_earlier_one() {
+        // The record says one; the table says two. Clearing under one
+        // would hand the next enrolment a key the move to two invalidated.
+        let later = ClientTable::cleared(&Clearing::found_at_boot(epoch(2)));
+        let mut part = Part::fresh();
+        let mut kept = block_on(Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(
+            crate::map::CLIENT_TABLE,
+            &mut part,
+        ))
+        .expect("reads");
+        block_on(kept.write(&mut part, later.clone())).expect("the supply is fine");
+        let before = part.bytes;
+        assert_eq!(
+            block_on(kept.booted(&mut part, Epoch::FIRST)),
+            Ok(Booted::Above(epoch(2)))
+        );
+        assert_eq!(kept.present(), Some(&later));
+        assert_eq!(part.bytes, before, "nothing was written");
+        // Under its own epoch it is an ordinary table.
+        assert_eq!(
+            block_on(kept.booted(&mut part, epoch(2))),
+            Ok(Booted::Rebased)
+        );
+        // Under a later one still, it is cleared: the reset that moved
+        // the epoch to three is finished here.
+        assert_eq!(
+            block_on(kept.booted(&mut part, epoch(3))),
+            Ok(Booted::Cleared(Because::Earlier(epoch(2))))
+        );
+        assert!(kept.present().is_some_and(|table| table.is_under(epoch(3))));
     }
 
     #[test]

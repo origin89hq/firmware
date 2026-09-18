@@ -86,7 +86,7 @@ fn p_085_a_reset_cut_at_any_step_leaves_the_old_epoch_with_its_rows_or_a_higher_
                 // is gone, either by the reset or by this boot.
                 assert_eq!(found, epoch(2), "cut at {step}");
                 assert_eq!(table.enrolled(), 0, "cut at {step}");
-                if booted == Booted::Cleared(Because::OtherEpoch(Epoch::FIRST)) {
+                if booted == Booted::Cleared(Because::Earlier(Epoch::FIRST)) {
                     finished_by_the_boot += 1;
                 }
             }

@@ -635,9 +635,15 @@ accepted, which is P-079 as a structure rather than a discipline.
 epoch first and clears the table second, and a power cut between the two
 leaves eight rows whose keys no longer derive counting towards
 `table_full`. The table carries the epoch its rows were enrolled under, and
-a boot that reads a table under another epoch than the epoch record holds
-clears it, finishing the reset (F-026). The permission to clear is a type
-that only the read-back of a new epoch, or that boot, can produce.
+a boot that reads a table under an earlier epoch than the epoch record
+holds clears it, finishing the reset (F-026). The permission to clear is a
+type that only the read-back of a new epoch, or that boot, can produce. The
+other direction is never a clearing: a table under a later epoch than the
+record means the record regressed, which this firmware does not do by its
+own hand, and clearing under the lower epoch would let the next enrolment
+derive a key the move was made to invalidate. The stamp is a second copy of
+a counter that only climbs, so the higher copy is the epoch and the boot
+raises the record to it.
 
 History at full resolution is a client's job. The controller keeps enough to
 survive a long disconnection, which is a different requirement from keeping
