@@ -300,8 +300,15 @@ role; `BOARD-A.md` maps them to pins.
    FRAM transaction starts, and one in flight completes. Seven brown-outs on
    the bench destroyed both counter slots at once; the write discipline is
    the answer, not a hope about the part.
-6. **FRAM read**: identity, epoch, configuration pointers, the client table,
-   counters, the dedup table, the generator run reason, the panic record.
+6. **FRAM read**: the secret, the epoch, the client table with its
+   counters and the dedup table, the generator run reason, the panic
+   record, the boot count, the challenge counter, the byte budget, the
+   authorised comms release, the network master copy; the configuration
+   sections when M5 adds them. One read into a `Store`, and the rules that
+   tie one record to another applied where both are in hand: a fresh unit
+   gets its first epoch, a table under another epoch is cleared (F-026),
+   the boot count climbs, the last words are written down with it, and
+   every window measured on the tick restarts at zero (P-121).
    **NOR scan**: the log ring's head and the time floor, the newest
    timestamped record (L-140).
 7. **Outputs to their declared fail state**, per output, from configuration,

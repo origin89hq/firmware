@@ -36,6 +36,7 @@ use crate::body::{Body, Held, Kept, Malformed, Reader, Writer};
 use crate::dedup::{DEDUP_BYTES, Dedup, Fingerprint, Recorded, Reserved, Verdict};
 use crate::epoch::Clearing;
 use crate::fram::{Fram, Refused};
+use crate::text::Text;
 use crate::tick::Tick;
 
 /// The bytes the client table's record budgets. The layout below takes
@@ -49,48 +50,18 @@ pub const ROWS: usize = MAX_CLIENTS;
 /// Its first accepted request carries one.
 pub const FRESHLY_ENROLLED: Counter = Counter(0);
 
-/// One row on the part: kind, label length, mask, label, counter.
-const ROW_BYTES: usize = 1 + 1 + 2 + MAX_LABEL + 8;
+/// One row on the part: kind, label, mask, counter.
+const ROW_BYTES: usize = 1 + (1 + MAX_LABEL) + 2 + 8;
 const LAYOUT: usize = 4 + ROWS * ROW_BYTES + DEDUP_BYTES;
 const _: () = assert!(LAYOUT <= CLIENT_TABLE_BYTES);
-const _: () = assert!(MAX_LABEL <= u8::MAX as usize);
 
 /// The kind byte of a vacant row: no client kind is zero.
 const VACANT: u8 = 0;
 
 /// A client's own name for itself, as the bytes that entered the pair
-/// proof. Held as bytes because byte equality is the only comparison the
-/// protocol permits, and a `str` invites the three it forbids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Label {
-    bytes: [u8; MAX_LABEL],
-    len: u8,
-}
-
-impl Label {
-    /// Refused rather than truncated: "pump hous" is a different label,
-    /// and somebody acts on it wrongly.
-    pub fn new(text: &str) -> Result<Self, LabelTooLong> {
-        let len = u8::try_from(text.len()).map_err(|_| LabelTooLong(text.len()))?;
-        let mut bytes = [0u8; MAX_LABEL];
-        let room = bytes
-            .get_mut(..text.len())
-            .ok_or(LabelTooLong(text.len()))?;
-        room.copy_from_slice(text.as_bytes());
-        Ok(Self { bytes, len })
-    }
-
-    /// The label's bytes, exactly as many as it has.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.bytes.get(..usize::from(self.len)).unwrap_or(&[])
-    }
-}
-
-/// A label past `MAX_LABEL`, carrying the length it had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct LabelTooLong(pub usize);
+/// proof: byte equality is the only comparison the protocol permits, and
+/// a label past the cap is refused rather than truncated.
+pub type Label = Text<MAX_LABEL>;
 
 /// One enrolled client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,9 +447,8 @@ impl Body<CLIENT_TABLE_BYTES> for ClientTable {
             match row {
                 Some(row) => {
                     writer.u8(row.kind as u8);
-                    writer.u8(row.label.len);
+                    row.label.put(&mut writer);
                     writer.u16(row.mask.0);
-                    writer.put(&row.label.bytes);
                     writer.u64(row.counter.0);
                 }
                 None => writer.skip(ROW_BYTES),
@@ -499,16 +469,8 @@ impl Body<CLIENT_TABLE_BYTES> for ClientTable {
                 continue;
             }
             let kind = ClientKind::try_from(kind).map_err(|()| reader.malformed(1))?;
-            let len = reader.u8()?;
-            if usize::from(len) > MAX_LABEL {
-                return Err(reader.malformed(1));
-            }
+            let label = Label::take(&mut reader)?;
             let mask = ClientCapability(reader.u16()?);
-            let bytes = reader.take::<MAX_LABEL>()?;
-            let label = Label { bytes, len };
-            if core::str::from_utf8(label.as_bytes()).is_err() {
-                return Err(reader.malformed(MAX_LABEL));
-            }
             let counter = Counter(reader.u64()?);
             *row = Some(Row {
                 label,
@@ -938,7 +900,7 @@ mod tests {
         assert_eq!(ClientTable::decode(&len), Err(Malformed { at: 5 }));
         let mut utf8 = good;
         utf8[8] = 0xFF;
-        assert_eq!(ClientTable::decode(&utf8), Err(Malformed { at: 8 }));
+        assert_eq!(ClientTable::decode(&utf8), Err(Malformed { at: 6 }));
         let mut epoch = good;
         epoch[..4].copy_from_slice(&[0; 4]);
         assert_eq!(ClientTable::decode(&epoch), Err(Malformed { at: 0 }));
@@ -956,8 +918,8 @@ mod tests {
     #[test]
     fn a_label_past_thirty_two_bytes_is_refused_not_truncated() {
         assert_eq!(
-            Label::new("a label of thirty-three bytes....").map(|l| l.as_bytes().len()),
-            Err(LabelTooLong(33))
+            Label::new("a label of thirty-three bytes....").map(|l| l.len()),
+            Err(crate::text::TooLong { len: 33, cap: 32 })
         );
         assert_eq!(label("").as_bytes(), b"");
         assert_eq!(label("étable").as_bytes(), "étable".as_bytes());

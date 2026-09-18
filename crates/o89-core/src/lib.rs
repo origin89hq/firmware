@@ -14,15 +14,21 @@
 //! boot, the [`Rollcall`] that earns the watchdog its feed, the lamp's
 //! [`Pattern`], the module rail's [`RailSequencer`], the contract
 //! [`Feedback`] is read under, the FRAM [`Record`] with the [`map`] that
-//! places every one of them in the part, and the first tables on it: the
-//! epoch with the [`Clearing`] a factory reset has to earn, and the
-//! [`ClientTable`] with its counters and the [`Dedup`] table beside them.
-//! The rest of the tables, the behaviours and the link-local state
-//! machines arrive with the milestones that name them.
+//! places every one of them in the part, and the [`Store`] of what the
+//! part holds: the epoch with the [`Clearing`] a factory reset has to
+//! earn, the [`ClientTable`] with its counters and the [`Dedup`] table
+//! beside them, the challenge counter with the [`Minted`] a challenge
+//! cannot leave without, the run reason with the [`Declared`] an output
+//! cannot move without, the secret, the panic record, the boot count, the
+//! log's byte budget, the authorised comms release and the network master
+//! copy. The behaviours and the link-local state machines arrive with the
+//! milestones that name them.
 
 #![no_std]
 
 mod body;
+mod boot_count;
+mod challenge;
 mod clients;
 mod dedup;
 mod epoch;
@@ -32,13 +38,23 @@ mod fram;
 mod lamp;
 mod last_words;
 pub mod map;
+mod network;
+mod panic_record;
 mod rail;
+mod release;
 mod reset;
 mod revision;
 mod rollcall;
+mod run_reason;
+mod secret;
+mod store;
+mod text;
 mod tick;
+mod write_volume;
 
 pub use body::*;
+pub use boot_count::*;
+pub use challenge::*;
 pub use clients::*;
 pub use dedup::*;
 pub use epoch::*;
@@ -47,8 +63,16 @@ pub use feedback::*;
 pub use fram::*;
 pub use lamp::*;
 pub use last_words::*;
+pub use network::*;
+pub use panic_record::*;
 pub use rail::*;
+pub use release::*;
 pub use reset::*;
 pub use revision::*;
 pub use rollcall::*;
+pub use run_reason::*;
+pub use secret::*;
+pub use store::*;
+pub use text::*;
 pub use tick::*;
+pub use write_volume::*;

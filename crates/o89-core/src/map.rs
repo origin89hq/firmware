@@ -8,41 +8,53 @@
 //! sizes are decided here so the part's 32 KiB is allocated once. The last
 //! line is the assertion: a map that does not fit does not build.
 
+use crate::boot_count::BOOT_COUNT_BYTES;
+use crate::challenge::CHALLENGE_COUNTER_BYTES;
 use crate::clients::CLIENT_TABLE_BYTES;
 use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Address, FRAM_BYTES, Record};
+use crate::network::NETWORK_BYTES;
+use crate::panic_record::PANIC_RECORD_BYTES;
+use crate::release::COMMS_RELEASE_BYTES;
+use crate::run_reason::RUN_REASON_BYTES;
+use crate::secret::SECRET_BYTES;
+use crate::write_volume::WRITE_VOLUME_BYTES;
 
 /// The epoch: a `u32` that only ever increments (P-085).
 pub const EPOCH: Record<EPOCH_BYTES> = Record::at(magic(*b"EPOC"), Address(0));
 
 /// The challenge counter, written before the challenge it names leaves: a
 /// `u64`, the width the derivation takes (F-041).
-pub const CHALLENGE_COUNTER: Record<8> = Record::at(magic(*b"CHAL"), EPOCH.end());
+pub const CHALLENGE_COUNTER: Record<CHALLENGE_COUNTER_BYTES> =
+    Record::at(magic(*b"CHAL"), EPOCH.end());
 
-/// The boot counter.
-pub const BOOT_COUNTER: Record<4> = Record::at(magic(*b"BOOT"), CHALLENGE_COUNTER.end());
+/// The boot count.
+pub const BOOT_COUNT: Record<BOOT_COUNT_BYTES> =
+    Record::at(magic(*b"BOOT"), CHALLENGE_COUNTER.end());
 
-/// The rolling 24-hour write-volume counter: the count and its window.
-pub const WRITE_VOLUME: Record<16> = Record::at(magic(*b"VOLU"), BOOT_COUNTER.end());
+/// The rolling 24-hour write-volume counter: the count and its window
+/// (F-024).
+pub const WRITE_VOLUME: Record<WRITE_VOLUME_BYTES> = Record::at(magic(*b"VOLU"), BOOT_COUNT.end());
 
 /// The device secret every key derives from: the sixteen bytes of the
 /// device id and the thirty-two of the printed secret (P-038, P-044).
-pub const DEVICE_SECRET: Record<48> = Record::at(magic(*b"SECR"), WRITE_VOLUME.end());
+pub const DEVICE_SECRET: Record<SECRET_BYTES> = Record::at(magic(*b"SECR"), WRITE_VOLUME.end());
 
-/// Why the generator is running, written before the output moves.
-pub const RUN_REASON: Record<16> = Record::at(magic(*b"RUNR"), DEVICE_SECRET.end());
+/// Why the generator is running, written before the output moves (F-022).
+pub const RUN_REASON: Record<RUN_REASON_BYTES> = Record::at(magic(*b"RUNR"), DEVICE_SECRET.end());
 
 /// The panic record: the boot it happened at and what the last words
 /// carry, kept past a power cut.
-pub const PANIC_RECORD: Record<24> = Record::at(magic(*b"PANI"), RUN_REASON.end());
+pub const PANIC_RECORD: Record<PANIC_RECORD_BYTES> = Record::at(magic(*b"PANI"), RUN_REASON.end());
 
 /// The authorised comms release (L-170): the version text, the image
 /// length, the digest and the tick it was authorised at.
-pub const COMMS_RELEASE: Record<96> = Record::at(magic(*b"RELS"), PANIC_RECORD.end());
+pub const COMMS_RELEASE: Record<COMMS_RELEASE_BYTES> =
+    Record::at(magic(*b"RELS"), PANIC_RECORD.end());
 
 /// The network master copy (L-130): one network, a value not a table, with
 /// its version, the credentials, the country and the hostname.
-pub const NETWORK: Record<160> = Record::at(magic(*b"NETW"), COMMS_RELEASE.end());
+pub const NETWORK: Record<NETWORK_BYTES> = Record::at(magic(*b"NETW"), COMMS_RELEASE.end());
 
 /// The client table: every enrolled client's label, kind, mask and counter,
 /// and the dedup table beside them, in one record because P-080 lands a

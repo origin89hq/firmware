@@ -1,24 +1,28 @@
 //! The tables' write paths, each cut at every byte, with the invariant a
 //! boot needs asserted after every cut (F-025).
 //!
-//! Three paths, three invariants. A factory reset leaves the old epoch
+//! Five paths, five invariants. A factory reset leaves the old epoch
 //! with its rows, or a higher epoch whose table the next boot clears. A
 //! command leaves its counter and its in-flight entry together or leaves
 //! neither. A pairing leaves the rows that were there, with or without the
-//! new one, and never a row half written.
+//! new one, and never a row half written. A mint hands out no counter and
+//! the next mint is past every one before it. A boot leaves a boot count
+//! that climbs and a panic record that is whole or absent.
 
 use embassy_futures::block_on;
 use km43::{ClientId, ClientKind, Counter, Epoch};
-use o89_core::map::{CLIENT_TABLE, EPOCH};
+use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH};
 use o89_core::{
-    Admitted, Because, Booted, CLIENT_TABLE_BYTES, ClientTable, EPOCH_BYTES, Fingerprint, Kept,
-    Label, Paired, Tick,
+    Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
+    ChallengeCounter, ClientTable, EPOCH_BYTES, Fingerprint, Held, Kept, Label, LastWords, Paired,
+    PanicSite, Store, Tick,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
 
 type Epochs = Kept<Epoch, EPOCH_BYTES>;
 type Clients = Kept<ClientTable, CLIENT_TABLE_BYTES>;
+type Counters = Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>;
 
 fn client(n: u32) -> ClientId {
     ClientId::new(n).expect("a nonzero client")
@@ -199,4 +203,74 @@ fn p_078_a_pairing_cut_at_any_step_leaves_the_rows_that_were_there_and_never_hal
             steps: 16 + CLIENT_TABLE_BYTES
         }
     );
+}
+
+#[test]
+fn f_041_a_mint_cut_at_any_step_hands_out_no_counter_and_the_next_mint_is_past_every_one_before() {
+    // One challenge has left already: the counter the part holds is one.
+    let mut start = with_one_phone();
+    let mut counter =
+        block_on(Counters::read(CHALLENGE_COUNTER, &mut start)).expect("the part answers");
+    let minted_before_the_cut = block_on(counter.mint(&mut start))
+        .expect("the supply is steady")
+        .counter();
+    assert_eq!(minted_before_the_cut, 1);
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            let mut counter = block_on(Counters::read(CHALLENGE_COUNTER, part)).map_err(|_| ())?;
+            block_on(counter.mint(part)).map(|_| ()).map_err(|_| ())
+        },
+        |part, step| {
+            let mut counter =
+                block_on(Counters::read(CHALLENGE_COUNTER, part)).expect("the part is back");
+            // The part holds the counter that left, or the one that was
+            // about to; either way the next mint is past both.
+            let held = counter.present().expect("a counter").last();
+            assert!(held == 1 || held == 2, "cut at {step}: {held}");
+            let next = block_on(counter.mint(part)).expect("the supply is steady");
+            assert!(next.counter() > minted_before_the_cut, "cut at {step}");
+            assert!(next.counter() > held, "cut at {step}");
+        },
+    )
+    .expect("the path runs uncut");
+    assert_eq!(crashes, Crashes { steps: 20 });
+}
+
+#[test]
+fn f_008_a_boot_cut_at_any_step_leaves_a_boot_count_that_climbs_and_a_panic_record_whole_or_absent()
+{
+    let start = with_one_phone();
+    let words = LastWords::Panicked(PanicSite {
+        file: 0xDEAD_BEEF,
+        line: 42,
+    });
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            let (_, report) = block_on(Store::boot(part, Some(words))).map_err(|_| ())?;
+            match (report.boot_recorded, report.panic_recorded) {
+                (Ok(()), Some(Ok(()))) => Ok(()),
+                _ => Err(()),
+            }
+        },
+        |part, step| {
+            let (store, report) = block_on(Store::boot(part, None)).expect("the part is back");
+            // The cut boot was the unit's first: it wrote one or did not,
+            // and this boot is one past whatever landed.
+            assert!(
+                report.boot == BootCount::FIRST || report.boot == BootCount::FIRST.next(),
+                "cut at {step}: {:?}",
+                report.boot
+            );
+            match store.panics.held() {
+                Held::Absent => {}
+                Held::Present(record) => assert_eq!(record.words, words, "cut at {step}"),
+                other => panic!("cut at {step}: {other:?}"),
+            }
+        },
+    )
+    .expect("the path runs uncut");
+    // The boot count's 16 bytes and the panic record's 36.
+    assert_eq!(crashes, Crashes { steps: 16 + 36 });
 }
