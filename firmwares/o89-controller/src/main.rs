@@ -36,12 +36,16 @@ use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootRecord, Bus, Clock, FailState, Feedback, LastWords, Line, Pull as DeclaredPull,
+    BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Pull as DeclaredPull,
     RailSequencer, ResetCause, RtcClock, Task,
 };
 
 use crate::board::{Board, REVISION};
 use crate::supervisor::Uptime;
+
+// Every log line carries the tick, so a bench reads intervals off the log:
+// the withheld feed to the watchdog reset, the reset to the first output.
+defmt::timestamp!("{=u64:ms}", embassy_time::Instant::now().as_millis());
 
 /// The level a driven line is held at, from the table `o89-core` declares.
 ///
@@ -139,7 +143,10 @@ async fn main(spawner: Spawner) {
     let fault = Output::new(b.led_fault, Level::Low, Speed::Low);
     // The generator's FEEDBACK, read under the contract o89-core declares:
     // the internal pull-up, because neither board has one, and low is both
-    // relays closed. Nothing decides on it yet; the control tick logs it.
+    // relays closed. Nothing decides on it yet; the control tick logs it,
+    // and the first read is the first tick's: a read in the microsecond
+    // after the pull-up is configured sees the line before it has risen,
+    // and the bench logged a contact that was never closed.
     let feedback = Input::new(
         b.gen_feedback,
         match Feedback::PULL {
@@ -147,8 +154,7 @@ async fn main(spawner: Spawner) {
             DeclaredPull::None => Pull::None,
         },
     );
-    let mut contact = Feedback::contact(feedback.is_high());
-    defmt::info!("generator contact: {}", contact);
+    let mut contact: Option<Contact> = None;
 
     supervisor::check_in(Task::Supervisor);
     // The pool holds one supervisor and this is its only spawn; an unfed
@@ -183,13 +189,13 @@ async fn main(spawner: Spawner) {
     supervisor::check_in(Task::Control);
     let mut ticker = Ticker::every(Duration::from_secs(1));
     #[cfg(feature = "bench")]
-    let mut proof = bench::Proof::new(cause);
+    let mut proof = bench::Proof::new(words);
     loop {
         ticker.next().await;
         let seen = Feedback::contact(feedback.is_high());
-        if seen != contact {
+        if contact != Some(seen) {
             defmt::info!("generator contact: {}", seen);
-            contact = seen;
+            contact = Some(seen);
         }
         #[cfg(feature = "bench")]
         match proof.tick() {
@@ -216,7 +222,7 @@ async fn main(spawner: Spawner) {
 /// The one-shot proofs that show the safety floor on the bench.
 #[cfg(feature = "bench")]
 mod bench {
-    use o89_core::ResetCause;
+    use o89_core::LastWords;
 
     /// Seconds of ordinary running before a proof.
     const AFTER_TICKS: u32 = 15;
@@ -231,25 +237,23 @@ mod bench {
         Panic,
     }
 
-    /// Which proof this boot runs, from what reset it: a boot the watchdog
-    /// did not cause starves; the boot after a watchdog reset panics; the
-    /// boot after a software reset runs, and the three records in a row are
-    /// the evidence.
+    /// Which proof this boot runs, from what the previous run left: nothing
+    /// means this boot starves; a blame means the watchdog just fired, so
+    /// this boot panics; a panic site means the chain is done and this boot
+    /// runs. The last words rather than the reset cause, because a reset the
+    /// probe requests reads as a software reset, the same as the one after
+    /// a panic. The three records in a row are the evidence.
     pub struct Proof {
         step: Step,
         ticks: u32,
     }
 
     impl Proof {
-        pub fn new(cause: ResetCause) -> Self {
-            let step = match cause {
-                ResetCause::Watchdog => Step::Panic,
-                ResetCause::Software => Step::Run,
-                ResetCause::Power
-                | ResetCause::Pin
-                | ResetCause::WindowWatchdog
-                | ResetCause::LowPower
-                | ResetCause::OptionByte => Step::Starve,
+        pub fn new(words: Option<LastWords>) -> Self {
+            let step = match words {
+                None => Step::Starve,
+                Some(LastWords::Starved(_)) => Step::Panic,
+                Some(LastWords::Panicked(_)) => Step::Run,
             };
             Self { step, ticks: 0 }
         }

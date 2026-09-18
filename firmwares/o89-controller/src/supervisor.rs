@@ -60,6 +60,11 @@ pub async fn run(
 ) {
     let mut ticker = Ticker::every(PERIOD);
     let mut withheld: Option<Blame> = None;
+    // When the feed was first withheld, and the last whole second reported
+    // since, so the log bounds the interval to the watchdog's reset within
+    // a second: the number F-016's budget is built on.
+    let mut withheld_at: Option<Tick> = None;
+    let mut reported_secs: u64 = 0;
     loop {
         ticker.next().await;
         let now = Uptime.now();
@@ -67,6 +72,7 @@ pub async fn run(
             Feed::Earned => {
                 wdg.pet();
                 withheld = None;
+                withheld_at = None;
             }
             Feed::NobodyOnTheRoll => {
                 // Not health: the part is not fed on an empty roll.
@@ -81,7 +87,23 @@ pub async fn run(
                         blame.overdue.as_millis()
                     );
                 }
+                // The episode starts at the first withheld feed and runs
+                // until the reset: a change of the task named in the middle
+                // updates the last words, not the clock.
+                if withheld_at.is_none() {
+                    withheld_at = Some(now);
+                    reported_secs = 0;
+                }
                 withheld = Some(blame);
+            }
+        }
+        if let Some(since) = withheld_at
+            && let Some(elapsed) = now.since(since)
+        {
+            let secs = elapsed.as_millis() / 1_000;
+            if secs > reported_secs {
+                reported_secs = secs;
+                defmt::warn!("feed withheld for {} s; reset pending", secs);
             }
         }
         let pattern = if withheld.is_some() {
