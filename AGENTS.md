@@ -32,10 +32,10 @@ The two firmwares of the Origin89 controller, written for the boards in
 [origin89hq/hardware](https://github.com/origin89hq/hardware): the controller
 on the STM32G0B1RE, which decides, and the comms processor on the ESP32-C6,
 which transports. Read [README.md](README.md) for where the work stands. The
-design is being planned before any code lands; until a maintained architecture
-document exists here, the reasoning lives in origin89's
-[controller design](https://github.com/origin89hq/origin89/blob/main/docs/CONTROLLER-V1.md)
-and the protocol in [km43](https://github.com/origin89hq/km43).
+design is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), maintained here and
+cited by section; the protocol is [km43](https://github.com/origin89hq/km43),
+and the plan with its milestones is
+[issue #3](https://github.com/origin89hq/firmware/issues/3).
 
 ## Rules that are not preferences
 

@@ -28,7 +28,8 @@ milestones and the decisions behind them are
 a sub-issue with the evidence that closes it. Today the repository holds two
 workspaces, the first seam of the controller's core, and three images that
 link for their parts and do nothing — they exist so the gate measures linking
-and size before code lands. Nothing runs on a board yet.
+and size before code lands. Nothing runs on a board yet. The design the code
+implements is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 The earlier firmware in
 [origin89hq/origin89](https://github.com/origin89hq/origin89/tree/main/firmwares)
