@@ -11,8 +11,8 @@
 //! that reads it, and the safety floor's decisions: the fail state every
 //! line declares, the board [`Revision`] and the policies read from it, the
 //! reset cause and the boot record, the last words a run leaves for the next
-//! boot, the [`Rollcall`] that earns the watchdog its feed, and the lamp's
-//! [`Pattern`]. The tables,
+//! boot, the [`Rollcall`] that earns the watchdog its feed, the lamp's
+//! [`Pattern`], and the module rail's [`RailSequencer`]. The tables,
 //! the behaviours and the link-local state machines arrive with the
 //! milestones that name them.
 
@@ -21,6 +21,7 @@
 mod fail_state;
 mod lamp;
 mod last_words;
+mod rail;
 mod reset;
 mod revision;
 mod rollcall;
@@ -29,6 +30,7 @@ mod tick;
 pub use fail_state::*;
 pub use lamp::*;
 pub use last_words::*;
+pub use rail::*;
 pub use reset::*;
 pub use revision::*;
 pub use rollcall::*;

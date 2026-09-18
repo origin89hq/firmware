@@ -21,7 +21,6 @@
 # test while another gains one and reads unchanged. A rule joins the list in
 # the commit that adds it, where the diff shows it.
 uncovered = [
-    "F-004",
     "F-006",
     "F-013",
     "F-016",
