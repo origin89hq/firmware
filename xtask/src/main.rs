@@ -2,9 +2,10 @@
 //! build for the laptop.
 //!
 //! `cargo xtask check` cross-compiles every `#![no_std]` crate for both
-//! targets, builds the three images in release and measures the bytes that
-//! reach the part, and refuses a dependency that crosses a boundary the
-//! design draws. Each check here is one that has been watched go red.
+//! targets, refuses a dependency that crosses a boundary the design draws,
+//! sorts every numbered rule into covered, declared untestable or uncovered
+//! and holds the ratchet on the last, and builds the three images in release
+//! and measures the bytes that reach the part. Each check here is one that has been watched go red.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -13,6 +14,7 @@ mod cross;
 mod deps;
 mod images;
 mod repo;
+mod traceability;
 
 #[derive(Parser)]
 #[command(about = "The firmware gate")]
@@ -40,6 +42,7 @@ fn main() -> Result<()> {
         Command::Check => {
             cross::check(&repo)?;
             deps::check(&repo)?;
+            traceability::check(&repo)?;
             let measured = images::build_and_measure(&repo)?;
             images::report(&measured);
             images::enforce(&measured)?;
