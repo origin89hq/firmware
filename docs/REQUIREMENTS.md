@@ -272,6 +272,11 @@ lands, joins it only in the commit that adds the rule, and a rule whose test
 goes missing fails the gate whatever the count. Source: KM43 VERIFICATION §1.
 M0.
 
+**F-083** — Every pin the controller's board module takes has a row in
+`BOARD-A.md`, and every row there is taken by the module or named by it as
+left alone; a pin lives in exactly two places that cannot disagree. Source:
+[#3][plan] §6. M1.
+
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6
 [h13]: https://github.com/origin89hq/hardware/issues/13
