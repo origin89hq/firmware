@@ -12,7 +12,10 @@
 //! the HAL; the clocks, with the LSE asserted; the watchdog, fed only by the
 //! rollcall; the voltage detector; every output to its declared fail state;
 //! the module rail sequence; then the control tick. The FRAM read and the
-//! buses arrive with the milestones that name them.
+//! buses arrive with the milestones that name them. The `bench` build adds
+//! the one-shot proofs: a starvation on a boot the watchdog did not cause,
+//! and a panic on the boot that follows, so three boots in a row show the
+//! watchdog, the blame it leaves, the panic path and the site it leaves.
 
 #![no_std]
 #![no_main]
@@ -161,47 +164,90 @@ async fn main(spawner: Spawner) {
     loop {
         ticker.next().await;
         #[cfg(feature = "bench")]
-        if proof.starve_now() {
-            defmt::warn!(
-                "watchdog proof: the control tick stops checking in on purpose; the part resets in about 8 s and the next boot names it"
-            );
-            loop {
-                ticker.next().await;
+        match proof.tick() {
+            bench::Step::Run => {}
+            bench::Step::Starve => {
+                defmt::warn!(
+                    "watchdog proof: the control tick stops checking in on purpose; the part resets in about 8 s and the next boot names it"
+                );
+                loop {
+                    ticker.next().await;
+                }
+            }
+            bench::Step::Panic => {
+                defmt::warn!(
+                    "panic proof: panicking on purpose; the part resets and the next boot names the site"
+                );
+                bench::panic_on_purpose();
             }
         }
         supervisor::check_in(Task::Control);
     }
 }
 
-/// The one-shot starvation that proves the watchdog on the bench.
+/// The one-shot proofs that show the safety floor on the bench.
 #[cfg(feature = "bench")]
 mod bench {
     use o89_core::ResetCause;
 
-    /// Seconds of ordinary running before the starvation.
+    /// Seconds of ordinary running before a proof.
     const AFTER_TICKS: u32 = 15;
 
-    /// Starves once per flash: on a boot the watchdog did not cause, after
-    /// fifteen ticks; never on the boot that follows.
+    /// What the control tick does this second.
+    pub enum Step {
+        /// Check in as usual.
+        Run,
+        /// Stop checking in: the watchdog proof.
+        Starve,
+        /// Panic: the panic-path proof.
+        Panic,
+    }
+
+    /// Which proof this boot runs, from what reset it: a boot the watchdog
+    /// did not cause starves; the boot after a watchdog reset panics; the
+    /// boot after a software reset runs, and the three records in a row are
+    /// the evidence.
     pub struct Proof {
-        armed: bool,
+        step: Step,
         ticks: u32,
     }
 
     impl Proof {
         pub fn new(cause: ResetCause) -> Self {
-            Self {
-                armed: !matches!(cause, ResetCause::Watchdog),
-                ticks: 0,
-            }
+            let step = match cause {
+                ResetCause::Watchdog => Step::Panic,
+                ResetCause::Software => Step::Run,
+                ResetCause::Power
+                | ResetCause::Pin
+                | ResetCause::WindowWatchdog
+                | ResetCause::LowPower
+                | ResetCause::OptionByte => Step::Starve,
+            };
+            Self { step, ticks: 0 }
         }
 
-        pub fn starve_now(&mut self) -> bool {
-            if !self.armed {
-                return false;
-            }
+        /// One second passed: the proof's step once its time has come, and
+        /// `Run` before.
+        pub fn tick(&mut self) -> Step {
             self.ticks = self.ticks.saturating_add(1);
-            self.ticks >= AFTER_TICKS
+            if self.ticks < AFTER_TICKS {
+                return Step::Run;
+            }
+            match self.step {
+                Step::Run => Step::Run,
+                Step::Starve => Step::Starve,
+                Step::Panic => Step::Panic,
+            }
         }
+    }
+
+    /// The panic-path proof: the production handler writes the site to the
+    /// last words and resets, and the next boot reports it.
+    #[expect(
+        clippy::panic,
+        reason = "the one deliberate panic in the firmware, in the bench build alone, to prove the path a real one takes"
+    )]
+    pub fn panic_on_purpose() -> ! {
+        panic!("the panic proof");
     }
 }
