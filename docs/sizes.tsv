@@ -1,0 +1,4 @@
+commit	image	bytes	budget
+eb52d1d	o89-boot	288	8192
+eb52d1d	o89-controller	8896	253952
+eb52d1d	o89-comms	95040	2097152

@@ -1,0 +1,10 @@
+# Per crate, because cargo resolves this by walking up from the working
+# directory and the comms processor is a RISC-V part with a different runner.
+# The linker scripts and the log level are set in build.rs, not here, so a
+# build from the repository root gets the same image as one from this
+# directory.
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "probe-rs run --chip STM32G0B1RETx"

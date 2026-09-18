@@ -1,0 +1,14 @@
+[package]
+name = "o89-core"
+version = "0.0.0"
+description = "The controller's decisions: host-testable, no allocator, names no peripheral"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

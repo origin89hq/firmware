@@ -22,8 +22,13 @@ client.
 
 ## Where this stands
 
-**Set up on 2026-09-18, with no code yet.** The plan comes first; the crates,
-the check gate and the CI arrive with it.
+**The plan is agreed and the foundation is being laid.** The plan, its
+milestones and the decisions behind them are
+[issue #3](https://github.com/origin89hq/firmware/issues/3); each milestone is
+a sub-issue with the evidence that closes it. Today the repository holds two
+workspaces, the first seam of the controller's core, and three images that
+link for their parts and do nothing — they exist so the gate measures linking
+and size before code lands. Nothing runs on a board yet.
 
 The earlier firmware in
 [origin89hq/origin89](https://github.com/origin89hq/origin89/tree/main/firmwares)
@@ -48,16 +53,27 @@ Two things are already decided by the board and filed as the first requirements:
 The open hardware issues on revision A, several of which the firmware has to
 live with, are in [origin89hq/hardware](https://github.com/origin89hq/hardware/issues).
 
-## Toolchain
+## Layout and commands
 
-`rust-toolchain.toml` pins the compiler and both targets; rustup installs them
-on the first cargo command. The comms processor is bare-metal
-[`esp-hal`](https://github.com/esp-rs/esp-hal), the controller is
-[Embassy](https://embassy.dev/) on `embassy-stm32`. Flashing goes through
-`probe-rs` for the STM32 and, on revision A, through the STM32 for the ESP32.
+| Path | What it is |
+| --- | --- |
+| `crates/o89-core` | The controller's decisions: `no_std`, no allocator, names no peripheral, host-tested |
+| `xtask/` | The gate `cargo test` cannot be: cross-compiles, dependency rules, the three images measured against their slots |
+| `firmwares/` | Its own workspace: `o89-boot` and `o89-controller` for the STM32G0B1RE, `o89-comms` for the ESP32-C6 |
+| `docs/sizes.tsv` | What each image cost, per commit, as the `.bin` and never the ELF |
 
-`just --list` shows the recipes. `just skills-sync` fetches the shared
-engineering skills at the start of a task. See [CONTRIBUTING.md](CONTRIBUTING.md).
+`rust-toolchain.toml` pins the compiler, both targets and `llvm-tools`; rustup
+installs them on the first cargo command. `espflash` measures the comms image
+(`cargo install espflash --locked`). The comms processor is bare-metal
+[`esp-hal`](https://github.com/esp-rs/esp-hal); the controller is
+[Embassy](https://embassy.dev/) on `embassy-stm32`.
+
+`just check` runs what CI runs: formatting, Clippy with the restriction lints
+that make the house rules build failures, the host tests, and `cargo xtask
+check`. `just sizes` prints the three images against their budgets. Flashing
+and actuation are never part of `check`; those recipes arrive with the first
+image that touches a pin. `just skills-sync` fetches the shared engineering
+skills at the start of a task. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

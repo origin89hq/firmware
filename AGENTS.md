@@ -82,10 +82,12 @@ and the protocol in [km43](https://github.com/origin89hq/km43).
 
 ## Verification
 
-Run `just check` before committing once it exists; until then there is
-nothing to check and the README says so. Host tests for domain logic, a
-release build of the actual target with its linked size measured, then the
-bench. A build is not bench evidence and a bench pass is not a winter.
+Run `just check` before committing: formatting, Clippy with the restriction
+lints, the host tests, and `cargo xtask check` — cross-compiles for both
+targets, the dependency boundaries, the three images built in release and
+measured against their slots. Host tests for domain logic, a release build of
+the actual target with its linked size measured, then the bench. A build is
+not bench evidence and a bench pass is not a winter.
 
 Break a new check on purpose and watch it fail before trusting it. Back up the
 file with `cp` first and restore from that copy; `git checkout -- <file>` and
