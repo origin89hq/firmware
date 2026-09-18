@@ -43,6 +43,10 @@ use o89_core::{
 use crate::board::{Board, REVISION};
 use crate::supervisor::Uptime;
 
+// Every log line carries the tick, so a bench reads intervals off the log:
+// the withheld feed to the watchdog reset, the reset to the first output.
+defmt::timestamp!("{=u64:ms}", embassy_time::Instant::now().as_millis());
+
 /// The level a driven line is held at, from the table `o89-core` declares.
 ///
 /// Only lines the table declares driven are passed here; the assertions
