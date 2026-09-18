@@ -15,6 +15,40 @@
 ///
 /// A clock write does not move it. Two ticks from different boots compare
 /// meaninglessly, which is why [`Tick::since`] refuses rather than wraps.
+///
+/// ```
+/// use o89_core::{Millis, Tick};
+///
+/// let boot = Tick::ZERO;
+/// let now = Tick::from_millis(1_500);
+/// assert_eq!(now.since(boot), Some(Millis::from_millis(1_500)));
+/// assert_eq!(boot.since(now), None);
+/// ```
+///
+/// A tick is a moment and a [`Millis`] is a duration, and the compiler holds
+/// the difference. A moment is not a duration to move by:
+///
+/// ```compile_fail
+/// use o89_core::Tick;
+///
+/// let later = Tick::from_millis(1).after(Tick::from_millis(2));
+/// ```
+///
+/// a duration is not a moment to measure from:
+///
+/// ```compile_fail
+/// use o89_core::{Millis, Tick};
+///
+/// let elapsed = Tick::ZERO.since(Millis::from_millis(5));
+/// ```
+///
+/// and the refusal in [`Tick::since`] is not a duration until it is handled:
+///
+/// ```compile_fail
+/// use o89_core::Tick;
+///
+/// let elapsed = Tick::from_millis(5).since(Tick::ZERO).as_millis();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tick(u64);
 
