@@ -4,11 +4,16 @@
 //! power cut by itself; what it cannot do is make several words land
 //! together. Every record here is therefore an A/B pair of slots, each
 //! `[magic | seq | body | crc32]`. A write goes to the slot that is not
-//! current, its CRC last and in a transaction of its own, and the reader
-//! takes the slot whose CRC holds with the higher sequence. The CRC landing
-//! is what makes a slot current: a write cut at any byte before it leaves a
-//! slot whose CRC does not match and the previous record in effect, and
-//! there is no third word to flip and no third thing to tear (P-102, F-020).
+//! current, and the reader takes the slot whose magic and CRC hold with the
+//! higher sequence. The magic lands last, in a transaction of its own, and
+//! is cleared first: whatever the slot held stops being a record before a
+//! byte of the new one lands, and nothing in between is one. A write cut
+//! at any byte before the magic leaves a slot no CRC can make a record of
+//! and the previous record in effect, and there is no third word to flip
+//! and no third thing to tear (P-102, F-020). The CRC alone was not enough
+//! here: a slot being reused still holds the old record's CRC while the
+//! new sequence and body land over it, and a CRC is thirty-two bits, so an
+//! image that collides with it exists and the review built one.
 //!
 //! The seven brown-outs of 2026-09-16 destroyed both counter slots at once
 //! because one transaction wrote into both. The order above is the half of
@@ -97,6 +102,12 @@ const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// The bytes before the body: the magic and the sequence.
 const HEAD: usize = 8;
+/// The bytes of the magic, at the front of a slot.
+const MAGIC_BYTES: usize = 4;
+/// What a slot's magic is cleared to before a new record lands over it.
+/// Zero, which no record's magic is, and which is what a fresh part reads
+/// as blank when the rest is zero too.
+const NO_MAGIC: [u8; MAGIC_BYTES] = [0; MAGIC_BYTES];
 /// The bytes after it: the CRC.
 const TAIL: usize = 4;
 
@@ -271,10 +282,12 @@ impl<const N: usize> Record<N> {
         })
     }
 
-    /// Write `body` as the next record, into the slot that is not current,
-    /// the CRC last in a transaction of its own. `current` is what the last
-    /// read returned; passing a stale one writes over the wrong slot, so the
-    /// caller reads, then writes, then keeps what this returns.
+    /// Write `body` as the next record, into the slot that is not current:
+    /// the magic cleared first, so whatever the slot held stops being a
+    /// record; then the sequence, the body and the CRC; then the magic, in
+    /// a transaction of its own, which is the switch. `current` is what the
+    /// last read returned; passing a stale one writes over the wrong slot,
+    /// so the caller reads, then writes, then keeps what this returns.
     pub async fn write<F: Fram>(
         self,
         fram: &mut F,
@@ -289,13 +302,16 @@ impl<const N: usize> Record<N> {
             Current::Empty | Current::Corrupt => (1, Slot::A),
         };
         let at = self.address(slot);
-        let (head, crc) = self.encode(seq, body);
-        let mut first = [0u8; HEAD];
-        first.copy_from_slice(&head);
-        fram.write(at, &first).await?;
+        let (_, crc) = self.encode(seq, body);
+        // 1. Whatever the slot held is no longer a record.
+        fram.write(at, &NO_MAGIC).await?;
+        // 2. Everything after the magic. None of it is a record without one.
+        fram.write(at.plus(MAGIC_BYTES), &seq.to_le_bytes()).await?;
         fram.write(at.plus(HEAD), body).await?;
         fram.write(at.plus(HEAD.saturating_add(N)), &crc.to_le_bytes())
             .await?;
+        // 3. The magic, last: the switch.
+        fram.write(at, &self.magic.to_le_bytes()).await?;
         Ok(Written {
             current: Current::Valid {
                 seq,
@@ -312,12 +328,18 @@ mod tests {
 
     use super::*;
 
-    /// A part in an array, with a supply that can be made to fall and a
-    /// count of every transaction, so a test reads what a write did.
+    /// A part in an array, with a supply that can be made to fall, a count
+    /// of every transaction, and a power that can be cut before any byte,
+    /// so a test reads what a write did and what a cut left.
     struct Part {
         bytes: [u8; 256],
         falling: bool,
         transactions: usize,
+        /// Bytes landed since the last power-up.
+        landed: usize,
+        /// The byte the power is cut before, if a cut is scheduled.
+        cut_at: Option<usize>,
+        dead: bool,
     }
 
     impl Part {
@@ -326,6 +348,34 @@ mod tests {
                 bytes: [0xFF; 256],
                 falling: false,
                 transactions: 0,
+                landed: 0,
+                cut_at: None,
+                dead: false,
+            }
+        }
+
+        /// The same bytes, powered up, with the power cut before byte `at`
+        /// of what is written next.
+        fn cut_before(&self, at: usize) -> Self {
+            Self {
+                bytes: self.bytes,
+                falling: false,
+                transactions: 0,
+                landed: 0,
+                cut_at: Some(at),
+                dead: false,
+            }
+        }
+
+        /// Power back on: the bytes stay.
+        fn rebooted(&self) -> Self {
+            Self {
+                bytes: self.bytes,
+                falling: false,
+                transactions: 0,
+                landed: 0,
+                cut_at: None,
+                dead: false,
             }
         }
     }
@@ -344,13 +394,24 @@ mod tests {
             at: Address,
             bytes: &[u8],
         ) -> impl Future<Output = Result<(), Refused<()>>> {
-            let outcome = if self.falling {
+            let outcome = if self.dead {
+                Err(Refused::Bus(()))
+            } else if self.falling {
                 Err(Refused::SupplyFalling)
             } else {
                 self.transactions = self.transactions.saturating_add(1);
                 let start = usize::from(at.0);
-                self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
-                Ok(())
+                let mut outcome = Ok(());
+                for (i, byte) in bytes.iter().enumerate() {
+                    if self.cut_at == Some(self.landed) {
+                        self.dead = true;
+                        outcome = Err(Refused::Bus(()));
+                        break;
+                    }
+                    self.bytes[start.saturating_add(i)] = *byte;
+                    self.landed = self.landed.saturating_add(1);
+                }
+                outcome
             };
             core::future::ready(outcome)
         }
@@ -405,57 +466,111 @@ mod tests {
 
     #[test]
     fn f_020_a_write_cut_at_any_byte_leaves_the_previous_record_in_effect() {
-        // Write once for real, then replay the second write cut after every
-        // byte it would have landed, and read what a boot would find.
+        // Write once for real, then replay the second write with the power
+        // cut before every byte it lands, and read what a boot would find.
         let mut part = Part::fresh();
         let first = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
             .expect("the supply is fine")
             .current;
-        let before = part.bytes;
-        let mut whole = Part::fresh();
-        whole.bytes = before;
-        let _second = block_on(COUNTER.write(&mut whole, &first, &2u32.to_le_bytes()))
-            .expect("the supply is fine");
-        let after = whole.bytes;
-        // The bytes land in address order, head then body then CRC, so a
-        // cut after any prefix of the image is a cut after that many bytes
-        // of the transaction; the last byte to change is the CRC's.
-        let last_changed = (0..256)
-            .rev()
-            .find(|i| before[*i] != after[*i])
-            .expect("the write changed something");
-        for cut in 0..=last_changed {
-            let mut torn = Part::fresh();
-            torn.bytes = before;
-            torn.bytes[..cut].copy_from_slice(&after[..cut]);
-            let found = block_on(COUNTER.read(&mut torn)).expect("reads");
-            assert_eq!(found, first, "cut after {cut} bytes");
+        let mut whole = part.rebooted();
+        let second = block_on(COUNTER.write(&mut whole, &first, &2u32.to_le_bytes()))
+            .expect("the supply is fine")
+            .current;
+        // Four bytes cleared, four of sequence, four of body, four of CRC,
+        // four of magic: twenty bytes, and a cut before any of them keeps
+        // the first record.
+        assert_eq!(whole.landed, 20);
+        for cut in 0..whole.landed {
+            let mut torn = part.cut_before(cut);
+            let refused = block_on(COUNTER.write(&mut torn, &first, &2u32.to_le_bytes()));
+            assert_eq!(refused, Err(Refused::Bus(())), "cut before byte {cut}");
+            let mut booted = torn.rebooted();
+            assert_eq!(
+                block_on(COUNTER.read(&mut booted)),
+                Ok(first),
+                "cut before byte {cut}"
+            );
         }
         // Every byte landed: the new record is current.
-        let mut done = Part::fresh();
-        done.bytes = after;
+        assert_eq!(block_on(COUNTER.read(&mut whole)), Ok(second));
         assert_eq!(
-            block_on(COUNTER.read(&mut done)),
-            Ok(Current::Valid {
+            second,
+            Current::Valid {
                 seq: 2,
                 body: 2u32.to_le_bytes(),
                 slot: Slot::B
-            })
+            }
         );
     }
 
     #[test]
-    fn f_020_the_crc_lands_last_and_on_its_own() {
+    fn f_020_the_magic_lands_last_and_on_its_own_and_is_cleared_first() {
         let mut part = Part::fresh();
         let _nine = block_on(COUNTER.write(&mut part, &Current::Empty, &9u32.to_le_bytes()))
             .expect("the supply is fine");
-        assert_eq!(part.transactions, 3);
-        // With the CRC blanked the slot is corrupt and the record empty; with
-        // the CRC alone in place and the body blank it is corrupt too.
-        let mut no_crc = Part::fresh();
-        no_crc.bytes = part.bytes;
-        no_crc.bytes[16 + 8 + 4..16 + 8 + 4 + 4].copy_from_slice(&[0xFF; 4]);
-        assert_eq!(block_on(COUNTER.read(&mut no_crc)), Ok(Current::Empty));
+        // The clearing, the sequence, the body, the CRC, the magic.
+        assert_eq!(part.transactions, 5);
+        // With the magic blanked the slot is not a record, whatever its CRC.
+        let mut no_magic = Part::fresh();
+        no_magic.bytes = part.bytes;
+        no_magic.bytes[16..20].copy_from_slice(&[0xFF; 4]);
+        assert_eq!(block_on(COUNTER.read(&mut no_magic)), Ok(Current::Empty));
+        // The first bytes a write lands clear the old magic: a reused slot
+        // stops being a record before anything else in it changes.
+        let mut reused = part.rebooted();
+        let first = block_on(COUNTER.read(&mut reused)).expect("reads");
+        let _ = block_on(COUNTER.write(&mut reused, &first, &10u32.to_le_bytes()));
+        let mut again = reused.rebooted();
+        let second = block_on(COUNTER.read(&mut again)).expect("reads");
+        let mut cut = again.cut_before(4);
+        let _ = block_on(COUNTER.write(&mut cut, &second, &11u32.to_le_bytes()));
+        assert_eq!(&cut.bytes[16..20], &[0, 0, 0, 0]);
+        assert_eq!(&cut.bytes[20..32], &part.bytes[20..32]);
+    }
+
+    #[test]
+    fn f_020_a_reused_slot_cannot_present_the_old_crcs_collision_as_a_record() {
+        // Sequence 1 with body 01 00 00 00 and sequence 3 with body
+        // 8a c8 09 aa have the same CRC under this magic: a collision the
+        // review constructed. Writing the third record over the first, a
+        // cut right before its magic leaves the new sequence and body over
+        // the old CRC, which matches; without the magic it is no record.
+        let colliding = [0x8a, 0xc8, 0x09, 0xaa];
+        assert_eq!(
+            COUNTER.encode(1, &1u32.to_le_bytes()).1,
+            COUNTER.encode(3, &colliding).1
+        );
+        let mut part = Part::fresh();
+        let first = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
+            .expect("the supply is fine")
+            .current;
+        let second = block_on(COUNTER.write(&mut part, &first, &2u32.to_le_bytes()))
+            .expect("the supply is fine")
+            .current;
+        for cut in 0..20 {
+            let mut torn = part.cut_before(cut);
+            let _ = block_on(COUNTER.write(&mut torn, &second, &colliding));
+            let mut booted = torn.rebooted();
+            assert_eq!(
+                block_on(COUNTER.read(&mut booted)),
+                Ok(second),
+                "cut before byte {cut}"
+            );
+        }
+        // Landed whole, it is the record.
+        let mut whole = part.rebooted();
+        let third = block_on(COUNTER.write(&mut whole, &second, &colliding))
+            .expect("the supply is fine")
+            .current;
+        assert_eq!(block_on(COUNTER.read(&mut whole)), Ok(third));
+        assert_eq!(
+            third,
+            Current::Valid {
+                seq: 3,
+                body: colliding,
+                slot: Slot::A
+            }
+        );
     }
 
     #[test]

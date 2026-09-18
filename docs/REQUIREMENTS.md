@@ -110,11 +110,12 @@ this allowance (`B-20`, [hardware#51][h51]). M1; held through M7.
 ## Persistence
 
 **F-020** — Every FRAM record is an A/B pair of slots `[magic | seq | body |
-crc32]`; a write goes to the slot that is not current with its CRC last, and
-the reader takes the slot whose CRC holds with the higher sequence, so a
-write cut at any byte leaves the previous record in effect. Source: KM43
-P-102, the seven brown-outs of 2026-09-16 that destroyed both counter slots.
-M2.
+crc32]`; a write goes to the slot that is not current, clears its magic
+first and lands its magic last, in a transaction of its own, and the reader
+takes the slot whose magic and CRC hold with the higher sequence, so a
+write cut at any byte leaves the previous record in effect and no
+intermediate image is a record, whatever its CRC. Source: KM43 P-102, the
+seven brown-outs of 2026-09-16 that destroyed both counter slots. M2.
 
 **F-021** — No FRAM transaction starts after the PVD's falling edge; one in
 flight completes. Source: the same brown-outs. M2.
