@@ -20,7 +20,8 @@
   is a commit that names the release note it read and the bench that
   revalidated it.
 - **The `.bin` is the size, never the ELF.** `just sizes` after a change that
-  could move one; `--record` when it did.
+  could move one; the pull request says by how much; `just sizes --record`
+  on `main` after the merge, so the row names a commit that exists.
 - **Build and check are never flashing.** A recipe that flashes, erases or
   actuates says so in its name, and before running one against a board:
   the exact target, the expected effect, the safe setup, the recovery path.
