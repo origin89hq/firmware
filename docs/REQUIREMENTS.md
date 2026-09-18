@@ -35,10 +35,11 @@ until their USARTs own them. A floating `DI` makes the transceiver drive its
 bus low and blocks every other device on it. Source: [hardware#28][h28],
 `A-41`. M1.
 
-**F-003** — `PB6`, `PB3`, `PC2` and `PC3` are inputs from before `V3V3_ESP`
-drops until after it is up. A pin driven high into an unpowered module
-back-powers it through its input protection. Source: [hardware#17][h17],
-`A-39`. M1.
+**F-003** — `PB6`, `PB3`, `PC2` and `PC3` are inputs, or driven low, and never
+driven high, from before `V3V3_ESP` drops until after it is up. A pin driven
+high into an unpowered module back-powers it through its input protection;
+`EN` is driven low on purpose across a cycle (F-004). Source:
+[hardware#17][h17], `A-39`. M1.
 
 **F-004** — `EN` is held low by `PC2` across every rail cycle and released
 only after the rail has settled. The RC alone does not reset a module whose
@@ -97,6 +98,12 @@ record says so. Source: [hardware#48][h48] `A-23`, [km43#35][k35]. M1.
 watchdog, supply cut, panic — with a logic analyser on `CN9` pins 3 and 4,
 and posted on [hardware#18][h18] with the watchdog timeout the firmware
 settled on. M1; re-measured in M7 when the bootloader verifies a signature.
+
+**F-016** — When the boot decides to resume an automatic start, `RUN` is up
+and the first `KICK` is sent within 3 seconds of the reset, the FRAM read and
+the bootloader's signature verification included. Board B revision B's
+ride-through window is 15 s, budgeted as the 8.8 s worst-case watchdog plus
+this allowance (`B-20`, [hardware#51][h51]). M1; held through M7.
 
 ## Persistence
 
@@ -273,6 +280,7 @@ rules with neither only goes down. Source: KM43 VERIFICATION §1. M0.
 [h30]: https://github.com/origin89hq/hardware/issues/30
 [h31]: https://github.com/origin89hq/hardware/issues/31
 [h48]: https://github.com/origin89hq/hardware/pull/48
+[h51]: https://github.com/origin89hq/hardware/pull/51
 [i1]: https://github.com/origin89hq/firmware/issues/1
 [i2]: https://github.com/origin89hq/firmware/issues/2
 [i4]: https://github.com/origin89hq/firmware/issues/4

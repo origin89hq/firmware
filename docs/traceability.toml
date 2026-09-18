@@ -17,9 +17,10 @@
 # covered nor declared below. The check fails when the real count goes above
 # it, and fails when it drops below and this number was not lowered with it.
 # It started at 45 because forty-five of the forty-nine rules the plan named
-# had no code behind them when they were written; it goes up for exactly one reason, that a rule
+# had no code behind them when they were written, and went to 46 when F-016
+# arrived with board B's ride-through window; it goes up for exactly one reason, that a rule
 # was added.
-uncovered_at_most = 45
+uncovered_at_most = 46
 
 # Kinds: `hardware` — a dated bench log stands in for the test; `spec-check`
 # — a named check in xtask is the test; `deferred` — an entry whose trigger

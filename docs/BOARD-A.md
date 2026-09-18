@@ -63,7 +63,7 @@ hardware repository's item 2 and land here with the revision B export.
 | CN5 | CAN | H, L, ground |
 | CN6, CN7 | VE.Direct 1, 2 | Victron's table: 1 ground, 2 RX, 3 TX, 4 power; revision A listens on pin 3 |
 | CN8, CN11 | 1-Wire | 1 `OW_VCC`, 2 data, 3 ground |
-| CN9 | board B | 1 `+12V` (the bank on revision B), 2 ground, 3 `RUN`, 4 `KICK`, 5 `FEEDBACK` (`B-09`) |
+| CN9 | board B | 1 `+12V`: raw `V12` on revision A; board A's regulated rail on revision B, 12 V nominal and not below 10 V at the connector on any bank (`A-20b`, `A-20e`); 2 ground, 3 `RUN`, 4 `KICK`, 5 `FEEDBACK` (`B-09`) |
 | CN10 | selector | auto, manual, ground |
 | CN12 | start battery sense | positive, ground |
 | CN13 | tank sender | 1 raw `V12` on revision A, a 24 V loop on B; 2 sense; 3 ground |
