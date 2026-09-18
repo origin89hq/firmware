@@ -1,0 +1,39 @@
+# Requirements nothing can test, and a count of the ones nobody has tested yet.
+#
+# `cargo xtask check` sorts every **F-nnn** in REQUIREMENTS.md into three
+# buckets: covered by a test named after it that carries an assertion, or by
+# a check of the gate nominated below; declared here with a kind and a reason
+# somebody argued for in review; or uncovered. Uncovered means nobody has
+# written the test. Untestable means no test can be written. Filling this
+# file with `deferred` entries to make the count go down turns the first word
+# into the second, which is the graveyard this file exists to not become.
+#
+# The KM43 rules this repository's tests cite are counted against the pinned
+# index in km43/requirements.tsv and reported, not ratcheted: which of them
+# are the controller's obligations rather than a client's or the crate's is
+# what origin89hq/km43#31 will carry.
+
+# The number somebody defends at each audit round: F rules that are neither
+# covered nor declared below. The check fails when the real count goes above
+# it, and fails when it drops below and this number was not lowered with it.
+# It started at 45 because forty-five of the forty-nine rules the plan named
+# had no code behind them when they were written, and went to 46 when F-016
+# arrived with board B's ride-through window; it goes up for exactly one reason, that a rule
+# was added.
+uncovered_at_most = 46
+
+# Kinds: `hardware` — a dated bench log stands in for the test; `spec-check`
+# — a named check in xtask is the test; `deferred` — an entry whose trigger
+# is the due date; `judgement` — a test proves the surfacing, nothing proves
+# the reading.
+
+[[untestable]]
+id = "F-015"
+kind = "hardware"
+reason = "Boot-to-first-kick is a number a logic analyser reads off CN9; the dated bench log in M1 stands in for the test, and the comment on origin89hq/hardware#18 is where it is posted."
+
+[[untestable]]
+id = "F-080"
+kind = "spec-check"
+check = "images"
+reason = "The image measurement is a check of the gate itself; it was watched refuse a controller whose budget was lowered under its size."

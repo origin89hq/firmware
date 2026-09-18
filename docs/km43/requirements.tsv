@@ -1,0 +1,213 @@
+# The numbered rules of KM43 as of origin89hq/km43 712046df4a6a684fb68881219e5e00b74fa3fee4, extracted from PROTOCOL.md and LINK.md.
+# A pinned copy until km43 ships the index (origin89hq/km43#31); regenerate with `cargo xtask km43-index` once it does.
+id	document	section	first sentence
+P-001	docs/PROTOCOL.md	How to read this	An implementation MUST reproduce every vector in
+P-005	docs/PROTOCOL.md	Reported by the controller	The controller MUST report keys 12 to 17 with the values it actually
+P-006	docs/PROTOCOL.md	Reported by the controller	`max_channels` (key 13) MUST only ever be reported **downward from
+P-002	docs/PROTOCOL.md	Neither fixed nor reported	A receiver MUST size its frame buffer at `MAX_FRAME` and MUST
+P-003	docs/PROTOCOL.md	Neither fixed nor reported	Refusing MUST be preferred to evicting.
+P-169	docs/PROTOCOL.md	Neither fixed nor reported	The concern table MUST refuse rather than evict, MUST reserve
+P-004	docs/PROTOCOL.md	Neither fixed nor reported	Every duration in this document MUST be measured on a **monotonic
+P-010	docs/PROTOCOL.md	Encoding	Envelopes MUST be CBOR arrays.
+P-011	docs/PROTOCOL.md	Encoding	Bodies MUST be CBOR maps with **integer keys only**.
+P-012	docs/PROTOCOL.md	Encoding	A retired field number MUST NOT be reused.
+P-013	docs/PROTOCOL.md	Encoding	A decoder MUST skip map keys it does not recognise, and MUST NOT
+P-014	docs/PROTOCOL.md	Encoding	A decoder MUST reject an **enum discriminant** it does not
+P-019	docs/PROTOCOL.md	Encoding	P-014 has exactly one exception: the vendor and experimental range
+P-015	docs/PROTOCOL.md	Encoding	Every key listed in a body definition below is REQUIRED unless
+P-016	docs/PROTOCOL.md	Encoding	Encoders MUST emit RFC 8949 §4.2 deterministic encoding: shortest
+P-017	docs/PROTOCOL.md	Encoding	Authentication MUST NOT depend on P-016.
+P-018	docs/PROTOCOL.md	Encoding	Floating point MUST NOT appear on the wire.
+P-028	docs/PROTOCOL.md	Envelope	The **array length is the extension point**.
+P-029	docs/PROTOCOL.md	Envelope	Every `seq` bound in this document names the **first position
+P-020	docs/PROTOCOL.md	Envelope	`type` with the high bit set means *response to a request*.
+P-021	docs/PROTOCOL.md	Envelope	A client that has no session yet MUST send `session_id = 0`, and MUST
+P-026	docs/PROTOCOL.md	Envelope	The controller MUST answer a pre-session request — `Discover 0x80`,
+P-022	docs/PROTOCOL.md	Envelope	`req_id` is a **`u32`**, MUST be **strictly increasing within a
+P-023	docs/PROTOCOL.md	Envelope	For an unsolicited `Event` the sender MUST set `req_id = 0`, and it
+P-024	docs/PROTOCOL.md	Envelope	A client MUST drop a response whose `(session_id, req_id)` matches no
+P-025	docs/PROTOCOL.md	Envelope	A frame too malformed to parse its envelope MUST be answered with
+P-027	docs/PROTOCOL.md	Envelope	An `Error` answering a frame whose envelope parsed MUST echo that
+P-030	docs/PROTOCOL.md	UART — controller ↔ comms processor	A receiver MUST resynchronise by reading to the next `0x00`.
+P-031	docs/PROTOCOL.md	UART — controller ↔ comms processor	A frame failing its CRC MUST be dropped silently.
+P-032	docs/PROTOCOL.md	UART — controller ↔ comms processor	A COBS code byte of `0x00` inside a frame, or a block running past
+P-033	docs/PROTOCOL.md	UART — controller ↔ comms processor	RTS/CTS is REQUIRED at this rate and the production connector MUST
+P-034	docs/PROTOCOL.md	WebSocket	One protocol message per binary WebSocket frame.
+P-035	docs/PROTOCOL.md	USB CDC	As UART, including COBS and the CRC, without the flow-control
+P-036	docs/PROTOCOL.md	BLE GATT	`flags` bit 7 (`0x80`) is `last`; bits 6–0 are the fragment index,
+P-037	docs/PROTOCOL.md	BLE GATT	Fragment data MUST be at most `ATT_MTU − 5` bytes: three for the ATT
+P-039	docs/PROTOCOL.md	BLE GATT	`msg_id` identifies the protocol message a fragment belongs to.
+P-038	docs/PROTOCOL.md	MQTT	`<device_id>` MUST be the 16 bytes rendered as 32 **lowercase**
+P-040	docs/PROTOCOL.md	Cryptographic conventions	Every integer entering a MAC or a KDF MUST be encoded **big-endian,
+P-041	docs/PROTOCOL.md	Cryptographic conventions	`HMAC` means **HMAC-SHA256**.
+P-042	docs/PROTOCOL.md	Cryptographic conventions	`HKDF` means **HKDF-SHA256** (RFC 5869) with `salt`, `IKM` and `info`
+P-043	docs/PROTOCOL.md	Cryptographic conventions	Every **domain input** MUST begin with its label, so a value computed
+P-085	docs/PROTOCOL.md	Key derivation	`epoch` is a `u32` monotonic counter in FRAM.
+P-086	docs/PROTOCOL.md	Key derivation	`client_id` MUST be allocated as the **lowest free slot index in the
+P-087	docs/PROTOCOL.md	Key derivation	`Discover 0x80` MUST carry the current `epoch` (key 8), so a client
+P-088	docs/PROTOCOL.md	Key derivation	`printed_secret` MUST NOT be used directly as an HMAC key.
+P-044	docs/PROTOCOL.md	Key derivation	`printed_secret` MUST be exactly **32 bytes of entropy**, carried in
+P-045	docs/PROTOCOL.md	Key derivation	No key is ever transmitted.
+P-049	docs/PROTOCOL.md	Key derivation	The QR code payload MUST be exactly
+P-046	docs/PROTOCOL.md	Message authentication	`type` MUST be inside every preimage, so a signed `SetConfig` cannot
+P-047	docs/PROTOCOL.md	Message authentication	`req_id` MUST be inside both the request and the response preimage.
+P-048	docs/PROTOCOL.md	Message authentication	`operation` and `payload` are **byte strings carried on the wire**,
+P-050	docs/PROTOCOL.md	Authenticated bodies	Every message listed in P-052 has a body that is exactly this
+P-051	docs/PROTOCOL.md	Authenticated bodies	For every message in P-052 a receiver MUST verify the MAC **before**
+P-052	docs/PROTOCOL.md	Authenticated bodies	The following are authenticated by the wrapper above under
+P-053	docs/PROTOCOL.md	Authenticated bodies	Signed requests (`0x07`, `0x08`, `0x09`, `0x0A`) use the signed body
+P-054	docs/PROTOCOL.md	Authenticated bodies	`0x00`/`0x80` (Discover) are **unauthenticated**: no key exists yet.
+P-055	docs/PROTOCOL.md	Authenticated bodies	A client MUST NOT render an unauthenticated message as a statement
+P-056	docs/PROTOCOL.md	Authenticated bodies	A client MUST hold a mark meaning **the lowest `seq` it will still
+P-057	docs/PROTOCOL.md	Authenticated bodies	`Hello 0x01` and `Pair 0x0B` cannot be checked before their bodies
+P-060	docs/PROTOCOL.md	Discover — `0x00` / `0x80`	The controller MUST mint a **fresh challenge per connection**, using
+P-061	docs/PROTOCOL.md	Discover — `0x00` / `0x80`	A challenge MUST be **single-use**: consumed by the first `Hello` or
+P-062	docs/PROTOCOL.md	Discover — `0x00` / `0x80`	A challenge MUST expire 120 seconds after it is minted, and MUST be
+P-063	docs/PROTOCOL.md	Discover — `0x00` / `0x80`	A challenge MUST come from a CSPRNG.
+P-069	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	`client_nonce` MUST be fresh per pairing attempt and MUST be in both
+P-058	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	`Pair 0x8B` MUST carry `next_challenge`: the challenge the
+P-064	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	An enrolment that succeeds MUST be answered with `Pair 0x8B` outcome
+P-065	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	A newly enrolled client's counter MUST start at **0**, and the
+P-066	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	A physical act at the controller MUST gate enrolment: the pushbutton
+P-067	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	A full client table MUST refuse with outcome 4, **unless P-078's
+P-068	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	Counter recovery is a **re-pair, not a reset**.
+P-078	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	Inside an open pairing window, a `Pair` whose proof verifies and
+P-105	docs/PROTOCOL.md	Pair — `0x0B` / `0x8B`	Every enrolled client MUST carry a **capability mask**, fixed at
+P-070	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	The Hello proof MUST cover the whole inner body, so that
+P-071	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	`client_nonce` MUST come from a CSPRNG and MUST be fresh per
+P-072	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	The client derives `session_key` using the `session_id` from the
+P-073	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	A major version mismatch MUST refuse the session with error 3.
+P-074	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	`state_seq` is the state store's own counter.
+P-075	docs/PROTOCOL.md	Hello — `0x01` / `0x81`	A client SHOULD refuse, and MUST surface, a session whose
+P-076	docs/PROTOCOL.md	Goodbye — `0x0C` / `0x8C`	A connection row has two independent states: **allocated**, meaning a
+P-077	docs/PROTOCOL.md	Goodbye — `0x0C` / `0x8C`	Sessions expire after 15 minutes without traffic, and the controller
+P-080	docs/PROTOCOL.md	Signed requests	The controller MUST take these steps in this order:
+P-079	docs/PROTOCOL.md	Signed requests	If persisting the counter fails, the operation MUST NOT execute.
+P-081	docs/PROTOCOL.md	Signed requests	Counters are **per client**, stored `client_id → highest accepted` in
+P-084	docs/PROTOCOL.md	Signed requests	Key 1 `client_id` MUST equal the `client_id` the session was bound to
+P-082	docs/PROTOCOL.md	Signed requests	`counter` prevents replay.
+P-083	docs/PROTOCOL.md	Signed requests	`operation` MUST NOT exceed `MAX_OPERATION` (960 bytes).
+P-093	docs/PROTOCOL.md	State and events	Every field carrying a **wall-clock time** MUST be omitted when the
+P-168	docs/PROTOCOL.md	State and events	Acknowledging a concern moves `state` from **1 `active` to 2
+P-180	docs/PROTOCOL.md	State and events	`5 cleared` is terminal, and a concern row leaves the table only
+P-208	docs/PROTOCOL.md	State and events	A page ends at its **row cap** or its **byte cap**, whichever binds
+P-145	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	An `Inventory 0x8D` whose `outcome` is not 1 MUST carry `next = 0`,
+P-146	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	The controller MUST NOT pin a walk.
+P-147	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	A request that was answered, in whole or in part, is **outcome 1
+P-148	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`topo_digest` is the **leftmost 8 bytes of SHA-256** over this
+P-149	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`rev` and `topo_digest` are **one identity**.
+P-200	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`cmp = 0` is reserved in **every** message that names a component
+P-201	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	An absent `cmds`, on a `ComponentRow` or a `DeviceRow`, means that
+P-187	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	Neither `parent` chain — `DeviceRow` key 7 or `ComponentRow` key 3 —
+P-202	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`DeviceRow` key 3 `addr` MUST be present when the row's `bus` has an
+P-203	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	A component whose `rollup` is set MUST have its values **already
+P-204	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`unit` and `scale` MUST be **absent** from a `SignalRow` or a
+P-205	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`DeviceRow` key 12 `since` MUST be set to the current `rev` whenever
+P-206	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`ebase` is the **label of element 0**, not its position: element `k`
+P-207	docs/PROTOCOL.md	Inventory — `0x0D` / `0x8D`	`(dev, cmp, kind, shape, vtype, domain, point, dir)` MUST be
+P-198	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	The resolved selection of a `ReadSignals` is the **set union** of its
+P-199	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	A responder MUST evaluate a response's outcomes in **ascending order**
+P-185	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	Every value position on this wire is a signed integer in the `i32`
+P-196	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	A reading's value key MUST be present exactly when its `q` byte's
+P-164	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	A source reporting an operating state this controller has no
+P-125	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	A **receiver** meeting a value drawn from an enum space it does not
+P-197	docs/PROTOCOL.md	Readings — `0x0E` / `0x8E`	A series reading's key 2 MUST be exactly `n` bytes, where `n` is the
+P-209	docs/PROTOCOL.md	Concerns — `0x0F` / `0x8F`	A `ReadConcerns` walk is ordered by **`cid` ascending**; `from` and
+P-210	docs/PROTOCOL.md	Concerns — `0x0F` / `0x8F`	`Concerns` key 2 `seq` is the pin a walk is held against.
+P-211	docs/PROTOCOL.md	Concerns — `0x0F` / `0x8F`	`Concern` key 9 `age` is a duration in **seconds** on P-004's tick
+P-094	docs/PROTOCOL.md	Subscribe — `0x03` / `0x83`	The transition from replay to live MUST be atomic: the controller
+P-104	docs/PROTOCOL.md	Subscribe — `0x03` / `0x83`	`accepted_from_seq` MUST be `current_seq + 1` when `from_seq` is 0,
+P-144	docs/PROTOCOL.md	Subscribe — `0x03` / `0x83`	**`seq` 0 is not a position.** The first record a log ever writes is
+P-095	docs/PROTOCOL.md	Subscribe — `0x03` / `0x83`	`gap` MUST be true when `from_seq` is not 0 and
+P-212	docs/PROTOCOL.md	Event — `0x04`	`0x0102` and `0x0902` each carry an **array**, and a controller MUST
+P-213	docs/PROTOCOL.md	Event — `0x04`	A `0x0901` MUST carry the reason the revision moved.
+P-182	docs/PROTOCOL.md	Event — `0x04`	The controller MUST NOT enqueue more than one `0x0102` and one
+P-096	docs/PROTOCOL.md	Event — `0x04`	`seq` is strictly increasing but **NOT contiguous**.
+P-097	docs/PROTOCOL.md	Event — `0x04`	A client MUST NOT re-read the log on every hole.
+P-119	docs/PROTOCOL.md	Event — `0x04`	A subscribed client MUST compare the highest `Event` `seq` it has
+P-098	docs/PROTOCOL.md	Event — `0x04`	The controller MUST send one separately-MAC'd copy of an event to
+P-099	docs/PROTOCOL.md	ReadLog — `0x05` / `0x85`	If `from_seq < oldest_seq` the controller MUST answer from
+P-100	docs/PROTOCOL.md	Configuration	`expected_version` MUST be checked and a mismatch refused with
+P-101	docs/PROTOCOL.md	Configuration	Validation happens on the controller and rejection is loud.
+P-102	docs/PROTOCOL.md	Configuration	Writes MUST land in the inactive **A/B slot** with a sequence number
+P-103	docs/PROTOCOL.md	Configuration	Every behaviour section MUST carry a `shadow` flag readable by a
+P-110	docs/PROTOCOL.md	Time	Setting the clock is a **signed write**.
+P-111	docs/PROTOCOL.md	Time	The controller MUST record `source` in the resulting `time set` event
+P-112	docs/PROTOCOL.md	Time	Events already written with no timestamp MUST NOT be retroactively
+P-113	docs/PROTOCOL.md	Time	A `Time 0x0A` whose `at` falls outside the **plausibility window**
+P-114	docs/PROTOCOL.md	Time	A `Time 0x0A` whose `at` is earlier than the timestamp of the newest
+P-115	docs/PROTOCOL.md	Time	When the clock was **already known** and an accepted set moves it by
+P-116	docs/PROTOCOL.md	Time	A `Time 0x0A` that the floor would refuse MUST be accepted **while a
+P-117	docs/PROTOCOL.md	Time	The floor override:
+P-118	docs/PROTOCOL.md	Time	The controller MUST accept at most one `Time 0x0A` per **15 minutes**
+P-120	docs/PROTOCOL.md	Commands	The dedup table MUST be keyed
+P-121	docs/PROTOCOL.md	Commands	The dedup table MUST live in **FRAM** and survive a reset.
+P-122	docs/PROTOCOL.md	Commands	The table holds `MAX_CMD_DEDUP` entries for 10 minutes.
+P-124	docs/PROTOCOL.md	Commands	A `Command` whose `(client_id, cmd_id)` matches a live dedup entry
+P-123	docs/PROTOCOL.md	Commands	`inhibited` and `shadowed` are outcomes, not errors.
+P-130	docs/PROTOCOL.md	Firmware	The comms processor delivers the controller image; the **controller's
+P-131	docs/PROTOCOL.md	Firmware	A comms image is verified twice: the controller authorises the
+P-140	docs/PROTOCOL.md	Errors	See P-055.
+P-141	docs/PROTOCOL.md	Errors	A request that reaches its handler MUST be answered by its own
+P-142	docs/PROTOCOL.md	Errors	Which of the two shapes an `Error` takes is decided by whether the
+P-143	docs/PROTOCOL.md	Errors	A request whose type requires a session, arriving before any `Hello`
+L-001	docs/protocol/LINK.md	Reserved range	A receiver MUST refuse a link-local message arriving from the side
+L-002	docs/protocol/LINK.md	A link-local opcode on a client transport is a protocol error	The comms processor MUST NOT emit a frame in this range on BLE,
+L-003	docs/protocol/LINK.md	A link-local opcode on a client transport is a protocol error	In the other direction: the comms processor MUST drop a frame the
+L-010	docs/protocol/LINK.md	Envelope, framing and correlation	A link-local frame MUST use the client protocol's envelope, framing
+L-011	docs/protocol/LINK.md	Envelope, framing and correlation	Every duration in this document MUST be measured on P-004's
+L-012	docs/protocol/LINK.md	Envelope, framing and correlation	Every link-local frame MUST carry `session_id = 0`.
+L-013	docs/protocol/LINK.md	Envelope, framing and correlation	The sender MUST allocate `req_id` from its own counter, independent
+L-014	docs/protocol/LINK.md	Envelope, framing and correlation	A side MUST NOT have more than 4 link-local requests outstanding,
+L-015	docs/protocol/LINK.md	Envelope, framing and correlation	A sender MUST treat a request unanswered after 500 ms as failed and
+L-020	docs/protocol/LINK.md	Unauthenticated by design, and where that stops	**While the two chips are on one board**, a link-local message MUST
+L-024	docs/protocol/LINK.md	Unauthenticated by design, and where that stops	If this link ever leaves the board, every link-local message MUST be
+L-030	docs/protocol/LINK.md	LinkUp	Both sides MUST send `LinkUp` at boot, and either side MAY send it
+L-031	docs/protocol/LINK.md	LinkUp	The controller MUST store field 4 of the last successful `LinkUp`
+L-032	docs/protocol/LINK.md	LinkUp	A client MAY display `fw_comms`, MUST NOT read it as confirmation
+L-033	docs/protocol/LINK.md	LinkUp	Until a `LinkUp` exchange has completed in both directions, the
+L-040	docs/protocol/LINK.md	boot_id is what makes a reboot visible	Each side MUST redraw `boot_id` randomly on every boot.
+L-041	docs/protocol/LINK.md	boot_id is what makes a reboot visible	On a `LinkUp` whose comms `boot_id` differs from the one last seen,
+L-042	docs/protocol/LINK.md	boot_id is what makes a reboot visible	On a `LinkUp` whose controller `boot_id` differs from the one last
+L-050	docs/protocol/LINK.md	Version mismatch does not take the link down	On a link protocol major mismatch the controller MUST accept only
+L-051	docs/protocol/LINK.md	Version mismatch does not take the link down	On a minor version mismatch both sides MUST proceed at the lower of
+L-060	docs/protocol/LINK.md	Who allocates what	The comms processor MUST allocate every connection handle itself,
+L-061	docs/protocol/LINK.md	Who allocates what	When all eight connection rows are allocated the controller MUST
+L-062	docs/protocol/LINK.md	Who allocates what	The controller MUST answer a frame carrying a connection handle it
+L-070	docs/protocol/LINK.md	ClientConnected	On answering `ClientConnected` with `accepted` the controller MUST
+L-071	docs/protocol/LINK.md	ClientConnected	`ClientConnectedAck` MUST NOT carry the challenge.
+L-072	docs/protocol/LINK.md	ClientConnected	`peer` and `transport` are both assertions from the untrusted peer.
+L-080	docs/protocol/LINK.md	ClientDisconnected	The comms processor MUST NOT reuse a handle until the controller has
+L-090	docs/protocol/LINK.md	CloseConnection	The comms processor MUST treat `CloseConnection` with `conn = 0` as
+L-100	docs/protocol/LINK.md	Heartbeat	Each side MUST send a `Heartbeat` every 2 seconds and MUST answer the
+L-101	docs/protocol/LINK.md	Heartbeat	`conns` MUST count allocated connection rows, bound or not, and MUST
+L-102	docs/protocol/LINK.md	Heartbeat	When the two counts differ for three consecutive heartbeats the
+L-110	docs/protocol/LINK.md	When the controller stops hearing the comms processor	Six seconds after the last heartbeat from the comms processor the
+L-111	docs/protocol/LINK.md	When the controller stops hearing the comms processor	Sixty seconds after the last heartbeat the controller MUST cut the
+L-112	docs/protocol/LINK.md	When the controller stops hearing the comms processor	After 3 power cycles inside an hour the controller MUST leave the
+L-113	docs/protocol/LINK.md	When the controller stops hearing the comms processor	While a comms firmware install is in flight the controller MUST
+L-114	docs/protocol/LINK.md	When the controller stops hearing the comms processor	The rail's declared fail state MUST be on, so that a controller
+L-120	docs/protocol/LINK.md	When the comms processor stops hearing the controller	Six seconds after the last heartbeat from the controller the comms
+L-121	docs/protocol/LINK.md	When the comms processor stops hearing the controller	A comms processor that has lost the controller MUST NOT serve a
+L-130	docs/protocol/LINK.md	Wi-Fi credentials	The controller MUST hold the master copy of the Wi-Fi credentials,
+L-131	docs/protocol/LINK.md	Wi-Fi credentials	A `NetConfig` with `op = clear` MUST omit both `psk` and `ssid`, and
+L-132	docs/protocol/LINK.md	Wi-Fi credentials	`NetConfigAck` MUST report in `version` what the comms processor now
+L-133	docs/protocol/LINK.md	Wi-Fi credentials	The controller MUST push `NetConfig` after every `LinkUp` whose
+L-134	docs/protocol/LINK.md	Wi-Fi credentials	`NetConfig` MUST carry `country` as exactly two bytes of ISO 3166-1
+L-135	docs/protocol/LINK.md	Wi-Fi credentials	The controller MUST send `NetConfig` with `op = clear` on a factory
+L-136	docs/protocol/LINK.md	Wi-Fi credentials	The comms processor MUST cache at most one network, and a `NetConfig`
+L-137	docs/protocol/LINK.md	Wi-Fi credentials	A comms processor whose NVS write fails MUST answer
+L-140	docs/protocol/LINK.md	Time offers	The controller MUST refuse the first set after boot with
+L-141	docs/protocol/LINK.md	Time offers	The controller MUST NOT apply the floor to an offer that moves an
+L-142	docs/protocol/LINK.md	Time offers	A controller that holds no log record carrying a timestamp MUST use
+L-143	docs/protocol/LINK.md	Time offers	A boot at which the RTC reports its backup domain invalid MUST be
+L-150	docs/protocol/LINK.md	Time offers	Once the clock is known the controller MUST refuse an offer that
+L-151	docs/protocol/LINK.md	Time offers	The controller MUST accept at most one offer per 15 minutes,
+L-152	docs/protocol/LINK.md	Time offers	The controller MUST NOT emit `TimeOfferAck` outcome 3.
+L-160	docs/protocol/LINK.md	Time offers	The controller MUST record any accepted clock change of more than
+L-161	docs/protocol/LINK.md	Time offers	A behaviour whose decision actuates MUST NOT treat time the
+L-162	docs/protocol/LINK.md	Time offers	The link-local `source` value MUST NOT be copied into the `0x0604`
+L-174	docs/protocol/LINK.md	Comms firmware release	The controller MUST hold at most one authorised release at a time, a
+L-180	docs/protocol/LINK.md	Error codes	Codes 257, 258 and 259 MUST reach the client whose frame raised
+L-181	docs/protocol/LINK.md	Error codes	An error raised about a link-local frame MUST carry
+L-182	docs/protocol/LINK.md	Error codes	An error raised about a client's frame MUST be routed to that
