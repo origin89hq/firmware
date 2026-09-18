@@ -22,7 +22,6 @@
 # the commit that adds it, where the diff shows it.
 uncovered = [
     "F-006",
-    "F-013",
     "F-016",
     "F-020",
     "F-021",

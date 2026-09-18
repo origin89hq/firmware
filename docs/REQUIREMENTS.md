@@ -88,7 +88,7 @@ locked away from the probe for good. Source: [hardware#29][h29]. M1.
 
 **F-013** — `FEEDBACK` is read through the pin's internal pull-up, and low
 means both relays are closed. No pull-up exists on either board. Source:
-`B-09b`. M8.
+`B-09b`. M1 reads it under the contract and logs it; M8 decides on it.
 
 **F-014** — On revision B the rail is on with `PC5` high-impedance, the
 controller takes ownership of it once booted, and every cut it makes is a

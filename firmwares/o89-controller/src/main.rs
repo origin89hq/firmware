@@ -32,11 +32,12 @@ mod supervisor;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Flex, Level, Output, Speed};
+use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootRecord, Bus, Clock, FailState, LastWords, Line, RailSequencer, ResetCause, RtcClock, Task,
+    BootRecord, Bus, Clock, FailState, Feedback, LastWords, Line, Pull as DeclaredPull,
+    RailSequencer, ResetCause, RtcClock, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -136,6 +137,18 @@ async fn main(spawner: Spawner) {
     let _rs485_3_tx = Output::new(b.rs485_3.tx, driven(Line::Rs485Tx(Bus::Three)), Speed::Low);
     let status = Output::new(b.led_status, Level::Low, Speed::Low);
     let fault = Output::new(b.led_fault, Level::Low, Speed::Low);
+    // The generator's FEEDBACK, read under the contract o89-core declares:
+    // the internal pull-up, because neither board has one, and low is both
+    // relays closed. Nothing decides on it yet; the control tick logs it.
+    let feedback = Input::new(
+        b.gen_feedback,
+        match Feedback::PULL {
+            DeclaredPull::Up => Pull::Up,
+            DeclaredPull::None => Pull::None,
+        },
+    );
+    let mut contact = Feedback::contact(feedback.is_high());
+    defmt::info!("generator contact: {}", contact);
 
     supervisor::check_in(Task::Supervisor);
     // The pool holds one supervisor and this is its only spawn; an unfed
@@ -173,6 +186,11 @@ async fn main(spawner: Spawner) {
     let mut proof = bench::Proof::new(cause);
     loop {
         ticker.next().await;
+        let seen = Feedback::contact(feedback.is_high());
+        if seen != contact {
+            defmt::info!("generator contact: {}", seen);
+            contact = seen;
+        }
         #[cfg(feature = "bench")]
         match proof.tick() {
             bench::Step::Run => {}
