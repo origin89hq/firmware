@@ -15,7 +15,10 @@
 //! probe's and are never reconfigured on revision A (F-012); `PF0`, `PF1`,
 //! `PC14` and `PC15` are the crystals', owned by the clock configuration;
 //! `PA11` and `PA12` stay untouched (`BOARD-A.md`); the nineteen unused pads
-//! stay in their reset state.
+//! stay in their reset state. The gate reads the line below against the pin
+//! map's rows, so a row is either taken by [`Board::split`] or named here.
+//!
+//! leaves alone: PA13, PA14, PF0, PF1, PC14, PC15
 //!
 //! The lines with a fail state that the first statements of `main` drive
 //! through the registers, before the HAL owns anything, are named here too:

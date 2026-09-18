@@ -139,10 +139,11 @@ docs/
 part of it `cargo test` cannot do because it builds for the laptop: every
 `no_std` crate cross-compiled for both targets, the three images built in
 release with their `.bin` measured against the slot and a stated margin, the
-dependency rules below refused mechanically, and every numbered rule sorted
+dependency rules below refused mechanically, the pin table in `BOARD-A.md`
+held against the controller's board module, and every numbered rule sorted
 into covered, declared untestable or uncovered against `traceability.toml`,
-with a ratchet on the uncovered count. Flashing, erasing and actuation are
-separate recipes that never run from `check`.
+which lists the uncovered rules by name and only shrinks. Flashing, erasing
+and actuation are separate recipes that never run from `check`.
 
 ## The controller
 

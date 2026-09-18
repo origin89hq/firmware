@@ -11,9 +11,9 @@ flying-probe netlist, checked against the HAL's pin-function table for the
 `stm32g0b1re`, and revision B's moves are recorded where the rule that moves
 them is.
 
-The controller firmware's board module carries this table as its own
-documentation, and from M1 the gate checks that every pin the code takes
-appears here and every row here is taken or marked as deliberately left alone.
+The controller firmware's board module names every pin the image takes, and
+the gate holds the two together: every pin the code takes has a row here, and
+every row here is taken by the module or named by it as left alone (F-083).
 
 ## Revision A pin map
 
