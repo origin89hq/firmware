@@ -49,11 +49,13 @@ upgrade path, and a crate called `o89-stm32` would be wrong the day that
 happens.
 
 **The comms processor is a pipe, not a participant.** It frames, forwards and
-provisions. It holds no key, caches no state, translates no semantics, and
-never depends on the crate that decides. The moment it knows what a generator
-is there are two sources of truth, and one of them is on the chip that will
-have a CVE. Its power rail is switched by the controller, so a wedged radio is
-recoverable without a drive and the power argument stays honest.
+provisions. It holds no controller secret, caches no control state,
+translates no semantics, and never depends on the crate that decides; the one
+record it keeps is the network it joins, and the controller holds the master
+copy (L-130). The moment it knows what a generator is there are two sources
+of truth, and one of them is on the chip that will have a CVE. Its power rail
+is switched by the controller, so a wedged radio is recoverable without a
+drive and the power argument stays honest.
 
 **The security boundary is the controller.** The comms processor is the
 internet-facing part: the one an attacker reaches first and the one being
@@ -94,8 +96,9 @@ in the relayed client stream. It is the first requirement, not a feature.
 ## Repository layout
 
 Two Cargo workspaces: the host workspace never cross-compiles by accident,
-and the firmware workspace has its own lockfile and release profile. A crate
-is created in the milestone that gives it its first code, never ahead of it.
+and the firmware workspace has its own lockfile and release profile. The
+layout below is where things end up; a crate is created in the milestone
+that gives it its first code, never ahead of it.
 
 ```text
 Cargo.toml                 host workspace
