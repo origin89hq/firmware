@@ -50,6 +50,29 @@ const WINDOW: usize = 64;
 const _: () = assert!(WINDOW <= SCRATCH);
 const _: () = assert!(WINDOW > 2);
 
+/// How far into a block a probe hunts for its first record: past one
+/// record at its largest, so a first record that failed its CRC does not
+/// hide the valid one after it, and no further, so a part full of
+/// somebody else's bytes costs a bounded read per block rather than the
+/// whole block. The boot on a fresh part probes every block once.
+const PROBE_REACH: usize = 2 * MAX_RECORD;
+
+/// Hand the executor a turn between blocks, so a walk over thousands of
+/// them is not a task that never checks in.
+async fn yield_now() {
+    let mut yielded = false;
+    core::future::poll_fn(|cx| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
 /// Where the log continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -310,6 +333,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         let mut lo = 0u32;
         let mut hi = run;
         while hi.saturating_sub(lo) > 1 {
+            yield_now().await;
             let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
             let first = self.first_in_run(first_block, run, mid, scratch).await?;
             if first.is_some_and(|first| first <= start) {
@@ -320,9 +344,10 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         }
         let mut next = start;
         for k in lo..run {
+            yield_now().await;
             let block = self.in_run(first_block, k);
             let (_, wants) = self
-                .scan_block(block, scratch, &mut |found| {
+                .scan_block(block, Self::block_len(), scratch, &mut |found| {
                     if found.seq < start {
                         return Wants::More;
                     }
@@ -351,10 +376,11 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         let (first_block, run) = self.run(scratch).await?;
         let mut newest = None;
         for k in (0..run).rev() {
+            yield_now().await;
             let block = self.in_run(first_block, k);
             let mut in_block = None;
             let _ = self
-                .scan_block(block, scratch, &mut |found| {
+                .scan_block(block, Self::block_len(), scratch, &mut |found| {
                     if let Ok(event) = Event::decode(found.payload)
                         && let Some(at) = event.at
                     {
@@ -379,6 +405,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         // the run is the first holding records from two past the head.
         let mut block = self.next_block(self.next_block(self.head.block));
         for _ in 0..self.blocks {
+            yield_now().await;
             match self.probe(block, scratch).await? {
                 Probe::Records { .. } => break,
                 Probe::Erased | Probe::Closed => block = self.next_block(block),
@@ -412,6 +439,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         scratch: &mut [u8],
     ) -> Result<Option<u64>, RingError<N::Error>> {
         for j in k..run {
+            yield_now().await;
             let block = self.in_run(first_block, j);
             match self.probe(block, scratch).await? {
                 Probe::Records { first } => return Ok(Some(first)),
@@ -427,6 +455,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         // An anchor: the first block holding records.
         let mut anchor = None;
         for block in 0..self.blocks {
+            yield_now().await;
             match self.probe(block, scratch).await? {
                 Probe::Records { first } => {
                     anchor = Some((block, first));
@@ -441,6 +470,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             // block zero when every block was closed.
             let mut block = None;
             for candidate in 0..self.blocks {
+                yield_now().await;
                 if self.probe(candidate, scratch).await? == Probe::Erased {
                     block = Some(candidate);
                     break;
@@ -468,6 +498,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         let mut lo = anchor;
         let mut hi = self.blocks;
         while hi.saturating_sub(lo) > 1 {
+            yield_now().await;
             let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
             let nearest = self.nearest_records(mid, scratch).await?;
             if nearest.is_some_and(|seq| seq >= first) {
@@ -485,6 +516,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             // first write closed as well.
             at = 0;
             for _ in 0..self.blocks {
+                yield_now().await;
                 head = self.next_block(head);
                 match self.probe(head, scratch).await? {
                     Probe::Closed => {}
@@ -521,6 +553,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     ) -> Result<Option<u64>, RingError<N::Error>> {
         let mut block = self.next_block(self.next_block(self.head.block));
         for _ in 0..self.blocks {
+            yield_now().await;
             match self.probe(block, scratch).await? {
                 Probe::Records { first } => return Ok(Some(first)),
                 Probe::Erased => return Ok(Some(anchor)),
@@ -538,6 +571,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         scratch: &mut [u8],
     ) -> Result<Option<u64>, RingError<N::Error>> {
         for candidate in block..self.blocks {
+            yield_now().await;
             match self.probe(candidate, scratch).await? {
                 Probe::Records { first } => return Ok(Some(first)),
                 Probe::Erased => return Ok(None),
@@ -550,7 +584,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// Move the head into the next block and erase the one after it.
     async fn turn_the_page(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
         let next = self.next_block(self.head.block);
-        if self.probe(next, scratch).await? != Probe::Erased {
+        if !self.is_erased(next, scratch).await? {
             // The erase ahead did not land before a reset, or the block was
             // closed: it goes now, and an append waits once.
             self.erase(next).await?;
@@ -568,7 +602,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// Erase the block after the head unless it already is.
     async fn erase_ahead(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
         let ahead = self.next_block(self.head.block);
-        if self.probe(ahead, scratch).await? != Probe::Erased {
+        if !self.is_erased(ahead, scratch).await? {
             self.erase(ahead).await?;
         }
         Ok(())
@@ -582,14 +616,15 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         self.flash.erase(from, to).await.map_err(RingError::Flash)
     }
 
-    /// What a block's first bytes say.
+    /// What a block's first bytes say, from one probe's reach and no more.
     async fn probe(
         &mut self,
         block: u32,
         scratch: &mut [u8],
     ) -> Result<Probe, RingError<N::Error>> {
+        let reach = Self::len_u32(PROBE_REACH)?.min(Self::block_len());
         let (scanned, _) = self
-            .scan_block(block, scratch, &mut |_| Wants::Enough)
+            .scan_block(block, reach, scratch, &mut |_| Wants::Enough)
             .await?;
         Ok(match scanned.first {
             Some(first) => Probe::Records { first },
@@ -597,15 +632,15 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             None => Probe::Closed,
         })
     }
-
     /// Scan a whole block, counting what it holds.
     async fn scan_whole(
         &mut self,
         block: u32,
         scratch: &mut [u8],
     ) -> Result<Scanned, RingError<N::Error>> {
+        let len = Self::block_len();
         let (scanned, _) = self
-            .scan_block(block, scratch, &mut |_| Wants::More)
+            .scan_block(block, len, scratch, &mut |_| Wants::More)
             .await?;
         self.damage.failed_crc = self.damage.failed_crc.saturating_add(scanned.failed_crc);
         if scanned.closed {
@@ -613,13 +648,20 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         }
         Ok(scanned)
     }
-
     /// Stream the records of one block through `scratch`, verifying each,
     /// hunting forward past one that does not hold, and stopping at the
-    /// erased tail or at residue nothing readable follows.
+    /// erased tail or at residue nothing readable follows. The hunt for a
+    /// record's start goes no further than `reach`; a record that starts
+    /// inside it is read whole.
+    ///
+    /// An erased header is the tail. A body lands from its first byte, so
+    /// a torn write leaves bytes right after the magic's two; a block that
+    /// reads erased where a record would start holds nothing after it that
+    /// this log wrote.
     async fn scan_block(
         &mut self,
         block: u32,
+        reach: u32,
         scratch: &mut [u8],
         visit: &mut impl FnMut(&Found<'_>) -> Wants,
     ) -> Result<(Scanned, Wants), RingError<N::Error>> {
@@ -628,9 +670,9 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         let mut scanned = Scanned::default();
         let mut at: u32 = 0;
         let mut wants = Wants::More;
-        // Bounded by the block: every turn either consumes a record or
+        // Bounded by the reach: every turn either consumes a record or
         // moves the hunt forward by at least a byte.
-        while at < len {
+        while at < reach {
             let remaining = len.saturating_sub(at);
             let head_len = remaining.min(Self::len_u32(HEADER)?);
             let head = scratch
@@ -673,7 +715,10 @@ impl<N: MultiwriteNorFlash> Ring<N> {
                     continue;
                 }
                 scanned.failed_crc = scanned.failed_crc.saturating_add(1);
-                let Some(next) = self.hunt(base, at.saturating_add(1), len, scratch).await? else {
+                let Some(next) = self
+                    .hunt(base, at.saturating_add(1), reach, scratch)
+                    .await?
+                else {
                     scanned.closed = true;
                     break;
                 };
@@ -683,8 +728,9 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             let erased_head = scratch
                 .get(..Self::len_usize(head_len))
                 .is_some_and(|head| head.iter().all(|byte| *byte == 0xFF));
-            if erased_head && self.erased_from(base, at, len, scratch).await? {
-                // The tail: nothing written from here on.
+            if erased_head {
+                // The tail: nothing this log wrote lies past an erased
+                // header.
                 break;
             }
             let from = if header.is_some() {
@@ -694,7 +740,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             } else {
                 at
             };
-            let Some(next) = self.hunt(base, from, len, scratch).await? else {
+            let Some(next) = self.hunt(base, from, reach, scratch).await? else {
                 scanned.closed = true;
                 break;
             };
@@ -702,8 +748,6 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         }
         Ok((scanned, wants))
     }
-
-    /// The next offset at or after `from` holding the magic, or `None`.
     async fn hunt(
         &mut self,
         base: u32,
@@ -731,15 +775,16 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         Ok(None)
     }
 
-    /// Whether every byte from `from` to the end of the block is erased.
-    async fn erased_from(
+    /// Whether every byte of the block is erased: the check before a block
+    /// is appended into, which reads the whole of it once.
+    async fn is_erased(
         &mut self,
-        base: u32,
-        from: u32,
-        len: u32,
+        block: u32,
         scratch: &mut [u8],
     ) -> Result<bool, RingError<N::Error>> {
-        let mut at = from;
+        let base = self.address(block, 0)?;
+        let len = Self::block_len();
+        let mut at = 0;
         while at < len {
             let take = len.saturating_sub(at).min(Self::len_u32(WINDOW)?);
             let window = scratch
@@ -756,7 +801,6 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         }
         Ok(true)
     }
-
     fn next_block(&self, block: u32) -> u32 {
         block
             .saturating_add(1)
@@ -799,11 +843,15 @@ mod tests {
 
     const ERASE: usize = 512;
     const BLOCKS: u32 = 8;
-    const PART: usize = ERASE * 8;
+    /// Sixteen kilobytes: eight blocks of 512 for most tests, four of
+    /// 4096 for the one that needs a block a record cannot fill.
+    const PART: usize = 16 * 1024;
 
-    /// A byte-programmable NOR part in an array.
-    struct Part {
+    /// A byte-programmable NOR part in an array, `E` bytes a block.
+    struct Part<const E: usize> {
         bytes: [u8; PART],
+        /// Bytes read since the part was made.
+        read: usize,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,11 +863,11 @@ mod tests {
         }
     }
 
-    impl ErrorType for Part {
+    impl<const E: usize> ErrorType for Part<E> {
         type Error = Refused;
     }
 
-    impl ReadNorFlash for Part {
+    impl<const E: usize> ReadNorFlash for Part<E> {
         const READ_SIZE: usize = 1;
 
         fn read(
@@ -828,6 +876,7 @@ mod tests {
             bytes: &mut [u8],
         ) -> impl Future<Output = Result<(), Refused>> {
             let at = offset as usize;
+            self.read = self.read.saturating_add(bytes.len());
             let outcome = self
                 .bytes
                 .get(at..at.saturating_add(bytes.len()))
@@ -841,9 +890,9 @@ mod tests {
         }
     }
 
-    impl NorFlash for Part {
+    impl<const E: usize> NorFlash for Part<E> {
         const WRITE_SIZE: usize = 1;
-        const ERASE_SIZE: usize = ERASE;
+        const ERASE_SIZE: usize = E;
 
         fn erase(&mut self, from: u32, to: u32) -> impl Future<Output = Result<(), Refused>> {
             let outcome = self
@@ -873,11 +922,12 @@ mod tests {
         }
     }
 
-    impl MultiwriteNorFlash for Part {}
+    impl<const E: usize> MultiwriteNorFlash for Part<E> {}
 
-    fn fresh() -> Part {
+    fn fresh<const E: usize>() -> Part<E> {
         Part {
             bytes: [0xFF; PART],
+            read: 0,
         }
     }
 
@@ -891,19 +941,22 @@ mod tests {
 
     /// Boot: take the part into a ring. The part is worth a few kilobytes,
     /// so it moves rather than borrows; `close` hands it back.
-    fn open(part: &mut Part) -> Ring<Part> {
+    fn open<const E: usize>(part: &mut Part<E>) -> Ring<Part<E>> {
         let taken = core::mem::replace(part, fresh());
         let mut scratch = [0u8; SCRATCH];
-        block_on(Ring::open(taken, 0, BLOCKS, &mut scratch)).expect("opens")
+        let blocks = u32::try_from(PART.checked_div(E).expect("a block size"))
+            .expect("fits")
+            .min(BLOCKS);
+        block_on(Ring::open(taken, 0, blocks, &mut scratch)).expect("opens")
     }
 
     /// Power off: the part comes back out of the ring.
-    fn close(part: &mut Part, ring: Ring<Part>) {
+    fn close<const E: usize>(part: &mut Part<E>, ring: Ring<Part<E>>) {
         *part = ring.release();
     }
 
     /// Append one class A event, answering its sequence.
-    fn append(ring: &mut Ring<Part>, at: Option<u64>) -> u64 {
+    fn append<const E: usize>(ring: &mut Ring<Part<E>>, at: Option<u64>) -> u64 {
         let mut payload = [0u8; 64];
         let len = event(ring.next_seq(), at, &mut payload);
         let mut scratch = [0u8; SCRATCH];
@@ -911,7 +964,7 @@ mod tests {
     }
 
     /// Every sequence readable from `from`, and what the client asks next.
-    fn read(ring: &mut Ring<Part>, from: u64) -> ([u64; 256], usize, u64) {
+    fn read<const E: usize>(ring: &mut Ring<Part<E>>, from: u64) -> ([u64; 256], usize, u64) {
         let mut seqs = [0u64; 256];
         let mut count = 0;
         let mut scratch = [0u8; SCRATCH];
@@ -926,7 +979,7 @@ mod tests {
 
     #[test]
     fn f_023_a_fresh_part_opens_empty_and_the_first_record_is_one() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         assert_eq!(
             ring.head(),
@@ -955,7 +1008,7 @@ mod tests {
 
     #[test]
     fn f_023_the_ring_wraps_the_oldest_block_is_erased_one_ahead_and_the_oldest_moves() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         // About 21 bytes a record: about 24 per 512-byte block, 8 blocks.
         let mut last = 0;
@@ -990,7 +1043,7 @@ mod tests {
 
     #[test]
     fn p_099_a_read_from_below_the_oldest_is_answered_from_the_oldest() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         for _ in 0..300 {
             let _ = append(&mut ring, None);
@@ -1010,7 +1063,7 @@ mod tests {
 
     #[test]
     fn p_096_a_record_that_fails_its_crc_is_a_hole_and_the_scan_hunts_past_it() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         for _ in 0..5 {
             let _ = append(&mut ring, None);
@@ -1033,7 +1086,7 @@ mod tests {
 
     #[test]
     fn f_023_a_torn_write_closes_its_block_and_is_not_damage() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         for _ in 0..3 {
             let _ = append(&mut ring, None);
@@ -1068,7 +1121,7 @@ mod tests {
 
     #[test]
     fn f_023_a_first_write_cut_short_on_a_fresh_part_is_an_ordinary_first_boot() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         // Half a body at the very start of block 0, no magic, nothing else.
         part.bytes[2..10].copy_from_slice(&[0x12; 8]);
         let mut ring = open(&mut part);
@@ -1082,7 +1135,7 @@ mod tests {
 
     #[test]
     fn l_140_the_floor_is_the_newest_timestamp_held_and_none_when_no_record_carries_one() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         let mut scratch = [0u8; SCRATCH];
         assert_eq!(block_on(ring.floor(&mut scratch)), Ok(None));
@@ -1114,8 +1167,47 @@ mod tests {
     }
 
     #[test]
+    fn f_023_a_part_full_of_somebody_elses_bytes_opens_in_bounded_reads_and_starts_over() {
+        // Four blocks of 4096, every byte a pseudo-random non-erased value,
+        // the way a part out of another firmware reads.
+        const BIG: usize = 4096;
+        let mut part: Part<BIG> = fresh();
+        let mut x: u32 = 0x1234_5678;
+        for byte in &mut part.bytes {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (x >> 24) as u8 | 0x01;
+        }
+        part.read = 0;
+        let mut ring = open(&mut part);
+        // Nothing readable anywhere: the log starts over in block zero,
+        // erased for it, with block one erased ahead.
+        assert_eq!(ring.head().block, 0);
+        assert_eq!(ring.head().next_seq, 1);
+        assert_eq!(append(&mut ring, None), 1);
+        close(&mut part, ring);
+        // The boot read a probe's reach per block on each of its two passes
+        // over them, plus the whole of the blocks it checked for erasure,
+        // and never the whole of every block.
+        let blocks = PART / BIG;
+        let reach = 2 * blocks * (PROBE_REACH + 2 * WINDOW);
+        assert!(
+            part.read <= reach + 3 * BIG,
+            "{} bytes read, more than {}",
+            part.read,
+            reach + 3 * BIG
+        );
+        assert!(
+            part.read < 2 * PART,
+            "{} bytes read: the whole part, twice",
+            part.read
+        );
+        let ring = open(&mut part);
+        assert_eq!(ring.head().next_seq, 2);
+    }
+
+    #[test]
     fn a_payload_that_is_not_the_next_event_is_refused_before_anything_lands() {
-        let mut part = fresh();
+        let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         let mut payload = [0u8; 64];
         let len = event(7, None, &mut payload);
@@ -1141,12 +1233,12 @@ mod tests {
     fn a_ring_of_one_block_or_a_scratch_under_a_record_is_refused() {
         let mut scratch = [0u8; SCRATCH];
         assert!(matches!(
-            block_on(Ring::open(fresh(), 0, 1, &mut scratch)),
+            block_on(Ring::open(fresh::<ERASE>(), 0, 1, &mut scratch)),
             Err(RingError::TooFewBlocks(1))
         ));
         let mut small = [0u8; 8];
         assert!(matches!(
-            block_on(Ring::open(fresh(), 0, BLOCKS, &mut small)),
+            block_on(Ring::open(fresh::<ERASE>(), 0, BLOCKS, &mut small)),
             Err(RingError::ScratchTooSmall(8))
         ));
     }
