@@ -10,12 +10,17 @@ publish.workspace = true
 
 [features]
 # Links the image at the bottom of flash so a bench board boots it directly,
-# with no bootloader in front of it. Not additive, and deliberately so: it
-# changes where the image sits, which is exactly the kind of thing that must
-# be asked for out loud. The build prints a warning when it is on, and an
-# image built with it must never be flashed onto a unit that will take an
-# update.
-bench = ["dep:panic-probe"]
+# with no bootloader in front of it, and carries the one-shot proofs: a
+# starvation on a boot the watchdog did not cause, a panic on the boot that
+# follows. Not additive, and deliberately so: it changes where the image
+# sits, which is exactly the kind of thing that must be asked for out loud.
+# The build prints a warning when it is on, and an image built with it must
+# never be flashed onto a unit that will take an update.
+bench = []
+# Halts on a panic with the message on the probe instead of writing the last
+# words and resetting. For chasing a panic at the bench, and nothing else: a
+# bench run that proves the panic path runs without it.
+panic-probe = ["dep:panic-probe"]
 
 [dependencies]
 o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
