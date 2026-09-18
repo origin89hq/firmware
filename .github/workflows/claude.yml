@@ -1,0 +1,53 @@
+name: Claude Code
+
+# Invoke @claude in an issue or PR conversation, not an inline review reply.
+# Copilot review events require approval before the job's mention check runs.
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+  actions: read
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: claude-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Load shared engineering skills
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: origin89hq/engineering
+          ref: main
+          path: .origin89/engineering
+          sparse-checkout: skills
+          persist-credentials: false
+      - uses: anthropics/claude-code-action@19dda84776b3518d98b8798e591daee763049ed3 # v1.0.220
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          branch_prefix: ${{ github.actor }}/
+          additional_permissions: |
+            actions: read
+          settings: '{"attribution":{"commit":"","pr":""}}'
+          claude_args: |
+            --append-system-prompt "Read AGENTS.md, CLAUDE.md, and applicable local instructions.
+            Shared skills are already checked out in .origin89/engineering/skills; do not run just skills-sync in this job.
+            Read origin89-working/SKILL.md, origin89-commits/SKILL.md, origin89-writing/SKILL.md, and the relevant domain skill there. For reviews, also read origin89-review/SKILL.md.
+            Apply the triggering request's scope: answering or reviewing does not authorize code changes, commits, or pushes. An explicit fix request authorizes the necessary fix within that scope.
+            This job does not install the project's test toolchain. Use existing CI evidence for the actual PR head and state which checks you did not run; do not assume a queued run passed.
+            Keep comments concise, with one physical line per paragraph and no assistant attribution. Do not deploy, publish, or operate equipment."

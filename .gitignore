@@ -1,0 +1,16 @@
+target/
+*.bin
+*.elf
+*.map
+.DS_Store
+bench-logs/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# The shared skills cache and its links; `just skills-sync` writes them.
+/.origin89/engineering/
+/.agents/skills/origin89-*
+/.claude/skills/origin89-*
