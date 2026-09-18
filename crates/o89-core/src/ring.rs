@@ -411,10 +411,14 @@ impl<N: MultiwriteNorFlash> Ring<N> {
                 Probe::Erased | Probe::Closed => block = self.next_block(block),
             }
         }
+        // The distance in the ring, not modulo two to the thirty-two: a
+        // wrapping subtraction only comes out right when the block count
+        // is a power of two, and 232 blocks of 64 KB is not.
         let run = self
             .head
             .block
-            .wrapping_sub(block)
+            .saturating_add(self.blocks)
+            .saturating_sub(block)
             .checked_rem(self.blocks)
             .unwrap_or(0)
             .saturating_add(1);
@@ -733,13 +737,14 @@ impl<N: MultiwriteNorFlash> Ring<N> {
                 // header.
                 break;
             }
-            let from = if header.is_some() {
+            if header.is_some() {
                 // A magic with a header nobody can read.
                 scanned.failed_crc = scanned.failed_crc.saturating_add(1);
-                at.saturating_add(1)
-            } else {
-                at
-            };
+            }
+            // Always from the next byte: a magic in the last bytes of the
+            // block, too short to be a header, would otherwise be found at
+            // `at` again and again.
+            let from = at.saturating_add(1);
             let Some(next) = self.hunt(base, from, reach, scratch).await? else {
                 scanned.closed = true;
                 break;
@@ -942,11 +947,16 @@ mod tests {
     /// Boot: take the part into a ring. The part is worth a few kilobytes,
     /// so it moves rather than borrows; `close` hands it back.
     fn open<const E: usize>(part: &mut Part<E>) -> Ring<Part<E>> {
-        let taken = core::mem::replace(part, fresh());
-        let mut scratch = [0u8; SCRATCH];
         let blocks = u32::try_from(PART.checked_div(E).expect("a block size"))
             .expect("fits")
             .min(BLOCKS);
+        open_with(part, blocks)
+    }
+
+    /// Boot over `blocks` blocks of the part.
+    fn open_with<const E: usize>(part: &mut Part<E>, blocks: u32) -> Ring<Part<E>> {
+        let taken = core::mem::replace(part, fresh());
+        let mut scratch = [0u8; SCRATCH];
         block_on(Ring::open(taken, 0, blocks, &mut scratch)).expect("opens")
     }
 
@@ -1203,6 +1213,57 @@ mod tests {
         );
         let ring = open(&mut part);
         assert_eq!(ring.head().next_seq, 2);
+    }
+
+    #[test]
+    fn p_099_the_run_is_the_distance_in_the_ring_for_a_block_count_that_is_not_a_power_of_two() {
+        // Five blocks: a wrapping subtraction modulo two to the thirty-two
+        // is off by one for any count that does not divide it, and the walk
+        // then hands a client older records after newer ones.
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open_with(&mut part, 5);
+        let mut last = 0;
+        for i in 0..120u64 {
+            last = append(&mut ring, Some(1_790_000_000_000 + i));
+        }
+        let oldest = ring.head().oldest.expect("records");
+        assert!(oldest > 1);
+        let (seqs, count, next) = read(&mut ring, 1);
+        assert_eq!(seqs[0], oldest);
+        assert!(seqs[..count].windows(2).all(|w| w[1] == w[0] + 1));
+        assert_eq!(next, last + 1);
+        let mut scratch = [0u8; SCRATCH];
+        assert_eq!(
+            block_on(ring.floor(&mut scratch)),
+            Ok(Some(1_790_000_000_000 + 119))
+        );
+        // A reboot walks the same run.
+        close(&mut part, ring);
+        let mut rebooted = open_with(&mut part, 5);
+        let (seqs, count, _) = read(&mut rebooted, 1);
+        assert_eq!(seqs[0], oldest);
+        assert_eq!(seqs[count - 1], last);
+    }
+
+    #[test]
+    fn f_023_a_magic_in_the_last_bytes_of_a_block_does_not_trap_the_scan() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        let _ = append(&mut ring, None);
+        let tail = ring.head().at as usize;
+        close(&mut part, ring);
+        // Residue from the tail to the end of the block, ending in the two
+        // bytes of the magic with no room for a header behind them.
+        for byte in &mut part.bytes[tail..ERASE] {
+            *byte = 0x55;
+        }
+        part.bytes[ERASE - 2..ERASE].copy_from_slice(&MAGIC_BYTES);
+        let mut ring = open(&mut part);
+        assert_eq!(ring.head().block, 1);
+        assert_eq!(ring.damage().closed, 1);
+        let (seqs, count, _) = read(&mut ring, 1);
+        assert_eq!(&seqs[..count], &[1]);
+        assert_eq!(append(&mut ring, None), 2);
     }
 
     #[test]
