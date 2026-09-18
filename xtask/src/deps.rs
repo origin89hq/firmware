@@ -8,11 +8,17 @@
 //! seam is in the wrong place, and an allocator is how a bound stops being
 //! named.
 //!
-//! The allocator rule is read from the sources as text, with comments
-//! stripped, over `src/` and `tests/` alike, because the domain tests are held
-//! to it too — a test that allocates is a test that cannot disagree with the
-//! target about a bound. It is a marker list and not a parser, so it errs
-//! towards refusing: a name in a string literal counts.
+//! What makes an allocator reachable in a `no_std` crate is the `alloc` or
+//! `std` crate root, and nothing else: in the crate's own sources, or through
+//! a dependency resolved with an `alloc` or `std` feature that re-exports one.
+//! Type names cannot be the rule, because `heapless::Vec` and
+//! `heapless::String` are exactly what the house asks for. So the sources are
+//! read as identifier tokens with comments stripped — spacing, generics and a
+//! comment inside a path change nothing — over `src/` and `tests/` alike,
+//! because the domain tests are held to the rule too, and the resolved
+//! features of every reachable dependency are read from cargo. A `Vec` with
+//! neither root in reach does not compile, which is the compiler holding the
+//! other half.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -41,30 +47,15 @@ const HAL_PREFIXES: &[&str] = &[
     "riscv",
 ];
 
-/// What reaching for the allocator, or for `std`, looks like in a source
-/// that has neither.
-const ALLOC_MARKERS: &[&str] = &[
-    "extern crate alloc",
-    "alloc::",
-    "extern crate std",
-    "std::",
-    "Vec<",
-    "vec![",
-    "String",
-    "Box<",
-    "format!",
-    "to_owned(",
-    "to_string(",
-    "BTreeMap",
-    "BTreeSet",
-    "HashMap",
-    "HashSet",
-];
+/// The crate roots that bring an allocator with them.
+const ALLOC_ROOTS: &[&str] = &["alloc", "std"];
 
-/// The resolved graph as adjacency by package id, with each id's name.
+/// The resolved graph as adjacency by package id, with each id's name and
+/// the features it was resolved with.
 struct Graph {
     edges: BTreeMap<PackageId, Vec<PackageId>>,
     names: BTreeMap<PackageId, String>,
+    features: BTreeMap<PackageId, Vec<String>>,
 }
 
 impl Graph {
@@ -88,53 +79,128 @@ impl Graph {
                 )
             })
             .collect();
-        Ok(Self { edges, names })
+        let features = resolve
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    node.features.iter().map(ToString::to_string).collect(),
+                )
+            })
+            .collect();
+        Ok(Self {
+            edges,
+            names,
+            features,
+        })
     }
 
-    /// Every package name reachable from `from`.
+    /// Every package id reachable from `from`, in the order found.
     ///
-    /// Visited is kept by id and the result by name, separately: two ids can
-    /// share a name — two versions of `embassy-sync` on two paths — and a walk
-    /// that marked the name visited would skip the second one's subtree, and
-    /// with it whatever forbidden crate sat there.
-    fn reachable(&self, from: &PackageId) -> Result<BTreeSet<String>> {
-        let mut names = BTreeSet::new();
+    /// Visited is kept by id: two ids can share a name — two versions of
+    /// `embassy-sync` on two paths — and a walk that marked the name visited
+    /// would skip the second one's subtree, and with it whatever forbidden
+    /// crate sat there.
+    fn reachable_ids(&self, from: &PackageId) -> Vec<PackageId> {
         let mut visited = BTreeSet::from([from.clone()]);
+        let mut order = Vec::new();
         let mut queue = VecDeque::from([from.clone()]);
         while let Some(id) = queue.pop_front() {
             let Some(deps) = self.edges.get(&id) else {
                 continue;
             };
             for dep in deps {
-                let name = self
-                    .names
-                    .get(dep)
-                    .with_context(|| format!("dependency {dep} is not in the package list"))?;
-                names.insert(name.clone());
                 if visited.insert(dep.clone()) {
+                    order.push(dep.clone());
                     queue.push_back(dep.clone());
                 }
             }
         }
-        Ok(names)
+        order
+    }
+
+    /// Every package name reachable from `from`.
+    fn reachable(&self, from: &PackageId) -> Result<BTreeSet<String>> {
+        self.reachable_ids(from)
+            .iter()
+            .map(|id| {
+                self.names
+                    .get(id)
+                    .cloned()
+                    .with_context(|| format!("dependency {id} is not in the package list"))
+            })
+            .collect()
+    }
+
+    /// The first reachable dependency resolved with an `alloc` or `std`
+    /// feature, and the feature.
+    fn alloc_feature_reachable(&self, from: &PackageId) -> Option<(String, String)> {
+        self.reachable_ids(from).into_iter().find_map(|id| {
+            let feature = self
+                .features
+                .get(&id)?
+                .iter()
+                .find(|feature| ALLOC_ROOTS.contains(&feature.as_str()))?;
+            let name = self
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string());
+            Some((name, feature.clone()))
+        })
     }
 }
 
-/// The first allocation marker in a source, with comments stripped.
-fn allocation_in(source: &str) -> Option<&'static str> {
-    source
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| !line.starts_with("//"))
-        .find_map(|line| {
-            ALLOC_MARKERS
-                .iter()
-                .copied()
-                .find(|marker| line.contains(marker))
-        })
+/// The source with every comment removed, line and block alike, block
+/// comments nested as Rust nests them.
+fn without_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        if depth > 0 {
+            match (c, chars.peek()) {
+                ('*', Some('/')) => {
+                    chars.next();
+                    depth = depth.saturating_sub(1);
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    depth = depth.saturating_add(1);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('/', Some('*')) => {
+                chars.next();
+                depth = 1;
+                out.push(' ');
+            }
+            ('/', Some('/')) => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
-/// The first allocation marker under `dir`, and the file it sits in.
+/// The first identifier token in a source that is an allocator's crate root.
+fn alloc_root_in(source: &str) -> Option<&'static str> {
+    let text = without_comments(source);
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find_map(|token| ALLOC_ROOTS.iter().copied().find(|root| *root == token))
+}
+
+/// The first allocator root under `dir`, and the file it sits in.
 fn uses_alloc(dir: &Path) -> Result<Option<(String, &'static str)>> {
     if !dir.is_dir() {
         return Ok(None);
@@ -148,8 +214,8 @@ fn uses_alloc(dir: &Path) -> Result<Option<(String, &'static str)>> {
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
-                if let Some(marker) = allocation_in(&source) {
-                    return Ok(Some((path.display().to_string(), marker)));
+                if let Some(root) = alloc_root_in(&source) {
+                    return Ok(Some((path.display().to_string(), root)));
                 }
             }
         }
@@ -197,14 +263,19 @@ pub fn check(repo: &Repo) -> Result<()> {
         {
             bail!("{name} depends on {hal}: a domain crate names no peripheral");
         }
+        if let Some((dep, feature)) = graph.alloc_feature_reachable(&package.id) {
+            bail!(
+                "{name} reaches {dep} with its {feature:?} feature on: an allocator arriving through a dependency is still an allocator"
+            );
+        }
         let crate_dir = package
             .manifest_path
             .parent()
             .context("a manifest has a directory")?;
         for sub in ["src", "tests"] {
-            if let Some((file, marker)) = uses_alloc(crate_dir.join(sub).as_std_path())? {
+            if let Some((file, root)) = uses_alloc(crate_dir.join(sub).as_std_path())? {
                 bail!(
-                    "{name} reaches for the allocator ({marker:?} in {file}): every collection here has a named capacity, in the tests too"
+                    "{name} names the {root} crate in {file}: every collection here has a named capacity, in the tests too"
                 );
             }
         }
@@ -246,7 +317,15 @@ mod tests {
         .into_iter()
         .map(|(from, to)| (id(from), to.into_iter().map(id).collect()))
         .collect();
-        Graph { edges, names }
+        let features = [("sync-b", vec!["alloc"])]
+            .into_iter()
+            .map(|(repr, features)| (id(repr), features.into_iter().map(str::to_owned).collect()))
+            .collect();
+        Graph {
+            edges,
+            names,
+            features,
+        }
     }
 
     #[test]
@@ -270,13 +349,42 @@ mod tests {
     }
 
     #[test]
-    fn f_081_an_allocation_is_found_past_a_comment_that_names_one() {
-        let clean =
-            "//! there is no `Vec<u8>` here\n/// nor a String\nfn f() -> [u8; 4] { [0; 4] }\n";
-        assert_eq!(allocation_in(clean), None);
-        let vec = "fn f() -> Vec<u8> { Vec::new() }\n";
-        assert_eq!(allocation_in(vec), Some("Vec<"));
-        let test_std = "#[cfg(test)]\nmod t { extern crate std; }\n";
-        assert_eq!(allocation_in(test_std), Some("extern crate std"));
+    fn f_081_an_allocator_arriving_through_a_dependency_feature_is_found() {
+        let found = diamond().alloc_feature_reachable(&id("app"));
+        assert_eq!(found, Some(("sync".to_owned(), "alloc".to_owned())));
+        assert_eq!(diamond().alloc_feature_reachable(&id("sync-a")), None);
+    }
+
+    #[test]
+    fn f_081_a_crate_root_is_found_whatever_the_spacing_or_comments() {
+        assert_eq!(alloc_root_in("extern crate /* test */ std;"), Some("std"));
+        assert_eq!(
+            alloc_root_in("let v = std :: vec::Vec::<u8>::with_capacity(1);"),
+            Some("std")
+        );
+        assert_eq!(alloc_root_in("use alloc::boxed::Box;"), Some("alloc"));
+        assert_eq!(alloc_root_in("#[cfg(test)] extern crate std;"), Some("std"));
+    }
+
+    #[test]
+    fn a_comment_naming_a_crate_root_is_not_a_use_of_it() {
+        let commented =
+            "//! no `alloc` and no `std` here\n/* nor /* nested std */ here */\nfn f() {}\n";
+        assert_eq!(alloc_root_in(commented), None);
+        let stdio = "fn stdio() -> u8 { 0 }\nlet allocation = 1;\n";
+        assert_eq!(alloc_root_in(stdio), None);
+    }
+
+    #[test]
+    fn a_type_name_without_a_crate_root_is_the_compilers_to_refuse() {
+        // `Vec::with_capacity` with neither `alloc` nor `std` in reach does
+        // not compile in a `no_std` crate, and `heapless::Vec` is allowed;
+        // the scan looks for the root, not the name.
+        assert_eq!(alloc_root_in("let v = Vec::with_capacity(4);"), None);
+        assert_eq!(alloc_root_in("let b = Box::new(1);"), None);
+        assert_eq!(
+            alloc_root_in("let v: heapless::Vec<u8, 8> = heapless::Vec::new();"),
+            None
+        );
     }
 }
