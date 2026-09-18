@@ -117,7 +117,6 @@ pub struct Board {
     pub gen_kick: Peri<'static, p::PD1>,
     /// `FEEDBACK` from board B, CN9 pin 5; the internal pull-up, low is
     /// both relays closed (F-013).
-    #[expect(dead_code, reason = "taken in M8, authority")]
     pub gen_feedback: Peri<'static, p::PD2>,
 
     /// The status lamp, active high.
