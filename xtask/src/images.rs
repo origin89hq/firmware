@@ -9,12 +9,13 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use cargo_metadata::Artifact;
 
-use crate::repo::{CORTEX_M0, RISCV, Repo, llvm_tool, run};
+use crate::repo::{CORTEX_M0, RISCV, Repo, artifacts, llvm_tool, run};
 
 /// How the bytes that reach the part are produced from the ELF.
 #[derive(Clone, Copy)]
@@ -90,8 +91,13 @@ impl Measured {
 pub fn build_and_measure(repo: &Repo) -> Result<Vec<Measured>> {
     let mut out = Vec::with_capacity(IMAGES.len());
     for image in IMAGES {
-        let elf = build(repo, image)?;
-        let bytes = measure(image, &elf)?;
+        let built = build(repo, image)?;
+        let elf = built
+            .iter()
+            .filter(|artifact| artifact.target.name == image.package)
+            .find_map(|artifact| artifact.executable.as_deref())
+            .with_context(|| format!("{} built but reported no executable", image.package))?;
+        let bytes = measure(image, elf.as_std_path())?;
         out.push(Measured {
             package: image.package,
             bytes,
@@ -102,36 +108,32 @@ pub fn build_and_measure(repo: &Repo) -> Result<Vec<Measured>> {
     Ok(out)
 }
 
-fn build(repo: &Repo, image: &Image) -> Result<PathBuf> {
+/// Build every image in release and return what those builds compiled.
+pub fn compile(repo: &Repo) -> Result<Vec<Artifact>> {
+    let mut built = Vec::new();
+    for image in IMAGES {
+        built.extend(build(repo, image)?);
+    }
+    Ok(built)
+}
+
+fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
     let manifest = repo.firmware_manifest();
     let mut command = repo.cargo();
     command.args(["build", "--locked", "--release", "--manifest-path"]);
     command.arg(&manifest);
     command.args(["-p", image.package, "--target", image.target]);
-    run(
+    artifacts(
         &mut command,
         &format!(
             "cargo build --release -p {} --target {}",
             image.package, image.target
         ),
-    )?;
-    let elf = repo
-        .firmware_target_dir()
-        .join(image.target)
-        .join("release")
-        .join(image.package);
-    if !elf.is_file() {
-        bail!(
-            "{} built but produced no ELF at {}",
-            image.package,
-            elf.display()
-        );
-    }
-    Ok(elf)
+    )
 }
 
-fn measure(image: &Image, elf: &PathBuf) -> Result<u64> {
-    let bin = elf.with_extension("bin");
+fn measure(image: &Image, elf: &Path) -> Result<u64> {
+    let bin: PathBuf = elf.with_extension("bin");
     match image.kind {
         Kind::RawBinary => {
             let objcopy = llvm_tool("llvm-objcopy")?;

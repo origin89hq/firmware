@@ -1,0 +1,86 @@
+# Requirements nothing can test, and a count of the ones nobody has tested yet.
+#
+# `cargo xtask check` sorts every **F-nnn** in REQUIREMENTS.md into three
+# buckets: covered by a `#[test]` named after it that invokes an assertion,
+# or by a check of the gate nominated below; declared here with a kind and a reason
+# somebody argued for in review; or uncovered. Uncovered means nobody has
+# written the test. Untestable means no test can be written. Filling this
+# file with `deferred` entries to make the count go down turns the first word
+# into the second, which is the graveyard this file exists to not become.
+#
+# The KM43 rules this repository's tests cite are counted against the pinned
+# index in km43/requirements.tsv and reported, not ratcheted: which of them
+# are the controller's obligations rather than a client's or the crate's is
+# what origin89hq/km43#31 will carry.
+
+# The list somebody defends at each audit round: the F rules that have
+# neither a test nor a declaration below, by name. The check fails when a
+# rule is uncovered and not listed — a new rule nobody listed, or a test that
+# went missing — and fails when a listed rule has a test now, so the list only
+# shrinks. By name and not by count, because a count lets one rule lose its
+# test while another gains one and reads unchanged. A rule joins the list in
+# the commit that adds it, where the diff shows it.
+uncovered = [
+    "F-001",
+    "F-002",
+    "F-003",
+    "F-004",
+    "F-005",
+    "F-006",
+    "F-007",
+    "F-008",
+    "F-009",
+    "F-010",
+    "F-011",
+    "F-012",
+    "F-013",
+    "F-014",
+    "F-016",
+    "F-020",
+    "F-021",
+    "F-022",
+    "F-023",
+    "F-024",
+    "F-025",
+    "F-030",
+    "F-031",
+    "F-032",
+    "F-033",
+    "F-034",
+    "F-035",
+    "F-036",
+    "F-037",
+    "F-038",
+    "F-040",
+    "F-041",
+    "F-042",
+    "F-050",
+    "F-051",
+    "F-052",
+    "F-053",
+    "F-054",
+    "F-060",
+    "F-061",
+    "F-062",
+    "F-070",
+    "F-071",
+    "F-072",
+    "F-073",
+    "F-074",
+]
+
+# Kinds: `hardware` — a dated bench log stands in for the test; `spec-check`
+# — a named check in xtask is the test; `deferred` — an entry whose trigger
+# is the due date; `judgement` — a test proves the surfacing, nothing proves
+# the reading.
+
+[[untestable]]
+id = "F-015"
+kind = "hardware"
+reason = "Boot-to-first-kick is a number a logic analyser reads off CN9; the dated bench log in M1 stands in for the test, and the comment on origin89hq/hardware#18 is where it is posted."
+
+[[untestable]]
+id = "F-080"
+kind = "spec-check"
+check = "images"
+reason = "The image measurement is a check of the gate itself; it was watched refuse a controller whose budget was lowered under its size."
