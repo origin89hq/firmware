@@ -251,6 +251,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "o89-sim"
+version = "0.0.0"
+dependencies = [
+ "embassy-futures",
+ "o89-core",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

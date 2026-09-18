@@ -1,0 +1,16 @@
+[package]
+name = "o89-sim"
+version = "0.0.0"
+description = "The simulated site: the seams o89-core leaves, filled with faults on a laptop"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+o89-core = { path = "../o89-core" }
+embassy-futures.workspace = true
+
+[lints]
+workspace = true
