@@ -32,8 +32,8 @@ every row here is taken by the module or named by it as left alone (F-083).
 | PB8 / PB9 | CAN RX / TX | TJA1051T/3 | FDCAN1, AF3 | CN5 | `A` §5 item 2 |
 | PC0 | VE.Direct 1 RX | through R14 1 kΩ, connector pin 3 on revision A | LPUART1 | CN6 | hardware#27 |
 | PC1 | VE.Direct 2 RX | through R15 1 kΩ, connector pin 3 on revision A | LPUART2 | CN7 | hardware#27 |
-| PB13 / PB14 | FRAM SCL / SDA | FM24W256, 32 KB, 400 kHz | I2C2 | U9 | bench 2026-09-14 |
-| PA4, PA5, PA6, PA7 | NOR CS, SCK, MISO, MOSI | W25Q128JV, 16 MB, JEDEC `EF 40 18`; PA4 and PA5 are 3.3 V-only pins | SPI1 | U10 | bench 2026-09-14, `A` §5 item 3 |
+| PB13 / PB14 | FRAM SCL / SDA | FM24W256, 32 KB, 400 kHz, 7-bit address `0x50` (A0–A2 low); blocking transfers, see #39 | I2C2 | U9 | bench 2026-09-14, 2026-09-18 |
+| PA4, PA5, PA6, PA7 | NOR CS, SCK, MISO, MOSI | W25Q128JV, 16 MB, JEDEC `EF 40 18`; PA4 and PA5 are 3.3 V-only pins; 8 MHz, blocking transfers, see #39 | SPI1 | U10 | bench 2026-09-14, 2026-09-18, `A` §5 item 3 |
 | PC4 | `OW_DATA_F` | 1-Wire, bit-banged; R41 100 Ω, D9 at CN8, R16 4.7 kΩ pull-up | GPIO | CN8, CN11 | `A-26`, hardware#31 |
 | PB0 | `AIN_HOUSE` | bank voltage ÷11, about 36 V full scale | ADC1 | from `V12` | `A-29` |
 | PB1 | `AIN_START` | start battery ÷11 | ADC1 | CN12 | `A-29` |

@@ -24,6 +24,8 @@ panic-probe = ["dep:panic-probe"]
 
 [dependencies]
 o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
+embedded-storage-async.workspace = true
+km43.workspace = true
 
 embassy-executor = { workspace = true, features = [
     "platform-cortex-m",

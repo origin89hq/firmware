@@ -1468,6 +1468,8 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync 0.8.0",
  "embassy-time",
+ "embedded-storage-async",
+ "km43",
  "o89-core",
  "panic-probe",
  "portable-atomic",
