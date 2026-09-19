@@ -10,6 +10,9 @@ publish.workspace = true
 
 [dependencies]
 o89-core = { path = "../o89-core" }
+# The comms processor's own link, which the hostile peer runs for
+# everything it does honestly.
+o89-comms-core = { path = "../o89-comms-core" }
 embassy-futures.workspace = true
 embedded-storage-async.workspace = true
 km43.workspace = true

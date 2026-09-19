@@ -19,10 +19,11 @@
 - **Crash at every step.** Every persistence and command path runs on the
   host with a deterministic step counter behind the storage seam, crashing at
   step *k* for every *k*, asserting the recovery invariant after each.
-- **The hostile peer is a harness.** `HostileComms` with a named capability
-  set — drop, delay, reorder, replay, withhold, stamp, invent a connection,
-  drain slowly, offer a time, reboot — and every test declares the
-  capabilities it uses.
+- **The hostile peer is a harness.** `HostileComms` runs the comms
+  processor's own link from `o89-comms-core` for everything it does
+  honestly, with a named capability set on top — drop, delay, reorder,
+  replay, withhold, stamp, invent a connection, drain slowly, offer a time,
+  reboot — and every test declares the capabilities it uses.
 - Unit tests live beside the code in `#[cfg(test)]`; season-scale tests and
   fault injection live in `o89-sim`; captured bench exchanges are committed
   fixtures so a driver is a host test.
