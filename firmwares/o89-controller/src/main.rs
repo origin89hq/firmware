@@ -56,9 +56,9 @@ use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Ticker, Timer};
 use o89_core::{
-    Blame, BootId, BootRecord, Bus, Clock, Contact, FailState, Feedback, Identity, LastWords, Line,
-    LinkText, Millis, Pull as DeclaredPull, RailSequencer, ResetCause, Revision, RtcClock, SETTLE,
-    Store, Task,
+    Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, Contact, CutsOnPart, CutsRecord, FailState,
+    Feedback, Identity, LastWords, Line, LinkText, Millis, Pull as DeclaredPull, Rail,
+    RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -218,7 +218,10 @@ async fn main(spawner: Spawner) {
         b.i2c2, b.fram_scl, b.fram_sda, i2c_config,
     ));
     let mut boot_count = None;
-    let store = match Store::boot(&mut fram, words).await {
+    // With no store the ladder starts full, since a count the part lost is
+    // never zero.
+    let mut carried = CarriedCuts::FULL;
+    let mut store = match Store::boot(&mut fram, words).await {
         Ok((store, report)) => {
             defmt::info!("store: {}", report);
             if let Some(reason) = store.run.present() {
@@ -230,6 +233,7 @@ async fn main(spawner: Spawner) {
             // again next boot, which is the `boot_id` L-040 forbids; only
             // a written one names this boot (F-039).
             boot_count = report.boot_recorded.is_ok().then_some(report.boot);
+            carried = CutsRecord::carried(store.cuts.held(), report.boot);
             if boot_count.is_none() {
                 defmt::error!("store: the boot count was not written; no boot_id this boot");
             }
@@ -244,6 +248,37 @@ async fn main(spawner: Spawner) {
         }
     };
     last_words::clear();
+
+    // 6a. The ladder's cuts: carried from the part as made at this boot's
+    // start, this boot's own reset counted where it cut the rail, and kept
+    // before anything else can fail, so a boot that never gets further
+    // still counts toward the third rung (F-017, F-018); every boot since
+    // the record was written, whose own record never landed, counts too.
+    // With no store there is nowhere to keep them.
+    sequencer.carry(carried, Uptime.now());
+    let cuts = sequencer.recent_cuts(Uptime.now());
+    let on_part = match store.as_mut() {
+        Some(store) => {
+            let mut on_part = CutsOnPart::read(carried.cuts);
+            let record = CutsRecord {
+                boot: store.boots.present().copied(),
+                cuts,
+            };
+            match store.cuts.write(&mut fram, record).await {
+                Ok(()) => on_part.landed(cuts),
+                Err(error) => {
+                    defmt::error!("rail: this boot's cuts not kept: {}", error);
+                    on_part.unknown(Uptime.now());
+                }
+            }
+            Some(on_part)
+        }
+        None => None,
+    };
+    defmt::info!(
+        "rail: {} cuts in the last hour, carried and this boot's",
+        cuts.count()
+    );
     // What this side says about itself on the link (F-039). No boot count
     // is no `boot_id`: a hash over the unique id alone would come back the
     // same after the reboot L-040 exists to make visible, so a part whose
@@ -291,7 +326,8 @@ async fn main(spawner: Spawner) {
     }
 
     // 9. The module rail sequence, powered since 5a: the task releases EN
-    // once the rail has settled, which it already has.
+    // once the rail has settled, which it already has, and runs the ladder
+    // from the cuts carried and kept at 6a.
     if identity.is_none() {
         defmt::error!(
             "link: no boot count, so no boot_id (F-039); the module is powered and the link stays down"
@@ -300,7 +336,7 @@ async fn main(spawner: Spawner) {
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
-    if let Ok(token) = rail::run(rail, sequencer) {
+    if let Ok(token) = rail::run(rail, Rail::new(sequencer, on_part)) {
         spawner.spawn(token);
     } else {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");

@@ -14,7 +14,13 @@
 //! The ladder's recoveries come from the link task, which drops its UART
 //! before asking so the lines into the module are inputs before the rail
 //! goes (F-003); what the sequencer answered, and every settling of the
-//! rail, go back to it as words on a bounded channel.
+//! rail, go back to it as words on a bounded channel. The ladder's cuts of
+//! the last hour go to the FRAM through the recorder whenever they change,
+//! before the lines move, so a cut is kept before the rail goes off and a
+//! controller reset does not lower the count (F-017). The task never waits
+//! on the recorder: what a turn does, and in what order, is `o89_core`'s
+//! [`Rail`], and this task only carries its request, its answer and its
+//! words.
 
 use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -22,11 +28,12 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine, RailSequencer,
-    Recovery, StrapRoute, Task,
+    BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, Rail, RailEvent, RailLine,
+    RailRequest, Recovery, StrapRoute, Task,
 };
 
 use crate::REVISION;
+use crate::recorder;
 use crate::supervisor::{Uptime, check_in};
 
 /// What the rail tells the link.
@@ -38,17 +45,6 @@ pub enum RailWord {
     Recovered(Recovery),
     /// What a module reset did.
     Reset(ModuleReset),
-}
-
-/// What the link asks of the rail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub enum RailRequest {
-    /// Recover, by whatever rung the sequencer is at.
-    Recover,
-    /// Reset the module with the rail on: `EN` held and released, which is
-    /// the boot the download window opens in, or with the strap held for
-    /// the ROM's own download mode (F-038).
-    ResetModule(ModuleBoot),
 }
 
 /// The link's request. One at a time: a second before the first is served
@@ -143,52 +139,36 @@ impl Pins {
 }
 
 /// The rail task: the sequencer's lines from here on. The boot power-on
-/// was applied by `main` before this task was spawned.
+/// was applied by `main` before this task was spawned, and the ladder's
+/// cuts carried and kept. A boot with no store has no link either (F-039),
+/// so nothing asks it for a cut; were one asked, the recorder would refuse
+/// its count and the cut would be deferred, because a count held only here
+/// is one a later boot that reads the part does not carry (F-017).
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
+pub async fn run(mut pins: Pins, mut rail: Rail) {
     let mut ticker = Ticker::every(PERIOD);
+    let mut keeper = recorder::CutsKeeper::new();
     loop {
         ticker.next().await;
         let now = Uptime.now();
-        match REQUEST.try_take() {
-            Some(RailRequest::Recover) => {
-                let recovery = sequencer.recover(now);
-                match recovery {
-                    Recovery::Cycling { count, off_for } => defmt::warn!(
-                        "rail: cutting for {} ms, cycle {} in the last hour",
-                        off_for.as_millis(),
-                        count
-                    ),
-                    Recovery::LeftOnAndRaised => {
-                        defmt::error!("rail: the third rung; left on, comms unrecoverable");
-                    }
-                    Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
-                }
-                say(RailWord::Recovered(recovery));
+        let answer = keeper.poll();
+        if let Some((keep, kept)) = answer {
+            match kept {
+                Ok(()) => defmt::info!("rail: {} cuts in the last hour kept", keep.cuts().count()),
+                Err(why) => defmt::error!("rail: the ladder's cuts not kept: {}", why),
             }
-            Some(RailRequest::ResetModule(boot)) => {
-                let reset = sequencer.reset_module(now, boot);
-                match (reset, boot) {
-                    (ModuleReset::Holding, ModuleBoot::Normal) => {
-                        defmt::info!("rail: resetting the module, EN held");
-                    }
-                    (ModuleReset::Holding, ModuleBoot::Download) => match REVISION.strap_route() {
-                        StrapRoute::NeedsIo8Wire => defmt::warn!(
-                            "rail: resetting the module with IO9 low; this revision needs IO8 held high by a wire"
-                        ),
-                        StrapRoute::Wired => {
-                            defmt::info!("rail: resetting the module with IO9 low, EN held");
-                        }
-                    },
-                    (ModuleReset::NotPowered, ModuleBoot::Normal | ModuleBoot::Download) => {
-                        defmt::warn!("rail: no module to reset");
-                    }
-                }
-                say(RailWord::Reset(reset));
-            }
-            None => {}
         }
-        if let Some(event) = sequencer.tick(now) {
+        let request = REQUEST.try_take();
+        let turn = rail.turn(now, request, answer);
+        if let Some(recovery) = turn.recovered {
+            answer_recovery(recovery);
+        }
+        // A reset is only ever the answer to a request for one.
+        if let (Some(reset), Some(RailRequest::ResetModule(boot))) = (turn.reset, request) {
+            log_reset(reset, boot);
+            say(RailWord::Reset(reset));
+        }
+        if let Some(event) = turn.event {
             match event {
                 RailEvent::Settled => {
                     defmt::info!("rail: settled, EN released");
@@ -202,7 +182,51 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
                 }
             }
         }
-        pins.apply(sequencer.lines());
+        if let Some(keep) = turn.keep {
+            keeper.hand(keep);
+        }
+        pins.apply(rail.lines());
         check_in(Task::Rail);
     }
+}
+
+/// Log what a module reset into `boot` did.
+fn log_reset(reset: ModuleReset, boot: ModuleBoot) {
+    match (reset, boot) {
+        (ModuleReset::Holding, ModuleBoot::Normal) => {
+            defmt::info!("rail: resetting the module, EN held");
+        }
+        (ModuleReset::Holding, ModuleBoot::Download) => match REVISION.strap_route() {
+            StrapRoute::NeedsIo8Wire => defmt::warn!(
+                "rail: resetting the module with IO9 low; this revision needs IO8 held high by a wire"
+            ),
+            StrapRoute::Wired => {
+                defmt::info!("rail: resetting the module with IO9 low, EN held");
+            }
+        },
+        (ModuleReset::NotPowered, ModuleBoot::Normal | ModuleBoot::Download) => {
+            defmt::warn!("rail: no module to reset");
+        }
+    }
+}
+
+/// Tell the link what its recovery request did.
+fn answer_recovery(recovery: Recovery) {
+    match recovery {
+        Recovery::Cycling { count, off_for } => defmt::warn!(
+            "rail: cutting for {} ms, cycle {} in the last hour",
+            off_for.as_millis(),
+            count
+        ),
+        Recovery::LeftOnAndRaised => {
+            defmt::error!("rail: the third rung; left on, comms unrecoverable");
+        }
+        Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
+        Recovery::Deferred => {
+            defmt::warn!(
+                "rail: the cut deferred, its count not kept or the module reset; the ladder asks again"
+            );
+        }
+    }
+    say(RailWord::Recovered(recovery));
 }

@@ -506,6 +506,11 @@ impl Link {
                 }
             }
             Recovery::Busy => {}
+            Recovery::Deferred => {
+                // Nothing moved and nothing will settle: the ladder is
+                // back, and asks again once the cut is due again.
+                self.cut_pending = false;
+            }
         }
         actions
     }

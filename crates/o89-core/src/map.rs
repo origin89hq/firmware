@@ -15,6 +15,7 @@ use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Address, FRAM_BYTES, Record};
 use crate::network::NETWORK_BYTES;
 use crate::panic_record::PANIC_RECORD_BYTES;
+use crate::rail::CUTS_RECORD_BYTES;
 use crate::release::COMMS_RELEASE_BYTES;
 use crate::run_reason::RUN_REASON_BYTES;
 use crate::secret::SECRET_BYTES;
@@ -62,8 +63,14 @@ pub const NETWORK: Record<NETWORK_BYTES> = Record::at(magic(*b"NETW"), COMMS_REL
 /// P-121).
 pub const CLIENT_TABLE: Record<CLIENT_TABLE_BYTES> = Record::at(magic(*b"CLNT"), NETWORK.end());
 
+/// The recovery ladder's cuts of the last hour, kept before the rail goes
+/// off so a controller reset does not lower the count L-112 is judged on
+/// (F-017). Before the configuration sections, which nothing has written
+/// yet, so that adding it moved nothing a part holds.
+pub const RECENT_CUTS: Record<CUTS_RECORD_BYTES> = Record::at(magic(*b"LADR"), CLIENT_TABLE.end());
+
 /// The site configuration section (P-102).
-pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), CLIENT_TABLE.end());
+pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), RECENT_CUTS.end());
 
 /// The generator behaviour's section.
 pub const GENERATOR_CONFIG: Record<1024> = Record::at(magic(*b"GENR"), SITE_CONFIG.end());
@@ -110,8 +117,12 @@ mod tests {
         assert_eq!(EPOCH.end(), Address(32));
         assert_eq!(CHALLENGE_COUNTER.end(), Address(72));
         assert_eq!(
+            usize::from(RECENT_CUTS.end().0),
+            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(CUTS_RECORD_BYTES)
+        );
+        assert_eq!(
             usize::from(SITE_CONFIG.end().0),
-            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(2048)
+            usize::from(RECENT_CUTS.end().0) + 2 * slot_bytes(2048)
         );
     }
 
@@ -133,6 +144,7 @@ mod tests {
             magic(*b"FRST"),
             magic(*b"SCHD"),
             magic(*b"SHED"),
+            magic(*b"LADR"),
         ];
         for (i, a) in magics.iter().enumerate() {
             // Never zero: zero is a slot's magic while a record lands over

@@ -17,9 +17,17 @@
 //! Nothing here touches a pin. The adapter applies [`Lines`] and reports
 //! [`RailEvent`]s.
 //!
+//! The cuts of the last hour outlive a controller reset: the adapter keeps
+//! [`RecentCuts`] on the FRAM before the rail goes off, and a boot carries
+//! them as made at its own start, the P-121 rule for every window measured
+//! on the tick. On revision A the reset that began the boot is one of them,
+//! and so is the reset that began every boot since the record was written,
+//! which the boot count tells (F-017, F-018).
+//!
 //! cites: F-004, F-005
 
-use crate::{Millis, RailThroughReset, Revision, ThirdRung, Tick};
+use crate::body::{Body, Held, Malformed};
+use crate::{BootCount, Millis, RailThroughReset, Revision, ThirdRung, Tick};
 
 /// What the rail line is asked to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +122,63 @@ pub enum Recovery {
     LeftOnAndRaised,
     /// A cut is already in progress; nothing changed.
     Busy,
+    /// The cut was due and not made, and nothing moved: the count it would
+    /// have added could not be kept on the FRAM first (F-017), which the
+    /// adapter reports, or the module was reset while it went out, which
+    /// [`PlannedCut::make`] does. The ladder asks again.
+    Deferred,
+}
+
+/// What a recovery request plans, before anything moves (F-017).
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a plan nobody answers is a ladder waiting on a word that never comes"]
+pub enum Plan {
+    /// The third rung on a board that does not execute it: nothing moves,
+    /// and comms unrecoverable is to be raised.
+    LeftOnAndRaised,
+    /// A cut is already in progress; nothing changes.
+    Busy,
+    /// A cut, made once the count it adds is kept.
+    Cut(PlannedCut),
+}
+
+/// A cut planned and not made (F-017): the sequencer as it was asked, the
+/// instant of the cut and the rung's off time. [`cuts`](Self::cuts) is the
+/// count to keep on the FRAM first, and [`make`](Self::make) the only way
+/// to the cut, which the adapter calls once that count has landed; a plan
+/// dropped instead moves nothing. Not `Copy`, so a plan is made once.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a planned cut is made or deferred, and the link waits to hear which"]
+pub struct PlannedCut {
+    asked: RailSequencer,
+    at: Tick,
+    off_for: Millis,
+}
+
+impl PlannedCut {
+    /// The cuts of the last hour with this one, to keep before it is made:
+    /// the cuts the sequencer holds once [`make`](Self::make) has made it.
+    #[must_use]
+    pub fn cuts(&self) -> RecentCuts {
+        let mut cut = self.asked;
+        let _counted = cut.cut(self.at, self.off_for);
+        cut.recent_cuts(self.at)
+    }
+
+    /// Make the cut, its count kept: the lines move at `at`, the whole off
+    /// time runs from there (L-111), and the cut counts for the hour from
+    /// there (L-112). The count kept named the request's instant, a moment
+    /// earlier, and the adapter's next write corrects it. A sequencer that
+    /// moved since the plan, a module reset served while the count went
+    /// out, is left as it is and the cut is [`Recovery::Deferred`]: it was
+    /// planned for a module that is no longer as it was.
+    pub fn make(self, sequencer: &mut RailSequencer, at: Tick) -> Recovery {
+        if *sequencer != self.asked {
+            return Recovery::Deferred;
+        }
+        let (count, off_for) = sequencer.cut(at, self.off_for);
+        Recovery::Cycling { count, off_for }
+    }
 }
 
 /// The cut a recovery cycle makes (L-111).
@@ -153,8 +218,9 @@ pub const STRAP_HELD: Millis = Millis::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Rail off, `EN` held low, until the moment the rail comes back.
-    Cut { until: Tick },
+    /// Rail off, `EN` held low, until the moment the rail comes back,
+    /// `off_for` after the lines moved.
+    Cut { until: Tick, off_for: Millis },
     /// Rail on, `EN` held low, until the rail has settled; the strap held
     /// with it when the boot is for download.
     Rising { until: Tick, strap: bool },
@@ -165,6 +231,235 @@ enum Phase {
     Up,
     /// Rail off and nothing scheduled: the state before the first power-on.
     Off,
+}
+
+/// The bytes [`RecentCuts`] takes in its record: a count, then an instant
+/// for each cut the ladder remembers.
+pub const RECENT_CUTS_BYTES: usize = 1 + 8 * CYCLES_BEFORE_THE_THIRD_RUNG;
+
+/// The ladder's cuts of the last hour, oldest first, as the FRAM keeps them
+/// across a controller reset (F-017).
+///
+/// The instants are on the tick of the boot that wrote them, which a reset
+/// restarts; so a boot carries every one of them as made at its own start
+/// ([`RecentCuts::rebased`]). That counts a cut as recent for up to an hour
+/// longer than it was, and never for less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RecentCuts([Option<Tick>; CYCLES_BEFORE_THE_THIRD_RUNG]);
+
+impl RecentCuts {
+    /// No cut in the last hour.
+    pub const NONE: Self = Self([None; CYCLES_BEFORE_THE_THIRD_RUNG]);
+
+    /// As many cuts as the third rung needs, all at the boot's start: what a
+    /// record that does not read counts as (F-017).
+    pub const FULL: Self = Self([Some(Tick::ZERO); CYCLES_BEFORE_THE_THIRD_RUNG]);
+
+    /// Every cut moved to this boot's start (P-121): the previous boot's
+    /// tick means nothing on this one, and the start is the latest the cut
+    /// can have been.
+    #[must_use]
+    pub fn rebased(self) -> Self {
+        Self(self.0.map(|cut| cut.map(|_| Tick::ZERO)))
+    }
+
+    /// How many cuts.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.0.iter().flatten().count()
+    }
+
+    /// The cuts of `cycles` at most an hour before `now`, oldest first.
+    fn within_the_hour(cycles: &[Option<Tick>; CYCLES_BEFORE_THE_THIRD_RUNG], now: Tick) -> Self {
+        let mut cuts = Self::NONE;
+        let mut recent = cycles
+            .iter()
+            .flatten()
+            .filter(|at| now.since(**at).is_some_and(|ago| ago <= HOUR));
+        for slot in &mut cuts.0 {
+            *slot = recent.next().copied();
+        }
+        cuts.0
+            .sort_unstable_by_key(|cut| cut.map_or(u64::MAX, Tick::as_millis));
+        cuts
+    }
+}
+
+#[cfg(test)]
+impl RecentCuts {
+    /// One cut, at `at`.
+    pub(crate) const fn one_at(at: Tick) -> Self {
+        Self([Some(at), None, None])
+    }
+}
+
+impl Body<RECENT_CUTS_BYTES> for RecentCuts {
+    fn encode(&self) -> [u8; RECENT_CUTS_BYTES] {
+        let mut bytes = [0u8; RECENT_CUTS_BYTES];
+        let cuts = self.0.iter().flatten();
+        let count = u8::try_from(self.count()).unwrap_or(u8::MAX);
+        if let Some(first) = bytes.first_mut() {
+            *first = count;
+        }
+        let (instants, _) = bytes.get_mut(1..).unwrap_or(&mut []).as_chunks_mut::<8>();
+        for (cut, instant) in cuts.zip(instants) {
+            *instant = cut.as_millis().to_le_bytes();
+        }
+        bytes
+    }
+
+    /// A count past what the ladder remembers does not decode.
+    fn decode(bytes: &[u8; RECENT_CUTS_BYTES]) -> Result<Self, Malformed> {
+        let count = usize::from(*bytes.first().ok_or(Malformed { at: 0 })?);
+        if count > CYCLES_BEFORE_THE_THIRD_RUNG {
+            return Err(Malformed { at: 0 });
+        }
+        let mut cuts = Self::NONE;
+        let (instants, _) = bytes.get(1..).unwrap_or(&[]).as_chunks::<8>();
+        for (slot, instant) in cuts.0.iter_mut().zip(instants).take(count) {
+            *slot = Some(Tick::from_millis(u64::from_le_bytes(*instant)));
+        }
+        Ok(cuts)
+    }
+}
+
+/// The bytes a [`CutsRecord`] takes: the boot count, then the cuts.
+pub const CUTS_RECORD_BYTES: usize = 4 + RECENT_CUTS_BYTES;
+
+/// The ladder's record on the FRAM (F-017, F-018): the cuts of the last
+/// hour, and the boot count the part held when they were written. Every
+/// boot counted after that one began with a reset, and none of their own
+/// records landed; the boot that reads the record counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CutsRecord {
+    /// The boot count on the part when the record was written: the
+    /// writer's own once it has landed, the one before otherwise, and none
+    /// on a part that never held one.
+    pub boot: Option<BootCount>,
+    /// The cuts of the last hour, on the writer's tick.
+    pub cuts: RecentCuts,
+}
+
+impl CutsRecord {
+    /// What the boot numbered `boot` carries of the record as it read: its
+    /// cuts as made at this boot's start, and the boots between its writer
+    /// and this one. None for a record never written, which no boot before
+    /// this one kept; the full ladder for one that is there and does not
+    /// read, or that names this boot or a later one, because a count the
+    /// part lost is never taken as zero.
+    #[must_use]
+    pub fn carried(held: &Held<Self>, boot: BootCount) -> CarriedCuts {
+        let (cuts, kept_at) = match held {
+            Held::Present(record) => (record.cuts.rebased(), record.boot.map_or(0, BootCount::get)),
+            Held::Absent => (RecentCuts::NONE, 0),
+            Held::Corrupt | Held::Malformed(_) => return CarriedCuts::FULL,
+        };
+        match boot
+            .get()
+            .checked_sub(kept_at)
+            .and_then(|after| after.checked_sub(1))
+        {
+            Some(missed) => CarriedCuts { cuts, missed },
+            None => CarriedCuts::FULL,
+        }
+    }
+}
+
+impl Body<CUTS_RECORD_BYTES> for CutsRecord {
+    fn encode(&self) -> [u8; CUTS_RECORD_BYTES] {
+        let mut bytes = [0u8; CUTS_RECORD_BYTES];
+        let (boot, cuts) = bytes.split_at_mut(4);
+        boot.copy_from_slice(&self.boot.map_or(0, BootCount::get).to_le_bytes());
+        cuts.copy_from_slice(&self.cuts.encode());
+        bytes
+    }
+
+    /// A boot count of zero is none; the cuts decode as [`RecentCuts`] do.
+    fn decode(bytes: &[u8; CUTS_RECORD_BYTES]) -> Result<Self, Malformed> {
+        let (boot, cuts) = bytes.split_first_chunk::<4>().ok_or(Malformed { at: 0 })?;
+        let boot = match u32::from_le_bytes(*boot) {
+            0 => None,
+            _ => Some(BootCount::decode(boot)?),
+        };
+        let cuts = cuts
+            .first_chunk::<RECENT_CUTS_BYTES>()
+            .ok_or(Malformed { at: 4 })?;
+        let cuts = RecentCuts::decode(cuts).map_err(|malformed| Malformed {
+            at: malformed.at.saturating_add(4),
+        })?;
+        Ok(Self { boot, cuts })
+    }
+}
+
+/// What a boot carries of the ladder (F-017, F-018): the cuts the part
+/// kept, as made at this boot's start, and how many boots since the one
+/// that kept them began with a reset whose own record never landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CarriedCuts {
+    /// The cuts the part kept, at this boot's tick zero.
+    pub cuts: RecentCuts,
+    /// The boots between the one that kept them and this one.
+    pub missed: u32,
+}
+
+impl CarriedCuts {
+    /// The full ladder: what a record that does not read, or a boot with
+    /// no store, carries.
+    pub const FULL: Self = Self {
+        cuts: RecentCuts::FULL,
+        missed: 0,
+    };
+}
+
+/// How long after a write of the cuts that did not land the next is tried.
+pub const KEEP_RETRY: Millis = Millis::from_millis(1_000);
+
+/// What the FRAM holds of the ladder's cuts, as far as this boot knows,
+/// and so when to write them again (F-017).
+///
+/// A write that failed, or was abandoned late, leaves the part's content
+/// unknown: a late write may still land, a count for a cut that was never
+/// made. So after one the cuts go out again whatever they are, a retry
+/// later, and whatever landed late is overwritten by the count this boot
+/// holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutsOnPart {
+    held: Option<RecentCuts>,
+    retry_at: Option<Tick>,
+}
+
+impl CutsOnPart {
+    /// The part as the boot read it, carried to this boot.
+    #[must_use]
+    pub const fn read(held: RecentCuts) -> Self {
+        Self {
+            held: Some(held),
+            retry_at: None,
+        }
+    }
+
+    /// Whether `cuts` should be written at `now`: they are not what the
+    /// part is known to hold, and no retry is still waiting.
+    #[must_use]
+    pub fn due(&self, cuts: RecentCuts, now: Tick) -> bool {
+        self.held != Some(cuts) && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// The write of `cuts` landed.
+    pub fn landed(&mut self, cuts: RecentCuts) {
+        self.held = Some(cuts);
+        self.retry_at = None;
+    }
+
+    /// The write at `now` failed or was abandoned: what the part holds is
+    /// not known, and the cuts go out again [`KEEP_RETRY`] later.
+    pub fn unknown(&mut self, now: Tick) {
+        self.held = None;
+        self.retry_at = Some(now.after(KEEP_RETRY).unwrap_or(now));
+    }
 }
 
 /// The sequence, for one board revision.
@@ -192,6 +487,38 @@ impl RailSequencer {
         }
     }
 
+    /// Start from the cuts a previous boot kept, carried as made at this
+    /// boot's start (F-017). On a board whose rail is off through a reset,
+    /// the reset that began this boot cut the rail too, and so did the one
+    /// that began every boot the record missed; each is a cut at `now`
+    /// (F-018).
+    pub fn carry(&mut self, carried: CarriedCuts, now: Tick) {
+        self.cycles = carried.cuts.0;
+        match self.revision.rail_through_reset() {
+            RailThroughReset::Off => {
+                // Bounded by the ladder's slots: past them, every slot
+                // already holds a cut at `now`.
+                let missed = usize::try_from(carried.missed)
+                    .unwrap_or(usize::MAX)
+                    .min(CYCLES_BEFORE_THE_THIRD_RUNG);
+                for _ in 0..=missed {
+                    self.remember_cut(now);
+                }
+            }
+            RailThroughReset::On => {}
+        }
+    }
+
+    /// The cuts of the last hour as of `now`, for the FRAM (F-017): the
+    /// adapter keeps them whenever they differ from what the part holds,
+    /// before the lines move, so a cut is on the part before the rail goes
+    /// off and one that has aged out is off it before the next boot could
+    /// carry it again.
+    #[must_use]
+    pub fn recent_cuts(&self, now: Tick) -> RecentCuts {
+        RecentCuts::within_the_hour(&self.cycles, now)
+    }
+
     /// Power the module at boot: the rail on with `EN` held low, released
     /// once the rail has settled. On a board whose rail is already on, the
     /// module is booting by itself and this takes ownership without a cut.
@@ -205,19 +532,26 @@ impl RailSequencer {
         self.lines()
     }
 
-    /// The ladder asks for a recovery: a cut, or the third rung.
-    pub fn recover(&mut self, now: Tick) -> Recovery {
+    /// The ladder asks for a recovery at `now`: a cut, or the third rung.
+    /// Nothing moves here; a cut is made by [`PlannedCut::make`] once the
+    /// count it adds is on the FRAM (F-017).
+    pub fn plan_recovery(&self, now: Tick) -> Plan {
         if let Phase::Cut { .. } | Phase::Rising { .. } | Phase::Strapping { .. } = self.phase {
-            return Recovery::Busy;
+            return Plan::Busy;
         }
-        let recent = self.cycles_within(HOUR, now);
-        if recent >= CYCLES_BEFORE_THE_THIRD_RUNG {
-            return match self.revision.third_rung() {
-                ThirdRung::LeaveOnAndRaise => Recovery::LeftOnAndRaised,
-                ThirdRung::Cut(off_for) => self.cut(now, off_for),
-            };
-        }
-        self.cut(now, CUT)
+        let off_for = if self.cycles_within(HOUR, now) >= CYCLES_BEFORE_THE_THIRD_RUNG {
+            match self.revision.third_rung() {
+                ThirdRung::LeaveOnAndRaise => return Plan::LeftOnAndRaised,
+                ThirdRung::Cut(off_for) => off_for,
+            }
+        } else {
+            CUT
+        };
+        Plan::Cut(PlannedCut {
+            asked: *self,
+            at: now,
+            off_for,
+        })
     }
 
     /// Reset the module with the rail on: `EN` held low for [`EN_HELD`],
@@ -252,7 +586,7 @@ impl RailSequencer {
     /// is released once the rail has settled.
     pub fn tick(&mut self, now: Tick) -> Option<RailEvent> {
         match self.phase {
-            Phase::Cut { until } if now >= until => {
+            Phase::Cut { until, .. } if now >= until => {
                 self.phase = Phase::Rising {
                     until: now.after(SETTLE).unwrap_or(now),
                     strap: false,
@@ -336,28 +670,32 @@ impl RailSequencer {
         matches!(self.phase, Phase::Up | Phase::Strapping { .. })
     }
 
-    fn cut(&mut self, now: Tick, off_for: Millis) -> Recovery {
+    /// The cut at `now`, and the count of the last hour with it.
+    fn cut(&mut self, now: Tick, off_for: Millis) -> (u8, Millis) {
         // The cap is the board's, whatever the rung asked for.
         let off_for = if off_for > self.revision.longest_rail_off() {
             self.revision.longest_rail_off()
         } else {
             off_for
         };
-        // The oldest slot is overwritten, an empty one first of all.
+        self.remember_cut(now);
+        self.phase = Phase::Cut {
+            until: now.after(off_for).unwrap_or(now),
+            off_for,
+        };
+        let count = self.cycles_within(HOUR, now);
+        (u8::try_from(count).unwrap_or(u8::MAX), off_for)
+    }
+
+    /// A cut at `now`: an empty slot first of all, then the oldest cut. An
+    /// empty slot sorts before any cut, one carried at tick zero included.
+    fn remember_cut(&mut self, now: Tick) {
         if let Some(slot) = self
             .cycles
             .iter_mut()
-            .min_by_key(|slot| slot.map_or(0, Tick::as_millis))
+            .min_by_key(|slot| slot.map(Tick::as_millis))
         {
             *slot = Some(now);
-        }
-        self.phase = Phase::Cut {
-            until: now.after(off_for).unwrap_or(now),
-        };
-        let count = self.cycles_within(HOUR, now);
-        Recovery::Cycling {
-            count: u8::try_from(count).unwrap_or(u8::MAX),
-            off_for,
         }
     }
 
@@ -373,6 +711,15 @@ impl RailSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery whose count lands at once: planned and made at `now`.
+    fn recover(seq: &mut RailSequencer, now: Tick) -> Recovery {
+        match seq.plan_recovery(now) {
+            Plan::Cut(cut) => cut.make(seq, now),
+            Plan::LeftOnAndRaised => Recovery::LeftOnAndRaised,
+            Plan::Busy => Recovery::Busy,
+        }
+    }
 
     fn at(millis: u64) -> Tick {
         Tick::from_millis(millis)
@@ -405,7 +752,7 @@ mod tests {
         assert!(seq.settled());
         // The cut: EN low in the same step the rail goes off.
         assert_eq!(
-            seq.recover(at(1_000)),
+            recover(&mut seq, at(1_000)),
             Recovery::Cycling {
                 count: 1,
                 off_for: CUT
@@ -472,7 +819,10 @@ mod tests {
         let mut seq = RailSequencer::new(Revision::A);
         seq.power_on(at(0));
         run(&mut seq, 0, 200);
-        assert!(matches!(seq.recover(at(10_000)), Recovery::Cycling { .. }));
+        assert!(matches!(
+            recover(&mut seq, at(10_000)),
+            Recovery::Cycling { .. }
+        ));
         let events = run(&mut seq, 10_000, 16_000);
         assert_eq!(
             events,
@@ -495,7 +845,7 @@ mod tests {
         let mut now = 60_000;
         for expected in 1..=2 {
             assert_eq!(
-                seq.recover(at(now)),
+                recover(&mut seq, at(now)),
                 Recovery::Cycling {
                     count: expected,
                     off_for: CUT
@@ -506,7 +856,7 @@ mod tests {
         }
         // The third inside the hour.
         assert_eq!(
-            seq.recover(at(now)),
+            recover(&mut seq, at(now)),
             Recovery::Cycling {
                 count: 3,
                 off_for: CUT
@@ -516,14 +866,14 @@ mod tests {
         now += 60_000;
         // A fourth request inside the hour is the third rung: nothing moves.
         let before = seq.lines();
-        assert_eq!(seq.recover(at(now)), Recovery::LeftOnAndRaised);
+        assert_eq!(recover(&mut seq, at(now)), Recovery::LeftOnAndRaised);
         assert_eq!(seq.lines(), before);
         assert_eq!(seq.lines().rail, RailLine::On);
         assert_eq!(run(&mut seq, now, now + 1_000), NONE);
         // An hour after the first cycle it has aged out and cycling resumes.
         let later = 60_000 + 3_600_001;
         assert!(matches!(
-            seq.recover(at(later)),
+            recover(&mut seq, at(later)),
             Recovery::Cycling { count: 3, .. }
         ));
     }
@@ -533,12 +883,15 @@ mod tests {
         let mut seq = RailSequencer::new(Revision::B);
         let mut now = 60_000;
         for _ in 0..3 {
-            assert!(matches!(seq.recover(at(now)), Recovery::Cycling { .. }));
+            assert!(matches!(
+                recover(&mut seq, at(now)),
+                Recovery::Cycling { .. }
+            ));
             run(&mut seq, now, now + 6_000);
             now += 60_000;
         }
         assert_eq!(
-            seq.recover(at(now)),
+            recover(&mut seq, at(now)),
             Recovery::Cycling {
                 count: 3,
                 off_for: Millis::from_millis(900_000)
@@ -551,10 +904,13 @@ mod tests {
     fn a_recovery_during_a_cut_or_a_rise_changes_nothing() {
         let mut seq = RailSequencer::new(Revision::A);
         seq.power_on(at(0));
-        assert_eq!(seq.recover(at(50)), Recovery::Busy);
+        assert_eq!(recover(&mut seq, at(50)), Recovery::Busy);
         run(&mut seq, 0, 200);
-        assert!(matches!(seq.recover(at(1_000)), Recovery::Cycling { .. }));
-        assert_eq!(seq.recover(at(2_000)), Recovery::Busy);
+        assert!(matches!(
+            recover(&mut seq, at(1_000)),
+            Recovery::Cycling { .. }
+        ));
+        assert_eq!(recover(&mut seq, at(2_000)), Recovery::Busy);
         assert_eq!(seq.lines().rail, RailLine::Off);
     }
 
@@ -625,7 +981,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            rail.recover(Tick::from_millis(1_060)),
+            recover(&mut rail, Tick::from_millis(1_060)),
             Recovery::Busy
         ));
         assert_eq!(rail.tick(Tick::from_millis(1_140)), None);
@@ -683,7 +1039,7 @@ mod tests {
         );
         let _ = rail.power_on(Tick::from_millis(0));
         let _ = rail.tick(Tick::from_millis(100));
-        let cycling = rail.recover(Tick::from_millis(200));
+        let cycling = recover(&mut rail, Tick::from_millis(200));
         assert!(matches!(cycling, Recovery::Cycling { count: 1, .. }));
         assert_eq!(
             rail.reset_module(Tick::from_millis(300), ModuleBoot::Normal),
@@ -698,8 +1054,343 @@ mod tests {
         );
         let _ = rail.tick(Tick::from_millis(6_050));
         assert!(matches!(
-            rail.recover(Tick::from_millis(7_000)),
+            recover(&mut rail, Tick::from_millis(7_000)),
             Recovery::Cycling { count: 2, .. }
         ));
+    }
+
+    /// A sequencer on `revision` at the start of a boot that carries
+    /// `kept`, powered and settled.
+    fn booted(revision: Revision, kept: RecentCuts) -> RailSequencer {
+        carried(
+            revision,
+            CarriedCuts {
+                cuts: kept.rebased(),
+                missed: 0,
+            },
+        )
+    }
+
+    /// A sequencer on `revision` at the start of a boot that carries
+    /// `carried`, powered and settled.
+    fn carried(revision: Revision, carried: CarriedCuts) -> RailSequencer {
+        let mut seq = RailSequencer::new(revision);
+        seq.carry(carried, at(0));
+        let _ = seq.power_on(at(0));
+        let _ = run(&mut seq, 0, 200);
+        seq
+    }
+
+    #[test]
+    fn f_017_the_third_rung_is_reached_across_controller_resets() {
+        // Revision B keeps its rail through a reset, so only the ladder's
+        // own cuts count, one a boot, each boot starting from what the part
+        // kept.
+        let mut kept = RecentCuts::NONE;
+        for boot in 1..=3u8 {
+            let mut seq = booted(Revision::B, kept);
+            let Recovery::Cycling { count, off_for } = recover(&mut seq, at(60_000)) else {
+                panic!("boot {boot}: a cut");
+            };
+            assert_eq!(count, boot, "the count carries across the reset");
+            assert_eq!(off_for, CUT);
+            kept = seq.recent_cuts(at(60_000));
+        }
+        let mut seq = booted(Revision::B, kept);
+        let Recovery::Cycling { off_for, .. } = recover(&mut seq, at(60_000)) else {
+            panic!("the third rung cuts on revision B");
+        };
+        assert_eq!(
+            off_for,
+            Millis::from_millis(900_000),
+            "the fifteen minutes of L-112"
+        );
+    }
+
+    #[test]
+    fn f_017_a_carried_cut_expires_an_hour_into_the_boot_that_carried_it() {
+        let seq = booted(Revision::B, RecentCuts::FULL);
+        assert_eq!(seq.recent_cuts(at(3_600_000)).count(), 3);
+        assert_eq!(seq.recent_cuts(at(3_600_001)), RecentCuts::NONE);
+    }
+
+    fn boot(count: u32) -> BootCount {
+        BootCount::decode(&count.to_le_bytes()).expect("not zero")
+    }
+
+    #[test]
+    fn f_017_a_record_that_does_not_read_counts_as_the_full_ladder() {
+        assert_eq!(
+            CutsRecord::carried(&Held::Corrupt, boot(9)),
+            CarriedCuts::FULL
+        );
+        assert_eq!(
+            CutsRecord::carried(&Held::Malformed(Malformed { at: 0 }), boot(9)),
+            CarriedCuts::FULL
+        );
+        let one = RecentCuts([Some(at(7)), None, None]);
+        let record = CutsRecord {
+            boot: Some(boot(8)),
+            cuts: one,
+        };
+        assert_eq!(
+            CutsRecord::carried(&Held::Present(record), boot(9)),
+            CarriedCuts {
+                cuts: one.rebased(),
+                missed: 0
+            }
+        );
+        // Full, a revision A boot's first request is the third rung.
+        let mut seq = carried(Revision::A, CutsRecord::carried(&Held::Corrupt, boot(9)));
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
+    }
+
+    #[test]
+    fn f_018_a_record_counts_the_boots_since_it_was_written_and_one_that_names_a_later_boot_is_full()
+     {
+        let none_at = |kept_at: Option<BootCount>| {
+            Held::Present(CutsRecord {
+                boot: kept_at,
+                cuts: RecentCuts::NONE,
+            })
+        };
+        let missed = |held: &Held<CutsRecord>, count: u32| CutsRecord::carried(held, boot(count));
+        // Written at boot 5: boots 6 and 7 wrote nothing that landed.
+        assert_eq!(missed(&none_at(Some(boot(5))), 8).missed, 2);
+        // Written by a boot whose own count did not land, under the count
+        // before it, which this boot takes again.
+        assert_eq!(missed(&none_at(Some(boot(5))), 6).missed, 0);
+        // Never written: every boot before this one missed it; a fresh
+        // unit's first boot missed none.
+        assert_eq!(
+            missed(&Held::Absent, 1),
+            CarriedCuts {
+                cuts: RecentCuts::NONE,
+                missed: 0
+            }
+        );
+        assert_eq!(missed(&Held::Absent, 4).missed, 3);
+        assert_eq!(missed(&none_at(None), 3).missed, 2);
+        // A record from this boot's count or a later one: the counts
+        // disagree, and the ladder is full.
+        assert_eq!(missed(&none_at(Some(boot(6))), 6), CarriedCuts::FULL);
+        assert_eq!(missed(&none_at(Some(boot(9))), 6), CarriedCuts::FULL);
+    }
+
+    #[test]
+    fn f_018_on_revision_a_every_boot_the_record_missed_is_a_cut() {
+        // Two boots whose writes never landed, then this one: the third
+        // rung at the first request.
+        let carried_cuts = CarriedCuts {
+            cuts: RecentCuts::NONE,
+            missed: 2,
+        };
+        let mut seq = carried(Revision::A, carried_cuts);
+        assert_eq!(seq.recent_cuts(at(0)).count(), 3);
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
+        // Revision B keeps its rail through a reset: no boot is a cut.
+        let seq = carried(Revision::B, carried_cuts);
+        assert_eq!(seq.recent_cuts(at(0)), RecentCuts::NONE);
+        // However many were missed, the ladder holds three.
+        let seq = carried(
+            Revision::A,
+            CarriedCuts {
+                cuts: RecentCuts::NONE,
+                missed: u32::MAX,
+            },
+        );
+        assert_eq!(seq.recent_cuts(at(0)).count(), 3);
+    }
+
+    #[test]
+    fn f_017_the_cuts_round_trip_through_their_record_and_a_count_past_three_is_refused() {
+        for cuts in [
+            RecentCuts::NONE,
+            RecentCuts([Some(at(1_000)), None, None]),
+            RecentCuts([Some(at(1)), Some(at(2)), Some(at(u64::MAX))]),
+        ] {
+            for kept_at in [None, Some(BootCount::FIRST), Some(boot(u32::MAX))] {
+                let record = CutsRecord {
+                    boot: kept_at,
+                    cuts,
+                };
+                assert_eq!(CutsRecord::decode(&record.encode()), Ok(record));
+            }
+        }
+        let mut bytes = CutsRecord {
+            boot: Some(boot(3)),
+            cuts: RecentCuts::FULL,
+        }
+        .encode();
+        bytes[4] = 4;
+        assert_eq!(CutsRecord::decode(&bytes), Err(Malformed { at: 4 }));
+    }
+
+    #[test]
+    fn f_017_a_boot_carries_every_cut_as_made_at_its_start_and_keeps_them_oldest_first() {
+        let cuts = RecentCuts([Some(at(5_000)), Some(at(900)), None]);
+        assert_eq!(
+            cuts.rebased(),
+            RecentCuts([Some(Tick::ZERO), Some(Tick::ZERO), None])
+        );
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let _ = recover(&mut seq, at(5_000));
+        let _ = run(&mut seq, 5_001, 10_200);
+        let _ = recover(&mut seq, at(20_000));
+        assert_eq!(
+            seq.recent_cuts(at(20_000)),
+            RecentCuts([Some(at(5_000)), Some(at(20_000)), None])
+        );
+    }
+
+    #[test]
+    fn f_018_on_revision_a_the_reset_that_began_a_boot_is_a_cut() {
+        let mut kept = RecentCuts::NONE;
+        for boot in 1..=3usize {
+            let seq = booted(Revision::A, kept);
+            kept = seq.recent_cuts(at(0));
+            assert_eq!(kept.count(), boot);
+        }
+        // Three resets inside the hour: the ladder's first request on the
+        // next boot is the third rung, which revision A does not execute.
+        let mut seq = booted(Revision::A, kept);
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
+    }
+
+    #[test]
+    fn f_018_revision_b_keeps_its_rail_through_a_reset_and_counts_no_cut_for_it() {
+        let seq = booted(Revision::B, RecentCuts::NONE);
+        assert_eq!(seq.recent_cuts(at(0)), RecentCuts::NONE);
+    }
+
+    #[test]
+    fn l_111_the_rail_is_off_for_the_whole_cut_from_when_its_lines_move() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // The count took a second and a half to land; the lines move then.
+        assert!(matches!(
+            cut.make(&mut seq, at(2_500)),
+            Recovery::Cycling { count: 1, .. }
+        ));
+        assert_eq!(run(&mut seq, 2_501, 7_499), [None; 4], "still off");
+        assert_eq!(
+            run(&mut seq, 7_500, 7_500)[0],
+            Some((7_500, RailEvent::PowerCycled { count: 1 }))
+        );
+    }
+
+    #[test]
+    fn l_112_a_cut_counts_for_the_hour_from_when_its_lines_moved() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // Kept as planned at the request; made when the count landed.
+        assert_eq!(cut.cuts(), RecentCuts([Some(at(1_000)), None, None]));
+        let _ = cut.make(&mut seq, at(2_500));
+        assert_eq!(
+            seq.recent_cuts(at(3_601_000)).count(),
+            1,
+            "an hour from the request"
+        );
+        assert_eq!(
+            seq.recent_cuts(at(3_602_500)).count(),
+            1,
+            "an hour from the lines"
+        );
+        assert_eq!(seq.recent_cuts(at(3_602_501)), RecentCuts::NONE);
+    }
+
+    #[test]
+    fn f_017_a_planned_cut_moves_nothing_until_it_is_made_and_keeps_the_count_it_makes() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let before = seq;
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // Planned: the rail on, no cut counted, and the count to keep is
+        // the one the cut will make.
+        assert_eq!(seq, before);
+        assert_eq!(seq.lines().rail, RailLine::On);
+        assert_eq!(seq.recent_cuts(at(1_000)), RecentCuts::NONE);
+        assert_eq!(cut.cuts(), RecentCuts([Some(at(1_000)), None, None]));
+        assert_eq!(
+            cut.make(&mut seq, at(1_000)),
+            Recovery::Cycling {
+                count: 1,
+                off_for: CUT
+            }
+        );
+        assert_eq!(seq.lines().rail, RailLine::Off);
+        assert_eq!(
+            seq.recent_cuts(at(1_000)),
+            RecentCuts([Some(at(1_000)), None, None]),
+            "what was kept is what the sequencer counts"
+        );
+    }
+
+    #[test]
+    fn f_017_a_cut_planned_before_a_module_reset_is_not_made_after_it() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // A download's reset is served while the count goes out.
+        assert_eq!(
+            seq.reset_module(at(1_020), ModuleBoot::Download),
+            ModuleReset::Holding
+        );
+        let reset = seq;
+        assert_eq!(cut.make(&mut seq, at(1_500)), Recovery::Deferred);
+        assert_eq!(seq, reset, "the reset stands, strap and all");
+        assert_eq!(
+            seq.recent_cuts(at(1_500)),
+            RecentCuts::NONE,
+            "no cut counted"
+        );
+        assert_eq!(seq.lines().rail, RailLine::On);
+    }
+
+    #[test]
+    fn f_017_a_plan_that_moves_nothing_needs_no_count_kept() {
+        // During a cut, and at a third rung revision A does not execute:
+        // nothing to keep, and the answer at once.
+        let mut seq = booted(Revision::A, RecentCuts::NONE);
+        assert!(matches!(
+            recover(&mut seq, at(60_000)),
+            Recovery::Cycling { count: 2, .. }
+        ));
+        assert_eq!(seq.plan_recovery(at(60_020)), Plan::Busy);
+        let full = booted(Revision::A, RecentCuts::FULL);
+        assert_eq!(full.plan_recovery(at(60_000)), Plan::LeftOnAndRaised);
+    }
+
+    #[test]
+    fn f_017_the_cuts_go_to_the_part_when_they_differ_from_what_it_is_known_to_hold() {
+        let one = RecentCuts([Some(at(1)), None, None]);
+        let mut part = CutsOnPart::read(RecentCuts::NONE);
+        assert!(!part.due(RecentCuts::NONE, at(0)));
+        assert!(part.due(one, at(0)));
+        part.landed(one);
+        assert!(!part.due(one, at(10)));
+    }
+
+    #[test]
+    fn f_017_after_a_write_that_did_not_land_the_cuts_go_out_again_a_retry_later() {
+        let one = RecentCuts([Some(at(1)), None, None]);
+        let mut part = CutsOnPart::read(RecentCuts::NONE);
+        // A late write of a planned cut that was then not made: the part
+        // may hold it, so the count this boot holds, none, goes out again.
+        part.unknown(at(100));
+        assert!(
+            !part.due(RecentCuts::NONE, at(1_099)),
+            "not before the retry"
+        );
+        assert!(part.due(RecentCuts::NONE, at(1_100)), "even the same cuts");
+        part.landed(RecentCuts::NONE);
+        assert!(!part.due(RecentCuts::NONE, at(1_200)));
+        assert!(part.due(one, at(1_200)));
     }
 }

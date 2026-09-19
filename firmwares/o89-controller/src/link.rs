@@ -241,7 +241,7 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                     perform_quiet(&actions);
                     match recovery {
                         Recovery::Cycling { .. } => None,
-                        Recovery::LeftOnAndRaised | Recovery::Busy => {
+                        Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
                             // The rail did not move: the module is still
                             // powered, and the UART comes back with no new
                             // statement.

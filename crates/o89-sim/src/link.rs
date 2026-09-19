@@ -17,9 +17,9 @@ use km43::{
     Version,
 };
 use o89_core::{
-    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Link,
-    LinkEvent, LinkText, Millis, Note, Outgoing, RailEvent, RailLine, RailSequencer, Recovery,
-    Revision, Tick,
+    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Keep,
+    Link, LinkEvent, LinkText, Millis, NotKept, Note, Outgoing, Rail, RailEvent, RailLine,
+    RailRequest, RailSequencer, Recovery, Revision, Tick,
 };
 
 use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
@@ -48,7 +48,7 @@ struct Bench {
     comms: HostileComms,
     reader: FrameReader,
     writer: FrameWriter,
-    rail: RailSequencer,
+    rail: Rail,
     install_in_flight: bool,
     /// Everything the link asked for, with the tick it asked at.
     asked: Vec<(Tick, Action)>,
@@ -59,6 +59,9 @@ struct Bench {
     noise: u32,
     /// What the comms processor's module has been told to be.
     module_booted: bool,
+    /// Whether the ladder's cuts land on the FRAM when the adapter keeps
+    /// them before a cut (F-017).
+    keeps_land: bool,
 }
 
 impl Bench {
@@ -66,8 +69,9 @@ impl Bench {
     /// up when it settles.
     fn new(caps: Capabilities) -> Self {
         let now = Tick::from_millis(1_000);
-        let mut rail = RailSequencer::new(Revision::A);
-        let _ = rail.power_on(now);
+        let mut sequencer = RailSequencer::new(Revision::A);
+        let _ = sequencer.power_on(now);
+        let rail = Rail::new(sequencer, None);
         Self {
             now,
             link: Link::new(identity(), now),
@@ -80,6 +84,7 @@ impl Bench {
             ticked: Vec::new(),
             noise: 0,
             module_booted: false,
+            keeps_land: true,
         }
     }
 
@@ -93,7 +98,8 @@ impl Bench {
     fn step(&mut self) {
         self.now = self.now.after(STEP).expect("fits");
         let now = self.now;
-        if let Some(event) = self.rail.tick(now) {
+        let turn = self.rail.turn(now, None, None);
+        if let Some(event) = turn.event {
             match event {
                 RailEvent::Settled => {
                     let actions = self.link.module_settled(now);
@@ -141,7 +147,27 @@ impl Bench {
                             to_comms.push_back(dst[..len].to_vec());
                         }
                         Action::CutRail => {
-                            let recovery = self.rail.recover(self.now);
+                            // As the adapter does: the rail turned with the
+                            // request, and the count it hands out answered
+                            // by the recorder at once, landed or not.
+                            let asked = self.rail.turn(self.now, Some(RailRequest::Recover), None);
+                            let turn = match asked.keep {
+                                Some(keep @ Keep::Cut(_)) => {
+                                    let kept = if self.keeps_land {
+                                        Ok(())
+                                    } else {
+                                        Err(NotKept::Refused)
+                                    };
+                                    self.rail.turn(self.now, None, Some((keep, kept)))
+                                }
+                                Some(Keep::Changed(_)) | None => asked,
+                            };
+                            assert_eq!(
+                                (asked.event, turn.event),
+                                (None, None),
+                                "the step's own turn moved time"
+                            );
+                            let recovery = turn.recovered.expect("a recovery is answered");
                             if matches!(recovery, Recovery::Cycling { .. }) {
                                 // The module loses its power with the rail.
                                 self.comms.power_off();
@@ -681,6 +707,50 @@ fn l_041_after_a_peer_reboots_an_answer_to_a_beat_of_the_old_boot_does_not_count
             .notes()
             .contains(&Note::UnexpectedAck(LinkMessageType::HeartbeatAck))
     );
+}
+
+#[test]
+fn f_017_a_cut_whose_count_does_not_land_is_not_made_and_is_asked_again() {
+    // Capabilities: answers nothing, from boot; the FRAM refuses the
+    // ladder's first keep.
+    let mut bench = Bench::new(Capabilities {
+        answers: Answers::Nothing,
+        ..Capabilities::default()
+    });
+    let cycled = |bench: &Bench| {
+        bench
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, LinkEvent::PowerCycled { .. }))
+            .count()
+    };
+    bench.keeps_land = false;
+    bench.run_for(Millis::from_millis(70_000));
+    assert_eq!(bench.cuts().len(), 1, "the cut was asked for");
+    assert_eq!(cycled(&bench), 0, "and not made");
+    let statements = bench
+        .sent(|out| matches!(out, Outgoing::LinkUp { .. }))
+        .len();
+    bench.keeps_land = true;
+    bench.run_for(Millis::from_millis(60_000));
+    assert!(
+        bench
+            .sent(|out| matches!(out, Outgoing::LinkUp { .. }))
+            .len()
+            > statements,
+        "the ladder came back and kept stating itself"
+    );
+    let cuts = bench.cuts();
+    assert_eq!(cuts.len(), 2, "asked again");
+    let first = *cuts.first().expect("two");
+    let second = *cuts.get(1).expect("two");
+    assert!(
+        second
+            .since(first)
+            .is_some_and(|gap| gap.as_millis() >= CUT_AFTER.as_millis()),
+        "a cut interval later"
+    );
+    assert_eq!(cycled(&bench), 1, "and made, once its count landed");
 }
 
 #[test]
