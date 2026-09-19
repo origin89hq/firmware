@@ -102,7 +102,6 @@ pub struct Module {
     /// `ESP_EN`, held low across every rail cycle (F-004).
     pub en: Peri<'static, p::PC2>,
     /// `ESP_BOOT`, the IO9 strap.
-    #[expect(dead_code, reason = "taken in M3, the bench flashing path")]
     pub boot: Peri<'static, p::PC3>,
     /// `ESP_PWR_EN`: the rail, high is on; off with the pin high-impedance
     /// on revision A (F-014).

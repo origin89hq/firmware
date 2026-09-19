@@ -21,8 +21,12 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker};
-use o89_core::{Clock, EnLine, Lines, RailEvent, RailLine, RailSequencer, Recovery, Task};
+use o89_core::{
+    BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine, RailSequencer,
+    Recovery, StrapRoute, Task,
+};
 
+use crate::REVISION;
 use crate::supervisor::{Uptime, check_in};
 
 /// What the rail tells the link.
@@ -32,10 +36,24 @@ pub enum RailWord {
     Settled,
     /// What a recovery request did.
     Recovered(Recovery),
+    /// What a module reset did.
+    Reset(ModuleReset),
 }
 
-/// The link's request: recover, by whatever rung the sequencer is at.
-static RECOVER: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// What the link asks of the rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum RailRequest {
+    /// Recover, by whatever rung the sequencer is at.
+    Recover,
+    /// Reset the module with the rail on: `EN` held and released, which is
+    /// the boot the download window opens in, or with the strap held for
+    /// the ROM's own download mode (F-038).
+    ResetModule(ModuleBoot),
+}
+
+/// The link's request. One at a time: a second before the first is served
+/// replaces it, which the link never does.
+static REQUEST: Signal<CriticalSectionRawMutex, RailRequest> = Signal::new();
 
 /// The words to the link. Four deep: a recovery answers at most one word
 /// and settles at most once, and a word that does not fit is logged, not
@@ -44,7 +62,12 @@ static WORDS: Channel<CriticalSectionRawMutex, RailWord, 4> = Channel::new();
 
 /// Ask the rail task to recover the module.
 pub fn request_recovery() {
-    RECOVER.signal(());
+    REQUEST.signal(RailRequest::Recover);
+}
+
+/// Ask the rail task to reset the module into `boot`, the rail staying on.
+pub fn request_module_reset(boot: ModuleBoot) {
+    REQUEST.signal(RailRequest::ResetModule(boot));
 }
 
 /// The rail's words, for the link task to receive.
@@ -65,19 +88,22 @@ const PERIOD: Duration = Duration::from_millis(20);
 pub struct Pins {
     rail: Output<'static>,
     en: Flex<'static>,
+    boot: Flex<'static>,
     applied: Lines,
 }
 
 impl Pins {
     /// Take the pins in their reset state: the rail off, `EN` an input.
     #[must_use]
-    pub fn new(rail: Output<'static>, en: Flex<'static>) -> Self {
+    pub fn new(rail: Output<'static>, en: Flex<'static>, boot: Flex<'static>) -> Self {
         Self {
             rail,
             en,
+            boot,
             applied: Lines {
                 rail: RailLine::Off,
                 en: EnLine::Released,
+                boot: BootLine::Released,
             },
         }
     }
@@ -88,6 +114,12 @@ impl Pins {
     pub fn apply(&mut self, lines: Lines) {
         if lines == self.applied {
             return;
+        }
+        // The strap goes low before the reset it is read at, and back to an
+        // input only after it (F-003: low or an input, never high).
+        if lines.boot == BootLine::HeldLow && self.applied.boot != BootLine::HeldLow {
+            self.boot.set_low();
+            self.boot.set_as_output(Speed::Low);
         }
         match lines.en {
             EnLine::HeldLow if self.applied.en != EnLine::HeldLow => {
@@ -103,6 +135,9 @@ impl Pins {
         if lines.en == EnLine::Released && self.applied.en != EnLine::Released {
             self.en.set_as_input(Pull::None);
         }
+        if lines.boot == BootLine::Released && self.applied.boot != BootLine::Released {
+            self.boot.set_as_input(Pull::None);
+        }
         self.applied = lines;
     }
 }
@@ -115,20 +150,43 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
     loop {
         ticker.next().await;
         let now = Uptime.now();
-        if RECOVER.try_take().is_some() {
-            let recovery = sequencer.recover(now);
-            match recovery {
-                Recovery::Cycling { count, off_for } => defmt::warn!(
-                    "rail: cutting for {} ms, cycle {} in the last hour",
-                    off_for.as_millis(),
-                    count
-                ),
-                Recovery::LeftOnAndRaised => {
-                    defmt::error!("rail: the third rung; left on, comms unrecoverable");
+        match REQUEST.try_take() {
+            Some(RailRequest::Recover) => {
+                let recovery = sequencer.recover(now);
+                match recovery {
+                    Recovery::Cycling { count, off_for } => defmt::warn!(
+                        "rail: cutting for {} ms, cycle {} in the last hour",
+                        off_for.as_millis(),
+                        count
+                    ),
+                    Recovery::LeftOnAndRaised => {
+                        defmt::error!("rail: the third rung; left on, comms unrecoverable");
+                    }
+                    Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
                 }
-                Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
+                say(RailWord::Recovered(recovery));
             }
-            say(RailWord::Recovered(recovery));
+            Some(RailRequest::ResetModule(boot)) => {
+                let reset = sequencer.reset_module(now, boot);
+                match (reset, boot) {
+                    (ModuleReset::Holding, ModuleBoot::Normal) => {
+                        defmt::info!("rail: resetting the module, EN held");
+                    }
+                    (ModuleReset::Holding, ModuleBoot::Download) => match REVISION.strap_route() {
+                        StrapRoute::NeedsIo8Wire => defmt::warn!(
+                            "rail: resetting the module with IO9 low; this revision needs IO8 held high by a wire"
+                        ),
+                        StrapRoute::Wired => {
+                            defmt::info!("rail: resetting the module with IO9 low, EN held");
+                        }
+                    },
+                    (ModuleReset::NotPowered, ModuleBoot::Normal | ModuleBoot::Download) => {
+                        defmt::warn!("rail: no module to reset");
+                    }
+                }
+                say(RailWord::Reset(reset));
+            }
+            None => {}
         }
         if let Some(event) = sequencer.tick(now) {
             match event {

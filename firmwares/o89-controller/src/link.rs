@@ -26,16 +26,107 @@ use embassy_futures::yield_now;
 use embassy_stm32::gpio::{Flex, Pull};
 use embassy_stm32::usart::{BufferedUart, BufferedUartTx, Config, Error};
 use embassy_stm32::{Peri, bind_interrupts, usart};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::{Read, Write};
-use km43::{FrameReader, FrameWriter, LinkEnvelope, MAX_FRAME, Received};
-use o89_core::{Action, Actions, Clock, Identity, Link, Note, Recovery, Task};
+use km43::{
+    DownloadReason, DownloadRequest, FrameReader, FrameWriter, LinkEnvelope, LinkHeader,
+    LinkMessageType, MAX_FRAME, Received, ReqId, SessionId,
+};
+use o89_core::mailbox::DownloadEntry;
+use o89_core::{
+    Action, Actions, Clock, Identity, KnockAnswer, Link, ModuleBoot, ModuleReset, Note, Recovery,
+    Task, knock_answer,
+};
+use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use crate::board::{EspCts, EspRts, EspRx, EspTx, EspUsart};
+use crate::mailbox;
 use crate::rail::{self, RailWord};
 use crate::recorder;
 use crate::supervisor::{Uptime, check_in};
+
+/// What the bench asks of the link, through the mailbox (F-038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Put the module into its ROM's download mode and bridge its UART to
+    /// the mailbox's rings, for the reason the controller logs (L-192).
+    Download {
+        /// Why, as the registry names it: the mailbox refuses a number it
+        /// does not name rather than guess one.
+        reason: DownloadReason,
+        /// The route in: the window, the strap, or a reset to listen to.
+        entry: DownloadEntry,
+    },
+    /// End the bridge: the module reset normally, the link back.
+    Normal,
+}
+
+/// What the link answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum Report {
+    /// The module answered `entering` and the bridge is up.
+    Bridging,
+    /// The module did not answer inside the window.
+    NoAnswer,
+    /// The module answered `refused_outside_window` (L-191).
+    Refused,
+    /// The rail is not up, or a request is already being served.
+    Busy,
+    /// The bridge is over and the module is booting normally.
+    Normal,
+    /// This boot has no store, so no link, and the bench is not served
+    /// (F-039).
+    NoStore,
+    /// USART1 refused the ROM's configuration; the module was reset
+    /// normally and nothing was bridged.
+    BridgeRefused,
+}
+
+/// A request and the number that names it, so a report is read only by
+/// the asker it answers: a request that timed out in the mailbox may be
+/// reported later, and that report must not answer the next one.
+static REQUEST: Signal<CriticalSectionRawMutex, (u32, Request)> = Signal::new();
+static REPORT: Signal<CriticalSectionRawMutex, (u32, Report)> = Signal::new();
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Ask the link task; one request at a time. The number to wait on.
+pub fn request(request: Request) -> u32 {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    REQUEST.signal((seq, request));
+    seq
+}
+
+/// What the link task did with request `seq`. Bounded by the caller's
+/// deadline: reports for other requests are passed over.
+pub async fn report(seq: u32) -> Report {
+    loop {
+        let (answered, report) = REPORT.wait().await;
+        if answered == seq {
+            return report;
+        }
+    }
+}
+
+/// How long a bridge stays open with its lease unrenewed before it is
+/// closed as abandoned. The host renews the lease about once a second
+/// while it holds the bridge, so a host that died, lost power or lost its
+/// probe lets it lapse; the module's own bytes do not count, because a
+/// module talks whether anyone listens or not.
+const BRIDGE_IDLE: Duration = Duration::from_secs(60);
+
+/// The ROM's serial download rate, with no flow control (F-038).
+const ROM_BAUD: u32 = 115_200;
+/// How long the module has to settle after a reset the bridge asked for.
+const RESET_DEADLINE: Duration = Duration::from_millis(2_000);
+/// L-192: the first statement within 200 ms of `EN` released, then every
+/// 100 ms, until 3 000 ms have passed.
+const KNOCK_PERIOD: Duration = Duration::from_millis(100);
+const KNOCK_DEADLINE: Duration = Duration::from_millis(3_000);
+/// How often the bridge turns when nothing arrives.
+const BRIDGE_TICK: Duration = Duration::from_millis(5);
 
 bind_interrupts!(struct Irqs {
     USART1 => usart::BufferedInterruptHandler<EspUsart>;
@@ -81,6 +172,8 @@ enum Ended {
     /// The UART is gone with the bytes stuck in its ring, and the next
     /// episode starts at once with nothing new to say.
     Stalled,
+    /// The bench asked for the module's download mode; the UART is gone.
+    Download(Asked),
 }
 
 /// The link task. No identity is a boot without a written count (F-039):
@@ -90,8 +183,15 @@ enum Ended {
 #[embassy_executor::task]
 pub async fn run(mut pins: Pins, identity: Option<Identity>) {
     let Some(identity) = identity else {
+        // The bench's requests are answered, not served: a unit without
+        // its store has no link, and the FRAM is what is serviced first.
         loop {
-            Timer::after(TICK).await;
+            match with_timeout(TICK, REQUEST.wait()).await {
+                Ok((seq, Request::Download { .. } | Request::Normal)) => {
+                    REPORT.signal((seq, Report::NoStore));
+                }
+                Err(_) => {}
+            }
             check_in(Task::Link);
         }
     };
@@ -106,6 +206,24 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
     let mut resume = false;
     check_in(Task::Link);
     loop {
+        // The bench first: a request while the module is off is served the
+        // same way, and one for the normal state answers at once.
+        match REQUEST.try_take() {
+            Some((seq, Request::Download { reason, entry })) => {
+                perform_quiet(&link.module_taken());
+                download(
+                    &mut pins,
+                    &mut rings,
+                    &mut reader,
+                    &mut writer,
+                    Asked { seq, reason, entry },
+                )
+                .await;
+                continue;
+            }
+            Some((seq, Request::Normal)) => REPORT.signal((seq, Report::Normal)),
+            None => {}
+        }
         // The module is off, or being cut: nothing to say, the words to hear.
         // After a stall the module is still powered and the UART comes
         // straight back with nothing new to say.
@@ -117,6 +235,7 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                     defmt::info!("link: the rail settled; USART1 up");
                     Some(link.module_settled(Uptime.now()))
                 }
+                Ok(RailWord::Reset(_)) => None,
                 Ok(RailWord::Recovered(recovery)) => {
                     let actions = link.rail(recovery, Uptime.now());
                     perform_quiet(&actions);
@@ -164,6 +283,10 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                     park(&mut pins);
                     rail::request_recovery();
                 }
+                Ended::Download(asked) => {
+                    perform_quiet(&link.module_taken());
+                    download(&mut pins, &mut rings, &mut reader, &mut writer, asked).await;
+                }
             }
         }
         check_in(Task::Link);
@@ -198,6 +321,19 @@ struct Rings {
 /// frame stalls in the transmitter. The UART is dropped on the way out,
 /// which puts its pins back to inputs before the rail task hears the
 /// request (F-003) and empties the ring before the next episode's.
+/// The bench's request while the link runs: a download, which ends the
+/// episode, or a request for the normal state, which is answered at once.
+fn bench_download() -> Option<Asked> {
+    match REQUEST.try_take() {
+        Some((seq, Request::Download { reason, entry })) => Some(Asked { seq, reason, entry }),
+        Some((seq, Request::Normal)) => {
+            REPORT.signal((seq, Report::Normal));
+            None
+        }
+        None => None,
+    }
+}
+
 async fn episode(
     link: &mut Link,
     pins: &mut Pins,
@@ -247,7 +383,16 @@ async fn episode(
                     let ended = match reader.push(*byte) {
                         Received::Frame(frame) => {
                             if let Ok(envelope) = LinkEnvelope::decode(frame) {
+                                let was_up = link.is_up();
                                 let actions = link.received(envelope, Uptime.now());
+                                // The peer's own statement records it without
+                                // linking (L-033): only the transition is news.
+                                if !was_up
+                                    && link.is_up()
+                                    && let Some(peer) = link.peer()
+                                {
+                                    defmt::info!("link: up; the module is {}", peer);
+                                }
                                 perform(link, &mut tx, writer, &actions).await
                             } else {
                                 link.noise();
@@ -279,8 +424,12 @@ async fn episode(
                 }
             }
         }
+        if let Some(asked) = bench_download() {
+            return Ended::Download(asked);
+        }
         while let Ok(word) = rail::words().try_receive() {
             match word {
+                RailWord::Reset(_) => {}
                 RailWord::Settled => {
                     // Cannot happen while the UART is up: the rail only
                     // settles after a cut this task asked for.
@@ -299,11 +448,335 @@ async fn episode(
             return ended;
         }
         check_in(Task::Link);
-        // A read that is ready at once does not yield, and a module that
-        // keeps the ring full would hold the executor through every turn:
-        // the control, rail and recorder tasks run between two turns.
+        // A ready read never yields: the other tasks get every turn's end.
         yield_now().await;
     }
+}
+
+/// A download request with the number that names it. Every report goes
+/// out under the number of the request it answers, from one place, because
+/// the signal holds one value and a second report before the mailbox task
+/// runs would replace the first.
+#[derive(Debug, Clone, Copy)]
+struct Asked {
+    seq: u32,
+    reason: DownloadReason,
+    entry: DownloadEntry,
+}
+
+/// Why a bridge closed.
+enum Closed {
+    /// The host gave the module back, under this request number.
+    Normal { seq: u32 },
+    /// Another download was asked while this one's host held the bridge:
+    /// that host is gone, and the new one gets the bridge for its own.
+    Reclaimed(Asked),
+    /// The host's lease lapsed for [`BRIDGE_IDLE`]: the host is gone.
+    Idle,
+    /// USART1 refused the ROM's configuration: the host is told so and
+    /// never bridged.
+    Refused,
+}
+
+/// The bench's way into the module's ROM (F-038, L-192): a reset this
+/// side performs, the statement knocked inside the window, and the UART
+/// handed to the mailbox's rings at the ROM's rate until the bench gives
+/// the module back. The state machine sits this out: it is told the module
+/// settled when the link resumes.
+async fn download(
+    pins: &mut Pins,
+    rings: &mut Rings,
+    reader: &mut FrameReader,
+    writer: &mut FrameWriter,
+    mut asked: Asked,
+) {
+    // Bounded by the host: a bridge closes when the host gives the module
+    // back, when another download reclaims it, or when the host's lease on
+    // it lapses for `BRIDGE_IDLE`.
+    loop {
+        let reason = asked.reason;
+        // The reason on every route, so the log tells a bench flash from a
+        // recovery whether the module is knocked or strapped (L-192).
+        defmt::info!(
+            "link: download ({=str}) by {}",
+            reason_name(reason),
+            asked.entry
+        );
+        let boot = match asked.entry {
+            DownloadEntry::Strap => ModuleBoot::Download,
+            DownloadEntry::Knock | DownloadEntry::Reset => ModuleBoot::Normal,
+        };
+        rail::request_module_reset(boot);
+        if !settled_after_reset().await {
+            // The reset may still finish after the deadline, and a strapped
+            // one must not leave the module in its ROM with no bridge.
+            rail::request_module_reset(ModuleBoot::Normal);
+            REPORT.signal((asked.seq, Report::Busy));
+            return;
+        }
+        if let DownloadEntry::Knock = asked.entry {
+            let report = match knock(pins, rings, reader, writer, reason).await {
+                Knocked::Entering => None,
+                Knocked::Refused => Some(Report::Refused),
+                Knocked::Unanswered => {
+                    defmt::warn!("link: the module did not answer EnterDownload inside the window");
+                    Some(Report::NoAnswer)
+                }
+            };
+            if let Some(report) = report {
+                rail::request_module_reset(ModuleBoot::Normal);
+                REPORT.signal((asked.seq, report));
+                return;
+            }
+        }
+        defmt::info!(
+            "link: the module is entering download mode; bridging at {} baud",
+            ROM_BAUD
+        );
+        match bridge(pins, rings, asked.seq).await {
+            Closed::Normal { seq } => {
+                REPORT.signal((seq, Report::Normal));
+                break;
+            }
+            Closed::Idle => {
+                defmt::warn!(
+                    "link: the host's lease on the bridge lapsed {} s ago; the host is gone",
+                    BRIDGE_IDLE.as_secs()
+                );
+                break;
+            }
+            Closed::Refused => {
+                REPORT.signal((asked.seq, Report::BridgeRefused));
+                break;
+            }
+            Closed::Reclaimed(next) => {
+                defmt::warn!("link: another download reclaims the bridge");
+                asked = next;
+            }
+        }
+    }
+    defmt::info!("link: the bridge is closed; the module reset normally");
+    rail::request_module_reset(ModuleBoot::Normal);
+}
+
+/// Wait for the rail task to say the module settled after the reset asked
+/// for, or that there was nothing to reset.
+async fn settled_after_reset() -> bool {
+    let until = Instant::now().checked_add(RESET_DEADLINE);
+    // A `Settled` still queued from an earlier power-up or reset is not
+    // this reset's: only one after this reset's `Holding` counts.
+    let mut holding = false;
+    // Bounded by the deadline: every turn waits a tick at most.
+    loop {
+        match with_timeout(TICK, rail::words().receive()).await {
+            Ok(RailWord::Settled) if holding => return true,
+            Ok(RailWord::Reset(ModuleReset::Holding)) => holding = true,
+            Ok(RailWord::Reset(ModuleReset::NotPowered)) => return false,
+            Ok(RailWord::Settled | RailWord::Recovered(_)) | Err(_) => {}
+        }
+        check_in(Task::Link);
+        if until.is_none_or(|until| Instant::now() >= until) {
+            return false;
+        }
+    }
+}
+
+/// How a knock ended.
+enum Knocked {
+    /// `entering`: the module is resetting into its ROM.
+    Entering,
+    /// `refused_outside_window`: the module runs an image whose window had
+    /// closed, a verdict of its own and not silence.
+    Refused,
+    /// Nothing under the knock's id in three seconds.
+    Unanswered,
+}
+
+/// `EnterDownload` every 100 ms under one `req_id` until `entering` comes
+/// back or three seconds have passed (L-192).
+async fn knock(
+    pins: &mut Pins,
+    rings: &mut Rings,
+    reader: &mut FrameReader,
+    writer: &mut FrameWriter,
+    reason: DownloadReason,
+) -> Knocked {
+    let mut config = Config::default();
+    config.baudrate = BAUD;
+    let Ok(uart) = BufferedUart::new_with_rtscts(
+        pins.usart.reborrow(),
+        pins.rx.reborrow(),
+        pins.tx.reborrow(),
+        pins.rts.reborrow(),
+        pins.cts.reborrow(),
+        Irqs,
+        &mut rings.tx[..],
+        &mut rings.rx[..],
+        config,
+    ) else {
+        return Knocked::Unanswered;
+    };
+    let (mut tx, mut rx) = uart.split();
+    // The reset cut the module off mid-frame, perhaps: that tail would merge
+    // with the only `entering` the module sends before it resets.
+    reader.discard();
+    let req_id = ReqId(0x5A5A_0001);
+    let mut envelope = [0u8; 64];
+    let Ok(len) = (DownloadRequest { reason }).write(
+        LinkHeader {
+            kind: LinkMessageType::EnterDownload,
+            session: SessionId::None,
+            req_id,
+        },
+        &mut envelope,
+    ) else {
+        return Knocked::Unanswered;
+    };
+    let mut frame = [0u8; MAX_FRAME];
+    let Ok(len) = writer.write(envelope.get(..len).unwrap_or(&[]), &mut frame) else {
+        return Knocked::Unanswered;
+    };
+    let frame = frame.get(..len).unwrap_or(&[]);
+    let started = Instant::now();
+    let mut next_knock = started;
+    let mut chunk = [0u8; 64];
+    // Bounded by the deadline: every turn knocks or reads for a tick.
+    while started.elapsed() < KNOCK_DEADLINE {
+        if Instant::now() >= next_knock {
+            next_knock = Instant::now()
+                .checked_add(KNOCK_PERIOD)
+                .unwrap_or(next_knock);
+            let _ = with_timeout(WRITE_DEADLINE, send(&mut tx, frame)).await;
+        }
+        if let Ok(Ok(count)) = with_timeout(KNOCK_PERIOD, rx.read(&mut chunk)).await {
+            for byte in chunk.get(..count).unwrap_or(&[]) {
+                let Received::Frame(bytes) = reader.push(*byte) else {
+                    continue;
+                };
+                let Ok(envelope) = LinkEnvelope::decode(bytes) else {
+                    continue;
+                };
+                match knock_answer(envelope, req_id) {
+                    KnockAnswer::Entering => {
+                        defmt::info!(
+                            "link: EnterDownload ({=str}) answered entering",
+                            reason_name(reason)
+                        );
+                        return Knocked::Entering;
+                    }
+                    KnockAnswer::Refused => {
+                        defmt::warn!(
+                            "link: EnterDownload ({=str}) answered refused_outside_window",
+                            reason_name(reason)
+                        );
+                        return Knocked::Refused;
+                    }
+                    KnockAnswer::NotOurs => {}
+                }
+            }
+        }
+        check_in(Task::Link);
+        yield_now().await;
+    }
+    defmt::warn!(
+        "link: EnterDownload ({=str}) unanswered after {} ms",
+        reason_name(reason),
+        KNOCK_DEADLINE.as_millis()
+    );
+    Knocked::Unanswered
+}
+
+/// The reason's registry name, for the log L-192 asks the controller to
+/// keep: the module keeps nothing across the reset.
+const fn reason_name(reason: DownloadReason) -> &'static str {
+    match reason {
+        DownloadReason::Bench => "bench",
+        DownloadReason::Recovery => "recovery",
+    }
+}
+
+/// The UART at the ROM's rate with no flow control, its bytes moved to
+/// and from the mailbox's rings until the bench asks for the module back.
+/// The bridge is reported up to request `seq` only once its UART is: a host
+/// told `Bridging` always has a bridge to talk to.
+async fn bridge(pins: &mut Pins, rings: &mut Rings, seq: u32) -> Closed {
+    let mut config = Config::default();
+    config.baudrate = ROM_BAUD;
+    let Ok(uart) = BufferedUart::new(
+        pins.usart.reborrow(),
+        pins.rx.reborrow(),
+        pins.tx.reborrow(),
+        &mut rings.tx[..],
+        &mut rings.rx[..],
+        Irqs,
+        config,
+    ) else {
+        defmt::error!("link: USART1 refused the ROM's configuration");
+        return Closed::Refused;
+    };
+    mailbox::bridge_reset();
+    REPORT.signal((seq, Report::Bridging));
+    let (mut tx, mut rx) = uart.split();
+    let mut chunk = [0u8; 256];
+    let mut lost: u32 = 0;
+    let mut lease = mailbox::bridge_lease();
+    let mut leased = Instant::now();
+    // Bounded by the bench's request for the normal state, by another
+    // download reclaiming the bridge, or by the host's lease lapsing for
+    // `BRIDGE_IDLE`; every turn waits a bridge tick at most and checks in.
+    let closed = loop {
+        match REQUEST.try_take() {
+            Some((seq, Request::Normal)) => break Closed::Normal { seq },
+            Some((seq, Request::Download { reason, entry })) => {
+                break Closed::Reclaimed(Asked { seq, reason, entry });
+            }
+            None => {}
+        }
+        let renewed = mailbox::bridge_lease();
+        if renewed != lease {
+            lease = renewed;
+            leased = Instant::now();
+        }
+        if leased.elapsed() >= BRIDGE_IDLE {
+            break Closed::Idle;
+        }
+        if let Ok(Ok(count)) = with_timeout(BRIDGE_TICK, rx.read(&mut chunk)).await {
+            let mut bytes = chunk.get(..count).unwrap_or(&[]);
+            // Bounded: the host drains the ring, and a host that does not
+            // is given a write deadline's worth before the bytes are lost.
+            let until = Instant::now().checked_add(WRITE_DEADLINE);
+            while !bytes.is_empty() {
+                let taken = mailbox::bridge_push(bytes);
+                bytes = bytes.get(taken..).unwrap_or(&[]);
+                if bytes.is_empty() || until.is_none_or(|until| Instant::now() >= until) {
+                    break;
+                }
+                Timer::after(BRIDGE_TICK).await;
+            }
+            if !bytes.is_empty() {
+                lost = lost.saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+            }
+        }
+        let count = mailbox::bridge_pull(&mut chunk);
+        if count > 0 {
+            let _ = with_timeout(
+                WRITE_DEADLINE,
+                send(&mut tx, chunk.get(..count).unwrap_or(&[])),
+            )
+            .await;
+        }
+        check_in(Task::Link);
+        // Ready reads do not yield: the module streaming at the ROM's rate
+        // would otherwise hold the executor through the whole flash.
+        yield_now().await;
+    };
+    if lost > 0 {
+        defmt::warn!(
+            "link: {} bytes from the module were lost on a full ring",
+            lost
+        );
+    }
+    closed
 }
 
 /// Perform actions with a UART in hand. Answers how the episode ends, if

@@ -1,4 +1,5 @@
-//! The bench tool's mailbox in RAM, served by the recorder.
+//! The bench tool's mailbox in RAM, served by the recorder, and the two
+//! rings the bridge to the module runs on, served by the link task.
 //!
 //! The words are atomics because the host writes them over SWD while the
 //! part runs, and the region is one the runtime never loads or zeroes, so
@@ -10,15 +11,23 @@
 //! ring use, so a write from the bench meets the voltage detector's
 //! refusal exactly as the firmware's own would. The layout and the address
 //! are `o89_core::mailbox`'s, shared with the host.
+//!
+//! The bridge rings carry the ROM's download protocol between the host's
+//! flashing tool and the module's UART while the link task holds the UART
+//! for it (F-038): one ring each way, one writer and one reader each, the
+//! arithmetic `o89_core::mailbox::Ring`'s on both sides.
 
 use core::sync::atomic::Ordering;
 
 use cortex_m::peripheral::SCB;
-use o89_core::mailbox::{DATA_BYTES, MAGIC, Op, Status, VERSION};
-use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring};
+use embassy_time::{Duration, with_timeout};
+use km43::DownloadReason;
+use o89_core::mailbox::{DATA_BYTES, DownloadEntry, MAGIC, Op, RING_BYTES, Ring, Status, VERSION};
+use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing};
 use portable_atomic::{AtomicU8, AtomicU32};
 
 use crate::fram::Fram;
+use crate::link::{self, Report, Request};
 use crate::nor::{CAPACITY, Nor};
 
 /// The mailbox, laid out as `o89_core::mailbox::offset` says.
@@ -34,9 +43,16 @@ struct Mailbox {
     status: AtomicU32,
     length: AtomicU32,
     data: [AtomicU8; DATA_BYTES],
+    to_module_write: AtomicU32,
+    to_module_read: AtomicU32,
+    to_module: [AtomicU8; RING_BYTES],
+    from_module_write: AtomicU32,
+    from_module_read: AtomicU32,
+    from_module: [AtomicU8; RING_BYTES],
+    bridge_lease: AtomicU32,
 }
 
-const _: () = assert!(core::mem::size_of::<Mailbox>() == 36 + DATA_BYTES);
+const _: () = assert!(core::mem::size_of::<Mailbox>() == o89_core::mailbox::offset::END as usize);
 
 #[expect(
     unsafe_code,
@@ -54,7 +70,19 @@ static MAILBOX: Mailbox = Mailbox {
     status: AtomicU32::new(0),
     length: AtomicU32::new(0),
     data: [const { AtomicU8::new(0) }; DATA_BYTES],
+    to_module_write: AtomicU32::new(0),
+    to_module_read: AtomicU32::new(0),
+    to_module: [const { AtomicU8::new(0) }; RING_BYTES],
+    from_module_write: AtomicU32::new(0),
+    from_module_read: AtomicU32::new(0),
+    from_module: [const { AtomicU8::new(0) }; RING_BYTES],
+    bridge_lease: AtomicU32::new(0),
 };
+
+/// How long the recorder waits for the link task to answer a request that
+/// puts the module into download mode: a module reset, the window, and
+/// the three seconds of attempts L-192 allows.
+const LINK_DEADLINE: Duration = Duration::from_secs(6);
 
 /// No mailbox: the first thing the boot does, so that the magic a reset
 /// left in RAM does not invite a request before anyone serves one.
@@ -78,7 +106,7 @@ pub struct Parts<'a> {
     /// The FRAM, through the seam.
     pub fram: &'a mut Fram,
     /// The ring on the NOR, if it opened.
-    pub ring: Option<&'a mut Ring<Nor>>,
+    pub ring: Option<&'a mut NorRing<Nor>>,
     /// The ring's scratch, for the head search after an erase.
     pub scratch: &'a mut [u8],
     /// The boot count, for a ping.
@@ -115,9 +143,42 @@ pub async fn serve(parts: Parts<'_>) {
             answer(seq, Status::Ok, 0);
             SCB::sys_reset()
         }
+        Some(Op::Download) => {
+            let reason = u8::try_from(arg0)
+                .ok()
+                .and_then(|code| DownloadReason::try_from(code).ok());
+            let status = match (reason, DownloadEntry::of(arg1)) {
+                (Some(reason), Some(entry)) => {
+                    defmt::warn!(
+                        "mailbox: the host asks for the module's download mode, by {}",
+                        entry
+                    );
+                    ask_link(Request::Download { reason, entry }).await
+                }
+                (None, _) | (_, None) => Status::OutOfRange,
+            };
+            (status, 0)
+        }
+        Some(Op::Normal) => {
+            defmt::info!("mailbox: the host gives the module back");
+            (ask_link(Request::Normal).await, 0)
+        }
         None => (Status::UnknownOp, 0),
     };
     answer(seq, status, length);
+}
+
+/// Hand a request to the link task and wait for what it did.
+async fn ask_link(request: Request) -> Status {
+    let seq = link::request(request);
+    match with_timeout(LINK_DEADLINE, link::report(seq)).await {
+        Ok(Report::Bridging | Report::Normal) => Status::Ok,
+        Ok(Report::NoAnswer) => Status::NoModuleAnswer,
+        Ok(Report::NoStore) => Status::NoStore,
+        Ok(Report::BridgeRefused) => Status::BridgeRefused,
+        Ok(Report::Refused) => Status::ModuleRefused,
+        Ok(Report::Busy) | Err(_) => Status::LinkBusy,
+    }
 }
 
 fn answer(seq: u32, status: Status, length: u32) {
@@ -138,6 +199,53 @@ fn take(into: &mut [u8]) {
     for (byte, slot) in into.iter_mut().zip(&MAILBOX.data) {
         *byte = slot.load(Ordering::Relaxed);
     }
+}
+
+/// Both rings emptied, before the host is told the bridge is up.
+pub fn bridge_reset() {
+    MAILBOX.to_module_read.store(0, Ordering::Relaxed);
+    MAILBOX.to_module_write.store(0, Ordering::Relaxed);
+    MAILBOX.from_module_read.store(0, Ordering::Relaxed);
+    MAILBOX.from_module_write.store(0, Ordering::Release);
+}
+
+/// Bytes the host left for the module, into `into`; how many.
+/// The host's lease on the bridge, as it last wrote it.
+pub fn bridge_lease() -> u32 {
+    MAILBOX.bridge_lease.load(Ordering::Acquire)
+}
+
+pub fn bridge_pull(into: &mut [u8]) -> usize {
+    let write = MAILBOX.to_module_write.load(Ordering::Acquire);
+    let read = MAILBOX.to_module_read.load(Ordering::Relaxed);
+    let count = Ring::available(write, read).min(into.len());
+    let mut index = read;
+    for byte in into.iter_mut().take(count) {
+        *byte = MAILBOX
+            .to_module
+            .get(Ring::index(index))
+            .map_or(0, |slot| slot.load(Ordering::Relaxed));
+        index = Ring::advanced(index, 1);
+    }
+    MAILBOX.to_module_read.store(index, Ordering::Release);
+    count
+}
+
+/// Bytes from the module for the host, as many as the ring has room for;
+/// how many were taken. The rest is the caller's to offer again.
+pub fn bridge_push(bytes: &[u8]) -> usize {
+    let write = MAILBOX.from_module_write.load(Ordering::Relaxed);
+    let read = MAILBOX.from_module_read.load(Ordering::Acquire);
+    let count = Ring::room(write, read).min(bytes.len());
+    let mut index = write;
+    for byte in bytes.iter().take(count) {
+        if let Some(slot) = MAILBOX.from_module.get(Ring::index(index)) {
+            slot.store(*byte, Ordering::Relaxed);
+        }
+        index = Ring::advanced(index, 1);
+    }
+    MAILBOX.from_module_write.store(index, Ordering::Release);
+    count
 }
 
 fn span(at: u32, len: u32, part: usize) -> Option<(usize, usize)> {
@@ -186,7 +294,7 @@ async fn write_fram(fram: &mut Fram, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-async fn read_nor(ring: &mut Ring<Nor>, at: u32, len: u32) -> (Status, u32) {
+async fn read_nor(ring: &mut NorRing<Nor>, at: u32, len: u32) -> (Status, u32) {
     let Some((_, len)) = span(at, len, CAPACITY) else {
         return (Status::OutOfRange, 0);
     };
@@ -203,7 +311,7 @@ async fn read_nor(ring: &mut Ring<Nor>, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-async fn erase_nor(ring: &mut Ring<Nor>, block: u32, scratch: &mut [u8]) -> (Status, u32) {
+async fn erase_nor(ring: &mut NorRing<Nor>, block: u32, scratch: &mut [u8]) -> (Status, u32) {
     match ring.erase_block(block, scratch).await {
         Ok(()) => (Status::Ok, 0),
         Err(o89_core::RingError::OutOfRange) => (Status::OutOfRange, 0),

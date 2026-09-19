@@ -60,29 +60,38 @@ skills-sync:
 
 chip := "STM32G0B1RETx"
 controller_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-controller"
+comms_elf := "firmwares/target/riscv32imac-unknown-none-elf/release/o89-comms"
 boot_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-boot"
 boot_bin := "firmwares/target/thumbv6m-none-eabi/release/o89-boot.bin"
 
 # Flash the bootloader into both banks of the controller: the ELF at
-# 0x08000000, the same bytes as a `.bin` at 0x08040000. Effect: the part boots
-# through the bootloader, which drives RUN and KICK low and jumps to
-# 0x08002000. Recovery: `just flash-controller` if the application is not
-# there yet; the part waits with the lines low until it is.
+# 0x08000000, the same bytes as a `.bin` at 0x08040000, then a reset, because
+# `probe-rs download` leaves the part halted in its flash loader with every
+# pin an input, and the transceivers drive their buses low on a floating DI
+# (origin89hq/hardware#28). Effect: the part boots through the bootloader,
+# which drives RUN and KICK low and jumps to 0x08002000. Recovery:
+# `just flash-controller` if the application is not there yet; the part
+# waits with the lines low until it is.
 #
-# Flash the bootloader into both banks of the controller.
+# Flash the bootloader into both banks of the controller, then reset it.
 flash-boot: sizes
     probe-rs download --chip {{chip}} --verify {{boot_elf}}
     probe-rs download --chip {{chip}} --verify --binary-format bin --base-address 0x08040000 {{boot_bin}}
+    probe-rs reset --chip {{chip}}
 
-# Flash the production controller image at 0x08002000. Needs the bootloader
-# in front of it (`just flash-boot`); on its own the part waits at the
-# bootloader with the lines low. Effect: the controller boots in the order
-# the hazards dictate. Recovery: `just flash-controller` again, or
+# Flash the production controller image at 0x08002000, then reset the part:
+# `probe-rs download` alone leaves it halted in its flash loader with every
+# pin an input, which is a controller that runs nothing and buses driven low
+# by floating DIs (origin89hq/hardware#28). Needs the bootloader in front of
+# it (`just flash-boot`); on its own the part waits at the bootloader with
+# the lines low. Effect: the controller boots in the order the hazards
+# dictate. Recovery: `just flash-controller` again, or
 # `just run-controller-bench` to bypass the bootloader.
 #
-# Flash the production controller image at 0x08002000, behind the bootloader.
+# Flash the production controller image at 0x08002000 and reset the part.
 flash-controller: sizes
     probe-rs download --chip {{chip}} --verify {{controller_elf}}
+    probe-rs reset --chip {{chip}}
 
 # Flash and run the production controller image with the log on the probe.
 # The runner is `probe-rs run`, which flashes the ELF's own regions only, so
@@ -208,3 +217,27 @@ dev-erase-nor block count="1" *args:
 # RESET the controller through the firmware's mailbox.
 dev-reboot *args:
     cargo run -q -p o89-dev -- {{args}} reboot
+
+# FLASH the comms image onto the module through the controller (F-038):
+# the firmware resets the module, knocks inside its download window and
+# bridges the ROM's UART to the mailbox; esptool writes the merged image,
+# bootloader and partition table included, at address 0. Effect: whatever
+# the module ran is replaced; the module reboots on the new image when
+# esptool is done. Recovery: run it again with `--entry strap` and, on
+# revision A, a wire holding IO8 high (hardware#6): a transfer that dies
+# after the erase leaves a module that boots nothing and never enters the
+# ROM's loader by itself, which is #1. Needs `uvx` for esptool. The images
+# are built first, so what is flashed is the source as it stands.
+#
+# FLASH the comms image onto the module through the controller; replaces what it ran.
+dev-flash-comms *args: sizes
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} {{args}}
+
+# LISTEN to the module through the bridge: the firmware resets it, by
+# `--entry reset` (the default), `knock` or `strap`, and prints what it
+# says on its UART0 for a few seconds, then resets it normally. Effect: two
+# module resets. Recovery: none needed.
+#
+# LISTEN to what the module says after a reset, through the controller.
+dev-comms-listen *args:
+    cargo run -q -p o89-dev -- comms-listen {{args}}
