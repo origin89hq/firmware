@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::layout::{ImageState, OTADATA_LEN, Role, Table, otadata_no_slot, otadata_selecting};
+use crate::layout::{
+    ImageState, OTADATA_LEN, Role, TABLE_AT, TABLE_LEN, Table, otadata_no_slot, otadata_selecting,
+};
 use crate::link::Link;
 
 /// `download_reason` as the registry numbers `bench`.
@@ -287,22 +289,34 @@ fn espflash(extra: &[&str], partitions: Option<&Path>, elf: &Path, out: &Path) -
     Ok(())
 }
 
-/// Carry out `plan` on the module through the controller. With `knock`
+/// What a flash is asked to do. The slot route's plan cannot be made
+/// before the bridge is up, because it is made from the table the module
+/// holds and not from the one in the repository (F-085).
+pub enum Request<'a> {
+    /// The application into an OTA slot, the recovery image kept.
+    Slot {
+        /// The application image, as the bootloader loads it from a slot.
+        app: &'a Path,
+        /// Where the `otadata` this writes is built.
+        scratch: &'a Scratch,
+        /// The table the image was built against, compared against the
+        /// module's so that a repository that has moved on says so.
+        declared: Option<&'a Table>,
+    },
+    /// The whole flash from zero, the recovery image with it.
+    Whole {
+        /// The merged image: bootloader, partition table and factory app.
+        merged: &'a Path,
+    },
+}
+
+/// Carry out `request` on the module through the controller. With `knock`
 /// the firmware asks the module's own window; with the strap it holds IO9
 /// low across a reset, for a module that runs nothing that answers.
-pub fn flash(link: &mut Link, plan: &Plan, entry: DownloadEntry) -> Result<()> {
-    println!("{}", plan.says);
+pub fn flash(link: &mut Link, request: &Request, entry: DownloadEntry) -> Result<()> {
     link.download(REASON_BENCH, entry)?;
     println!("module in download mode; the bridge is up");
-    let mut outcome = Ok(());
-    for (number, pass) in plan.passes.iter().enumerate() {
-        let number = number.saturating_add(1);
-        outcome = run_esptool(link, pass)
-            .with_context(|| format!("pass {number} of {}", plan.passes.len()));
-        if outcome.is_err() {
-            break;
-        }
-    }
+    let outcome = carry_out(link, request);
     // The module goes back whatever esptool did: a half-written image is
     // the bootloader's to refuse, and a module left in the ROM is a
     // module nobody can reach.
@@ -310,6 +324,93 @@ pub fn flash(link: &mut Link, plan: &Plan, entry: DownloadEntry) -> Result<()> {
     both(outcome, back)?;
     println!("module reset normally");
     Ok(())
+}
+
+/// The plan made and run with the bridge up, so that whatever happens the
+/// caller still gives the module back.
+fn carry_out(link: &mut Link, request: &Request) -> Result<()> {
+    let plan = match request {
+        Request::Slot {
+            app,
+            scratch,
+            declared,
+        } => {
+            let installed = installed_table(link, scratch)?;
+            if let Some(declared) = declared {
+                differences(&installed, declared);
+            }
+            plan_slot(&installed, app, scratch)?
+        }
+        Request::Whole { merged } => plan_whole(merged)?,
+    };
+    println!("{}", plan.says);
+    let mut outcome = Ok(());
+    for (number, pass) in plan.passes.iter().enumerate() {
+        let number = number.saturating_add(1);
+        let mut args = vec!["write-flash".to_owned()];
+        // In the order given, which is the order they land: what a pass
+        // writes first is what a pass that dies has already done.
+        for write in pass {
+            println!(
+                "  {} bytes at {:#x} from {}",
+                write.len,
+                write.at,
+                write.file.display()
+            );
+            args.push(format!("{:#x}", write.at));
+            args.push(write.file.to_string_lossy().into_owned());
+        }
+        outcome = run_esptool(link, &args)
+            .with_context(|| format!("pass {number} of {}", plan.passes.len()));
+        if outcome.is_err() {
+            break;
+        }
+    }
+    outcome
+}
+
+/// The partition table the module holds, read out of the sector the
+/// bootloader reads it from (F-085).
+fn installed_table(link: &mut Link, scratch: &Scratch) -> Result<Table> {
+    let out = scratch.file("installed-table.bin");
+    run_esptool(
+        link,
+        &[
+            "read-flash".to_owned(),
+            format!("{TABLE_AT:#x}"),
+            format!("{TABLE_LEN:#x}"),
+            out.to_string_lossy().into_owned(),
+        ],
+    )
+    .context("reading the module's partition table")?;
+    let bytes = std::fs::read(&out).with_context(|| format!("reading back {}", out.display()))?;
+    Table::parse_installed(&bytes).context("the module's partition table")
+}
+
+/// Say where the module's table and the one in the repository disagree
+/// about the partitions this writes.
+///
+/// Not a refusal: the module's table is the one that decides, and it is
+/// the one this plans from. But a repository whose table has moved on is
+/// a whole flash somebody has not run yet, and the operator should hear
+/// it from the tool rather than from a module that boots the wrong thing.
+fn differences(installed: &Table, declared: &Table) {
+    for role in [Role::OTA_DATA, Role::FACTORY, Role::ota(BENCH_SLOT)] {
+        match (installed.find(role), declared.find(role)) {
+            (Ok(on_part), Ok(in_repo))
+                if on_part.offset != in_repo.offset || on_part.size != in_repo.size =>
+            {
+                println!(
+                    "note: the module has {role} at {:#x} for {} bytes; the table in the \
+                     repository says {:#x} for {}. The module's is used",
+                    on_part.offset, on_part.size, in_repo.offset, in_repo.size
+                );
+            }
+            (Err(_), Ok(_)) => println!("note: the module's table has no {role}"),
+            (Ok(_), Err(_)) => println!("note: the table in the repository has no {role}"),
+            (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
+        }
+    }
 }
 
 /// An operation's outcome and the module's return to normal after it,
@@ -377,11 +478,11 @@ pub fn listen(link: &mut Link, seconds: u64, entry: DownloadEntry, leave_open: b
     Ok(())
 }
 
-fn run_esptool(link: &mut Link, writes: &[Write]) -> Result<()> {
+fn run_esptool(link: &mut Link, args: &[String]) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("opening the relay socket")?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let (mut esptool, from_esptool) = spawn_esptool(port, writes)?;
+    let (mut esptool, from_esptool) = spawn_esptool(port, args)?;
     let mut relay = Relay {
         listener,
         client: None,
@@ -445,7 +546,7 @@ impl Drop for Esptool {
 }
 
 /// `esptool` against the socket, its output lines on a channel.
-fn spawn_esptool(port: u16, writes: &[Write]) -> Result<(Esptool, mpsc::Receiver<String>)> {
+fn spawn_esptool(port: u16, args: &[String]) -> Result<(Esptool, mpsc::Receiver<String>)> {
     let esptool = std::env::var("O89_ESPTOOL").unwrap_or_else(|_| "uvx esptool".to_owned());
     let mut words = esptool.split_whitespace();
     let program = words.next().context("an esptool command")?;
@@ -459,18 +560,8 @@ fn spawn_esptool(port: u16, writes: &[Write]) -> Result<(Esptool, mpsc::Receiver
         ])
         // The ROM's own loader: the stub would be one more image to move over
         // the bridge, and the 176 KB take under a minute without it.
-        .args(["--no-stub", "write-flash"]);
-    // In the order given, which is the order they land: what a pass writes
-    // first is what a pass that dies has already done.
-    for write in writes {
-        println!(
-            "  {} bytes at {:#x} from {}",
-            write.len,
-            write.at,
-            write.file.display()
-        );
-        command.arg(format!("{:#x}", write.at)).arg(&write.file);
-    }
+        .arg("--no-stub")
+        .args(args);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -660,6 +751,45 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
         let naming =
             std::fs::read(&second.first().expect("the otadata").file).expect("it is there");
         assert_ne!(naming.first(), Some(&0xff), "a slot chosen");
+    }
+
+    #[test]
+    fn f_085_the_plan_comes_from_the_table_the_module_holds() {
+        // The repository's table has moved on: what it now calls ota_0 is
+        // where the module still keeps its factory image. A plan made from
+        // the repository's table would erase the recovery image and report
+        // that it stays, because the guard would be checking the wrong
+        // factory range.
+        let moved_on = Table::parse(
+            "otadata, data, ota,     0x9000,   0x2000,\n\
+             ota_0,   app,  ota_0,   0x10000,  0x200000,\n\
+             factory, app,  factory, 0x210000, 0x200000,\n",
+        )
+        .expect("the table parses");
+        let scratch = Scratch::new().expect("a scratch");
+        let app = application(&scratch, 112_832);
+        // Planned from the module's table, the application goes where the
+        // module keeps ota_0, and the module's factory image is what the
+        // guard protects.
+        let installed = board_a();
+        let plan = plan_slot(&installed, &app, &scratch).expect("a plan");
+        let landing = plan
+            .passes
+            .iter()
+            .flatten()
+            .find(|write| write.file == app)
+            .expect("the application is written");
+        assert_eq!(
+            landing.at, 0x0021_0000,
+            "the module's ota_0, not the repository's"
+        );
+        keeps_the_recovery_image(&plan, &installed).expect("the module's factory image stays");
+        // And the same plan judged against the table that moved on would
+        // have been called safe while erasing the image it protects.
+        assert!(
+            keeps_the_recovery_image(&plan, &moved_on).is_err(),
+            "the repository's table calls this plan safe, which is the bug"
+        );
     }
 
     #[test]

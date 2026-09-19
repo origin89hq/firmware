@@ -353,6 +353,17 @@ knock at with no wire on it, which is what the erase at address zero did not.
 Source: [#1][i1], F-036, bench 2026-09-19 §5 for the loss this prevents and
 §10 for the sequence run on the board. M3.
 
+**F-085** — The slot route plans from the partition table the module holds,
+read back from the sector the bootloader reads it from, and never from the
+table in the repository, which says only what the next whole flash would
+install. The two are compared and any disagreement about the partitions
+being written is reported, because a repository whose table has moved on is
+a whole flash somebody has not run. A table this tool cannot read whole is
+refused rather than partly believed. Without this the guard of F-084 checks
+the factory range the repository claims while the bytes land on the
+module's, so a table change alone could erase the recovery image and report
+that it stayed. Source: [#1][i1], F-084, review of [#58][p58]. M3.
+
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6
 [h13]: https://github.com/origin89hq/hardware/issues/13
@@ -377,3 +388,4 @@ Source: [#1][i1], F-036, bench 2026-09-19 §5 for the loss this prevents and
 [k34]: https://github.com/origin89hq/km43/issues/34
 [k35]: https://github.com/origin89hq/km43/issues/35
 [k36]: https://github.com/origin89hq/km43/issues/36
+[p58]: https://github.com/origin89hq/firmware/pull/58

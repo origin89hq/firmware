@@ -19,8 +19,14 @@ use anyhow::{Context, Result, bail};
 pub const OTADATA_LEN: u32 = 0x2000;
 
 /// One entry, which is a sector each. Sized so that flash encryption, which
-/// this product does not use, would still have whole blocks.
+/// this product does not use, would still have whole blocks. A partition
+/// table's entries are the same width, which is why this is shared.
 const ENTRY_LEN: usize = 32;
+
+/// The sector the bootloader reads the partition table out of.
+pub const TABLE_AT: u32 = 0x8000;
+/// How much of it is read back.
+pub const TABLE_LEN: u32 = 0x1000;
 
 /// The erased byte, which is what a sector reads as before anything is
 /// programmed into it, and what "no slot chosen" is written as.
@@ -141,6 +147,43 @@ impl Table {
         Self::parse(&text).with_context(|| format!("in {}", path.display()))
     }
 
+    /// The table the module actually holds, from the sector the bootloader
+    /// reads it out of (F-085).
+    ///
+    /// This is the one that decides where the module's partitions are. The
+    /// CSV in the repository says what the next whole flash would install,
+    /// which is a different question and the wrong one to answer when
+    /// writing a slot on a module somebody else flashed.
+    ///
+    /// Entries are 32 bytes: `AA 50`, the type and subtype, the offset and
+    /// the size, a label and flags. The table ends at its MD5 entry or at
+    /// erased bytes; anything else in an entry's place is refused, because
+    /// a table this tool cannot read whole is one whose offsets it must
+    /// not act on.
+    pub fn parse_installed(bytes: &[u8]) -> Result<Self> {
+        let mut partitions = Vec::new();
+        // Bounded: one turn per 32-byte entry in the sector.
+        for (number, entry) in bytes.as_chunks::<ENTRY_LEN>().0.iter().enumerate() {
+            let magic = entry.get(..2).unwrap_or(&[]);
+            match magic {
+                // A partition.
+                [0xaa, 0x50] => partitions.push(Partition::parse_installed(entry)?),
+                // The MD5 of everything before it: not a partition.
+                [0xeb, 0xeb] => {}
+                // Erased: the end of the table.
+                [ERASED, ERASED] => break,
+                _ => bail!(
+                    "entry {number} of the module's partition table is neither a partition, \
+                     an MD5 nor the end of the table"
+                ),
+            }
+        }
+        if partitions.is_empty() {
+            bail!("the module's partition table holds no partitions");
+        }
+        Ok(Self { partitions })
+    }
+
     /// The table's rows, by the text of the file.
     pub fn parse(text: &str) -> Result<Self> {
         let mut partitions = Vec::new();
@@ -212,6 +255,31 @@ impl Partition {
             role: role(kind, subtype),
             offset: number(offset).context("the offset")?,
             size: number(size).context("the size")?,
+        })
+    }
+
+    /// One 32-byte entry of the table the module holds.
+    fn parse_installed(entry: &[u8]) -> Result<Self> {
+        let field = |at: usize| -> Result<u32> {
+            let bytes = entry
+                .get(at..at.saturating_add(4))
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .context("a partition entry that is four bytes short")?;
+            Ok(u32::from_le_bytes(bytes))
+        };
+        let kind = *entry.get(2).context("a partition entry with no type")?;
+        let subtype = *entry.get(3).context("a partition entry with no subtype")?;
+        let label = entry.get(12..28).unwrap_or(&[]);
+        let label: String = label
+            .iter()
+            .take_while(|byte| **byte != 0 && **byte != ERASED)
+            .map(|byte| char::from(*byte))
+            .collect();
+        Ok(Self {
+            name: label,
+            role: Some(Role { kind, subtype }),
+            offset: field(4)?,
+            size: field(8)?,
         })
     }
 
@@ -394,6 +462,71 @@ creds,     data, nvs,     0x610000, 0x6000,
         assert_eq!(slot.offset, 0x0021_0000);
         assert_eq!(slot.size, 0x0020_0000);
         assert_eq!(slot.end().expect("it ends"), 0x0041_0000);
+    }
+
+    /// One 32-byte entry of a table as the module holds it.
+    fn installed_entry(kind: u8, subtype: u8, offset: u32, size: u32, label: &str) -> Vec<u8> {
+        let mut entry = vec![0xaa, 0x50, kind, subtype];
+        entry.extend_from_slice(&offset.to_le_bytes());
+        entry.extend_from_slice(&size.to_le_bytes());
+        let mut name = [0u8; 16];
+        for (at, byte) in label.bytes().take(16).enumerate() {
+            name[at] = byte;
+        }
+        entry.extend_from_slice(&name);
+        entry.extend_from_slice(&0u32.to_le_bytes());
+        entry
+    }
+
+    /// A whole sector: the rows, the MD5 entry the tool writes after them,
+    /// and erased bytes to the end.
+    fn installed_sector(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes: Vec<u8> = rows.concat();
+        let mut md5 = vec![0xeb, 0xeb];
+        md5.extend_from_slice(&[ERASED; 14]);
+        md5.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(&md5);
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        bytes
+    }
+
+    #[test]
+    fn f_085_the_table_the_module_holds_is_read_from_its_own_sector() {
+        let sector = installed_sector(&[
+            installed_entry(1, 0x00, 0x9000, 0x2000, "otadata"),
+            installed_entry(0, 0x00, 0x0001_0000, 0x0020_0000, "factory"),
+            installed_entry(0, 0x10, 0x0021_0000, 0x0020_0000, "ota_0"),
+        ]);
+        let table = Table::parse_installed(&sector).expect("the table parses");
+        let slot = table.find(Role::ota(0)).expect("ota_0");
+        assert_eq!(slot.offset, 0x0021_0000);
+        assert_eq!(
+            slot.name, "ota_0",
+            "the label comes back without its padding"
+        );
+        assert_eq!(
+            table.find(Role::FACTORY).expect("factory").offset,
+            0x0001_0000
+        );
+    }
+
+    #[test]
+    fn an_installed_table_with_nothing_in_it_is_refused() {
+        assert!(Table::parse_installed(&[ERASED; 64]).is_err());
+    }
+
+    #[test]
+    fn an_installed_table_this_tool_cannot_read_whole_is_refused() {
+        // Neither a partition, an MD5, nor the end: offsets from a table
+        // that is only partly understood are offsets to write nothing at.
+        let mut sector = installed_sector(&[installed_entry(1, 0x00, 0x9000, 0x2000, "otadata")]);
+        sector[32] = 0x12;
+        sector[33] = 0x34;
+        let error = format!(
+            "{:#}",
+            Table::parse_installed(&sector).expect_err("refused")
+        );
+        assert!(error.contains("entry 1"), "{error}");
     }
 
     #[test]

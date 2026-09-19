@@ -19,7 +19,7 @@ mod link;
 mod rail;
 mod store;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -333,32 +333,57 @@ fn main() -> Result<()> {
             entry,
             layout,
             yes,
-        } => {
-            // The generated files live for this flash and go with it.
-            let scratch = flash::Scratch::new()?;
-            layout.permitted(yes)?;
-            let entry = entry.unwrap_or_else(|| layout.entry());
-            let plan = match layout {
-                Layout::Slot => {
-                    let table = layout::Table::read(&partitions)?;
-                    let app = scratch.file("o89-comms.bin");
-                    flash::app_image(&elf, &app)?;
-                    flash::plan_slot(&table, &app, &scratch)?
-                }
-                Layout::Whole => {
-                    let merged = scratch.file("o89-comms-merged.bin");
-                    flash::merge(&elf, &partitions, &merged)?;
-                    flash::plan_whole(&merged)?
-                }
-            };
-            flash::flash(&mut link, &plan, entry.into())
-        }
+        } => flash_comms(&mut link, &elf, &partitions, entry, layout, yes),
         Command::CommsListen {
             seconds,
             entry,
             leave_open,
         } => flash::listen(&mut link, seconds, entry.into(), leave_open),
     }
+}
+
+/// FLASH the comms image onto the module through the controller.
+fn flash_comms(
+    link: &mut Link,
+    elf: &Path,
+    partitions: &Path,
+    entry: Option<FlashEntry>,
+    layout: Layout,
+    yes: bool,
+) -> Result<()> {
+    // The generated files live for this flash and go with it.
+    let scratch = flash::Scratch::new()?;
+    layout.permitted(yes)?;
+    let entry = entry.unwrap_or_else(|| layout.entry());
+    let app;
+    let declared;
+    let merged;
+    let request = match layout {
+        Layout::Slot => {
+            app = scratch.file("o89-comms.bin");
+            flash::app_image(elf, &app)?;
+            // Only to be compared against the module's own, which
+            // is what the slot route plans from (F-085): a table
+            // the repository cannot read is not a reason to refuse
+            // a flash the module's table fully describes.
+            declared = layout::Table::read(partitions)
+                .inspect_err(|error| {
+                    println!("note: {}: {error:#}", partitions.display());
+                })
+                .ok();
+            flash::Request::Slot {
+                app: &app,
+                scratch: &scratch,
+                declared: declared.as_ref(),
+            }
+        }
+        Layout::Whole => {
+            merged = scratch.file("o89-comms-merged.bin");
+            flash::merge(elf, partitions, &merged)?;
+            flash::Request::Whole { merged: &merged }
+        }
+    };
+    flash::flash(link, &request, entry.into())
 }
 
 /// Sixteen bytes a line, the address in front.
