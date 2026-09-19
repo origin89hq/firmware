@@ -68,22 +68,83 @@ pub enum NotKept {
 /// answer to the next.
 pub struct CutsKeeper {
     next: u32,
+    in_flight: Option<InFlight>,
+}
+
+/// A keep started and not yet answered.
+#[derive(Clone, Copy)]
+struct InFlight {
+    request: u32,
+    cuts: RecentCuts,
+    deadline: Option<Instant>,
 }
 
 impl CutsKeeper {
     /// No request made yet.
     pub const fn new() -> Self {
-        Self { next: 0 }
+        Self {
+            next: 0,
+            in_flight: None,
+        }
     }
 
-    /// Keep `cuts` on the FRAM (F-017), and wait for them to land or for
-    /// the deadline. A request the recorder has not started by then is
-    /// withdrawn; one it has started may still land, which the caller
-    /// counts as not knowing what the part holds.
-    pub async fn keep(&mut self, cuts: RecentCuts) -> Result<(), NotKept> {
+    fn ask(&mut self, cuts: RecentCuts) -> u32 {
         let request = self.next;
         self.next = self.next.wrapping_add(1);
         CUTS.signal((request, cuts));
+        request
+    }
+
+    /// Start keeping `cuts` without waiting, for a change the rail does not
+    /// move on: its answer comes from [`poll`](Self::poll), so the rail task
+    /// never stalls on the recorder while the recorder waits on the link,
+    /// as a bench download makes it. One at a time: `false` while another
+    /// is in flight.
+    pub fn start(&mut self, cuts: RecentCuts) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let request = self.ask(cuts);
+        self.in_flight = Some(InFlight {
+            request,
+            cuts,
+            deadline: Instant::now().checked_add(KEEP_DEADLINE),
+        });
+        true
+    }
+
+    /// The answer to the keep in flight, once it has come or its deadline
+    /// has passed; a request the recorder has not started by then is
+    /// withdrawn.
+    pub fn poll(&mut self) -> Option<(RecentCuts, Result<(), NotKept>)> {
+        let flight = self.in_flight?;
+        if let Some((answered, kept)) = CUTS_KEPT.try_take()
+            && answered == flight.request
+        {
+            self.in_flight = None;
+            return Some((flight.cuts, kept));
+        }
+        if flight
+            .deadline
+            .is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            CUTS.reset();
+            self.in_flight = None;
+            return Some((flight.cuts, Err(NotKept::Late)));
+        }
+        None
+    }
+
+    /// Keep `cuts` on the FRAM (F-017) and wait for them to land or for
+    /// the deadline, for a cut, which is made only once its count is kept.
+    /// A keep in flight is superseded: the recorder writes in order, so the
+    /// part ends with these cuts, and the older answer is passed over. A
+    /// request not started by the deadline is withdrawn; one started may
+    /// still land, which the caller counts as not knowing what the part
+    /// holds.
+    pub async fn keep(&mut self, cuts: RecentCuts) -> Result<(), NotKept> {
+        self.in_flight = None;
+        let request = self.ask(cuts);
         let deadline = Instant::now().checked_add(KEEP_DEADLINE);
         // Bounded by the deadline: every turn takes an answer, and an
         // answer to an earlier request is passed over.
