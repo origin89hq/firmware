@@ -8,18 +8,25 @@
 //! fault found on the bench becomes a fault here first, so it is a test
 //! that runs on every commit rather than a night somebody remembers.
 //!
-//! What exists today is the storage seam: a simulated FRAM and a simulated
+//! What exists today: the storage seam, a simulated FRAM and a simulated
 //! NOR, each with a step counter, the harness that runs a write path
 //! crashing at every step and asserts the recovery invariant after each
-//! (VERIFICATION §6, F-025), and the tables' and the ring's write paths run
-//! through it. This crate is host-only: it is
-//! never cross-compiled, so it may hold a whole part's bytes on the heap;
-//! the rules that bind the domain crates bind what it tests, not itself.
+//! (VERIFICATION §6, F-025), the tables' and the ring's write paths run
+//! through it; and the hostile comms processor, a peer with a named set of
+//! capabilities that every test using it declares, driving the link's state
+//! machine through what a real one can do to it. This crate is host-only:
+//! it is never cross-compiled, so it may hold a whole part's bytes on the
+//! heap; the rules that bind the domain crates bind what it tests, not
+//! itself.
 
+mod comms;
 mod fram;
+#[cfg(test)]
+mod link;
 mod nor;
 #[cfg(test)]
 mod tables;
 
+pub use comms::*;
 pub use fram::*;
 pub use nor::*;

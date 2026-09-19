@@ -592,7 +592,28 @@ cap and rate limit, and the comms release flow. The adapter owns the bytes
 and the rail pin. The ROM's boot text arrives on the link at 115200 after
 every module reset while the link runs at 921600; the framer resynchronises
 through it and counts it, and a count that is not near one per module boot
-means the link is wrong (#2).
+means the link is wrong (#2). The state machine takes decoded frames and
+ticks and answers typed actions, so the whole rulebook runs on the host
+against a hostile peer with a named capability set: linked once the
+controller's own `LinkUp` is answered and not before, a changed `boot_id`
+dropping every connection, a heartbeat every two seconds answered at once,
+the ladder measured from the peer's last answer to a request of the
+controller's and never from what it says of its own accord, so a comms
+processor that talks but cannot hear is cut at sixty seconds, the ladder
+suspended while a release installs, and the request counter with its four
+outstanding and three attempts. The
+controller's `boot_id` is a hash of the part's unique id and the boot
+count (F-039): the G0 has no RNG, and what L-040 needs is a number that
+is new at every boot and never read back from RAM, which a boot count kept
+on the FRAM and advanced at every boot is; two boots
+share a value with the chance two random draws would, one in 2^32.
+Until the session layer and the clock exist, a connection the comms
+processor announces is refused as not yet linked before the `LinkUp`
+exchange and as a full table after it, which a table of no rows is; a
+handle it releases is unknown; a time offer is refused as implausible,
+because a controller that cannot take a time cannot find one plausible.
+Every answer is a real outcome the peer acts on and never silence, which
+L-015 would read as a dead link. M4 replaces each arm.
 
 ## Persistence
 
