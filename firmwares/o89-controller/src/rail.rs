@@ -14,7 +14,10 @@
 //! The ladder's recoveries come from the link task, which drops its UART
 //! before asking so the lines into the module are inputs before the rail
 //! goes (F-003); what the sequencer answered, and every settling of the
-//! rail, go back to it as words on a bounded channel.
+//! rail, go back to it as words on a bounded channel. The ladder's cuts of
+//! the last hour go to the FRAM through the recorder whenever they change,
+//! before the lines move, so a cut is kept before the rail goes off and a
+//! controller reset does not lower the count (F-017).
 
 use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -23,10 +26,11 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker};
 use o89_core::{
     BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine, RailSequencer,
-    Recovery, StrapRoute, Task,
+    RecentCuts, Recovery, StrapRoute, Task,
 };
 
 use crate::REVISION;
+use crate::recorder;
 use crate::supervisor::{Uptime, check_in};
 
 /// What the rail tells the link.
@@ -143,9 +147,10 @@ impl Pins {
 }
 
 /// The rail task: the sequencer's lines from here on. The boot power-on
-/// was applied by `main` before this task was spawned.
+/// was applied by `main` before this task was spawned; `kept` is the
+/// ladder's cuts as the part holds them, carried to this boot.
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
+pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentCuts) {
     let mut ticker = Ticker::every(PERIOD);
     loop {
         ticker.next().await;
@@ -201,6 +206,19 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer) {
                     defmt::error!("rail: left on; comms unrecoverable");
                 }
             }
+        }
+        let cuts = sequencer.recent_cuts(now);
+        if cuts != kept {
+            // Kept before the lines move: a cut is on the part before the
+            // rail goes off, and one that aged out is off it before a boot
+            // could carry it again (F-017). A write that fails is logged
+            // and not retried until the cuts change again; the count in RAM
+            // still holds for this boot.
+            match recorder::keep_cuts(cuts).await {
+                Ok(()) => defmt::info!("rail: {} cuts in the last hour kept", cuts.count()),
+                Err(why) => defmt::error!("rail: the ladder's cuts not kept: {}", why),
+            }
+            kept = cuts;
         }
         pins.apply(sequencer.lines());
         check_in(Task::Rail);

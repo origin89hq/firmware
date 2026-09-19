@@ -1,21 +1,24 @@
 //! The tables' write paths, each cut at every byte, with the invariant a
 //! boot needs asserted after every cut (F-025).
 //!
-//! Five paths, five invariants. A factory reset leaves the old epoch
+//! Six paths, six invariants. A factory reset leaves the old epoch
 //! with its rows, or a higher epoch whose table the next boot clears. A
 //! command leaves its counter and its in-flight entry together or leaves
 //! neither. A pairing leaves the rows that were there, with or without the
 //! new one, and never a row half written. A mint hands out no counter and
 //! the next mint is past every one before it. A boot leaves a boot count
-//! that climbs and a panic record that is whole or absent.
+//! that climbs and a panic record that is whole or absent. The recovery
+//! ladder's cuts leave the ones before the cut or the ones after it, and
+//! never fewer than were kept.
 
 use embassy_futures::block_on;
 use km43::{ClientId, ClientKind, Counter, Epoch};
-use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH};
+use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS};
 use o89_core::{
     Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
     ChallengeCounter, ClientTable, EPOCH_BYTES, Fingerprint, Held, Kept, Label, LastWords, Paired,
-    PanicRecorded, PanicSite, Store, Tick,
+    PanicRecorded, PanicSite, RECENT_CUTS_BYTES, RailSequencer, RecentCuts, Recovery, Revision,
+    Store, Tick,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -23,6 +26,7 @@ use crate::{Crashes, SimFram, crash_at_every_step};
 type Epochs = Kept<Epoch, EPOCH_BYTES>;
 type Clients = Kept<ClientTable, CLIENT_TABLE_BYTES>;
 type Counters = Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>;
+type Cuts = Kept<RecentCuts, RECENT_CUTS_BYTES>;
 
 fn client(n: u32) -> ClientId {
     ClientId::new(n).expect("a nonzero client")
@@ -273,4 +277,54 @@ fn f_008_a_boot_cut_at_any_step_leaves_a_boot_count_that_climbs_and_a_panic_reco
     .expect("the path runs uncut");
     // The boot count's 20 bytes and the panic record's 40.
     assert_eq!(crashes, Crashes { steps: 20 + 40 });
+}
+
+#[test]
+fn f_017_a_ladder_write_cut_at_any_step_keeps_the_cuts_before_it_or_after_it() {
+    // One cut kept; the ladder makes a second, and its record is cut at
+    // every byte on the way to the part.
+    let mut seq = RailSequencer::new(Revision::B);
+    let first = Tick::from_millis(90_000);
+    assert!(matches!(
+        seq.recover(first),
+        Recovery::Cycling { count: 1, .. }
+    ));
+    let one = seq.recent_cuts(first);
+    let mut start = with_one_phone();
+    let mut cuts = block_on(Cuts::read(RECENT_CUTS, &mut start)).expect("the part answers");
+    block_on(cuts.write(&mut start, one)).expect("the supply is steady");
+    let mut after = seq;
+    for ms in 90_001..=95_200 {
+        let _ = after.tick(Tick::from_millis(ms));
+    }
+    let second = Tick::from_millis(160_000);
+    assert!(matches!(
+        after.recover(second),
+        Recovery::Cycling { count: 2, .. }
+    ));
+    let two = after.recent_cuts(second);
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            let mut cuts = block_on(Cuts::read(RECENT_CUTS, part)).map_err(|_| ())?;
+            block_on(cuts.write(part, two)).map_err(|_| ())
+        },
+        |part, step| {
+            let (store, _) = block_on(Store::boot(part, None)).expect("the part is back");
+            let carried = RecentCuts::carried(store.cuts.held());
+            assert!(
+                carried == one.rebased() || carried == two.rebased(),
+                "cut at {step}: {carried:?}"
+            );
+        },
+    )
+    .expect("the path runs uncut");
+    // Four bytes clearing the magic, four of sequence, twenty-five of body,
+    // four of CRC, four of magic.
+    assert_eq!(
+        crashes,
+        Crashes {
+            steps: 4 + 4 + 25 + 4 + 4
+        }
+    );
 }

@@ -898,7 +898,10 @@ it has booted and applies its policy from there:
 
 - The recovery ladder's cuts (L-111, L-112), each logged; the count L-111
   names goes into the record once origin89hq/km43#32 gives the body its
-  shape, and is on the probe's log until then.
+  shape, and is on the probe's log until then. The cuts of the last hour
+  are on the FRAM before the rail goes off, and a boot carries them as made
+  at its own start, so a controller that resets between rungs still reaches
+  the third (F-017).
 - A bank-voltage threshold below which the radio stays off, so the weakest
   bank in February is not also carrying a radio nobody is using. The
   threshold and its hysteresis are configuration values that have not been
@@ -923,7 +926,8 @@ Revision A is the opposite by accident, and the firmware lives with it. The
 rail defaults **off** through every controller reset, so each reset reboots
 the module, costs a Wi-Fi association and is a switch-on event; a crash loop
 at the 8 s watchdog is 450 rail cycles an hour against the ladder's three
-deliberate ones. Switching the rail on after minutes off corrupted the
+deliberate ones. Those resets are counted as the ladder's cuts, so three of
+them inside an hour are its third rung (F-018). Switching the rail on after minutes off corrupted the
 controller within milliseconds, 22 of 22 times on the bench, while short
 cycles pass hundreds of times
 ([origin89hq/hardware#5](https://github.com/origin89hq/hardware/issues/5)).

@@ -57,8 +57,8 @@ use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Ticker, Timer};
 use o89_core::{
     Blame, BootId, BootRecord, Bus, Clock, Contact, FailState, Feedback, Identity, LastWords, Line,
-    LinkText, Millis, Pull as DeclaredPull, RailSequencer, ResetCause, Revision, RtcClock, SETTLE,
-    Store, Task,
+    LinkText, Millis, Pull as DeclaredPull, RailSequencer, RecentCuts, ResetCause, Revision,
+    RtcClock, SETTLE, Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -291,7 +291,19 @@ async fn main(spawner: Spawner) {
     }
 
     // 9. The module rail sequence, powered since 5a: the task releases EN
-    // once the rail has settled, which it already has.
+    // once the rail has settled, which it already has. The ladder starts
+    // from the cuts the part kept, carried as made at this boot's start,
+    // with this boot's own reset counted where it cut the rail; with no
+    // store it starts full, since a count the part lost is never zero
+    // (F-017, F-018).
+    let kept = store.as_ref().map_or(RecentCuts::FULL, |store| {
+        RecentCuts::carried(store.cuts.held())
+    });
+    sequencer.carry(kept, Uptime.now());
+    defmt::info!(
+        "rail: {} cuts in the last hour, carried and this boot's",
+        sequencer.recent_cuts(Uptime.now()).count()
+    );
     if identity.is_none() {
         defmt::error!(
             "link: no boot count, so no boot_id (F-039); the module is powered and the link stays down"
@@ -300,7 +312,7 @@ async fn main(spawner: Spawner) {
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
-    if let Ok(token) = rail::run(rail, sequencer) {
+    if let Ok(token) = rail::run(rail, sequencer, kept) {
         spawner.spawn(token);
     } else {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");

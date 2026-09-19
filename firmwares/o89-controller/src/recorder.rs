@@ -6,15 +6,19 @@
 //! boot record, and from then on holds both parts for whoever asks: the
 //! requests arrive with the milestones that make them (M4's counters, M5's
 //! configuration, the event queue). A board whose NOR does not answer
-//! still has its store; the ring is simply absent and says so.
+//! still has its store; the ring is simply absent and says so. The rail
+//! task hands it the recovery ladder's cuts to keep before the rail goes
+//! off, and waits for the answer (F-017).
 //!
 //! cites: F-023
 
+use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, TrySendError};
-use embassy_time::{Duration, Ticker};
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Ticker, with_timeout};
 use km43::{Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
-use o89_core::{Class, LinkEvent, Ring, SCRATCH, Store, Task};
+use o89_core::{Class, LinkEvent, RecentCuts, Ring, SCRATCH, Store, Task};
 
 use crate::fram::Fram;
 use crate::mailbox;
@@ -35,6 +39,38 @@ const PERIOD: Duration = Duration::from_millis(100);
 /// so and says so, and nothing is evicted.
 static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
 
+/// The recovery ladder's cuts, to be kept on the FRAM before the rail
+/// moves. One at a time: the rail task waits for the answer.
+static CUTS: Signal<CriticalSectionRawMutex, RecentCuts> = Signal::new();
+
+/// The answer to [`CUTS`].
+static CUTS_KEPT: Signal<CriticalSectionRawMutex, Result<(), NotKept>> = Signal::new();
+
+/// How long the rail task waits for the cuts to land: a write the recorder
+/// takes at once, behind at most one ring append or mailbox request.
+const KEEP_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Why the ladder's cuts did not land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum NotKept {
+    /// This boot has no store: the FRAM did not answer at boot.
+    NoStore,
+    /// The part refused the write.
+    Refused,
+    /// The recorder did not answer inside [`KEEP_DEADLINE`].
+    Late,
+}
+
+/// Keep the ladder's cuts on the FRAM (F-017), and wait for them to land
+/// or for the deadline.
+pub async fn keep_cuts(cuts: RecentCuts) -> Result<(), NotKept> {
+    CUTS_KEPT.reset();
+    CUTS.signal(cuts);
+    with_timeout(KEEP_DEADLINE, CUTS_KEPT.wait())
+        .await
+        .unwrap_or(Err(NotKept::Late))
+}
+
 /// Queue an event for the ring, or hand it back when the queue is full.
 pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
     EVENTS.try_send(event).map_err(|refused| match refused {
@@ -45,7 +81,7 @@ pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
 /// The recorder task: the only owner of the FRAM and the NOR, and so the
 /// one that serves the bench tool's mailbox.
 #[embassy_executor::task]
-pub async fn run(store: Option<Store>, mut fram: Fram, mut nor: Nor) {
+pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     let mut scratch = [0u8; SCRATCH];
     defmt::info!("recorder: identifying the NOR");
     let jedec = nor.jedec().await;
@@ -98,25 +134,40 @@ pub async fn run(store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
-        ticker.next().await;
-        // Bounded by the queue's depth: what arrives meanwhile waits a turn.
-        for _ in 0..MAX_EVENT_QUEUE {
-            let Ok(event) = EVENTS.try_receive() else {
-                break;
-            };
-            if let Some(ring) = ring.as_mut() {
-                append(ring, &mut scratch, event.kind()).await;
-            } else {
-                defmt::error!("recorder: no ring; {} not recorded", event);
+        match select(ticker.next(), CUTS.wait()).await {
+            Either::First(()) => {
+                // Bounded by the queue's depth: what arrives meanwhile waits
+                // a turn.
+                for _ in 0..MAX_EVENT_QUEUE {
+                    let Ok(event) = EVENTS.try_receive() else {
+                        break;
+                    };
+                    if let Some(ring) = ring.as_mut() {
+                        append(ring, &mut scratch, event.kind()).await;
+                    } else {
+                        defmt::error!("recorder: no ring; {} not recorded", event);
+                    }
+                }
+                mailbox::serve(mailbox::Parts {
+                    fram: &mut fram,
+                    ring: ring.as_mut(),
+                    scratch: &mut scratch,
+                    boot,
+                })
+                .await;
+            }
+            Either::Second(cuts) => {
+                let kept = match store.as_mut() {
+                    Some(store) => store
+                        .cuts
+                        .write(&mut fram, cuts)
+                        .await
+                        .map_err(|_| NotKept::Refused),
+                    None => Err(NotKept::NoStore),
+                };
+                CUTS_KEPT.signal(kept);
             }
         }
-        mailbox::serve(mailbox::Parts {
-            fram: &mut fram,
-            ring: ring.as_mut(),
-            scratch: &mut scratch,
-            boot,
-        })
-        .await;
         check_in(Task::Recorder);
     }
 }
