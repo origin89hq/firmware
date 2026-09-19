@@ -350,7 +350,8 @@ them. The state written is `New`, which a bootloader with rollback holds
 against the image until it confirms itself, which `o89-comms` does after its
 window and not before. A transfer that dies leaves a module the controller can
 knock at with no wire on it, which is what the erase at address zero did not.
-Source: [#1][i1], F-036, bench 2026-09-19. M3.
+Source: [#1][i1], F-036, bench 2026-09-19 §5 for the loss this prevents and
+§10 for the sequence run on the board. M3.
 
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6

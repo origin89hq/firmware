@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::layout::{ImageState, OTADATA_LEN, Table, otadata_no_slot, otadata_selecting};
 use crate::link::Link;
@@ -85,11 +85,20 @@ impl Scratch {
     /// A directory of this flash's own: two benches on two probes must
     /// not hand `esptool` each other's image, and neither must two flashes
     /// of one process.
+    ///
+    /// Named from the operating system's generator and created exclusively,
+    /// so the directory is one nobody else could have made first. The
+    /// temporary directory is shared, the files in here are the bytes that
+    /// go onto the module, and this is what `Drop` later removes whole: a
+    /// path somebody else could hold is an image somebody else could
+    /// choose, and a directory somebody else could own is one this must
+    /// not delete.
     pub fn new() -> Result<Self> {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("o89-dev-{}-{number}", std::process::id()));
-        std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+        let mut name = [0u8; 16];
+        getrandom::fill(&mut name)
+            .map_err(|error| anyhow!("the operating system's generator: {error}"))?;
+        let dir = std::env::temp_dir().join(format!("o89-dev-{}", hex::encode(name)));
+        std::fs::create_dir(&dir).with_context(|| format!("making {}", dir.display()))?;
         Ok(Self(dir))
     }
 
@@ -745,6 +754,13 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
         .expect("the table parses");
         let app = application(&scratch, 1024);
         assert!(plan_slot(&table, &app, &scratch).is_err());
+    }
+
+    #[test]
+    fn two_scratches_never_share_a_directory() {
+        let one = Scratch::new().expect("a scratch");
+        let two = Scratch::new().expect("another");
+        assert_ne!(one.file("app.bin"), two.file("app.bin"));
     }
 
     #[test]
