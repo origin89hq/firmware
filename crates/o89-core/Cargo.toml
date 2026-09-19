@@ -14,7 +14,11 @@ publish.workspace = true
 defmt = ["dep:defmt"]
 
 [dependencies]
+crc.workspace = true
 defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+embassy-futures.workspace = true
 
 [lints]
 workspace = true
