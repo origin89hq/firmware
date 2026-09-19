@@ -275,12 +275,18 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// and find the head again when the block was one of the ring's: the
     /// bench tool's way to clear a part, one block per request so that
     /// whoever feeds the watchdog gets a turn between two. Everything the
-    /// ring knew is found again from the bytes, as a boot would find it.
+    /// ring knew is found again from the bytes, as a boot would find it,
+    /// which is why the scratch is checked before the erase: a search
+    /// that cannot run after the bytes are gone would leave a head
+    /// describing bytes that are no longer there.
     pub async fn erase_block(
         &mut self,
         block: u32,
         scratch: &mut [u8],
     ) -> Result<(), RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
+        }
         let from = block
             .checked_mul(Self::block_len())
             .ok_or(RingError::OutOfRange)?;
@@ -1085,6 +1091,25 @@ mod tests {
         assert_eq!(append(&mut ring, None), 1);
         let (_, count, next) = read(&mut ring, 1);
         assert_eq!((count, next), (1, 2));
+    }
+
+    #[test]
+    fn an_undersized_scratch_is_refused_before_anything_is_erased() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        for _ in 0..3 {
+            append(&mut ring, None);
+        }
+        let before = ring.head();
+        let mut small = [0u8; SCRATCH - 1];
+        assert_eq!(
+            block_on(ring.erase_block(0, &mut small)),
+            Err(RingError::ScratchTooSmall(SCRATCH - 1))
+        );
+        assert_eq!(ring.head(), before, "the head still describes the bytes");
+        let mut first = [0u8; 2];
+        block_on(ring.read_raw(0, &mut first)).expect("reads");
+        assert_eq!(first, MAGIC_BYTES, "and the bytes are still there");
     }
 
     #[test]
