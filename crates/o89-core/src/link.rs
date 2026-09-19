@@ -106,6 +106,7 @@ pub struct Identity {
 
 /// The peer, as its last `LinkUp` or acknowledgement stated it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Peer {
     /// Keys 1 and 2, as the peer speaks it.
     pub version: Version,
@@ -121,6 +122,7 @@ pub struct Peer {
 
 /// How far the two versions agree (L-050, L-051).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Compat {
     /// The lower of the two minors, under one major.
     Agreed(Version),
@@ -173,6 +175,7 @@ impl LinkEvent {
 
 /// Something for the log on the probe, never for the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Note {
     /// Bytes that were not frames since the module last booted (F-031):
     /// the ROM's text at its own baud, or a link that is wrong.
@@ -198,6 +201,7 @@ pub enum Note {
 /// A frame to put on the wire, described rather than encoded so the
 /// adapter and the simulator share one [`Link::encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Outgoing {
     /// Our statement.
     LinkUp {
@@ -1183,87 +1187,5 @@ mod tests {
                 .any(|a| matches!(a, Action::Send(Outgoing::LinkUp { .. }))),
             "the statement goes out the moment the module is powered"
         );
-    }
-}
-
-// `km43`'s types carry no `defmt::Format` yet (origin89hq/km43#38), so the
-// types here that hold one say it by its number, which is what the wire
-// carries anyway.
-#[cfg(feature = "defmt")]
-impl defmt::Format for Peer {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(
-            f,
-            "Peer {{ version: {=u8}.{=u8}, fw: {}, hw: {}, boot_id: {=u32:#x}, net_version: {} }}",
-            self.version.major,
-            self.version.minor,
-            self.fw,
-            self.hw,
-            self.boot_id,
-            self.net_version
-        );
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Compat {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Agreed(version) => {
-                defmt::write!(f, "Agreed({=u8}.{=u8})", version.major, version.minor);
-            }
-            Self::MajorMismatch { theirs } => {
-                defmt::write!(
-                    f,
-                    "MajorMismatch {{ theirs: {=u8}.{=u8} }}",
-                    theirs.major,
-                    theirs.minor
-                );
-            }
-        }
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Note {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::RomText { count } => defmt::write!(f, "RomText {{ count: {=u32} }}", count),
-            Self::Refused(code) => defmt::write!(f, "Refused({=u16})", *code as u16),
-            Self::RequestFailed(kind) => {
-                defmt::write!(f, "RequestFailed({=u8:#x})", *kind as u8);
-            }
-            Self::UnexpectedAck(kind) => {
-                defmt::write!(f, "UnexpectedAck({=u8:#x})", *kind as u8);
-            }
-            Self::Malformed(kind) => defmt::write!(f, "Malformed({=u8:#x})", *kind as u8),
-            Self::PeerRefused(Some(code)) => defmt::write!(f, "PeerRefused({=u16})", code),
-            Self::PeerRefused(None) => defmt::write!(f, "PeerRefused(unread)"),
-            Self::WrongRole => defmt::write!(f, "WrongRole"),
-        }
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Outgoing {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::LinkUp { req_id } => defmt::write!(f, "LinkUp({=u32})", req_id.0),
-            Self::LinkUpAck { req_id } => defmt::write!(f, "LinkUpAck({=u32})", req_id.0),
-            Self::Heartbeat { req_id } => defmt::write!(f, "Heartbeat({=u32})", req_id.0),
-            Self::HeartbeatAck { req_id } => {
-                defmt::write!(f, "HeartbeatAck({=u32})", req_id.0);
-            }
-            Self::ClientUpAck { req_id, outcome } => {
-                defmt::write!(f, "ClientUpAck({=u32}, {=u8})", req_id.0, *outcome as u8);
-            }
-            Self::ClientDownAck { req_id, outcome } => {
-                defmt::write!(f, "ClientDownAck({=u32}, {=u8})", req_id.0, *outcome as u8);
-            }
-            Self::TimeVerdict { req_id, outcome } => {
-                defmt::write!(f, "TimeVerdict({=u32}, {=u8})", req_id.0, *outcome as u8);
-            }
-            Self::Refuse { code } => defmt::write!(f, "Refuse({=u16})", *code as u16),
-        }
     }
 }

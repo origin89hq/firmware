@@ -27,22 +27,12 @@ pub const LINK_ENVELOPE: usize = 256;
 
 /// Why a frame did not encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum EncodeError {
     /// The body would not write.
     Body,
     /// The envelope would not frame into its buffer.
     Frame(FrameError),
-}
-
-// By hand: KM43's `FrameError` carries no `defmt` impl to derive through.
-#[cfg(feature = "defmt")]
-impl defmt::Format for EncodeError {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Body => defmt::write!(f, "Body"),
-            Self::Frame(_) => defmt::write!(f, "Frame"),
-        }
-    }
 }
 
 /// The header of a link-local frame: always session 0 (L-181).

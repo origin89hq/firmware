@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 # `defmt::Format` on every public type, for the controller's log. Off on the
 # host, where the tests read the types as Rust.
-defmt = ["dep:defmt", "o89-link/defmt"]
+defmt = ["dep:defmt", "km43/defmt", "o89-link/defmt"]
 
 [dependencies]
 # The link's mechanics, shared with the comms processor's core below both.

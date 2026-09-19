@@ -46,16 +46,10 @@ impl Body<EPOCH_BYTES> for Epoch {
 /// holds, which is a factory reset cut between its two writes and is
 /// finished by clearing the table under the epoch that landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a clearing nobody performs leaves eight rows enrolled under an epoch that no longer derives their keys"]
 pub struct Clearing {
     epoch: Epoch,
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Clearing {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(f, "Clearing under epoch {}", self.epoch.get());
-    }
 }
 
 impl Clearing {
