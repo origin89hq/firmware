@@ -13,13 +13,19 @@
 //! reset cause and the boot record, the last words a run leaves for the next
 //! boot, the [`Rollcall`] that earns the watchdog its feed, the lamp's
 //! [`Pattern`], the module rail's [`RailSequencer`], the contract
-//! [`Feedback`] is read under, and the FRAM [`Record`] with the [`map`] that
-//! places every one of them in the part. The tables,
-//! the behaviours and the link-local state machines arrive with the
-//! milestones that name them.
+//! [`Feedback`] is read under, the FRAM [`Record`] with the [`map`] that
+//! places every one of them in the part, and the first tables on it: the
+//! epoch with the [`Clearing`] a factory reset has to earn, and the
+//! [`ClientTable`] with its counters and the [`Dedup`] table beside them.
+//! The rest of the tables, the behaviours and the link-local state
+//! machines arrive with the milestones that name them.
 
 #![no_std]
 
+mod body;
+mod clients;
+mod dedup;
+mod epoch;
 mod fail_state;
 mod feedback;
 mod fram;
@@ -32,6 +38,10 @@ mod revision;
 mod rollcall;
 mod tick;
 
+pub use body::*;
+pub use clients::*;
+pub use dedup::*;
+pub use epoch::*;
 pub use fail_state::*;
 pub use feedback::*;
 pub use fram::*;

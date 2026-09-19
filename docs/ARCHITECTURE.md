@@ -583,7 +583,7 @@ means the link is wrong (#2).
 
 | | Part | Holds | Layout |
 |---|---|---|---|
-| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters (P-081, P-105), the dedup table (P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
+| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters and the dedup table beside them in one record, because P-080 lands a counter and an in-flight entry in one transaction (P-081, P-105, P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
 | NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a
@@ -619,6 +619,31 @@ is built once. The PVD discipline above is the other
 half: no
 transaction starts on a falling supply. Every FRAM write path runs crashing
 at every step on the host, and the invariant after recovery is asserted.
+
+**One record is one transaction, and that decides what shares a record.**
+The per-client counters and the dedup table are fields of the client table's
+record, not records of their own, because P-080 lands the new counter and
+the in-flight entry together or not at all, and two records cannot promise
+that. A signed request therefore rewrites the whole table, about 1.2 KB, in
+the time an I2C transaction takes; a phone sends a handful of those a second
+at most. The typed layer keeps the RAM copy of every record with the
+record's position on the part, and changes it only once the part has the
+change: a refused write leaves the controller knowing exactly what it
+accepted, which is P-079 as a structure rather than a discipline.
+
+**A factory reset is crash-safe by a stamp, not by luck.** P-085 moves the
+epoch first and clears the table second, and a power cut between the two
+leaves eight rows whose keys no longer derive counting towards
+`table_full`. The table carries the epoch its rows were enrolled under, and
+a boot that reads a table under an earlier epoch than the epoch record
+holds clears it, finishing the reset (F-026). The permission to clear is a
+type that only the read-back of a new epoch, or that boot, can produce. The
+other direction is never a clearing: a table under a later epoch than the
+record means the record regressed, which this firmware does not do by its
+own hand, and clearing under the lower epoch would let the next enrolment
+derive a key the move was made to invalidate. The stamp is a second copy of
+a counter that only climbs, so the higher copy is the epoch and the boot
+raises the record to it.
 
 History at full resolution is a client's job. The controller keeps enough to
 survive a long disconnection, which is a different requirement from keeping

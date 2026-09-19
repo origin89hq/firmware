@@ -139,6 +139,15 @@ over budget raises a concern. Source: the capacity budget in
 every step, with the recovery invariant asserted after each. Source: KM43
 VERIFICATION §6. M2.
 
+**F-026** — The client table carries the epoch its rows were enrolled under.
+A boot that reads a table under an earlier epoch than the epoch record
+holds clears it: a factory reset cut between moving the epoch and clearing
+the table is finished at the next boot rather than leaving eight rows whose
+keys no longer derive counting towards `table_full`. A table under a later
+epoch than the record is never cleared under the earlier one: the record
+regressed, and the higher of the two copies is the epoch. Source: KM43
+P-085's order, F-025 on the reset path. M2.
+
 ## The link and the comms processor
 
 **F-030** — The link is USART1 at 921600 8N1 with hardware flow control on

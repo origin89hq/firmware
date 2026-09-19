@@ -8,13 +8,16 @@
 //! sizes are decided here so the part's 32 KiB is allocated once. The last
 //! line is the assertion: a map that does not fit does not build.
 
+use crate::clients::CLIENT_TABLE_BYTES;
+use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Address, FRAM_BYTES, Record};
 
 /// The epoch: a `u32` that only ever increments (P-085).
-pub const EPOCH: Record<4> = Record::at(magic(*b"EPOC"), Address(0));
+pub const EPOCH: Record<EPOCH_BYTES> = Record::at(magic(*b"EPOC"), Address(0));
 
-/// The challenge counter, written before the challenge it names leaves.
-pub const CHALLENGE_COUNTER: Record<4> = Record::at(magic(*b"CHAL"), EPOCH.end());
+/// The challenge counter, written before the challenge it names leaves: a
+/// `u64`, the width the derivation takes (F-041).
+pub const CHALLENGE_COUNTER: Record<8> = Record::at(magic(*b"CHAL"), EPOCH.end());
 
 /// The boot counter.
 pub const BOOT_COUNTER: Record<4> = Record::at(magic(*b"BOOT"), CHALLENGE_COUNTER.end());
@@ -22,30 +25,33 @@ pub const BOOT_COUNTER: Record<4> = Record::at(magic(*b"BOOT"), CHALLENGE_COUNTE
 /// The rolling 24-hour write-volume counter: the count and its window.
 pub const WRITE_VOLUME: Record<16> = Record::at(magic(*b"VOLU"), BOOT_COUNTER.end());
 
-/// The device-unique secret every key derives from.
-pub const DEVICE_SECRET: Record<32> = Record::at(magic(*b"SECR"), WRITE_VOLUME.end());
+/// The device secret every key derives from: the sixteen bytes of the
+/// device id and the thirty-two of the printed secret (P-038, P-044).
+pub const DEVICE_SECRET: Record<48> = Record::at(magic(*b"SECR"), WRITE_VOLUME.end());
 
 /// Why the generator is running, written before the output moves.
 pub const RUN_REASON: Record<16> = Record::at(magic(*b"RUNR"), DEVICE_SECRET.end());
 
-/// The panic record: what the last words carry, kept past a power cut.
-pub const PANIC_RECORD: Record<20> = Record::at(magic(*b"PANI"), RUN_REASON.end());
+/// The panic record: the boot it happened at and what the last words
+/// carry, kept past a power cut.
+pub const PANIC_RECORD: Record<24> = Record::at(magic(*b"PANI"), RUN_REASON.end());
 
-/// The authorised comms release (L-170).
-pub const COMMS_RELEASE: Record<64> = Record::at(magic(*b"RELS"), PANIC_RECORD.end());
+/// The authorised comms release (L-170): the version text, the image
+/// length, the digest and the tick it was authorised at.
+pub const COMMS_RELEASE: Record<96> = Record::at(magic(*b"RELS"), PANIC_RECORD.end());
 
-/// The network master copy (L-130): one network, a value not a table.
-pub const NETWORK: Record<128> = Record::at(magic(*b"NETW"), COMMS_RELEASE.end());
+/// The network master copy (L-130): one network, a value not a table, with
+/// its version, the credentials, the country and the hostname.
+pub const NETWORK: Record<160> = Record::at(magic(*b"NETW"), COMMS_RELEASE.end());
 
-/// The client table: masks and counters for every enrolled client (P-081,
-/// P-105).
-pub const CLIENT_TABLE: Record<256> = Record::at(magic(*b"CLNT"), NETWORK.end());
-
-/// The dedup table (P-121).
-pub const DEDUP_TABLE: Record<1024> = Record::at(magic(*b"DEDU"), CLIENT_TABLE.end());
+/// The client table: every enrolled client's label, kind, mask and counter,
+/// and the dedup table beside them, in one record because P-080 lands a
+/// counter and an in-flight entry in one transaction (P-081, P-105,
+/// P-121).
+pub const CLIENT_TABLE: Record<CLIENT_TABLE_BYTES> = Record::at(magic(*b"CLNT"), NETWORK.end());
 
 /// The site configuration section (P-102).
-pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), DEDUP_TABLE.end());
+pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), CLIENT_TABLE.end());
 
 /// The generator behaviour's section.
 pub const GENERATOR_CONFIG: Record<1024> = Record::at(magic(*b"GENR"), SITE_CONFIG.end());
@@ -86,13 +92,14 @@ mod tests {
 
     #[test]
     fn records_follow_each_other_without_overlap_or_gap() {
-        // A four-byte body is a 16-byte slot, two slots a record.
+        // A four-byte body is a 16-byte slot, two slots a record; an
+        // eight-byte body is a 20-byte slot.
         assert_eq!(slot_bytes(4), 16);
         assert_eq!(EPOCH.end(), Address(32));
-        assert_eq!(CHALLENGE_COUNTER.end(), Address(64));
+        assert_eq!(CHALLENGE_COUNTER.end(), Address(72));
         assert_eq!(
             usize::from(SITE_CONFIG.end().0),
-            usize::from(DEDUP_TABLE.end().0) + 2 * slot_bytes(2048)
+            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(2048)
         );
     }
 
@@ -109,7 +116,6 @@ mod tests {
             magic(*b"RELS"),
             magic(*b"NETW"),
             magic(*b"CLNT"),
-            magic(*b"DEDU"),
             magic(*b"SITE"),
             magic(*b"GENR"),
             magic(*b"FRST"),

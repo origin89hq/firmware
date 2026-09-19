@@ -17,6 +17,9 @@ publish = false
 # The one wire format. Pinned exactly and written here once for both
 # workspaces; a member takes it with `.workspace = true` when it first needs it.
 km43 = "=0.1.0"
+# The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
+# operation bytes (P-120); the same release km43 hashes with.
+sha2 = { version = "0.11", default-features = false }
 
 anyhow = "1"
 cargo_metadata = "0.23"

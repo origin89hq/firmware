@@ -215,7 +215,7 @@ where
 #[cfg(test)]
 mod tests {
     use embassy_futures::block_on;
-    use o89_core::{Current, Record, Slot};
+    use o89_core::{Current, Position, Record, Slot};
 
     use super::*;
 
@@ -225,9 +225,9 @@ mod tests {
     /// starts from.
     fn with_one_record() -> (SimFram, Current<4>) {
         let mut part = SimFram::fresh();
-        let current = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
-            .expect("the supply is steady")
-            .current;
+        let _one = block_on(COUNTER.write(&mut part, Position::Start, &1u32.to_le_bytes()))
+            .expect("the supply is steady");
+        let current = block_on(COUNTER.read(&mut part)).expect("the part answers");
         (part, current)
     }
 
@@ -237,7 +237,7 @@ mod tests {
         let crashes = crash_at_every_step(
             &start,
             |part| {
-                block_on(COUNTER.write(part, &first, &2u32.to_le_bytes()))
+                block_on(COUNTER.write(part, first.position(), &2u32.to_le_bytes()))
                     .map(|_| ())
                     .map_err(|_| ())
             },
@@ -262,7 +262,7 @@ mod tests {
         let crashes = crash_at_every_step(
             &start,
             |part| {
-                block_on(COUNTER.write(part, &first, &2u32.to_le_bytes()))
+                block_on(COUNTER.write(part, first.position(), &2u32.to_le_bytes()))
                     .map(|_| ())
                     .map_err(|_| ())
             },
@@ -288,7 +288,7 @@ mod tests {
         let in_place = |part: &mut SimFram| -> Result<(), ()> {
             // The same bytes the record would write, over slot A itself.
             let mut scratch = SimFram::fresh();
-            let _ = block_on(COUNTER.write(&mut scratch, &Current::Empty, &2u32.to_le_bytes()));
+            let _ = block_on(COUNTER.write(&mut scratch, Position::Start, &2u32.to_le_bytes()));
             let image: Vec<u8> = scratch.bytes()[64..80].to_vec();
             block_on(part.write(Address(64), &image)).map_err(|_| ())
         };
@@ -310,7 +310,7 @@ mod tests {
         let across_slots = crash_at_every_step(
             &start,
             |part| {
-                block_on(COUNTER.write(part, &first, &2u32.to_le_bytes()))
+                block_on(COUNTER.write(part, first.position(), &2u32.to_le_bytes()))
                     .map(|_| ())
                     .map_err(|_| ())
             },
@@ -340,13 +340,13 @@ mod tests {
         let (mut part, first) = with_one_record();
         part.set_supply(Supply::Falling);
         assert_eq!(
-            block_on(COUNTER.write(&mut part, &first, &2u32.to_le_bytes())),
+            block_on(COUNTER.write(&mut part, first.position(), &2u32.to_le_bytes())),
             Err(Refused::SupplyFalling)
         );
         part.set_supply(Supply::Steady);
         part.cut_after(0);
         assert_eq!(
-            block_on(COUNTER.write(&mut part, &first, &2u32.to_le_bytes())),
+            block_on(COUNTER.write(&mut part, first.position(), &2u32.to_le_bytes())),
             Err(Refused::Bus(SimError::PowerLost))
         );
         assert!(part.is_dead());

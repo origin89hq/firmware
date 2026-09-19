@@ -175,13 +175,43 @@ pub enum Current<const N: usize> {
     Corrupt,
 }
 
+impl<const N: usize> Current<N> {
+    /// Where the next write goes, which is all a writer needs from a read.
+    #[must_use]
+    pub const fn position(&self) -> Position {
+        match *self {
+            Self::Valid { seq, slot, .. } => Position::At { seq, slot },
+            Self::Empty | Self::Corrupt => Position::Start,
+        }
+    }
+}
+
+/// Where a record's next write goes: the sequence and slot the last read
+/// found, and nothing else. The bytes are the reader's to decode and keep
+/// or drop; a two-kilobyte record is not held twice in RAM so that its
+/// slot is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Position {
+    /// A valid record at `seq` in `slot`: the next write is `seq + 1` in
+    /// the other slot.
+    At {
+        /// The current record's sequence.
+        seq: u32,
+        /// The slot it sits in.
+        slot: Slot,
+    },
+    /// No valid record: the next write is sequence one in `A`.
+    Start,
+}
+
 /// What a write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[must_use = "what landed is what the next read returns; discarding it is guessing"]
-pub struct Written<const N: usize> {
-    /// The record as the next read will find it.
-    pub current: Current<N>,
+#[must_use = "where the record now sits is what the next write needs; discarding it writes over the wrong slot"]
+pub struct Written {
+    /// Where the record sits now, for the next write.
+    pub position: Position,
 }
 
 /// One A/B record in the map: its magic and where its two slots sit.
@@ -312,21 +342,22 @@ impl<const N: usize> Record<N> {
     /// Write `body` as the next record, into the slot that is not current:
     /// the magic cleared first, so whatever the slot held stops being a
     /// record; then the sequence, the body and the CRC; then the magic, in
-    /// a transaction of its own, which is the switch. `current` is what the
-    /// last read returned; passing a stale one writes over the wrong slot,
-    /// so the caller reads, then writes, then keeps what this returns.
+    /// a transaction of its own, which is the switch. `at` is where the
+    /// last read or write left the record; a stale one writes over the
+    /// wrong slot, so the caller reads, then writes, then keeps what this
+    /// returns.
     pub async fn write<F: Fram>(
         self,
         fram: &mut F,
-        current: &Current<N>,
+        at: Position,
         body: &[u8; N],
-    ) -> Result<Written<N>, Refused<F::Error>> {
-        let (seq, slot) = match *current {
-            Current::Valid { seq, slot, .. } => match seq.checked_add(1) {
+    ) -> Result<Written, Refused<F::Error>> {
+        let (seq, slot) = match at {
+            Position::At { seq, slot } => match seq.checked_add(1) {
                 Some(next) => (next, slot.other()),
                 None => return Err(Refused::AtTheCeiling),
             },
-            Current::Empty | Current::Corrupt => (1, Slot::A),
+            Position::Start => (1, Slot::A),
         };
         let at = self.address(slot);
         let (_, crc) = self.encode(seq, body);
@@ -340,11 +371,7 @@ impl<const N: usize> Record<N> {
         // 3. The magic, last: the switch.
         fram.write(at, &self.magic.to_le_bytes()).await?;
         Ok(Written {
-            current: Current::Valid {
-                seq,
-                body: *body,
-                slot,
-            },
+            position: Position::At { seq, slot },
         })
     }
 }
@@ -450,45 +477,53 @@ mod tests {
     fn f_020_a_fresh_part_is_empty_and_the_first_write_lands_in_a_at_one() {
         let mut part = Part::fresh();
         assert_eq!(block_on(COUNTER.read(&mut part)), Ok(Current::Empty));
-        let written = block_on(COUNTER.write(&mut part, &Current::Empty, &7u32.to_le_bytes()))
+        let written = block_on(COUNTER.write(&mut part, Position::Start, &7u32.to_le_bytes()))
             .expect("the supply is fine");
         assert_eq!(
-            written.current,
+            written.position,
+            Position::At {
+                seq: 1,
+                slot: Slot::A
+            }
+        );
+        let found = block_on(COUNTER.read(&mut part)).expect("reads");
+        assert_eq!(
+            found,
             Current::Valid {
                 seq: 1,
                 body: 7u32.to_le_bytes(),
                 slot: Slot::A
             }
         );
-        assert_eq!(block_on(COUNTER.read(&mut part)), Ok(written.current));
+        assert_eq!(found.position(), written.position);
     }
 
     #[test]
     fn f_020_writes_alternate_slots_and_the_higher_sequence_is_current() {
         let mut part = Part::fresh();
-        let mut current = Current::Empty;
+        let mut at = Position::Start;
         for value in 1..=5u32 {
-            current = block_on(COUNTER.write(&mut part, &current, &value.to_le_bytes()))
+            at = block_on(COUNTER.write(&mut part, at, &value.to_le_bytes()))
                 .expect("the supply is fine")
-                .current;
+                .position;
         }
         assert_eq!(
-            current,
-            Current::Valid {
+            at,
+            Position::At {
                 seq: 5,
-                body: 5u32.to_le_bytes(),
                 slot: Slot::A
             }
         );
-        assert_eq!(block_on(COUNTER.read(&mut part)), Ok(current));
         // Both slots hold a valid record now; the newer one wins whichever
         // slot it sits in.
-        let stale = Current::Valid {
-            seq: 4,
-            body: 4u32.to_le_bytes(),
-            slot: Slot::B,
-        };
-        let _ = stale;
+        assert_eq!(
+            block_on(COUNTER.read(&mut part)),
+            Ok(Current::Valid {
+                seq: 5,
+                body: 5u32.to_le_bytes(),
+                slot: Slot::A
+            })
+        );
     }
 
     #[test]
@@ -496,20 +531,20 @@ mod tests {
         // Write once for real, then replay the second write with the power
         // cut before every byte it lands, and read what a boot would find.
         let mut part = Part::fresh();
-        let first = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
+        let at = block_on(COUNTER.write(&mut part, Position::Start, &1u32.to_le_bytes()))
             .expect("the supply is fine")
-            .current;
+            .position;
+        let first = block_on(COUNTER.read(&mut part)).expect("reads");
         let mut whole = part.rebooted();
-        let second = block_on(COUNTER.write(&mut whole, &first, &2u32.to_le_bytes()))
-            .expect("the supply is fine")
-            .current;
+        let _second = block_on(COUNTER.write(&mut whole, at, &2u32.to_le_bytes()))
+            .expect("the supply is fine");
         // Four bytes cleared, four of sequence, four of body, four of CRC,
         // four of magic: twenty bytes, and a cut before any of them keeps
         // the first record.
         assert_eq!(whole.landed, 20);
         for cut in 0..whole.landed {
             let mut torn = part.cut_before(cut);
-            let refused = block_on(COUNTER.write(&mut torn, &first, &2u32.to_le_bytes()));
+            let refused = block_on(COUNTER.write(&mut torn, at, &2u32.to_le_bytes()));
             assert_eq!(refused, Err(Refused::Bus(())), "cut before byte {cut}");
             let mut booted = torn.rebooted();
             assert_eq!(
@@ -519,21 +554,20 @@ mod tests {
             );
         }
         // Every byte landed: the new record is current.
-        assert_eq!(block_on(COUNTER.read(&mut whole)), Ok(second));
         assert_eq!(
-            second,
-            Current::Valid {
+            block_on(COUNTER.read(&mut whole)),
+            Ok(Current::Valid {
                 seq: 2,
                 body: 2u32.to_le_bytes(),
                 slot: Slot::B
-            }
+            })
         );
     }
 
     #[test]
     fn f_020_the_magic_lands_last_and_on_its_own_and_is_cleared_first() {
         let mut part = Part::fresh();
-        let _nine = block_on(COUNTER.write(&mut part, &Current::Empty, &9u32.to_le_bytes()))
+        let _nine = block_on(COUNTER.write(&mut part, Position::Start, &9u32.to_le_bytes()))
             .expect("the supply is fine");
         // The clearing, the sequence, the body, the CRC, the magic.
         assert_eq!(part.transactions, 5);
@@ -546,11 +580,11 @@ mod tests {
         // stops being a record before anything else in it changes.
         let mut reused = part.rebooted();
         let first = block_on(COUNTER.read(&mut reused)).expect("reads");
-        let _ = block_on(COUNTER.write(&mut reused, &first, &10u32.to_le_bytes()));
+        let _ = block_on(COUNTER.write(&mut reused, first.position(), &10u32.to_le_bytes()));
         let mut again = reused.rebooted();
         let second = block_on(COUNTER.read(&mut again)).expect("reads");
         let mut cut = again.cut_before(4);
-        let _ = block_on(COUNTER.write(&mut cut, &second, &11u32.to_le_bytes()));
+        let _ = block_on(COUNTER.write(&mut cut, second.position(), &11u32.to_le_bytes()));
         assert_eq!(&cut.bytes[16..20], &[0, 0, 0, 0]);
         assert_eq!(&cut.bytes[20..32], &part.bytes[20..32]);
     }
@@ -568,15 +602,16 @@ mod tests {
             COUNTER.encode(3, &colliding).1
         );
         let mut part = Part::fresh();
-        let first = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
+        let at = block_on(COUNTER.write(&mut part, Position::Start, &1u32.to_le_bytes()))
             .expect("the supply is fine")
-            .current;
-        let second = block_on(COUNTER.write(&mut part, &first, &2u32.to_le_bytes()))
+            .position;
+        let at = block_on(COUNTER.write(&mut part, at, &2u32.to_le_bytes()))
             .expect("the supply is fine")
-            .current;
+            .position;
+        let second = block_on(COUNTER.read(&mut part)).expect("reads");
         for cut in 0..20 {
             let mut torn = part.cut_before(cut);
-            let _ = block_on(COUNTER.write(&mut torn, &second, &colliding));
+            let _ = block_on(COUNTER.write(&mut torn, at, &colliding));
             let mut booted = torn.rebooted();
             assert_eq!(
                 block_on(COUNTER.read(&mut booted)),
@@ -586,28 +621,26 @@ mod tests {
         }
         // Landed whole, it is the record.
         let mut whole = part.rebooted();
-        let third = block_on(COUNTER.write(&mut whole, &second, &colliding))
-            .expect("the supply is fine")
-            .current;
-        assert_eq!(block_on(COUNTER.read(&mut whole)), Ok(third));
+        let _third =
+            block_on(COUNTER.write(&mut whole, at, &colliding)).expect("the supply is fine");
         assert_eq!(
-            third,
-            Current::Valid {
+            block_on(COUNTER.read(&mut whole)),
+            Ok(Current::Valid {
                 seq: 3,
                 body: colliding,
                 slot: Slot::A
-            }
+            })
         );
     }
 
     #[test]
     fn f_020_two_corrupt_slots_are_damage_and_a_stray_magic_is_not_a_record() {
         let mut part = Part::fresh();
-        let mut current = Current::Empty;
+        let mut at = Position::Start;
         for value in 1..=2u32 {
-            current = block_on(COUNTER.write(&mut part, &current, &value.to_le_bytes()))
+            at = block_on(COUNTER.write(&mut part, at, &value.to_le_bytes()))
                 .expect("the supply is fine")
-                .current;
+                .position;
         }
         // Flip one body byte in each slot.
         part.bytes[16 + 8] ^= 0x01;
@@ -626,12 +659,13 @@ mod tests {
     #[test]
     fn f_021_a_write_refused_on_a_falling_supply_changes_nothing() {
         let mut part = Part::fresh();
-        let current = block_on(COUNTER.write(&mut part, &Current::Empty, &1u32.to_le_bytes()))
+        let at = block_on(COUNTER.write(&mut part, Position::Start, &1u32.to_le_bytes()))
             .expect("the supply is fine")
-            .current;
+            .position;
+        let current = block_on(COUNTER.read(&mut part)).expect("reads");
         let before = part.bytes;
         part.falling = true;
-        let refused = block_on(COUNTER.write(&mut part, &current, &2u32.to_le_bytes()));
+        let refused = block_on(COUNTER.write(&mut part, at, &2u32.to_le_bytes()));
         assert_eq!(refused, Err(Refused::SupplyFalling));
         assert_eq!(part.bytes, before);
         assert_eq!(block_on(COUNTER.read(&mut part)), Ok(current));
@@ -640,13 +674,12 @@ mod tests {
     #[test]
     fn a_record_at_the_ceiling_refuses_rather_than_wraps() {
         let mut part = Part::fresh();
-        let at_top = Current::Valid {
+        let at_top = Position::At {
             seq: u32::MAX,
-            body: [0; 4],
             slot: Slot::A,
         };
         assert_eq!(
-            block_on(COUNTER.write(&mut part, &at_top, &[1; 4])),
+            block_on(COUNTER.write(&mut part, at_top, &[1; 4])),
             Err(Refused::AtTheCeiling)
         );
         assert!(part.bytes.iter().all(|b| *b == 0xFF));
