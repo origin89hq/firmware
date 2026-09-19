@@ -148,30 +148,22 @@ pub struct Board {
     #[expect(dead_code, reason = "taken in M5, the site")]
     pub vedirect_2: VeDirect<p::LPUART2, p::PC1>,
 
-    /// The FRAM's I2C.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
+    /// The FRAM's I2C. Blocking, no DMA: see `fram.rs`.
     pub i2c2: Peri<'static, p::I2C2>,
     /// FRAM SCL.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub fram_scl: Peri<'static, p::PB13>,
     /// FRAM SDA.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub fram_sda: Peri<'static, p::PB14>,
 
-    /// The NOR's SPI.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
+    /// The NOR's SPI. Blocking, no DMA: see `nor.rs`.
     pub spi1: Peri<'static, p::SPI1>,
     /// NOR chip select.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub nor_cs: Peri<'static, p::PA4>,
     /// NOR clock.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub nor_sck: Peri<'static, p::PA5>,
     /// NOR MISO.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub nor_miso: Peri<'static, p::PA6>,
     /// NOR MOSI.
-    #[expect(dead_code, reason = "taken in M2, persistence")]
     pub nor_mosi: Peri<'static, p::PA7>,
 
     /// `OW_DATA_F`: the 1-Wire bus, bit-banged.

@@ -10,8 +10,9 @@
 //! generator and bus lines through the registers as the first statement;
 //! the reset cause read and cleared and the last words taken, both before
 //! the HAL; the clocks, with the LSE asserted; the watchdog, fed only by the
-//! rollcall; the voltage detector; every output to its declared fail state;
-//! the module rail sequence; then the control tick. The FRAM read and the
+//! rollcall; the voltage detector; the store read off the FRAM, before any
+//! output moves; every output to its declared fail state; the module rail
+//! sequence; the recorder with the NOR; then the control tick. The other
 //! buses arrive with the milestones that name them. The `bench` build adds
 //! the one-shot proofs: a starvation on a boot the watchdog did not cause,
 //! and a panic on the boot that follows, so three boots in a row show the
@@ -22,25 +23,43 @@
 
 mod board;
 mod clock;
+#[expect(
+    unsafe_code,
+    reason = "cortex-m-rt requires the hard fault handler to be an unsafe fn; it reads the frame it is handed and resets"
+)]
+mod fault;
 mod first;
+mod fram;
 mod last_words;
+mod nor;
 mod panic;
 mod pvd;
 mod rail;
+mod recorder;
 mod reset;
+#[expect(
+    unsafe_code,
+    reason = "the supervisor's executor is polled from the interrupt started for it; the one call is under a SAFETY line"
+)]
 mod supervisor;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
+use embassy_stm32::i2c::I2c;
+use embassy_stm32::spi::Spi;
+use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
+use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Pull as DeclaredPull,
-    RailSequencer, ResetCause, RtcClock, Task,
+    Blame, BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Millis,
+    Pull as DeclaredPull, RailSequencer, ResetCause, RtcClock, Store, Task,
 };
 
 use crate::board::{Board, REVISION};
+use crate::fram::Fram;
+use crate::nor::Nor;
 use crate::supervisor::Uptime;
 
 // Every log line carries the tick, so a bench reads intervals off the log:
@@ -131,6 +150,45 @@ async fn main(spawner: Spawner) {
     // 5. The voltage detector.
     pvd::arm();
 
+    // 6. The store, off the FRAM, before any output moves: the run reason
+    // is what the boot decides on, and the boot count and the last words
+    // are written down here. A bus that does not answer leaves no store,
+    // and the boot goes on to the fail state as it would with one.
+    // The supervisor is not running yet, so this phase bounds itself: every
+    // transfer is cut by the driver's timeout, three times the longest one
+    // the store makes, and the phase is written to the last words as a
+    // provisional blame until the store is read, so a boot the watchdog
+    // cuts short here is still named by the boot after (F-016).
+    let mut i2c_config = i2c::Config::default();
+    i2c_config.frequency = Hertz::khz(400);
+    i2c_config.timeout = Duration::from_millis(100);
+    last_words::write(LastWords::Starved(Blame {
+        task: Task::Boot,
+        overdue: Millis::ZERO,
+    }));
+    let mut fram = Fram::new(I2c::new_blocking(
+        b.i2c2, b.fram_scl, b.fram_sda, i2c_config,
+    ));
+    let store = match Store::boot(&mut fram, words).await {
+        Ok((store, report)) => {
+            defmt::info!("store: {}", report);
+            if let Some(reason) = store.run.present() {
+                defmt::info!("run reason: {}", reason);
+            } else {
+                defmt::info!("run reason: none on the part");
+            }
+            Some(store)
+        }
+        Err(error) => {
+            defmt::error!(
+                "store: the FRAM did not answer: {}; booting without it",
+                error
+            );
+            None
+        }
+    };
+    last_words::clear();
+
     // 7. Every output this image drives, to its declared fail state. Held
     // for the life of this task, which never returns; a bus takes its
     // transmit line from here when it comes up.
@@ -158,10 +216,9 @@ async fn main(spawner: Spawner) {
 
     supervisor::check_in(Task::Supervisor);
     // The pool holds one supervisor and this is its only spawn; an unfed
-    // watchdog is the answer if it ever refuses.
-    if let Ok(token) = supervisor::run(wdg, status, fault) {
-        spawner.spawn(token);
-    } else {
+    // watchdog is the answer if it ever refuses. It runs from its own
+    // interrupt, so a task that blocks this executor is still named.
+    if supervisor::start(wdg, status, fault).is_err() {
         defmt::error!("the supervisor did not spawn; the watchdog will reset the part");
     }
 
@@ -185,6 +242,20 @@ async fn main(spawner: Spawner) {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");
     }
 
+    // 9b. The recorder, with the NOR: the ring is opened and the boot
+    // record written once the outputs are where they must be.
+    let mut spi_config = spi::Config::default();
+    spi_config.frequency = Hertz::mhz(8);
+    let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
+    let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
+    supervisor::check_in(Task::Recorder);
+    if let Ok(token) = recorder::run(store, nor) {
+        spawner.spawn(token);
+    } else {
+        defmt::error!("the recorder did not spawn; the watchdog will reset the part");
+    }
+    let _fram = fram;
+
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
     supervisor::check_in(Task::Control);
     let mut ticker = Ticker::every(Duration::from_secs(1));
@@ -202,10 +273,12 @@ async fn main(spawner: Spawner) {
             bench::Step::Run => {}
             bench::Step::Starve => {
                 defmt::warn!(
-                    "watchdog proof: the control tick stops checking in on purpose; the part resets in about 8 s and the next boot names it"
+                    "watchdog proof: the control tick blocks the executor on purpose; the part resets in about 8 s and the next boot names it"
                 );
+                // A spin, not a yield: the whole thread executor is held,
+                // and only a supervisor above it can still name this task.
                 loop {
-                    ticker.next().await;
+                    cortex_m::asm::nop();
                 }
             }
             bench::Step::Panic => {

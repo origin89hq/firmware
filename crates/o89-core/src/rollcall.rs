@@ -51,10 +51,16 @@ pub enum Task {
     Lamp = 13,
     /// The module rail sequence.
     Rail = 14,
+    /// The boot itself, before the supervisor runs: the store read off the
+    /// FRAM under the 3 s budget (F-016). Never on the roll; the boot
+    /// writes it to the last words as a provisional blame and clears it
+    /// once the store is read, so a boot the watchdog cuts short is still
+    /// named by the boot after.
+    Boot = 15,
 }
 
 /// How many tasks the roll holds.
-pub const TASKS: usize = 15;
+pub const TASKS: usize = 16;
 
 impl Task {
     /// Every task, in roll order, which is the order a late one is named in.
@@ -74,6 +80,7 @@ impl Task {
         Task::Selector,
         Task::Lamp,
         Task::Rail,
+        Task::Boot,
     ];
 
     /// The task's place on the roll, which is what the last words carry.
@@ -105,6 +112,7 @@ impl Task {
             12 => Some(Self::Selector),
             13 => Some(Self::Lamp),
             14 => Some(Self::Rail),
+            15 => Some(Self::Boot),
             _ => None,
         }
     }
@@ -120,6 +128,7 @@ impl Task {
             Self::Link | Self::Rs485One | Self::Rs485Two | Self::Rs485Three | Self::Can => 10_000,
             Self::VeDirectOne | Self::VeDirectTwo | Self::Adc => 15_000,
             Self::Recorder | Self::OneWire | Self::Rail => 30_000,
+            Self::Boot => 3_000,
         };
         Millis::from_millis(millis)
     }

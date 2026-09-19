@@ -24,10 +24,15 @@ panic-probe = ["dep:panic-probe"]
 
 [dependencies]
 o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
+embedded-storage-async.workspace = true
+km43.workspace = true
 
 embassy-executor = { workspace = true, features = [
     "platform-cortex-m",
     "executor-thread",
+    # The supervisor runs from an interrupt above the thread executor, so
+    # a task that blocks the executor is still named before the reset.
+    "executor-interrupt",
     "defmt",
 ] }
 embassy-time = { workspace = true, features = ["defmt"] }

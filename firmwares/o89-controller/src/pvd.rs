@@ -12,6 +12,12 @@ use stm32_metapac::{PWR, RCC};
 /// `PVDFT`/`PVDRT` code 6 (RM0444, `PWR_CR2`).
 const LEVEL: u8 = 6;
 
+/// Whether the supply is below the level right now: the answer the FRAM
+/// adapter reads at the last instant before it claims the bus.
+pub fn supply_is_below_level() -> bool {
+    PWR.sr2().read().pvdo()
+}
+
 /// Enable the detector at its level.
 pub fn arm() {
     RCC.apbenr1().modify(|w| w.set_pwren(true));

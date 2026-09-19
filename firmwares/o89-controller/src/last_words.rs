@@ -26,6 +26,13 @@ pub fn write(words: LastWords) {
     }
 }
 
+/// Clear the words: a provisional record whose moment has passed.
+pub fn clear() {
+    for slot in &LAST_WORDS {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Read and clear whatever the previous run left.
 pub fn take() -> Option<LastWords> {
     let mut words = CLEARED;

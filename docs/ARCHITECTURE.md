@@ -309,6 +309,10 @@ role; `BOARD-A.md` maps them to pins.
    gets its first epoch, a table under another epoch is cleared (F-026),
    the boot count climbs, the last words are written down with it, and
    every window measured on the tick restarts at zero (P-121).
+   The supervisor is not running yet, so this phase bounds itself: every
+   FRAM transfer is cut by the driver's timeout, and `Boot` is written to
+   the last words as a provisional blame until the store is read, so a
+   boot the watchdog cuts short here is named by the boot after.
    **NOR scan**: the log ring's head and the time floor, the newest
    timestamped record (L-140).
 7. **Outputs to their declared fail state**, per output, from configuration,
@@ -327,7 +331,11 @@ control, link, recorder (the only owner of the FRAM and NOR buses), one per
 RS-485 channel, CAN, one per VE.Direct port, 1-Wire, ADC, selector, lamp.
 Bounded channels between them, `static_cell` for what the executor needs, no
 allocator. Nothing blocks; a bus that hangs is a task that misses its
-check-in, which is a reset, which is the fail state.
+check-in, which is a reset, which is the fail state. The supervisor runs
+from its own interrupt above the thread executor, so a transfer that never
+returns and holds the executor is still a task named in the last words
+before the watchdog fires: the watchdog is the floor either way, the blame
+is what the next boot reads.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
 fed from a timer interrupt is a watchdog that does not work.
