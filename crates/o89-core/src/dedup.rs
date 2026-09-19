@@ -109,24 +109,12 @@ pub enum Recorded {
 /// of a [`Verdict::Fresh`], so an entry cannot be completed by anything
 /// that did not reserve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a reserved entry never finished is a retry answered in-flight forever"]
 pub struct Reserved {
     at: usize,
     client: ClientId,
     cmd: u32,
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Reserved {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(
-            f,
-            "entry {} for client {} cmd {}",
-            self.at,
-            self.client.get(),
-            self.cmd
-        );
-    }
 }
 
 /// What the table says about a command.

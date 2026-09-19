@@ -110,6 +110,7 @@ impl Row {
 /// What a `Pair` whose proof verified was answered with, and the slot it
 /// carries. Never zero: zero names no client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a pairing nobody answers is a phone that was enrolled and not told"]
 pub enum Paired {
     /// Outcome 1 `enrolled`: a free row, the lowest (P-064, P-086).
@@ -117,16 +118,6 @@ pub enum Paired {
     /// Outcome 5 `reclaimed`: the same label was already here, and its row
     /// is re-fixed with the counter back to zero (P-078).
     Reclaimed(ClientId),
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Paired {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Enrolled(id) => defmt::write!(f, "enrolled as client {}", id.get()),
-            Self::Reclaimed(id) => defmt::write!(f, "reclaimed client {}", id.get()),
-        }
-    }
 }
 
 impl Paired {
@@ -347,6 +338,7 @@ impl ClientTable {
 
 /// What a boot did with the client table it read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a boot that cleared the table has something to log"]
 pub enum Booted {
     /// The rows are under the epoch the part holds; every dedup entry
@@ -365,19 +357,9 @@ pub enum Booted {
     Above(Epoch),
 }
 
-#[cfg(feature = "defmt")]
-impl defmt::Format for Booted {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Rebased => defmt::write!(f, "rebased"),
-            Self::Cleared(because) => defmt::write!(f, "cleared: {}", because),
-            Self::Above(epoch) => defmt::write!(f, "left under epoch {}", epoch.get()),
-        }
-    }
-}
-
 /// Why a boot cleared the client table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Because {
     /// Never written: a fresh part.
     Absent,
@@ -389,18 +371,6 @@ pub enum Because {
     /// was cut between moving the epoch and clearing the table, finished
     /// here.
     Earlier(Epoch),
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Because {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Absent => defmt::write!(f, "never written"),
-            Self::Corrupt => defmt::write!(f, "both slots damaged"),
-            Self::Malformed(malformed) => defmt::write!(f, "malformed at {}", malformed.at),
-            Self::Earlier(epoch) => defmt::write!(f, "enrolled under epoch {}", epoch.get()),
-        }
-    }
 }
 
 impl Kept<ClientTable, CLIENT_TABLE_BYTES> {

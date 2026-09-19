@@ -497,11 +497,7 @@ async fn download(
         let reason = asked.reason;
         // The reason on every route, so the log tells a bench flash from a
         // recovery whether the module is knocked or strapped (L-192).
-        defmt::info!(
-            "link: download ({=str}) by {}",
-            reason_name(reason),
-            asked.entry
-        );
+        defmt::info!("link: download ({}) by {}", reason, asked.entry);
         let boot = match asked.entry {
             DownloadEntry::Strap => ModuleBoot::Download,
             DownloadEntry::Knock | DownloadEntry::Reset => ModuleBoot::Normal,
@@ -658,16 +654,13 @@ async fn knock(
                 };
                 match knock_answer(envelope, req_id) {
                     KnockAnswer::Entering => {
-                        defmt::info!(
-                            "link: EnterDownload ({=str}) answered entering",
-                            reason_name(reason)
-                        );
+                        defmt::info!("link: EnterDownload ({}) answered entering", reason);
                         return Knocked::Entering;
                     }
                     KnockAnswer::Refused => {
                         defmt::warn!(
-                            "link: EnterDownload ({=str}) answered refused_outside_window",
-                            reason_name(reason)
+                            "link: EnterDownload ({}) answered refused_outside_window",
+                            reason
                         );
                         return Knocked::Refused;
                     }
@@ -679,20 +672,11 @@ async fn knock(
         yield_now().await;
     }
     defmt::warn!(
-        "link: EnterDownload ({=str}) unanswered after {} ms",
-        reason_name(reason),
+        "link: EnterDownload ({}) unanswered after {} ms",
+        reason,
         KNOCK_DEADLINE.as_millis()
     );
     Knocked::Unanswered
-}
-
-/// The reason's registry name, for the log L-192 asks the controller to
-/// keep: the module keeps nothing across the reset.
-const fn reason_name(reason: DownloadReason) -> &'static str {
-    match reason {
-        DownloadReason::Bench => "bench",
-        DownloadReason::Recovery => "recovery",
-    }
 }
 
 /// The UART at the ROM's rate with no flow control, its bytes moved to

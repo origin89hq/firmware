@@ -25,7 +25,7 @@ publish = false
 # workspaces; a member takes it with `.workspace = true` when it first needs it.
 # On a revision of origin89hq/km43#40 until `EnterDownload` is published; the
 # registry pin returns with the release, in both workspaces at once.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "f934c1fbd5e660858b70d4d32e432730e7e8b182" }
+km43 = { git = "https://github.com/origin89hq/km43", rev = "6a6060acb73aaa9d1c223bbb55c7d16a68166ae2" }
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }
