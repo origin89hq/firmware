@@ -1465,14 +1465,17 @@ dependencies = [
  "defmt 1.1.1",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-stm32",
  "embassy-sync 0.8.0",
  "embassy-time",
+ "embedded-io-async 0.7.0",
  "embedded-storage-async",
  "km43",
  "o89-core",
  "panic-probe",
  "portable-atomic",
+ "static_cell",
  "stm32-metapac",
 ]
 

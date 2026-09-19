@@ -37,6 +37,9 @@ embassy-executor = { workspace = true, features = [
 ] }
 embassy-time = { workspace = true, features = ["defmt"] }
 embassy-sync = { workspace = true, features = ["defmt"] }
+embassy-futures.workspace = true
+static_cell.workspace = true
+embedded-io-async.workspace = true
 
 # The part. `memory-x` is off on purpose: it would emit the part's 512 KB,
 # and the budget is one slot less the bootloader. See memory.x.

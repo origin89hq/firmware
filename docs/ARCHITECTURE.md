@@ -232,8 +232,9 @@ the cost of a stolen label without changing the argument.
 Embassy, confined to `o89-controller`. The drivers are already async state
 machines: a Modbus exchange is send, await a reply, time out, which in a
 superloop is a hand-rolled state machine per bus, and that is where the bugs
-live. `embassy-stm32` gives DMA receive with idle-line detection, which is
-what the framing wants. And the one real concurrency constraint is *do not
+live. `embassy-stm32` gives a buffered UART fed from its interrupt, which is
+what the framing wants; its DMA ring overran on this part (#39). And the
+one real concurrency constraint is *do not
 block each other*: a slow Modbus timeout on one bus must not stall the frost
 tick or the link. Nothing here is fast; a device is polled every two seconds
 and behaviours tick once a second.
@@ -299,7 +300,11 @@ role; `BOARD-A.md` maps them to pins.
 5. **PVD armed** above the FRAM's minimum supply. On the falling edge no new
    FRAM transaction starts, and one in flight completes. Seven brown-outs on
    the bench destroyed both counter slots at once; the write discipline is
-   the answer, not a hope about the part.
+   the answer, not a hope about the part. Then the **module rail** back on
+   with `EN` held low, before any bus: revision A drops the rail through
+   every reset, so this path is all a reset adds to a cut (F-005), and the
+   boot waits the rail's settling before the FRAM is touched, so that the
+   switch-on of a cold boot never lands inside a write.
 6. **FRAM read**: the secret, the epoch, the client table with its
    counters and the dedup table, the generator run reason, the panic
    record, the boot count, the challenge counter, the byte budget, the
@@ -318,8 +323,8 @@ role; `BOARD-A.md` maps them to pins.
 7. **Outputs to their declared fail state**, per output, from configuration,
    and shadow unless authority was granted.
 8. **Buses up**: three RS-485 USARTs, FDCAN, two LPUARTs, 1-Wire, ADC.
-9. **The module rail sequence** (the safety architecture below), then the
-   link task.
+9. **The module rail sequence** (the safety architecture below): the rail
+   task, which releases `EN`, then the link task.
 10. **Control tick** at 1 Hz. Boot-to-first-kick is measured and logged; the
     hardware repository is waiting on that number
     ([origin89hq/hardware#18](https://github.com/origin89hq/hardware/issues/18)).
@@ -584,7 +589,8 @@ reserved until an output has been granted authority.
 
 ### The link
 
-USART1 with a DMA ring buffer and KM43's frame reader and writer. The core
+USART1, interrupt-fed into the driver's ring, and KM43's frame reader and
+writer. The core
 holds the link-local state: link-up and `boot_id` invalidation, the heartbeat
 and the recovery ladder with the board's revision policy (below), connection
 rows and challenges, network configuration push, time offers with the floor,
@@ -614,6 +620,30 @@ handle it releases is unknown; a time offer is refused as implausible,
 because a controller that cannot take a time cannot find one plausible.
 Every answer is a real outcome the peer acts on and never silence, which
 L-015 would read as a dead link. M4 replaces each arm.
+
+On the controller the link task owns USART1's pins for the life of the
+part and builds the UART only for as long as the module is powered: the
+rail task says the rail settled, the UART is built and the statement goes
+out (F-006); the state machine asks for a cut, the UART is dropped, its
+pins back to inputs, and only then is the rail task asked (F-003). What
+the sequencer answered and every settling come back to the link as words
+on a bounded channel. The UART's interrupt fills the driver's ring of
+two frames. A DMA ring on `DMA1` channels with interrupt lines of their
+own was tried first and overran from the first byte on board A, as the
+recorder's DMA had (#39), and the bench decided. Every await in the task has a deadline: a read
+waits one tick, a write two hundred milliseconds, so a module holding
+`CTS` costs a frame and never a check-in; the frame's bytes are stuck in
+the transmitter's ring, which the driver cannot clear, so the UART is
+dropped and built again and the ladder decides from the silence. A
+boot without a written boot count, which is a FRAM that did not answer
+or a new count that did not land on it, has no `boot_id` to state
+(F-039): the link task keeps its place on the roll and the link never
+comes up, the module powered as on every boot because a rail switched on
+at a later boot is what F-005 forbids, and the probe's log says why; the boot
+record carries the reason once origin89hq/km43#32 gives its body a
+shape. Records the
+link raises go to the recorder through a queue as deep as the protocol's
+event queue, which refuses when full.
 
 ## Persistence
 
@@ -843,7 +873,9 @@ switch is slew-limited, defaults on with the controller's pin high-impedance,
 and the pin drives low to cut it (A-23). The controller takes ownership once
 it has booted and applies its policy from there:
 
-- The recovery ladder's cuts (L-111, L-112), each logged with its count.
+- The recovery ladder's cuts (L-111, L-112), each logged; the count L-111
+  names goes into the record once origin89hq/km43#32 gives the body its
+  shape, and is on the probe's log until then.
 - A bank-voltage threshold below which the radio stays off, so the weakest
   bank in February is not also carrying a radio nobody is using. The
   threshold and its hysteresis are configuration values that have not been
@@ -872,7 +904,9 @@ deliberate ones. Switching the rail on after minutes off corrupted the
 controller within milliseconds, 22 of 22 times on the bench, while short
 cycles pass hundreds of times
 ([origin89hq/hardware#5](https://github.com/origin89hq/hardware/issues/5)).
-So on revision A a rail cycle is at most 5 s off; the ladder's third rung,
+So on revision A a rail cycle is at most 5 s off, and a controller reset
+inside one adds only the boot's path to the rail, which runs before any bus
+(boot step 5); the ladder's third rung,
 15 minutes off, is not executed
 ([origin89hq/km43#36](https://github.com/origin89hq/km43/issues/36) says how a
 conformance claim states that): the controller stops cycling, leaves the rail
