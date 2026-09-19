@@ -14,6 +14,8 @@ use embassy_time::{Duration, Ticker};
 use km43::{Event, EventKind, LogSeq};
 use o89_core::{Class, Ring, SCRATCH, Store, Task};
 
+use crate::fram::Fram;
+use crate::mailbox;
 use crate::nor::{JEDEC, Nor, SECTOR};
 use crate::supervisor::check_in;
 
@@ -22,12 +24,14 @@ use crate::supervisor::check_in;
 pub const RING_BLOCKS: u32 = 3712;
 const _: () = assert!((RING_BLOCKS as usize) * SECTOR <= 16 * 1024 * 1024);
 
-/// How often the task checks in; its window on the roll is thirty seconds.
-const PERIOD: Duration = Duration::from_secs(10);
+/// How often the task looks at the mailbox and checks in; its window on
+/// the roll is thirty seconds.
+const PERIOD: Duration = Duration::from_millis(100);
 
-/// The recorder task.
+/// The recorder task: the only owner of the FRAM and the NOR, and so the
+/// one that serves the bench tool's mailbox.
 #[embassy_executor::task]
-pub async fn run(store: Option<Store>, mut nor: Nor) {
+pub async fn run(store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     let mut scratch = [0u8; SCRATCH];
     defmt::info!("recorder: identifying the NOR");
     let jedec = nor.jedec().await;
@@ -74,12 +78,20 @@ pub async fn run(store: Option<Store>, mut nor: Nor) {
     }
     let boot = store
         .as_ref()
-        .and_then(|store| store.boots.present().map(|count| count.get()));
+        .and_then(|store| store.boots.present().map(|count| count.get()))
+        .unwrap_or(0);
+    mailbox::init();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
         ticker.next().await;
-        defmt::debug!("recorder: boot {} alive", boot);
+        mailbox::serve(mailbox::Parts {
+            fram: &mut fram,
+            ring: ring.as_mut(),
+            scratch: &mut scratch,
+            boot,
+        })
+        .await;
         check_in(Task::Recorder);
     }
 }

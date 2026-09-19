@@ -31,6 +31,7 @@ mod fault;
 mod first;
 mod fram;
 mod last_words;
+mod mailbox;
 mod nor;
 mod panic;
 mod pvd;
@@ -249,12 +250,11 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(store, nor) {
+    if let Ok(token) = recorder::run(store, fram, nor) {
         spawner.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");
     }
-    let _fram = fram;
 
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
     supervisor::check_in(Task::Control);

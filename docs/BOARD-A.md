@@ -91,4 +91,4 @@ is the one the gate traces.
 | VE.Direct lines carry 5 V from an MPPT with no level shift (hardware#27) | Pull-ups off unless the port is configured for a 3.3 V product; listens on pin 3 | An isolator per port with a fail-safe-high output; listens on pin 2 | F-051 |
 | Selector and 1-Wire inputs are unclamped (hardware#31) | Debounce the selector; a CRC failure is no value; an out-of-range reading is not a state change | Clamps (`A-26`, `A-36`); the rules stay | F-053 |
 | Three terminators leave the idle bias inside the receiver's undefined band (hardware#26) | Expect a silent or garbled bus and say so in the concern | Bias raised (`A-13c`) | — |
-| `PC5` reads high-impedance in the bench tool as "off" (#4) | Off | On; the tool reports the pin and the rail as two fields keyed on the revision | — |
+| `PC5` reads high-impedance in the bench tool as "off" (#4) | Off | On; the tool reports the pin and the rail as two fields keyed on the revision | F-014 |

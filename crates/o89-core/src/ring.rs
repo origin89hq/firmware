@@ -257,6 +257,52 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         self.flash
     }
 
+    /// The part's bytes at `at`, as they are: for the bench tool, which
+    /// wants what is on the part and not the records the ring makes of it.
+    /// A read moves nothing.
+    pub async fn read_raw(&mut self, at: u32, into: &mut [u8]) -> Result<(), RingError<N::Error>> {
+        let end = usize::try_from(at)
+            .ok()
+            .and_then(|at| at.checked_add(into.len()))
+            .ok_or(RingError::OutOfRange)?;
+        if end > self.flash.capacity() {
+            return Err(RingError::OutOfRange);
+        }
+        self.flash.read(at, into).await.map_err(RingError::Flash)
+    }
+
+    /// Erase one erase block of the part, counted from the part's start,
+    /// and find the head again when the block was one of the ring's: the
+    /// bench tool's way to clear a part, one block per request so that
+    /// whoever feeds the watchdog gets a turn between two. Everything the
+    /// ring knew is found again from the bytes, as a boot would find it.
+    pub async fn erase_block(
+        &mut self,
+        block: u32,
+        scratch: &mut [u8],
+    ) -> Result<(), RingError<N::Error>> {
+        let from = block
+            .checked_mul(Self::block_len())
+            .ok_or(RingError::OutOfRange)?;
+        let to = from
+            .checked_add(Self::block_len())
+            .ok_or(RingError::OutOfRange)?;
+        if usize::try_from(to).map_or(true, |to| to > self.flash.capacity()) {
+            return Err(RingError::OutOfRange);
+        }
+        self.flash.erase(from, to).await.map_err(RingError::Flash)?;
+        let first = self.from.checked_div(Self::block_len()).unwrap_or(0);
+        let ours = block
+            .checked_sub(first)
+            .is_some_and(|index| index < self.blocks);
+        if ours {
+            self.damage = Damage::default();
+            self.floor = Floor::Unknown;
+            self.find_the_head(scratch).await?;
+        }
+        Ok(())
+    }
+
     /// Append one event and answer the sequence it got.
     ///
     /// `payload` is an encoded `Event` naming [`next_seq`](Self::next_seq),
@@ -994,6 +1040,71 @@ mod tests {
         }))
         .expect("reads");
         (seqs, count, next)
+    }
+
+    #[test]
+    fn a_raw_read_answers_the_bytes_on_the_part_and_refuses_past_its_end() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        assert_eq!(append(&mut ring, None), 1);
+        let mut head = [0u8; 2];
+        block_on(ring.read_raw(0, &mut head)).expect("reads");
+        assert_eq!(
+            head, MAGIC_BYTES,
+            "the first record's magic is at the ring's start"
+        );
+        let mut beyond = [0u8; 2];
+        let end = u32::try_from(PART).expect("fits");
+        assert_eq!(
+            block_on(ring.read_raw(end.saturating_sub(1), &mut beyond)),
+            Err(RingError::OutOfRange)
+        );
+        assert_eq!(block_on(ring.read_raw(end, &mut [])), Ok(()));
+    }
+
+    #[test]
+    fn erasing_the_heads_block_finds_the_head_again_as_a_boot_would() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        for _ in 0..3 {
+            append(&mut ring, None);
+        }
+        assert_eq!(ring.next_seq(), 4);
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.erase_block(0, &mut scratch)).expect("erases");
+        assert_eq!(
+            ring.head(),
+            Head {
+                block: 0,
+                at: 0,
+                next_seq: 1,
+                oldest: None
+            },
+            "a ring with nothing on it is a fresh ring"
+        );
+        assert_eq!(append(&mut ring, None), 1);
+        let (_, count, next) = read(&mut ring, 1);
+        assert_eq!((count, next), (1, 2));
+    }
+
+    #[test]
+    fn erasing_a_block_outside_the_ring_leaves_the_head_alone() {
+        let mut part: Part<ERASE> = fresh();
+        // Four of the part's thirty-two blocks are the ring's.
+        let mut ring = open_with(&mut part, 4);
+        for _ in 0..3 {
+            append(&mut ring, None);
+        }
+        let before = ring.head();
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.erase_block(6, &mut scratch)).expect("erases");
+        assert_eq!(ring.head(), before);
+        let blocks = u32::try_from(PART / ERASE).expect("fits");
+        assert_eq!(
+            block_on(ring.erase_block(blocks, &mut scratch)),
+            Err(RingError::OutOfRange),
+            "the block after the last is past the part"
+        );
     }
 
     #[test]

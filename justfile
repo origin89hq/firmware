@@ -136,3 +136,63 @@ reset-controller:
 [confirm("Mass erase the connected controller? Only a spare board, with nothing on board B's CN10.")]
 erase-controller:
     probe-rs erase --chip {{chip}}
+
+# The bench tool: the controller's FRAM, NOR and rail over the probe, through
+# the mailbox the running firmware serves. Nothing below flashes; the part
+# keeps running what it runs. `just dev-ping` first: it says whether a
+# firmware with a mailbox is there. A second probe session cannot share the
+# probe, so `attach-controller` and these take turns.
+#
+# Ask the running firmware for its boot count.
+dev-ping *args:
+    cargo run -q -p o89-dev -- {{args}} ping
+
+# Every record of the store, decoded, as the firmware reads them.
+dev-store *args:
+    cargo run -q -p o89-dev -- {{args}} store
+
+# The module rail: the pin as the registers say and what it means on the revision (a or b).
+dev-rail revision *args:
+    cargo run -q -p o89-dev -- {{args}} rail --revision {{revision}}
+
+# Bytes of the FRAM in hex, from `at` for `len`.
+dev-fram at="0" len="256" *args:
+    cargo run -q -p o89-dev -- {{args}} fram --at {{at}} --len {{len}}
+
+# Bytes of the NOR in hex, from `at` for `len`.
+dev-nor at="0" len="256" *args:
+    cargo run -q -p o89-dev -- {{args}} nor --at {{at}} --len {{len}}
+
+# WRITE the epoch record on the FRAM, only ever upward. Effect: the boot
+# after it derives every key under this epoch and clears a client table
+# stamped below it. Recovery: none needed; a higher epoch is always allowed.
+#
+# WRITE the epoch record on the FRAM, only upward.
+dev-write-epoch epoch *args:
+    cargo run -q -p o89-dev -- {{args}} store write-epoch {{epoch}}
+
+# WRITE the device secret on the FRAM: a fresh id and printed secret from the
+# operating system's generator, shown once. Effect: the unit can enrol
+# clients. Refused when one is held; `--replace` orphans every client
+# enrolled under the old one. Recovery: none; a replaced secret is gone.
+#
+# WRITE the device secret on the FRAM, shown once; refused when one is held.
+dev-write-secret *args:
+    cargo run -q -p o89-dev -- store write-secret {{args}}
+
+# ERASE `count` 4 KiB blocks of the NOR from `block`, one request each, the
+# ring finding its head again after each block of its own. Effect: records
+# in those blocks are gone; the ring's sequence restarts at one when every
+# block of it is erased. Recovery: none; the log is the log.
+#
+# ERASE NOR blocks from `block`; records there are gone.
+dev-erase-nor block count="1" *args:
+    cargo run -q -p o89-dev -- {{args}} erase-nor {{block}} --count {{count}}
+
+# RESET the controller through the firmware. Effect: a software reset, a
+# boot record on the ring and one more on the boot count; the module rail
+# does what the revision's policy says through a reset.
+#
+# RESET the controller through the firmware's mailbox.
+dev-reboot *args:
+    cargo run -q -p o89-dev -- {{args}} reboot
