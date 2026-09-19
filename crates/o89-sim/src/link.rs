@@ -36,8 +36,8 @@ fn boot_count(n: u32) -> BootCount {
 
 fn identity() -> Identity {
     Identity {
-        fw: LinkText::new("ctrl 0.0.0-sim").expect("fits"),
-        hw: LinkText::new("A rev A").expect("fits"),
+        fw: LinkText::new("0.0.0-sim+g0123abcd").expect("fits"),
+        hw: LinkText::new("controller-a rev A").expect("fits"),
         boot_id: BootId::derive(b"unit-1", boot_count(7)),
     }
 }
@@ -274,7 +274,7 @@ fn l_030_both_sides_state_themselves_at_boot_and_one_exchange_brings_the_link_up
     assert!(bench.link.is_up());
     let peer = bench.link.peer().expect("a peer");
     assert_eq!(peer.boot_id, bench.comms.boot_id());
-    assert_eq!(peer.fw.as_str(), "comms 0.0.0-sim");
+    assert_eq!(peer.fw.as_str(), "0.1.0-sim+g89abcdef");
     assert_eq!(peer.net_version, Some(0));
     // The peer heard the controller state itself, and the controller
     // acknowledged the peer's statement.

@@ -1366,9 +1366,11 @@ dependencies = [
 
 [[package]]
 name = "km43"
-version = "0.1.0"
-source = "git+https://github.com/origin89hq/km43?rev=f934c1fbd5e660858b70d4d32e432730e7e8b182#f934c1fbd5e660858b70d4d32e432730e7e8b182"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b070a3ff20a7672b0e4abcacb0e728642be2f0476ed20843e04bea45ff37187d"
 dependencies = [
+ "defmt 1.1.1",
  "hkdf",
  "hmac",
  "sha2",

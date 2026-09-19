@@ -28,9 +28,10 @@
 //! `F` rules ratchet by identity, not by count. `traceability.toml` lists the
 //! uncovered rules by name: a rule leaves the list when its test lands, joins
 //! it only when the rule itself is added, and a rule that loses its test is a
-//! failure the count alone would hide. KM43 rules are reported, because which
-//! of them bind this controller rather than a client is what
-//! origin89hq/km43#31 will say.
+//! failure the count alone would hide. KM43 rules are read from the `km43`
+//! this repository builds against, `km43::REQUIREMENTS` (origin89hq/km43#31),
+//! so a citation is checked against the rules of the pinned version; they are
+//! reported, not ratcheted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -122,14 +123,15 @@ fn rules_in_markdown(text: &str, what: &str) -> Result<BTreeSet<String>> {
 }
 
 /// The identifiers in the pinned KM43 index.
-fn rules_in_index(text: &str, what: &str) -> Result<BTreeSet<String>> {
+/// The KM43 rules the crate ships, each once.
+fn rules_in_km43(requirements: &[km43::Requirement]) -> Result<BTreeSet<String>> {
     unique(
-        text.lines()
-            .filter(|line| !line.starts_with('#') && !line.starts_with("id\t"))
-            .filter_map(|line| line.split('\t').next())
+        requirements
+            .iter()
+            .map(|rule| rule.id)
             .filter(|id| is_rule_id(id))
             .map(str::to_owned),
-        what,
+        "km43::REQUIREMENTS",
     )
 }
 
@@ -627,10 +629,8 @@ pub fn check(repo: &Repo) -> Result<()> {
         !f_rules.is_empty(),
         "docs/REQUIREMENTS.md names no **F-nnn** rule"
     );
-    let index = fs::read_to_string(docs.join("km43").join("requirements.tsv"))
-        .context("reading docs/km43/requirements.tsv")?;
-    let km43_rules = rules_in_index(&index, "docs/km43/requirements.tsv")?;
-    ensure!(!km43_rules.is_empty(), "the KM43 index names no rule");
+    let km43_rules = rules_in_km43(km43::REQUIREMENTS)?;
+    ensure!(!km43_rules.is_empty(), "km43 ships no rule");
 
     let (cited, hollow_in) = citations_in_repo(repo)?;
     for (id, file) in &hollow_in {
@@ -741,8 +741,8 @@ mod tests {
         let doc = "**F-001** — one obligation.\n\n**F-001** — another.\n";
         let error = rules_in_markdown(doc, "doc").expect_err("a duplicate");
         assert!(error.to_string().contains("F-001 is allocated twice"));
-        let index = "id\tdocument\nP-001\ta\nP-001\tb\n";
-        assert!(rules_in_index(index, "index").is_err());
+        let twice = [rule("P-001"), rule("P-001")];
+        assert!(rules_in_km43(&twice).is_err());
     }
 
     #[test]
@@ -900,12 +900,28 @@ mod tests {
         );
     }
 
+    fn rule(id: &'static str) -> km43::Requirement {
+        km43::Requirement {
+            id,
+            document: "docs/protocol/LINK.md",
+            section: "a section",
+            statement: "A rule.",
+        }
+    }
+
     #[test]
-    fn the_index_yields_its_identifiers_and_skips_its_comments() {
-        let index =
-            "# pinned\nid\tdocument\nP-001\tdocs/PROTOCOL.md\nL-010\tdocs/protocol/LINK.md\n";
-        let rules = rules_in_index(index, "index").expect("no duplicates");
+    fn the_km43_index_yields_its_identifiers_and_nothing_that_is_not_one() {
+        let shipped = [rule("P-001"), rule("L-010"), rule("X-1")];
+        let rules = rules_in_km43(&shipped).expect("no duplicates");
         assert_eq!(rules, ids(&["P-001", "L-010"]));
+    }
+
+    #[test]
+    fn the_km43_this_repository_builds_against_carries_the_rules_it_cites() {
+        let rules = rules_in_km43(km43::REQUIREMENTS).expect("each once");
+        for id in ["L-033", "L-034", "L-100", "L-190", "P-031"] {
+            assert!(rules.contains(id), "{id} is not in the pinned km43");
+        }
     }
 
     #[test]

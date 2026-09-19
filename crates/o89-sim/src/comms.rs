@@ -541,9 +541,9 @@ impl HostileComms {
         let len = LinkUp {
             version: self.caps.version,
             role,
-            fw: "comms 0.0.0-sim",
+            fw: "0.1.0-sim+g89abcdef",
             boot_id: self.boot_id,
-            hw: "sim",
+            hw: "controller-a rev A",
             net_version,
         }
         .write(header(kind, req_id), &mut dst)

@@ -27,6 +27,7 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-boot --target {{cortex}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:
@@ -124,14 +125,15 @@ run-controller-bench-halting:
 # FLASH and run the comms image on an ESP32-C6 devkit over the devkit's own
 # USB serial, with espflash's monitor. Never board A: its module has no
 # serial wire but the link, and the image reaches it through the controller.
-# Run from the crate's directory, where the runner finds `partitions.csv`.
+# Run from the crate's directory, where the runner finds `partitions.csv`,
+# with the `devkit` feature, so its `LinkUp` names the devkit as its board.
 # Effect: the devkit's flash is replaced, partition table included.
 # Recovery: run it again, holding the devkit's BOOT button through its reset
 # if the image does not start.
 #
 # FLASH and run the comms image on a devkit over its own USB serial; never board A.
 run-comms-devkit:
-    cd firmwares/o89-comms && cargo run --release
+    cd firmwares/o89-comms && cargo run --release --features devkit
 
 # Read the defmt log of whatever the controller is running, without flashing
 # or resetting it: the way to read a boot record after a reset the probe did

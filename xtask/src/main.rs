@@ -11,6 +11,18 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// The firmwares' build-time version text, compiled here for its tests: a
+/// build script cannot hold any.
+#[cfg(test)]
+#[path = "../../firmwares/link_version.rs"]
+#[expect(
+    dead_code,
+    reason = "the build scripts call `emit`; the gate tests the pure half"
+)]
+mod link_version;
+#[cfg(test)]
+mod link_version_tests;
+
 mod cross;
 mod deps;
 mod images;

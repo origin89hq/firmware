@@ -8,10 +8,9 @@
 # file with `deferred` entries to make the count go down turns the first word
 # into the second, which is the graveyard this file exists to not become.
 #
-# The KM43 rules this repository's tests cite are counted against the pinned
-# index in km43/requirements.tsv and reported, not ratcheted: which of them
-# are the controller's obligations rather than a client's or the crate's is
-# what origin89hq/km43#31 will carry.
+# The KM43 rules this repository's tests cite are counted against the rules
+# the pinned km43 ships, `km43::REQUIREMENTS` (origin89hq/km43#31), and
+# reported, not ratcheted.
 
 # The list somebody defends at each audit round: the F rules that have
 # neither a test nor a declaration below, by name. The check fails when a
