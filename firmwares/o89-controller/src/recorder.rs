@@ -47,8 +47,9 @@ static CUTS: Signal<CriticalSectionRawMutex, RecentCuts> = Signal::new();
 static CUTS_KEPT: Signal<CriticalSectionRawMutex, Result<(), NotKept>> = Signal::new();
 
 /// How long the rail task waits for the cuts to land: a write the recorder
-/// takes at once, behind at most one ring append or mailbox request.
-const KEEP_DEADLINE: Duration = Duration::from_millis(500);
+/// takes at once, behind at most one ring append or mailbox request, and an
+/// append may erase a NOR sector first, 400 ms at most on the W25Q128JV.
+const KEEP_DEADLINE: Duration = Duration::from_millis(2_000);
 
 /// Why the ladder's cuts did not land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]

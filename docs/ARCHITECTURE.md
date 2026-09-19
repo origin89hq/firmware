@@ -899,7 +899,8 @@ it has booted and applies its policy from there:
 - The recovery ladder's cuts (L-111, L-112), each logged; the count L-111
   names goes into the record once origin89hq/km43#32 gives the body its
   shape, and is on the probe's log until then. The cuts of the last hour
-  are on the FRAM before the rail goes off, and a boot carries them as made
+  are on the FRAM before the rail goes off, a cut whose count does not land
+  is not made and the ladder asks again, and a boot carries them as made
   at its own start, so a controller that resets between rungs still reaches
   the third (F-017).
 - A bank-voltage threshold below which the radio stays off, so the weakest

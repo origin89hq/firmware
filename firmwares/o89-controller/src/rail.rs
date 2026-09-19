@@ -23,7 +23,7 @@ use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Instant, Ticker};
 use o89_core::{
     BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine, RailSequencer,
     RecentCuts, Recovery, StrapRoute, Task,
@@ -146,18 +146,41 @@ impl Pins {
     }
 }
 
+/// How long after a failed keep the rail task tries the cuts again.
+const KEEP_RETRY: Duration = Duration::from_secs(1);
+
 /// The rail task: the sequencer's lines from here on. The boot power-on
 /// was applied by `main` before this task was spawned; `kept` is the
 /// ladder's cuts as the part holds them, carried to this boot.
 #[embassy_executor::task]
 pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentCuts) {
     let mut ticker = Ticker::every(PERIOD);
+    let mut retry_at: Option<Instant> = None;
     loop {
         ticker.next().await;
         let now = Uptime.now();
         match REQUEST.try_take() {
             Some(RailRequest::Recover) => {
-                let recovery = sequencer.recover(now);
+                // Planned on a copy: a cut and the count it adds are on the
+                // FRAM before the sequencer moves, and a count that does not
+                // land moves nothing (F-017). The ladder asks again.
+                let mut planned = sequencer;
+                let mut recovery = planned.recover(now);
+                if let Recovery::Cycling { .. } = recovery {
+                    let cuts = planned.recent_cuts(now);
+                    match recorder::keep_cuts(cuts).await {
+                        Ok(()) => {
+                            kept = cuts;
+                            sequencer = planned;
+                        }
+                        Err(why) => {
+                            defmt::error!("rail: the cut's count not kept: {}; no cut", why);
+                            recovery = Recovery::Deferred;
+                        }
+                    }
+                } else {
+                    sequencer = planned;
+                }
                 match recovery {
                     Recovery::Cycling { count, off_for } => defmt::warn!(
                         "rail: cutting for {} ms, cycle {} in the last hour",
@@ -168,6 +191,9 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentC
                         defmt::error!("rail: the third rung; left on, comms unrecoverable");
                     }
                     Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
+                    Recovery::Deferred => {
+                        defmt::warn!("rail: the cut deferred; the ladder asks again");
+                    }
                 }
                 say(RailWord::Recovered(recovery));
             }
@@ -207,18 +233,23 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentC
                 }
             }
         }
+        // A cut is kept before it is made, above; what changes here is the
+        // cut this boot's reset counts, and a cut that aged out, which must
+        // be off the part before a boot could carry it again (F-017). A
+        // write that fails is tried again a second later.
         let cuts = sequencer.recent_cuts(now);
-        if cuts != kept {
-            // Kept before the lines move: a cut is on the part before the
-            // rail goes off, and one that aged out is off it before a boot
-            // could carry it again (F-017). A write that fails is logged
-            // and not retried until the cuts change again; the count in RAM
-            // still holds for this boot.
+        if cuts != kept && retry_at.is_none_or(|at| Instant::now() >= at) {
             match recorder::keep_cuts(cuts).await {
-                Ok(()) => defmt::info!("rail: {} cuts in the last hour kept", cuts.count()),
-                Err(why) => defmt::error!("rail: the ladder's cuts not kept: {}", why),
+                Ok(()) => {
+                    defmt::info!("rail: {} cuts in the last hour kept", cuts.count());
+                    kept = cuts;
+                    retry_at = None;
+                }
+                Err(why) => {
+                    defmt::error!("rail: the ladder's cuts not kept: {}", why);
+                    retry_at = Instant::now().checked_add(KEEP_RETRY);
+                }
             }
-            kept = cuts;
         }
         pins.apply(sequencer.lines());
         check_in(Task::Rail);

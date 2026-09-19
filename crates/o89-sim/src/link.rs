@@ -59,6 +59,9 @@ struct Bench {
     noise: u32,
     /// What the comms processor's module has been told to be.
     module_booted: bool,
+    /// Whether the ladder's cuts land on the FRAM when the adapter keeps
+    /// them before a cut (F-017).
+    keeps_land: bool,
 }
 
 impl Bench {
@@ -80,6 +83,7 @@ impl Bench {
             ticked: Vec::new(),
             noise: 0,
             module_booted: false,
+            keeps_land: true,
         }
     }
 
@@ -141,7 +145,19 @@ impl Bench {
                             to_comms.push_back(dst[..len].to_vec());
                         }
                         Action::CutRail => {
-                            let recovery = self.rail.recover(self.now);
+                            // As the adapter does: planned on a copy, the
+                            // cut made only once its count has landed.
+                            let mut planned = self.rail;
+                            let mut recovery = planned.recover(self.now);
+                            match recovery {
+                                Recovery::Cycling { .. } if !self.keeps_land => {
+                                    recovery = Recovery::Deferred;
+                                }
+                                Recovery::Cycling { .. }
+                                | Recovery::LeftOnAndRaised
+                                | Recovery::Busy
+                                | Recovery::Deferred => self.rail = planned,
+                            }
                             if matches!(recovery, Recovery::Cycling { .. }) {
                                 // The module loses its power with the rail.
                                 self.comms.power_off();
@@ -681,6 +697,50 @@ fn l_041_after_a_peer_reboots_an_answer_to_a_beat_of_the_old_boot_does_not_count
             .notes()
             .contains(&Note::UnexpectedAck(LinkMessageType::HeartbeatAck))
     );
+}
+
+#[test]
+fn f_017_a_cut_whose_count_does_not_land_is_not_made_and_is_asked_again() {
+    // Capabilities: answers nothing, from boot; the FRAM refuses the
+    // ladder's first keep.
+    let mut bench = Bench::new(Capabilities {
+        answers: Answers::Nothing,
+        ..Capabilities::default()
+    });
+    let cycled = |bench: &Bench| {
+        bench
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, LinkEvent::PowerCycled { .. }))
+            .count()
+    };
+    bench.keeps_land = false;
+    bench.run_for(Millis::from_millis(70_000));
+    assert_eq!(bench.cuts().len(), 1, "the cut was asked for");
+    assert_eq!(cycled(&bench), 0, "and not made");
+    let statements = bench
+        .sent(|out| matches!(out, Outgoing::LinkUp { .. }))
+        .len();
+    bench.keeps_land = true;
+    bench.run_for(Millis::from_millis(60_000));
+    assert!(
+        bench
+            .sent(|out| matches!(out, Outgoing::LinkUp { .. }))
+            .len()
+            > statements,
+        "the ladder came back and kept stating itself"
+    );
+    let cuts = bench.cuts();
+    assert_eq!(cuts.len(), 2, "asked again");
+    let first = *cuts.first().expect("two");
+    let second = *cuts.get(1).expect("two");
+    assert!(
+        second
+            .since(first)
+            .is_some_and(|gap| gap.as_millis() >= CUT_AFTER.as_millis()),
+        "a cut interval later"
+    );
+    assert_eq!(cycled(&bench), 1, "and made, once its count landed");
 }
 
 #[test]

@@ -111,9 +111,10 @@ ride-through window is 15 s, budgeted as the 8.8 s worst-case watchdog plus
 this allowance (`B-20`, [hardware#51][h51]). M1; held through M7.
 
 **F-017** — The recovery ladder's cuts of the last hour outlive a controller
-reset: they are written to the FRAM before the rail goes off, a boot carries
-each of them as made at its own start (P-121), and a record that does not
-read counts as the three cuts L-112 stops at. A reset therefore never lowers
+reset: they are written to the FRAM before the rail goes off, and a cut
+whose count does not land is not made; a boot carries each of them as made
+at its own start (P-121), and a record that does not read counts as the
+three cuts L-112 stops at. A reset therefore never lowers
 the count; it can keep a cut in the count for up to an hour longer than it
 was. Source: [#49][i49], KM43 L-112. M3.
 

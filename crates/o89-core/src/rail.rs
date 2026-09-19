@@ -121,6 +121,12 @@ pub enum Recovery {
     LeftOnAndRaised,
     /// A cut is already in progress; nothing changed.
     Busy,
+    /// The cut was due and not made: the count it would have added could
+    /// not be kept on the FRAM first (F-017), so nothing moved, and the
+    /// ladder asks again. The adapter reports this, never the sequencer,
+    /// which plans a cut on a copy of itself and keeps the copy only once
+    /// its count has landed.
+    Deferred,
 }
 
 /// The cut a recovery cycle makes (L-111).
