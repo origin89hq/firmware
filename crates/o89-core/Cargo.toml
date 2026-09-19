@@ -17,6 +17,7 @@ defmt = ["dep:defmt"]
 crc.workspace = true
 km43.workspace = true
 sha2.workspace = true
+embedded-storage-async.workspace = true
 defmt = { workspace = true, optional = true }
 
 [dev-dependencies]

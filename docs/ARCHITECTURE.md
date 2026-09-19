@@ -695,6 +695,24 @@ filesystem.
   takes the better part of six months, so each block is erased about twice a
   year against an endurance of 100,000 cycles.
 
+**Nothing is held per block, and the boot reads one block.** The part is
+megabytes and the controller has 144 KB, so the boot finds the head by
+binary search over the first record of each block, a probe that reads one
+record's reach at the block's start and no further, so a part full of
+somebody else's bytes costs a bounded read per block rather than the whole
+of it: blocks before the head carry newer sequences than the first block
+holding records, blocks after it carry older ones or nothing, and a block
+closed by a torn write is stepped over to its neighbour. The head block
+alone is scanned to its tail, the block ahead of it alone is read whole to
+be sure it is erased, every walk over blocks yields between them, and every
+read streams through one record's worth of scratch. The first boot on
+this bench board, whose NOR held the self-test's bytes, is what taught it:
+a scan that read every block whole took longer than the watchdog's eight
+seconds and the part never got to open its ring. The time floor a clock offer is checked against
+(L-140) is found the first time it is asked for rather than at boot,
+because the walk back to the newest timestamped record is instant on a unit
+whose clock was ever set and the whole ring on one whose clock never was.
+
 `sequential-storage` was read before this was designed and is not adopted,
 for shape rather than quality: its queue is a FIFO, and this log is read by
 sequence number from arbitrary positions by several clients months apart, and

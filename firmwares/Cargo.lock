@@ -1480,6 +1480,7 @@ version = "0.0.0"
 dependencies = [
  "crc",
  "defmt 1.1.1",
+ "embedded-storage-async",
  "km43",
  "sha2",
 ]

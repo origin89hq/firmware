@@ -20,6 +20,7 @@
 //! cites: F-024
 
 use crate::body::{Body, Malformed, Reader, Writer};
+use crate::record::Class;
 use crate::tick::{Millis, UnixMillis};
 
 /// The bytes the counter takes in its record.
@@ -27,16 +28,6 @@ pub const WRITE_VOLUME_BYTES: usize = 16;
 
 /// The window: one day.
 pub const BUDGET_WINDOW: Millis = Millis::from_millis(24 * 60 * 60 * 1_000);
-
-/// The record class, as the ring distinguishes them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Class {
-    /// Durable: state changes, commands and outcomes, alarms, boot records.
-    A,
-    /// Droppable: periodic aggregates, diagnostics, telemetry.
-    B,
-}
 
 /// What the budget says about an append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
