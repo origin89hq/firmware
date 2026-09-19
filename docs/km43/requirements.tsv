@@ -1,6 +1,7 @@
 # The numbered rules of KM43 as of origin89hq/km43 712046df4a6a684fb68881219e5e00b74fa3fee4, extracted from PROTOCOL.md and LINK.md.
 # A pinned copy until km43 ships the index (origin89hq/km43#31); regenerate with `cargo xtask km43-index` once it does.
 # Eight rules sit inside numbered or indented list items (L-021 to L-023, L-169 to L-173) and the first extraction, which read only paragraph-leading rules, missed them; they are added by hand from the same commit.
+# L-190 to L-192, the download window, are added by hand from f934c1fbd5e660858b70d4d32e432730e7e8b182, the revision of origin89hq/km43#40 both workspaces pin, which allocates them.
 id	document	section	first sentence
 P-001	docs/PROTOCOL.md	How to read this	An implementation MUST reproduce every vector in
 P-002	docs/PROTOCOL.md	Neither fixed nor reported	A receiver MUST size its frame buffer at `MAX_FRAME` and MUST
@@ -220,3 +221,6 @@ L-174	docs/protocol/LINK.md	Comms firmware release	The controller MUST hold at m
 L-180	docs/protocol/LINK.md	Error codes	Codes 257, 258 and 259 MUST reach the client whose frame raised
 L-181	docs/protocol/LINK.md	Error codes	An error raised about a link-local frame MUST carry
 L-182	docs/protocol/LINK.md	Error codes	An error raised about a client's frame MUST be routed to that
+L-190	docs/protocol/LINK.md	The download window	Before it forwards any client frame, the comms processor MUST
+L-191	docs/protocol/LINK.md	The download window	Outside that window the comms processor MUST answer
+L-192	docs/protocol/LINK.md	The download window	The controller MUST send `EnterDownload` only after it has itself

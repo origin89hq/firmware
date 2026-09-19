@@ -3,5 +3,9 @@
 [build]
 target = "riscv32imac-unknown-none-elf"
 
+# A devkit's serial only: board A has no wire to the module but the link, and
+# the image reaches it through the controller (`o89-dev`). The partition
+# table is the one F-036 names, and cargo runs the runner where it was
+# invoked, so `just run-comms-devkit` invokes it from this directory.
 [target.riscv32imac-unknown-none-elf]
-runner = "espflash flash --monitor"
+runner = "espflash flash --monitor --partition-table partitions.csv"

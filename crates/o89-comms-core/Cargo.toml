@@ -1,0 +1,19 @@
+[package]
+name = "o89-comms-core"
+version = "0.0.0"
+description = "The comms processor's decisions, pure of the wire: the download window's intake and the link-local state machine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Never `o89-core`: this crate is linked into the comms processor, and
+# `cargo xtask check` refuses a path from there to the crate that decides.
+# What the two sides share is `o89-link`'s, below both.
+[dependencies]
+km43.workspace = true
+o89-link = { path = "../o89-link" }
+
+[lints]
+workspace = true

@@ -3,7 +3,14 @@
 # never tries to build a Cortex-M0+ or a RISC-V crate for the laptop.
 [workspace]
 resolver = "3"
-members = ["crates/o89-core", "crates/o89-dev", "crates/o89-sim", "xtask"]
+members = [
+    "crates/o89-comms-core",
+    "crates/o89-core",
+    "crates/o89-dev",
+    "crates/o89-link",
+    "crates/o89-sim",
+    "xtask",
+]
 exclude = ["firmwares"]
 
 [workspace.package]
@@ -16,7 +23,9 @@ publish = false
 [workspace.dependencies]
 # The one wire format. Pinned exactly and written here once for both
 # workspaces; a member takes it with `.workspace = true` when it first needs it.
-km43 = "=0.1.0"
+# On a revision of origin89hq/km43#40 until `EnterDownload` is published; the
+# registry pin returns with the release, in both workspaces at once.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "f934c1fbd5e660858b70d4d32e432730e7e8b182" }
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }

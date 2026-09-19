@@ -813,8 +813,7 @@ dependencies = [
 [[package]]
 name = "km43"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60c416c4674ef51e3229ac4e2dc5857599ad0404fa7e6db5c4795dd25d6cfd1"
+source = "git+https://github.com/origin89hq/km43?rev=f934c1fbd5e660858b70d4d32e432730e7e8b182#f934c1fbd5e660858b70d4d32e432730e7e8b182"
 dependencies = [
  "hkdf",
  "hmac",
@@ -986,6 +985,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "o89-comms-core"
+version = "0.0.0"
+dependencies = [
+ "km43",
+ "o89-link",
+]
+
+[[package]]
 name = "o89-core"
 version = "0.0.0"
 dependencies = [
@@ -994,6 +1001,7 @@ dependencies = [
  "embassy-futures",
  "embedded-storage-async",
  "km43",
+ "o89-link",
  "sha2",
 ]
 
@@ -1011,6 +1019,14 @@ dependencies = [
  "probe-rs",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "o89-link"
+version = "0.0.0"
+dependencies = [
+ "defmt",
+ "km43",
 ]
 
 [[package]]

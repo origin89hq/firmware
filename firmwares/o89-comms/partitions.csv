@@ -1,0 +1,11 @@
+# The comms processor's flash, 8 MB (F-036). Two OTA slots and a factory slot
+# that OTA never writes and that always carries the download window; the
+# credential record and the web assets. The app partitions are 2 MB each,
+# the budget `cargo xtask sizes` measures the image against.
+# Name,    Type, SubType, Offset,   Size,     Flags
+otadata,   data, ota,     0x9000,   0x2000,
+factory,   app,  factory, 0x10000,  0x200000,
+ota_0,     app,  ota_0,   0x210000, 0x200000,
+ota_1,     app,  ota_1,   0x410000, 0x200000,
+creds,     data, nvs,     0x610000, 0x6000,
+assets,    data, spiffs,  0x616000, 0x1EA000,

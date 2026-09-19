@@ -12,17 +12,27 @@ publish.workspace = true
 # comms processor that could reach a decision is one that could make one.
 # `cargo xtask check` refuses the dependency.
 [dependencies]
-# The part. `unstable` is what carries UART flow control, the watchdogs and
-# the register blocks the download window needs.
+# The part. `unstable` is what carries UART flow control, the watchdogs, the
+# true random source and the register block the download window writes.
 esp-hal = { version = "=1.2.2", features = ["esp32c6", "unstable"] }
+# The scheduler the radio will need and the executor the link runs on.
+esp-rtos = { version = "=0.4.0", features = ["esp32c6", "embassy"] }
 # The application descriptor the ROM bootloader reads before it runs anything,
-# and later the OTA states.
+# the partition table, and the OTA state the window's completion confirms.
 esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c6"] }
-# The panic and exception handler. A RISC-V fault is not a Rust panic: a
-# hand-written handler never sees one, and a chip that faults before `main`
-# boots, runs nothing and says nothing.
-esp-backtrace = { version = "=0.20.0", features = ["esp32c6", "panic-handler", "println"] }
-esp-println = { version = "=0.18.0", default-features = false, features = ["esp32c6", "uart", "critical-section"] }
+esp-storage = { version = "=0.10.0", features = ["esp32c6"] }
+# No `esp-backtrace`: it insists on printing, and the module's only wire on
+# board A is the link, which no text may enter (#2). A panic resets the part
+# (`panic.rs`), and a RISC-V fault, which no Rust handler sees, is a hang
+# the watchdog ends the same way.
+embassy-executor.workspace = true
+embassy-time.workspace = true
+embassy-futures.workspace = true
+# The executor's home: entered once, at the end of the boot.
+static_cell.workspace = true
+km43.workspace = true
+# The window's and the link's rules, where the host tests them.
+o89-comms-core = { path = "../../crates/o89-comms-core" }
 
 [lints]
 workspace = true
