@@ -41,7 +41,7 @@ pub fn run(
             if let Some(honour) = window.take(reader, *byte, now())
                 && answered(uart, writer, honour)
             {
-                enter_download();
+                enter_download(rwdt);
             }
         }
     }
@@ -70,9 +70,14 @@ fn answered(uart: &mut Uart<'_, Blocking>, writer: &mut FrameWriter, honour: Hon
     uart.flush().is_ok()
 }
 
-/// The ROM's route into serial download: `FORCE_DOWNLOAD_BOOT` in
-/// `LP_AON.SYS_CFG`, then a reset. Nothing runs after this.
-fn enter_download() -> ! {
+/// The ROM's route into serial download: the watchdog disarmed, then
+/// `FORCE_DOWNLOAD_BOOT` in `LP_AON.SYS_CFG`, then a reset. Nothing runs
+/// after this. The watchdog goes first because it lives in the LP domain
+/// and outlives the software reset, and the ROM's loader does not feed it:
+/// left armed, it reset the chip out of the loader eight seconds in, after
+/// esptool's erase and before its first write (bench 2026-09-19).
+fn enter_download(rwdt: &mut Rwdt) -> ! {
+    rwdt.disable();
     LP_AON::regs()
         .sys_cfg()
         .modify(|_, w| w.force_download_boot().set_bit());

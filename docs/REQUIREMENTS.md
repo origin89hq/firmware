@@ -173,10 +173,13 @@ and a reset re-opens the download window. Source: [#1][i1]. M3.
 for a bounded period for `EnterDownload` on the controller UART and for
 nothing else. Source: [#1][i1], [km43#30][k30]. M3.
 
-**F-034** — `EnterDownload` is honoured by setting `FORCE_DOWNLOAD_BOOT` and
-resetting; it is never acted on outside the window, and never from a client
-transport. A pattern in the relayed stream that reboots the module is a way
-for any client to take the product off the air. Source: [#1][i1]. M3.
+**F-034** — `EnterDownload` is honoured by disarming the RTC watchdog, setting
+`FORCE_DOWNLOAD_BOOT` and resetting, in that order: the watchdog lives in the
+LP domain and outlives the software reset, and the ROM's loader does not feed
+it, so one left armed resets the chip out of the loader eight seconds in. It
+is never acted on outside the window, and never from a client transport. A
+pattern in the relayed stream that reboots the module is a way for any client
+to take the product off the air. Source: [#1][i1], bench 2026-09-19. M3.
 
 **F-035** — `boot_id` is drawn from the hardware RNG with the ADC entropy
 source enabled, before the RF subsystem is up; the bare RNG is pseudo-random

@@ -1046,9 +1046,11 @@ rolls back independently, and the two are never offline at once.
    listens for a link-local `EnterDownload` frame from the controller
    (KM43 L-190 to L-192, from
    [origin89hq/km43#30](https://github.com/origin89hq/km43/issues/30)) and
-   for nothing else. On one it acknowledges `entering`, sets the ROM's
-   force-download flag (`LP_AON.SYS_CFG` bit 30, a field write the register
-   crate makes safe) and resets into the ROM. It never scans the relayed
+   for nothing else. On one it acknowledges `entering`, disarms the RTC
+   watchdog, which outlives the software reset and which the ROM's loader
+   does not feed, sets the ROM's force-download flag (`LP_AON.SYS_CFG` bit
+   30, a field write the register crate makes safe) and resets into the
+   ROM. It never scans the relayed
    client stream for anything, and after the window a request is answered
    `refused_outside_window` and never acted on. The window runs before any
    code that can crash for a reason of ours, and its having run is what
