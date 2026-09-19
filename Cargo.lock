@@ -812,8 +812,9 @@ dependencies = [
 
 [[package]]
 name = "km43"
-version = "0.1.0"
-source = "git+https://github.com/origin89hq/km43?rev=6a6060acb73aaa9d1c223bbb55c7d16a68166ae2#6a6060acb73aaa9d1c223bbb55c7d16a68166ae2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b070a3ff20a7672b0e4abcacb0e728642be2f0476ed20843e04bea45ff37187d"
 dependencies = [
  "defmt",
  "hkdf",
@@ -1882,6 +1883,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
+ "km43",
  "serde",
  "syn 3.0.6",
  "toml",

@@ -14,8 +14,9 @@ rules. The list is by name and somebody defends it at each audit: a rule
 leaves it when its test lands and joins it only when the rule is added, so a
 test that goes missing is a failure and not a number that stayed the same. The
 KM43 rules this repository's tests cite are counted the same way and reported,
-against the pinned copy in [`km43/requirements.tsv`](km43/requirements.tsv),
-until km43 ships the index itself ([km43#31][k31]).
+against the rules the pinned `km43` ships as `km43::REQUIREMENTS`
+([km43#31][k31]), so a citation is checked against the version the firmware
+builds with.
 
 A rule states one obligation. Where it seems to state two, it is two rules.
 The reasoning behind a rule is in [`ARCHITECTURE.md`](ARCHITECTURE.md) or the

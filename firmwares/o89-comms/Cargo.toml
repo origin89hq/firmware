@@ -11,6 +11,12 @@ publish.workspace = true
 # This crate must never depend on `o89-core`. It is the untrusted half, and a
 # comms processor that could reach a decision is one that could make one.
 # `cargo xtask check` refuses the dependency.
+[features]
+# The image for an ESP32-C6 devkit on its own USB serial (`just
+# run-comms-devkit`): the same firmware, stating the devkit as its board in
+# every `LinkUp` rather than board A (L-034). Nothing else moves.
+devkit = []
+
 [dependencies]
 # The part. `unstable` is what carries UART flow control, the watchdogs, the
 # true random source and the register block the download window writes.
