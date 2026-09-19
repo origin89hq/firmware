@@ -122,8 +122,10 @@ L-112. M3.
 **F-018** — On revision A the reset that began a boot is one of the ladder's
 cuts, because the rail is off through every controller reset: three resets
 inside an hour are the third rung. The ladder's record names the boot count
-it was written at, and every boot counted since whose own record never
-landed is a cut too. A reset before a boot's count lands is not counted.
+it was written at; a boot whose count landed and whose own record did not
+is a cut the next boot counts, from the gap in the count. A reset before
+the boot count itself lands is counted by no later boot: the count never
+advanced, so no gap names the boot that was.
 Source: [#49][i49], [hardware#48][h48]. M3.
 
 ## Persistence
