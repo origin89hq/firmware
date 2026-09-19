@@ -237,11 +237,12 @@ dev-flash-comms *args: sizes
 
 # FLASH THE WHOLE MODULE FLASH from address 0: the bootloader, the partition
 # table and the factory image with it. For bringing a module up the first
-# time, or restoring one whose factory image is gone. Effect: everything the
-# module held is replaced, and from the first erase until esptool finishes it
-# boots nothing. Recovery: run it again with `--entry strap` and, on revision
-# A, a wire holding IO8 high (hardware#6), because a module that boots nothing
-# never enters the ROM's loader by itself (#1). Use `dev-flash-comms` for
+# time, or restoring one whose factory image is gone. Both boot nothing and
+# answer no knock, so this enters by the strap, which on revision A needs a
+# wire holding IO8 high (hardware#6); pass `--entry knock` to replace the
+# factory image of a module that is running. Effect: everything the module
+# held is replaced, and from the first erase until esptool finishes it boots
+# nothing. Recovery: run it again, with the wire. Use `dev-flash-comms` for
 # ordinary work.
 #
 # FLASH THE WHOLE MODULE FLASH, factory image included; leaves no way back but the strap.

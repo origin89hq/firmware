@@ -173,15 +173,18 @@ pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
     Ok(plan)
 }
 
-/// The flash's first bytes, which the second-stage bootloader is loaded
-/// from and which no route but the whole one may touch. The partition
-/// table declares nothing below its own offset, so this is the one
-/// boundary the table cannot state.
-const BOOTLOADER_END: u32 = 0x8000;
+/// The flash below the first partition: the second-stage bootloader from
+/// address zero, and the partition table in the sector at `0x8000`. No
+/// route but the whole one may touch either, and a table that is gone is
+/// as bad as a factory image that is gone — the bootloader cannot find
+/// the one without the other. The table declares nothing below its own
+/// offset, so this is the one boundary the table cannot state.
+const PARTITION_TABLE_END: u32 = 0x9000;
 
-/// Every write in `plan` stays clear of the factory image and of the
-/// bootloader in front of it (F-036, F-084): the two things that let a
-/// module with no wire on it be reached again.
+/// Every write in `plan` stays clear of the factory image, of the
+/// partition table that points at it, and of the bootloader that reads
+/// them (F-036, F-084): what lets a module with no wire on it be reached
+/// again is all three, and losing any one of them loses the window.
 ///
 /// Asserted on the plan rather than trusted from the code that built it,
 /// because it is the property the operator is relying on and a slot
@@ -194,9 +197,9 @@ pub fn keeps_the_recovery_image(plan: &Plan, table: &Table) -> Result<()> {
             .at
             .checked_add(write.len)
             .with_context(|| format!("a write at {:#x} that runs past the flash", write.at))?;
-        if write.at < BOOTLOADER_END {
+        if write.at < PARTITION_TABLE_END {
             bail!(
-                "a write of {} bytes at {:#x} reaches the bootloader",
+                "a write of {} bytes at {:#x} reaches the bootloader or the partition table",
                 write.len,
                 write.at
             );
@@ -657,7 +660,11 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
         let plan = plan_slot(&table, &application(&scratch, 176_272), &scratch).expect("a plan");
         keeps_the_recovery_image(&plan, &table).expect("the recovery image is untouched");
         for write in plan.passes.iter().flatten() {
-            assert!(write.at >= 0x8000, "{:#x} is in the bootloader", write.at);
+            assert!(
+                write.at >= 0x9000,
+                "{:#x} is in the bootloader or the partition table",
+                write.at
+            );
             let end = write.at + write.len;
             assert!(
                 write.at >= 0x0021_0000 || end <= 0x0001_0000,
@@ -682,6 +689,26 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
             keeps_the_recovery_image(&plan, &board_a()).expect_err("refused")
         );
         assert!(error.contains("download window"), "{error}");
+    }
+
+    #[test]
+    fn f_036_a_plan_that_reaches_the_partition_table_is_refused() {
+        // A table that placed a slot over the partition table would take
+        // the factory image out of the bootloader's reach without ever
+        // writing a byte of it.
+        let plan = Plan {
+            says: String::new(),
+            passes: vec![vec![Write {
+                at: 0x8000,
+                len: 0x1000,
+                file: PathBuf::from("otadata.bin"),
+            }]],
+        };
+        let error = format!(
+            "{:#}",
+            keeps_the_recovery_image(&plan, &board_a()).expect_err("refused")
+        );
+        assert!(error.contains("partition table"), "{error}");
     }
 
     #[test]

@@ -140,8 +140,11 @@ enum Command {
         /// The route into the ROM: the window the comms firmware opens, or
         /// the strap for a module that runs nothing that answers, which on
         /// revision A needs IO8 held high by a wire.
-        #[arg(long, value_enum, default_value_t = FlashEntry::Knock)]
-        entry: FlashEntry,
+        /// Left out, the layout chooses: the slot route knocks, and the
+        /// whole route straps, because the modules it is for answer
+        /// nothing.
+        #[arg(long, value_enum)]
+        entry: Option<FlashEntry>,
         /// What is written: the application into an OTA slot, which leaves
         /// the recovery image alone, or the whole flash, which replaces it.
         #[arg(long, value_enum, default_value_t = Layout::Slot)]
@@ -185,6 +188,21 @@ enum StoreCommand {
         #[arg(long)]
         replace: bool,
     },
+}
+
+impl Layout {
+    /// The route into the ROM this layout is for, when nobody named one.
+    ///
+    /// The whole route replaces the factory image, so the modules it
+    /// exists for — a new one, and one whose factory image is gone — boot
+    /// nothing and cannot answer a knock. It straps. The slot route runs
+    /// against a module that is running, so it knocks.
+    fn entry(self) -> FlashEntry {
+        match self {
+            Self::Slot => FlashEntry::Knock,
+            Self::Whole => FlashEntry::Strap,
+        }
+    }
 }
 
 /// What a flash writes.
@@ -290,6 +308,7 @@ fn main() -> Result<()> {
         } => {
             // The generated files live for this flash and go with it.
             let scratch = flash::Scratch::new()?;
+            let entry = entry.unwrap_or_else(|| layout.entry());
             let plan = match layout {
                 Layout::Slot => {
                     let table = layout::Table::read(&partitions)?;
@@ -341,10 +360,7 @@ mod tests {
         let knock = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
         assert!(matches!(
             knock.command,
-            Command::FlashComms {
-                entry: FlashEntry::Knock,
-                ..
-            }
+            Command::FlashComms { entry: None, .. }
         ));
         let strap =
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "strap"])
@@ -352,7 +368,7 @@ mod tests {
         assert!(matches!(
             strap.command,
             Command::FlashComms {
-                entry: FlashEntry::Strap,
+                entry: Some(FlashEntry::Strap),
                 ..
             }
         ));
@@ -360,6 +376,32 @@ mod tests {
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "reset"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_whole_route_straps_by_default_because_what_it_recovers_answers_no_knock() {
+        assert_eq!(Layout::Whole.entry(), FlashEntry::Strap);
+        assert_eq!(Layout::Slot.entry(), FlashEntry::Knock);
+        // And a route named on the command line is still the one taken:
+        // a healthy module's factory image is replaced through its window.
+        let named = Cli::try_parse_from([
+            "o89-dev",
+            "flash-comms",
+            "o89-comms",
+            "--layout",
+            "whole",
+            "--entry",
+            "knock",
+        ])
+        .expect("parses");
+        assert!(matches!(
+            named.command,
+            Command::FlashComms {
+                entry: Some(FlashEntry::Knock),
+                layout: Layout::Whole,
+                ..
+            }
+        ));
     }
 
     #[test]
