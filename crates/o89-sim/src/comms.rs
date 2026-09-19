@@ -351,7 +351,11 @@ impl HostileComms {
 
     /// A heartbeat outside its link's own cadence, under a request id its
     /// link does not track: its answer counts for nothing on this side.
+    /// Nothing from a peer that answers nothing or withholds its beats.
     pub fn heartbeat(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
+        if self.caps.answers == Answers::Nothing || self.caps.beats == Beats::Withheld {
+            return Ok(Vec::new());
+        }
         let req_id = self.take_injected();
         let frame = self.build(Frame::Heartbeat { req_id }, now)?;
         Ok(self.wire(&frame, Some(LinkMessageType::Heartbeat), now))
@@ -730,4 +734,52 @@ fn first_value(envelope: LinkEnvelope<'_>) -> Option<u8> {
         return None;
     }
     body.u8().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every heartbeat the peer put on the wire in five seconds from its
+    /// boot, ticked every ten milliseconds, before anyone answers it.
+    fn beats_in_five_seconds(caps: Capabilities) -> usize {
+        let mut peer = HostileComms::new(caps);
+        let _ = peer.boot(Tick::ZERO).expect("the peer boots");
+        for ms in (10..=5_000).step_by(10) {
+            let _ = peer.tick(Tick::from_millis(ms)).expect("the peer ticks");
+        }
+        let _ = peer.heartbeat(Tick::from_millis(5_000)).expect("builds");
+        peer.sent
+            .iter()
+            .filter(|kind| **kind == LinkMessageType::Heartbeat)
+            .count()
+    }
+
+    #[test]
+    fn a_peer_that_beats_regardless_beats_without_a_link() {
+        let beats = beats_in_five_seconds(Capabilities {
+            beats: Beats::Regardless,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 3, "two on its clock and the one injected");
+    }
+
+    #[test]
+    fn a_peer_that_answers_nothing_beats_nothing_even_regardless() {
+        let beats = beats_in_five_seconds(Capabilities {
+            answers: Answers::Nothing,
+            beats: Beats::Regardless,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 0);
+    }
+
+    #[test]
+    fn a_peer_that_withholds_its_beats_injects_none_either() {
+        let beats = beats_in_five_seconds(Capabilities {
+            beats: Beats::Withheld,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 0);
+    }
 }
