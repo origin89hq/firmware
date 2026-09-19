@@ -107,12 +107,14 @@ const _: () = {
     ));
 };
 
-/// This firmware, as key 4 of every `LinkUp` it sends (L-031's other half).
-const FW: &str = concat!("o89-controller ", env!("CARGO_PKG_VERSION"));
-/// The board, as key 6.
+/// This firmware, as key 4 of every `LinkUp`: its version with the commit
+/// it was built from, which the build script reads from git (KM43 L-034).
+const FW: &str = env!("O89_LINK_VERSION");
+/// The board, as key 6: its name and revision as origin89hq/hardware
+/// writes them (KM43 L-034).
 const HW: &str = match REVISION {
-    Revision::A => "board A rev A",
-    Revision::B => "board A rev B",
+    Revision::A => "controller-a rev A",
+    Revision::B => "controller-a rev B",
 };
 const _: () = {
     assert!(FW.len() <= km43::MAX_LINK_TEXT);

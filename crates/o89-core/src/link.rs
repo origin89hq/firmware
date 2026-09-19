@@ -1063,8 +1063,8 @@ mod tests {
 
     fn identity() -> Identity {
         Identity {
-            fw: LinkText::new("ctrl 0.0.0").expect("fits"),
-            hw: LinkText::new("A rev A").expect("fits"),
+            fw: LinkText::new("0.0.0+g0123abcd").expect("fits"),
+            hw: LinkText::new("controller-a rev A").expect("fits"),
             boot_id: BootId::derive(b"unit", boot(3)),
         }
     }
@@ -1116,6 +1116,49 @@ mod tests {
             assert_ne!(pair[0], pair[1]);
             assert_ne!(pair[1], pair[0].wrapping_add(1), "not a counter");
         }
+    }
+
+    #[test]
+    fn l_034_a_statement_is_written_only_with_a_version_and_its_commit() {
+        let link = Link::new(identity(), Tick::from_millis(0));
+        let (bytes, len) = envelope_of(
+            &link,
+            Outgoing::LinkUp { req_id: ReqId(1) },
+            Tick::from_millis(0),
+        );
+        let envelope = LinkEnvelope::decode(&bytes[..len]).expect("decodes");
+        let stated = LinkUp::decode(envelope).expect("a statement");
+        assert_eq!(stated.fw, "0.0.0+g0123abcd");
+        assert_eq!(stated.hw, "controller-a rev A");
+        // A text in another shape is refused where it is written, and the
+        // statement never leaves.
+        let mut unversioned = identity();
+        unversioned.fw = LinkText::new("o89-controller 0.0.0").expect("fits");
+        let link = Link::new(unversioned, Tick::from_millis(0));
+        let mut writer = FrameWriter::new();
+        let mut dst = [0u8; MAX_FRAME];
+        assert_eq!(
+            link.encode(
+                Outgoing::LinkUp { req_id: ReqId(1) },
+                Tick::from_millis(0),
+                &mut writer,
+                &mut dst
+            ),
+            Err(EncodeError::Body)
+        );
+        // No text at all is refused the same way.
+        let mut empty = identity();
+        empty.fw = LinkText::EMPTY;
+        let link = Link::new(empty, Tick::from_millis(0));
+        assert_eq!(
+            link.encode(
+                Outgoing::LinkUp { req_id: ReqId(1) },
+                Tick::from_millis(0),
+                &mut writer,
+                &mut dst
+            ),
+            Err(EncodeError::Body)
+        );
     }
 
     #[test]

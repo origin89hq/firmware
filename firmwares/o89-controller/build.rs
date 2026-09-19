@@ -12,8 +12,24 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
+#[path = "../link_version.rs"]
+mod link_version;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let out = PathBuf::from(env::var("OUT_DIR")?);
+    link_version::emit(
+        &env::var("CARGO_PKG_VERSION")?,
+        &[
+            ".",
+            "../link_version.rs",
+            "../Cargo.toml",
+            "../Cargo.lock",
+            "../../crates/o89-core",
+            "../../crates/o89-link",
+            "../../Cargo.toml",
+            "../../rust-toolchain.toml",
+        ],
+    )?;
 
     // `bench` moves where the image links and nothing else.
     let bench = env::var_os("CARGO_FEATURE_BENCH").is_some();
@@ -44,5 +60,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=memory-bench.x");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../link_version.rs");
     Ok(())
 }
