@@ -121,12 +121,62 @@ pub enum Recovery {
     LeftOnAndRaised,
     /// A cut is already in progress; nothing changed.
     Busy,
-    /// The cut was due and not made: the count it would have added could
-    /// not be kept on the FRAM first (F-017), so nothing moved, and the
-    /// ladder asks again. The adapter reports this, never the sequencer,
-    /// which plans a cut on a copy of itself and keeps the copy only once
-    /// its count has landed.
+    /// The cut was due and not made, and nothing moved: the count it would
+    /// have added could not be kept on the FRAM first (F-017), which the
+    /// adapter reports, or the module was reset while it went out, which
+    /// [`PlannedCut::make`] does. The ladder asks again.
     Deferred,
+}
+
+/// What a recovery request plans, before anything moves (F-017).
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a plan nobody answers is a ladder waiting on a word that never comes"]
+pub enum Plan {
+    /// The third rung on a board that does not execute it: nothing moves,
+    /// and comms unrecoverable is to be raised.
+    LeftOnAndRaised,
+    /// A cut is already in progress; nothing changes.
+    Busy,
+    /// A cut, made once the count it adds is kept.
+    Cut(PlannedCut),
+}
+
+/// A cut planned and not made (F-017): the sequencer as it was asked, the
+/// instant of the cut and the rung's off time. [`cuts`](Self::cuts) is the
+/// count to keep on the FRAM first, and [`make`](Self::make) the only way
+/// to the cut, which the adapter calls once that count has landed; a plan
+/// dropped instead moves nothing. Not `Copy`, so a plan is made once.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a planned cut is made or deferred, and the link waits to hear which"]
+pub struct PlannedCut {
+    asked: RailSequencer,
+    at: Tick,
+    off_for: Millis,
+}
+
+impl PlannedCut {
+    /// The cuts of the last hour with this one, to keep before it is made:
+    /// the cuts the sequencer holds once [`make`](Self::make) has made it.
+    #[must_use]
+    pub fn cuts(&self) -> RecentCuts {
+        let mut cut = self.asked;
+        let _counted = cut.cut(self.at, self.off_for);
+        cut.recent_cuts(self.at)
+    }
+
+    /// Make the cut, its count kept: the lines move at `at`, and the whole
+    /// off time runs from there (L-111). A sequencer that moved since the
+    /// plan, a module reset served while the count went out, is left as it
+    /// is and the cut is [`Recovery::Deferred`]: it was planned for a
+    /// module that is no longer as it was.
+    pub fn make(self, sequencer: &mut RailSequencer, at: Tick) -> Recovery {
+        if *sequencer != self.asked {
+            return Recovery::Deferred;
+        }
+        let (count, off_for) = sequencer.cut(self.at, self.off_for);
+        sequencer.start_cut(at);
+        Recovery::Cycling { count, off_for }
+    }
 }
 
 /// The cut a recovery cycle makes (L-111).
@@ -363,10 +413,8 @@ impl RailSequencer {
     }
 
     /// The cut just planned starts at `at`, when the adapter moves the
-    /// lines: it plans a cut, keeps its count, and only then switches the
-    /// rail off (F-017), so the whole off time runs from there (L-111).
-    /// Nothing changes outside a cut.
-    pub fn start_cut(&mut self, at: Tick) {
+    /// lines (L-111). Nothing changes outside a cut.
+    fn start_cut(&mut self, at: Tick) {
         if let Phase::Cut { off_for, .. } = self.phase {
             self.phase = Phase::Cut {
                 until: at.after(off_for).unwrap_or(at),
@@ -398,19 +446,26 @@ impl RailSequencer {
         self.lines()
     }
 
-    /// The ladder asks for a recovery: a cut, or the third rung.
-    pub fn recover(&mut self, now: Tick) -> Recovery {
+    /// The ladder asks for a recovery at `now`: a cut, or the third rung.
+    /// Nothing moves here; a cut is made by [`PlannedCut::make`] once the
+    /// count it adds is on the FRAM (F-017).
+    pub fn plan_recovery(&self, now: Tick) -> Plan {
         if let Phase::Cut { .. } | Phase::Rising { .. } | Phase::Strapping { .. } = self.phase {
-            return Recovery::Busy;
+            return Plan::Busy;
         }
-        let recent = self.cycles_within(HOUR, now);
-        if recent >= CYCLES_BEFORE_THE_THIRD_RUNG {
-            return match self.revision.third_rung() {
-                ThirdRung::LeaveOnAndRaise => Recovery::LeftOnAndRaised,
-                ThirdRung::Cut(off_for) => self.cut(now, off_for),
-            };
-        }
-        self.cut(now, CUT)
+        let off_for = if self.cycles_within(HOUR, now) >= CYCLES_BEFORE_THE_THIRD_RUNG {
+            match self.revision.third_rung() {
+                ThirdRung::LeaveOnAndRaise => return Plan::LeftOnAndRaised,
+                ThirdRung::Cut(off_for) => off_for,
+            }
+        } else {
+            CUT
+        };
+        Plan::Cut(PlannedCut {
+            asked: *self,
+            at: now,
+            off_for,
+        })
     }
 
     /// Reset the module with the rail on: `EN` held low for [`EN_HELD`],
@@ -529,7 +584,8 @@ impl RailSequencer {
         matches!(self.phase, Phase::Up | Phase::Strapping { .. })
     }
 
-    fn cut(&mut self, now: Tick, off_for: Millis) -> Recovery {
+    /// The cut at `now`, and the count of the last hour with it.
+    fn cut(&mut self, now: Tick, off_for: Millis) -> (u8, Millis) {
         // The cap is the board's, whatever the rung asked for.
         let off_for = if off_for > self.revision.longest_rail_off() {
             self.revision.longest_rail_off()
@@ -542,10 +598,7 @@ impl RailSequencer {
             off_for,
         };
         let count = self.cycles_within(HOUR, now);
-        Recovery::Cycling {
-            count: u8::try_from(count).unwrap_or(u8::MAX),
-            off_for,
-        }
+        (u8::try_from(count).unwrap_or(u8::MAX), off_for)
     }
 
     /// A cut at `now`: an empty slot first of all, then the oldest cut. An
@@ -572,6 +625,15 @@ impl RailSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery whose count lands at once: planned and made at `now`.
+    fn recover(seq: &mut RailSequencer, now: Tick) -> Recovery {
+        match seq.plan_recovery(now) {
+            Plan::Cut(cut) => cut.make(seq, now),
+            Plan::LeftOnAndRaised => Recovery::LeftOnAndRaised,
+            Plan::Busy => Recovery::Busy,
+        }
+    }
 
     fn at(millis: u64) -> Tick {
         Tick::from_millis(millis)
@@ -604,7 +666,7 @@ mod tests {
         assert!(seq.settled());
         // The cut: EN low in the same step the rail goes off.
         assert_eq!(
-            seq.recover(at(1_000)),
+            recover(&mut seq, at(1_000)),
             Recovery::Cycling {
                 count: 1,
                 off_for: CUT
@@ -671,7 +733,10 @@ mod tests {
         let mut seq = RailSequencer::new(Revision::A);
         seq.power_on(at(0));
         run(&mut seq, 0, 200);
-        assert!(matches!(seq.recover(at(10_000)), Recovery::Cycling { .. }));
+        assert!(matches!(
+            recover(&mut seq, at(10_000)),
+            Recovery::Cycling { .. }
+        ));
         let events = run(&mut seq, 10_000, 16_000);
         assert_eq!(
             events,
@@ -694,7 +759,7 @@ mod tests {
         let mut now = 60_000;
         for expected in 1..=2 {
             assert_eq!(
-                seq.recover(at(now)),
+                recover(&mut seq, at(now)),
                 Recovery::Cycling {
                     count: expected,
                     off_for: CUT
@@ -705,7 +770,7 @@ mod tests {
         }
         // The third inside the hour.
         assert_eq!(
-            seq.recover(at(now)),
+            recover(&mut seq, at(now)),
             Recovery::Cycling {
                 count: 3,
                 off_for: CUT
@@ -715,14 +780,14 @@ mod tests {
         now += 60_000;
         // A fourth request inside the hour is the third rung: nothing moves.
         let before = seq.lines();
-        assert_eq!(seq.recover(at(now)), Recovery::LeftOnAndRaised);
+        assert_eq!(recover(&mut seq, at(now)), Recovery::LeftOnAndRaised);
         assert_eq!(seq.lines(), before);
         assert_eq!(seq.lines().rail, RailLine::On);
         assert_eq!(run(&mut seq, now, now + 1_000), NONE);
         // An hour after the first cycle it has aged out and cycling resumes.
         let later = 60_000 + 3_600_001;
         assert!(matches!(
-            seq.recover(at(later)),
+            recover(&mut seq, at(later)),
             Recovery::Cycling { count: 3, .. }
         ));
     }
@@ -732,12 +797,15 @@ mod tests {
         let mut seq = RailSequencer::new(Revision::B);
         let mut now = 60_000;
         for _ in 0..3 {
-            assert!(matches!(seq.recover(at(now)), Recovery::Cycling { .. }));
+            assert!(matches!(
+                recover(&mut seq, at(now)),
+                Recovery::Cycling { .. }
+            ));
             run(&mut seq, now, now + 6_000);
             now += 60_000;
         }
         assert_eq!(
-            seq.recover(at(now)),
+            recover(&mut seq, at(now)),
             Recovery::Cycling {
                 count: 3,
                 off_for: Millis::from_millis(900_000)
@@ -750,10 +818,13 @@ mod tests {
     fn a_recovery_during_a_cut_or_a_rise_changes_nothing() {
         let mut seq = RailSequencer::new(Revision::A);
         seq.power_on(at(0));
-        assert_eq!(seq.recover(at(50)), Recovery::Busy);
+        assert_eq!(recover(&mut seq, at(50)), Recovery::Busy);
         run(&mut seq, 0, 200);
-        assert!(matches!(seq.recover(at(1_000)), Recovery::Cycling { .. }));
-        assert_eq!(seq.recover(at(2_000)), Recovery::Busy);
+        assert!(matches!(
+            recover(&mut seq, at(1_000)),
+            Recovery::Cycling { .. }
+        ));
+        assert_eq!(recover(&mut seq, at(2_000)), Recovery::Busy);
         assert_eq!(seq.lines().rail, RailLine::Off);
     }
 
@@ -824,7 +895,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            rail.recover(Tick::from_millis(1_060)),
+            recover(&mut rail, Tick::from_millis(1_060)),
             Recovery::Busy
         ));
         assert_eq!(rail.tick(Tick::from_millis(1_140)), None);
@@ -882,7 +953,7 @@ mod tests {
         );
         let _ = rail.power_on(Tick::from_millis(0));
         let _ = rail.tick(Tick::from_millis(100));
-        let cycling = rail.recover(Tick::from_millis(200));
+        let cycling = recover(&mut rail, Tick::from_millis(200));
         assert!(matches!(cycling, Recovery::Cycling { count: 1, .. }));
         assert_eq!(
             rail.reset_module(Tick::from_millis(300), ModuleBoot::Normal),
@@ -897,7 +968,7 @@ mod tests {
         );
         let _ = rail.tick(Tick::from_millis(6_050));
         assert!(matches!(
-            rail.recover(Tick::from_millis(7_000)),
+            recover(&mut rail, Tick::from_millis(7_000)),
             Recovery::Cycling { count: 2, .. }
         ));
     }
@@ -920,7 +991,7 @@ mod tests {
         let mut kept = RecentCuts::NONE;
         for boot in 1..=3u8 {
             let mut seq = booted(Revision::B, kept);
-            let Recovery::Cycling { count, off_for } = seq.recover(at(60_000)) else {
+            let Recovery::Cycling { count, off_for } = recover(&mut seq, at(60_000)) else {
                 panic!("boot {boot}: a cut");
             };
             assert_eq!(count, boot, "the count carries across the reset");
@@ -928,7 +999,7 @@ mod tests {
             kept = seq.recent_cuts(at(60_000));
         }
         let mut seq = booted(Revision::B, kept);
-        let Recovery::Cycling { off_for, .. } = seq.recover(at(60_000)) else {
+        let Recovery::Cycling { off_for, .. } = recover(&mut seq, at(60_000)) else {
             panic!("the third rung cuts on revision B");
         };
         assert_eq!(
@@ -957,7 +1028,7 @@ mod tests {
         assert_eq!(RecentCuts::carried(&Held::Present(one)), one);
         // Full, a revision A boot's first request is the third rung.
         let mut seq = booted(Revision::A, RecentCuts::carried(&Held::Corrupt));
-        assert_eq!(seq.recover(at(60_000)), Recovery::LeftOnAndRaised);
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
     }
 
     #[test]
@@ -982,9 +1053,9 @@ mod tests {
             RecentCuts([Some(Tick::ZERO), Some(Tick::ZERO), None])
         );
         let mut seq = booted(Revision::B, RecentCuts::NONE);
-        let _ = seq.recover(at(5_000));
+        let _ = recover(&mut seq, at(5_000));
         let _ = run(&mut seq, 5_001, 10_200);
-        let _ = seq.recover(at(20_000));
+        let _ = recover(&mut seq, at(20_000));
         assert_eq!(
             seq.recent_cuts(at(20_000)),
             RecentCuts([Some(at(5_000)), Some(at(20_000)), None])
@@ -1002,7 +1073,7 @@ mod tests {
         // Three resets inside the hour: the ladder's first request on the
         // next boot is the third rung, which revision A does not execute.
         let mut seq = booted(Revision::A, kept);
-        assert_eq!(seq.recover(at(60_000)), Recovery::LeftOnAndRaised);
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
     }
 
     #[test]
@@ -1014,10 +1085,15 @@ mod tests {
     #[test]
     fn l_111_the_rail_is_off_for_the_whole_cut_from_when_its_lines_move() {
         let mut seq = booted(Revision::B, RecentCuts::NONE);
-        let _ = seq.recover(at(1_000));
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
         // The count took a second and a half to land; the lines move then.
-        seq.start_cut(at(2_500));
-        assert_eq!(run(&mut seq, 1_001, 7_499), [None; 4], "still off");
+        assert!(matches!(
+            cut.make(&mut seq, at(2_500)),
+            Recovery::Cycling { count: 1, .. }
+        ));
+        assert_eq!(run(&mut seq, 2_501, 7_499), [None; 4], "still off");
         assert_eq!(
             run(&mut seq, 7_500, 7_500)[0],
             Some((7_500, RailEvent::PowerCycled { count: 1 }))
@@ -1027,6 +1103,70 @@ mod tests {
         let before = up;
         up.start_cut(at(3_000));
         assert_eq!(up, before);
+    }
+
+    #[test]
+    fn f_017_a_planned_cut_moves_nothing_until_it_is_made_and_keeps_the_count_it_makes() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let before = seq;
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // Planned: the rail on, no cut counted, and the count to keep is
+        // the one the cut will make.
+        assert_eq!(seq, before);
+        assert_eq!(seq.lines().rail, RailLine::On);
+        assert_eq!(seq.recent_cuts(at(1_000)), RecentCuts::NONE);
+        assert_eq!(cut.cuts(), RecentCuts([Some(at(1_000)), None, None]));
+        assert_eq!(
+            cut.make(&mut seq, at(1_000)),
+            Recovery::Cycling {
+                count: 1,
+                off_for: CUT
+            }
+        );
+        assert_eq!(seq.lines().rail, RailLine::Off);
+        assert_eq!(
+            seq.recent_cuts(at(1_000)),
+            RecentCuts([Some(at(1_000)), None, None]),
+            "what was kept is what the sequencer counts"
+        );
+    }
+
+    #[test]
+    fn f_017_a_cut_planned_before_a_module_reset_is_not_made_after_it() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // A download's reset is served while the count goes out.
+        assert_eq!(
+            seq.reset_module(at(1_020), ModuleBoot::Download),
+            ModuleReset::Holding
+        );
+        let reset = seq;
+        assert_eq!(cut.make(&mut seq, at(1_500)), Recovery::Deferred);
+        assert_eq!(seq, reset, "the reset stands, strap and all");
+        assert_eq!(
+            seq.recent_cuts(at(1_500)),
+            RecentCuts::NONE,
+            "no cut counted"
+        );
+        assert_eq!(seq.lines().rail, RailLine::On);
+    }
+
+    #[test]
+    fn f_017_a_plan_that_moves_nothing_needs_no_count_kept() {
+        // During a cut, and at a third rung revision A does not execute:
+        // nothing to keep, and the answer at once.
+        let mut seq = booted(Revision::A, RecentCuts::NONE);
+        assert!(matches!(
+            recover(&mut seq, at(60_000)),
+            Recovery::Cycling { count: 2, .. }
+        ));
+        assert_eq!(seq.plan_recovery(at(60_020)), Plan::Busy);
+        let full = booted(Revision::A, RecentCuts::FULL);
+        assert_eq!(full.plan_recovery(at(60_000)), Plan::LeftOnAndRaised);
     }
 
     #[test]

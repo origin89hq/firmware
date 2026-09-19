@@ -17,7 +17,9 @@
 //! rail, go back to it as words on a bounded channel. The ladder's cuts of
 //! the last hour go to the FRAM through the recorder whenever they change,
 //! before the lines move, so a cut is kept before the rail goes off and a
-//! controller reset does not lower the count (F-017).
+//! controller reset does not lower the count (F-017). The task never waits
+//! on the recorder: a cut is planned, its count sent, and the cut made on
+//! the turn the count lands, a module reset asked meanwhile served at once.
 
 use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -25,8 +27,8 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootLine, Clock, CutsOnPart, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine,
-    RailSequencer, Recovery, StrapRoute, Task,
+    BootLine, Clock, CutsOnPart, EnLine, Lines, ModuleBoot, ModuleReset, Plan, PlannedCut,
+    RailEvent, RailLine, RailSequencer, Recovery, StrapRoute, Task,
 };
 
 use crate::REVISION;
@@ -149,52 +151,62 @@ impl Pins {
 /// The rail task: the sequencer's lines from here on. The boot power-on
 /// was applied by `main` before this task was spawned, and the ladder's
 /// cuts carried and kept; `on_part` is what the part holds of them, or
-/// nothing for a boot with no store, which has nowhere to keep them.
+/// nothing for a boot with no store. That boot has no link either (F-039),
+/// so nothing asks it for a cut; were one asked, the recorder would refuse
+/// its count and the cut would be deferred, because a count held only here
+/// is one a later boot that reads the part does not carry (F-017).
 #[embassy_executor::task]
 pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut on_part: Option<CutsOnPart>) {
     let mut ticker = Ticker::every(PERIOD);
     let mut keeper = recorder::CutsKeeper::new();
+    // The cut the link asked for, planned and waiting on its count.
+    let mut planned: Option<PlannedCut> = None;
     loop {
         ticker.next().await;
         let now = Uptime.now();
-        if let Some(on_part) = on_part.as_mut()
-            && let Some((cuts, kept)) = keeper.poll()
-        {
-            match kept {
-                Ok(()) => {
-                    defmt::info!("rail: {} cuts in the last hour kept", cuts.count());
-                    on_part.landed(cuts);
+        if let Some((cuts, kept)) = keeper.poll() {
+            if let Some(on_part) = on_part.as_mut() {
+                match kept {
+                    Ok(()) => {
+                        defmt::info!("rail: {} cuts in the last hour kept", cuts.count());
+                        on_part.landed(cuts);
+                    }
+                    Err(why) => {
+                        defmt::error!("rail: the ladder's cuts not kept: {}", why);
+                        on_part.unknown(now);
+                    }
                 }
-                Err(why) => {
-                    defmt::error!("rail: the ladder's cuts not kept: {}", why);
-                    on_part.unknown(now);
-                }
+            }
+            // The keep in flight is the planned cut's: it superseded any
+            // other, and no other starts while it is planned. The lines
+            // move at the end of this turn, and the whole off time runs
+            // from here (L-111).
+            if let Some(cut) = planned.take() {
+                answer(match kept {
+                    Ok(()) => cut.make(&mut sequencer, now),
+                    Err(_) => Recovery::Deferred,
+                });
             }
         }
         match REQUEST.try_take() {
-            Some(RailRequest::Recover) => {
-                let recovery = recover(&mut sequencer, &mut on_part, &mut keeper, now).await;
-                say(RailWord::Recovered(recovery));
-            }
-            Some(RailRequest::ResetModule(boot)) => {
-                let reset = sequencer.reset_module(now, boot);
-                match (reset, boot) {
-                    (ModuleReset::Holding, ModuleBoot::Normal) => {
-                        defmt::info!("rail: resetting the module, EN held");
-                    }
-                    (ModuleReset::Holding, ModuleBoot::Download) => match REVISION.strap_route() {
-                        StrapRoute::NeedsIo8Wire => defmt::warn!(
-                            "rail: resetting the module with IO9 low; this revision needs IO8 held high by a wire"
-                        ),
-                        StrapRoute::Wired => {
-                            defmt::info!("rail: resetting the module with IO9 low, EN held");
-                        }
-                    },
-                    (ModuleReset::NotPowered, ModuleBoot::Normal | ModuleBoot::Download) => {
-                        defmt::warn!("rail: no module to reset");
-                    }
+            // A second request while a cut is planned is the same request,
+            // and the planned cut's answer answers it.
+            Some(RailRequest::Recover) if planned.is_some() => {}
+            Some(RailRequest::Recover) => match sequencer.plan_recovery(now) {
+                Plan::Cut(cut) => {
+                    keeper.supersede(cut.cuts());
+                    planned = Some(cut);
                 }
-                say(RailWord::Reset(reset));
+                Plan::LeftOnAndRaised => answer(Recovery::LeftOnAndRaised),
+                Plan::Busy => answer(Recovery::Busy),
+            },
+            Some(RailRequest::ResetModule(boot)) => {
+                // The reset is served now, whatever the recorder is doing,
+                // and a cut planned before it is not made after it.
+                if planned.take().is_some() {
+                    answer(Recovery::Deferred);
+                }
+                reset(&mut sequencer, now, boot);
             }
             None => {}
         }
@@ -215,10 +227,10 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut on_part: Opti
         // A cut is kept before it is made, above; what changes here is a
         // cut that aged out, which must be off the part before a boot could
         // carry it again, and a write that did not land, whose part is
-        // rewritten a retry later (F-017). Started without waiting, so the
-        // lines below move this turn whatever the recorder is doing.
+        // rewritten a retry later (F-017).
         let cuts = sequencer.recent_cuts(now);
-        if let Some(on_part) = on_part.as_ref()
+        if planned.is_none()
+            && let Some(on_part) = on_part.as_ref()
             && on_part.due(cuts, now)
         {
             let _started = keeper.start(cuts);
@@ -228,49 +240,30 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut on_part: Opti
     }
 }
 
-/// The ladder's recovery: planned on a copy, the cut and the count it adds
-/// kept on the FRAM before the sequencer moves, and a count that does not
-/// land moving nothing, which the link hears as `Deferred` and asks again
-/// (F-017).
-async fn recover(
-    sequencer: &mut RailSequencer,
-    on_part: &mut Option<CutsOnPart>,
-    keeper: &mut recorder::CutsKeeper,
-    now: o89_core::Tick,
-) -> Recovery {
-    // Planned on a copy: a cut and the count it adds are on the
-    // FRAM before the sequencer moves, and a count that does not
-    // land moves nothing (F-017). The ladder asks again.
-    let mut planned = *sequencer;
-    let mut recovery = planned.recover(now);
-    if let Recovery::Cycling { .. } = recovery {
-        let cuts = planned.recent_cuts(now);
-        let kept = match on_part.as_mut() {
-            Some(on_part) => {
-                let kept = keeper.keep(cuts).await;
-                match kept {
-                    Ok(()) => on_part.landed(cuts),
-                    Err(_) => on_part.unknown(Uptime.now()),
-                }
-                kept
-            }
-            None => Err(recorder::NotKept::NoStore),
-        };
-        match kept {
-            Ok(()) => {
-                *sequencer = planned;
-                // The lines move at the end of this turn: the
-                // whole off time runs from here (L-111).
-                sequencer.start_cut(Uptime.now());
-            }
-            Err(why) => {
-                defmt::error!("rail: the cut's count not kept: {}; no cut", why);
-                recovery = Recovery::Deferred;
-            }
+/// Reset the module into `boot`, the rail staying on, and tell the link.
+fn reset(sequencer: &mut RailSequencer, now: o89_core::Tick, boot: ModuleBoot) {
+    let reset = sequencer.reset_module(now, boot);
+    match (reset, boot) {
+        (ModuleReset::Holding, ModuleBoot::Normal) => {
+            defmt::info!("rail: resetting the module, EN held");
         }
-    } else {
-        *sequencer = planned;
+        (ModuleReset::Holding, ModuleBoot::Download) => match REVISION.strap_route() {
+            StrapRoute::NeedsIo8Wire => defmt::warn!(
+                "rail: resetting the module with IO9 low; this revision needs IO8 held high by a wire"
+            ),
+            StrapRoute::Wired => {
+                defmt::info!("rail: resetting the module with IO9 low, EN held");
+            }
+        },
+        (ModuleReset::NotPowered, ModuleBoot::Normal | ModuleBoot::Download) => {
+            defmt::warn!("rail: no module to reset");
+        }
     }
+    say(RailWord::Reset(reset));
+}
+
+/// Tell the link what its recovery request did.
+fn answer(recovery: Recovery) {
     match recovery {
         Recovery::Cycling { count, off_for } => defmt::warn!(
             "rail: cutting for {} ms, cycle {} in the last hour",
@@ -282,8 +275,8 @@ async fn recover(
         }
         Recovery::Busy => defmt::warn!("rail: a cycle is already in progress"),
         Recovery::Deferred => {
-            defmt::warn!("rail: the cut deferred; the ladder asks again");
+            defmt::warn!("rail: the cut deferred, its count not kept; the ladder asks again");
         }
     }
-    recovery
+    say(RailWord::Recovered(recovery));
 }

@@ -18,8 +18,8 @@ use km43::{
 };
 use o89_core::{
     Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Link,
-    LinkEvent, LinkText, Millis, Note, Outgoing, RailEvent, RailLine, RailSequencer, Recovery,
-    Revision, Tick,
+    LinkEvent, LinkText, Millis, Note, Outgoing, Plan, RailEvent, RailLine, RailSequencer,
+    Recovery, Revision, Tick,
 };
 
 use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
@@ -145,22 +145,16 @@ impl Bench {
                             to_comms.push_back(dst[..len].to_vec());
                         }
                         Action::CutRail => {
-                            // As the adapter does: planned on a copy, the
-                            // cut made only once its count has landed.
-                            let mut planned = self.rail;
-                            let mut recovery = planned.recover(self.now);
-                            match recovery {
-                                Recovery::Cycling { .. } if !self.keeps_land => {
-                                    recovery = Recovery::Deferred;
+                            // As the adapter does: planned, and the cut
+                            // made only once its count has landed.
+                            let recovery = match self.rail.plan_recovery(self.now) {
+                                Plan::Cut(cut) if self.keeps_land => {
+                                    cut.make(&mut self.rail, self.now)
                                 }
-                                Recovery::Cycling { .. } => {
-                                    self.rail = planned;
-                                    self.rail.start_cut(self.now);
-                                }
-                                Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
-                                    self.rail = planned;
-                                }
-                            }
+                                Plan::Cut(_) => Recovery::Deferred,
+                                Plan::LeftOnAndRaised => Recovery::LeftOnAndRaised,
+                                Plan::Busy => Recovery::Busy,
+                            };
                             if matches!(recovery, Recovery::Cycling { .. }) {
                                 // The module loses its power with the rail.
                                 self.comms.power_off();

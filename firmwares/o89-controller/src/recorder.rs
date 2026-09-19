@@ -8,7 +8,7 @@
 //! configuration, the event queue). A board whose NOR does not answer
 //! still has its store; the ring is simply absent and says so. The rail
 //! task hands it the recovery ladder's cuts to keep before the rail goes
-//! off, and waits for the answer (F-017).
+//! off, and polls for the answer without waiting on it (F-017).
 //!
 //! cites: F-023
 
@@ -16,7 +16,7 @@ use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use embassy_time::{Duration, Instant, Ticker};
 use km43::{Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
 use o89_core::{Class, LinkEvent, RecentCuts, Ring, SCRATCH, Store, Task};
 
@@ -40,8 +40,8 @@ const PERIOD: Duration = Duration::from_millis(100);
 static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
 
 /// The recovery ladder's cuts, to be kept on the FRAM before the rail
-/// moves, under the request's number. One at a time: the rail task waits
-/// for the answer.
+/// moves, under the request's number. One at a time: a request the
+/// recorder has not taken is replaced by the next.
 static CUTS: Signal<CriticalSectionRawMutex, (u32, RecentCuts)> = Signal::new();
 
 /// The answer to [`CUTS`], under the number of the request it answers.
@@ -88,34 +88,41 @@ impl CutsKeeper {
         }
     }
 
-    fn ask(&mut self, cuts: RecentCuts) -> u32 {
+    fn ask(&mut self, cuts: RecentCuts) {
         let request = self.next;
         self.next = self.next.wrapping_add(1);
         CUTS.signal((request, cuts));
-        request
-    }
-
-    /// Start keeping `cuts` without waiting, for a change the rail does not
-    /// move on: its answer comes from [`poll`](Self::poll), so the rail task
-    /// never stalls on the recorder while the recorder waits on the link,
-    /// as a bench download makes it. One at a time: `false` while another
-    /// is in flight.
-    pub fn start(&mut self, cuts: RecentCuts) -> bool {
-        if self.in_flight.is_some() {
-            return false;
-        }
-        let request = self.ask(cuts);
         self.in_flight = Some(InFlight {
             request,
             cuts,
             deadline: Instant::now().checked_add(KEEP_DEADLINE),
         });
+    }
+
+    /// Start keeping `cuts`, for a change the rail does not move on: a cut
+    /// that aged out, or a rewrite after a write that did not land. One at
+    /// a time: `false` while another is in flight.
+    pub fn start(&mut self, cuts: RecentCuts) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        self.ask(cuts);
         true
     }
 
+    /// Start keeping `cuts` for a cut, which is made once they land: the
+    /// keep in flight is superseded, and its answer passed over, because
+    /// the recorder writes in order and the part ends with these.
+    pub fn supersede(&mut self, cuts: RecentCuts) {
+        self.ask(cuts);
+    }
+
     /// The answer to the keep in flight, once it has come or its deadline
-    /// has passed; a request the recorder has not started by then is
-    /// withdrawn.
+    /// has passed; a request the recorder has not taken by then is
+    /// withdrawn, and one it took may still land, which the caller counts
+    /// as not knowing what the part holds. Never waits: the rail task
+    /// serves a module reset while the recorder is busy, as it is while a
+    /// bench download holds the link.
     pub fn poll(&mut self) -> Option<(RecentCuts, Result<(), NotKept>)> {
         let flight = self.in_flight?;
         if let Some((answered, kept)) = CUTS_KEPT.try_take()
@@ -133,34 +140,6 @@ impl CutsKeeper {
             return Some((flight.cuts, Err(NotKept::Late)));
         }
         None
-    }
-
-    /// Keep `cuts` on the FRAM (F-017) and wait for them to land or for
-    /// the deadline, for a cut, which is made only once its count is kept.
-    /// A keep in flight is superseded: the recorder writes in order, so the
-    /// part ends with these cuts, and the older answer is passed over. A
-    /// request not started by the deadline is withdrawn; one started may
-    /// still land, which the caller counts as not knowing what the part
-    /// holds.
-    pub async fn keep(&mut self, cuts: RecentCuts) -> Result<(), NotKept> {
-        self.in_flight = None;
-        let request = self.ask(cuts);
-        let deadline = Instant::now().checked_add(KEEP_DEADLINE);
-        // Bounded by the deadline: every turn takes an answer, and an
-        // answer to an earlier request is passed over.
-        loop {
-            let left = deadline.map_or(Duration::from_ticks(0), |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
-            match with_timeout(left, CUTS_KEPT.wait()).await {
-                Ok((answered, kept)) if answered == request => return kept,
-                Ok(_) => {}
-                Err(_) => {
-                    CUTS.reset();
-                    return Err(NotKept::Late);
-                }
-            }
-        }
     }
 }
 

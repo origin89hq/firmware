@@ -17,8 +17,8 @@ use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS};
 use o89_core::{
     Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
     ChallengeCounter, ClientTable, EPOCH_BYTES, Fingerprint, Held, Kept, Label, LastWords, Paired,
-    PanicRecorded, PanicSite, RECENT_CUTS_BYTES, RailSequencer, RecentCuts, Recovery, Revision,
-    Store, Tick,
+    PanicRecorded, PanicSite, Plan, RECENT_CUTS_BYTES, RailSequencer, RecentCuts, Recovery,
+    Revision, Store, Tick,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -285,11 +285,14 @@ fn f_017_a_ladder_write_cut_at_any_step_keeps_the_cuts_before_it_or_after_it() {
     // every byte on the way to the part.
     let mut seq = RailSequencer::new(Revision::B);
     let first = Tick::from_millis(90_000);
+    let Plan::Cut(cut) = seq.plan_recovery(first) else {
+        panic!("a cut");
+    };
+    let one = cut.cuts();
     assert!(matches!(
-        seq.recover(first),
+        cut.make(&mut seq, first),
         Recovery::Cycling { count: 1, .. }
     ));
-    let one = seq.recent_cuts(first);
     let mut start = with_one_phone();
     let mut cuts = block_on(Cuts::read(RECENT_CUTS, &mut start)).expect("the part answers");
     block_on(cuts.write(&mut start, one)).expect("the supply is steady");
@@ -298,11 +301,11 @@ fn f_017_a_ladder_write_cut_at_any_step_keeps_the_cuts_before_it_or_after_it() {
         let _ = after.tick(Tick::from_millis(ms));
     }
     let second = Tick::from_millis(160_000);
-    assert!(matches!(
-        after.recover(second),
-        Recovery::Cycling { count: 2, .. }
-    ));
-    let two = after.recent_cuts(second);
+    let Plan::Cut(cut) = after.plan_recovery(second) else {
+        panic!("a second cut");
+    };
+    let two = cut.cuts();
+    assert_eq!(two.count(), 2);
     let crashes = crash_at_every_step(
         &start,
         |part| {

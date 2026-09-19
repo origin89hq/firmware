@@ -610,9 +610,11 @@ mod tests {
             RecentCuts::NONE,
             "a fresh unit has made no cut"
         );
-        let mut seq = crate::RailSequencer::new(crate::Revision::B);
-        let _ = seq.recover(Tick::from_millis(90_000));
-        let kept = seq.recent_cuts(Tick::from_millis(90_000));
+        let seq = crate::RailSequencer::new(crate::Revision::B);
+        let crate::Plan::Cut(cut) = seq.plan_recovery(Tick::from_millis(90_000)) else {
+            panic!("a cut");
+        };
+        let kept = cut.cuts();
         block_on(store.cuts.write(&mut part, kept)).expect("the supply is fine");
         let (store, _) = boot(&mut part, None);
         let carried = RecentCuts::carried(store.cuts.held());
