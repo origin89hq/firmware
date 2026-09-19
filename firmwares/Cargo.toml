@@ -24,7 +24,7 @@ publish = false
 # The download window's `EnterDownload` (km43#30) is on this revision of
 # origin89hq/km43#40 until it is published; the registry pin returns with the
 # release, in both workspaces at once.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "f934c1fbd5e660858b70d4d32e432730e7e8b182" }
+km43 = { git = "https://github.com/origin89hq/km43", rev = "6a6060acb73aaa9d1c223bbb55c7d16a68166ae2" }
 
 embassy-executor = { version = "=0.10.0", default-features = false }
 embassy-time = { version = "=0.5.1", default-features = false }

@@ -9,9 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# `defmt::Format` on the tick types, for the controller's log. Off on the
+# `defmt::Format` on the public types, for the controller's log. Off on the
 # host and on the comms processor, which prints nothing.
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "km43/defmt"]
 
 # Below both cores and reaching neither: `o89-core` and `o89-comms-core`
 # depend on this, and the comms processor must never reach `o89-core`.
