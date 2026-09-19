@@ -3,7 +3,7 @@
 # never tries to build a Cortex-M0+ or a RISC-V crate for the laptop.
 [workspace]
 resolver = "3"
-members = ["crates/o89-core", "xtask"]
+members = ["crates/o89-core", "crates/o89-sim", "xtask"]
 exclude = ["firmwares"]
 
 [workspace.package]
