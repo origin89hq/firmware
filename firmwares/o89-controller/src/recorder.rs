@@ -63,13 +63,18 @@ pub enum NotKept {
 }
 
 /// Keep the ladder's cuts on the FRAM (F-017), and wait for them to land
-/// or for the deadline.
+/// or for the deadline. A request the recorder has not started by then is
+/// withdrawn; one it has started may still land, which the caller counts
+/// as not knowing what the part holds.
 pub async fn keep_cuts(cuts: RecentCuts) -> Result<(), NotKept> {
     CUTS_KEPT.reset();
     CUTS.signal(cuts);
-    with_timeout(KEEP_DEADLINE, CUTS_KEPT.wait())
-        .await
-        .unwrap_or(Err(NotKept::Late))
+    if let Ok(kept) = with_timeout(KEEP_DEADLINE, CUTS_KEPT.wait()).await {
+        kept
+    } else {
+        CUTS.reset();
+        Err(NotKept::Late)
+    }
 }
 
 /// Queue an event for the ring, or hand it back when the queue is full.

@@ -166,8 +166,9 @@ pub const STRAP_HELD: Millis = Millis::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Rail off, `EN` held low, until the moment the rail comes back.
-    Cut { until: Tick },
+    /// Rail off, `EN` held low, until the moment the rail comes back,
+    /// `off_for` after the lines moved.
+    Cut { until: Tick, off_for: Millis },
     /// Rail on, `EN` held low, until the rail has settled; the strap held
     /// with it when the boot is for download.
     Rising { until: Tick, strap: bool },
@@ -276,6 +277,54 @@ impl Body<RECENT_CUTS_BYTES> for RecentCuts {
     }
 }
 
+/// How long after a write of the cuts that did not land the next is tried.
+pub const KEEP_RETRY: Millis = Millis::from_millis(1_000);
+
+/// What the FRAM holds of the ladder's cuts, as far as this boot knows,
+/// and so when to write them again (F-017).
+///
+/// A write that failed, or was abandoned late, leaves the part's content
+/// unknown: a late write may still land, a count for a cut that was never
+/// made. So after one the cuts go out again whatever they are, a retry
+/// later, and whatever landed late is overwritten by the count this boot
+/// holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutsOnPart {
+    held: Option<RecentCuts>,
+    retry_at: Option<Tick>,
+}
+
+impl CutsOnPart {
+    /// The part as the boot read it, carried to this boot.
+    #[must_use]
+    pub const fn read(held: RecentCuts) -> Self {
+        Self {
+            held: Some(held),
+            retry_at: None,
+        }
+    }
+
+    /// Whether `cuts` should be written at `now`: they are not what the
+    /// part is known to hold, and no retry is still waiting.
+    #[must_use]
+    pub fn due(&self, cuts: RecentCuts, now: Tick) -> bool {
+        self.held != Some(cuts) && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// The write of `cuts` landed.
+    pub fn landed(&mut self, cuts: RecentCuts) {
+        self.held = Some(cuts);
+        self.retry_at = None;
+    }
+
+    /// The write at `now` failed or was abandoned: what the part holds is
+    /// not known, and the cuts go out again [`KEEP_RETRY`] later.
+    pub fn unknown(&mut self, now: Tick) {
+        self.held = None;
+        self.retry_at = Some(now.after(KEEP_RETRY).unwrap_or(now));
+    }
+}
+
 /// The sequence, for one board revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RailSequencer {
@@ -310,6 +359,19 @@ impl RailSequencer {
         match self.revision.rail_through_reset() {
             RailThroughReset::Off => self.remember_cut(now),
             RailThroughReset::On => {}
+        }
+    }
+
+    /// The cut just planned starts at `at`, when the adapter moves the
+    /// lines: it plans a cut, keeps its count, and only then switches the
+    /// rail off (F-017), so the whole off time runs from there (L-111).
+    /// Nothing changes outside a cut.
+    pub fn start_cut(&mut self, at: Tick) {
+        if let Phase::Cut { off_for, .. } = self.phase {
+            self.phase = Phase::Cut {
+                until: at.after(off_for).unwrap_or(at),
+                off_for,
+            };
         }
     }
 
@@ -383,7 +445,7 @@ impl RailSequencer {
     /// is released once the rail has settled.
     pub fn tick(&mut self, now: Tick) -> Option<RailEvent> {
         match self.phase {
-            Phase::Cut { until } if now >= until => {
+            Phase::Cut { until, .. } if now >= until => {
                 self.phase = Phase::Rising {
                     until: now.after(SETTLE).unwrap_or(now),
                     strap: false,
@@ -477,6 +539,7 @@ impl RailSequencer {
         self.remember_cut(now);
         self.phase = Phase::Cut {
             until: now.after(off_for).unwrap_or(now),
+            off_for,
         };
         let count = self.cycles_within(HOUR, now);
         Recovery::Cycling {
@@ -946,5 +1009,50 @@ mod tests {
     fn f_018_revision_b_keeps_its_rail_through_a_reset_and_counts_no_cut_for_it() {
         let seq = booted(Revision::B, RecentCuts::NONE);
         assert_eq!(seq.recent_cuts(at(0)), RecentCuts::NONE);
+    }
+
+    #[test]
+    fn l_111_the_rail_is_off_for_the_whole_cut_from_when_its_lines_move() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let _ = seq.recover(at(1_000));
+        // The count took a second and a half to land; the lines move then.
+        seq.start_cut(at(2_500));
+        assert_eq!(run(&mut seq, 1_001, 7_499), [None; 4], "still off");
+        assert_eq!(
+            run(&mut seq, 7_500, 7_500)[0],
+            Some((7_500, RailEvent::PowerCycled { count: 1 }))
+        );
+        // Outside a cut it moves nothing.
+        let mut up = booted(Revision::B, RecentCuts::NONE);
+        let before = up;
+        up.start_cut(at(3_000));
+        assert_eq!(up, before);
+    }
+
+    #[test]
+    fn f_017_the_cuts_go_to_the_part_when_they_differ_from_what_it_is_known_to_hold() {
+        let one = RecentCuts([Some(at(1)), None, None]);
+        let mut part = CutsOnPart::read(RecentCuts::NONE);
+        assert!(!part.due(RecentCuts::NONE, at(0)));
+        assert!(part.due(one, at(0)));
+        part.landed(one);
+        assert!(!part.due(one, at(10)));
+    }
+
+    #[test]
+    fn f_017_after_a_write_that_did_not_land_the_cuts_go_out_again_a_retry_later() {
+        let one = RecentCuts([Some(at(1)), None, None]);
+        let mut part = CutsOnPart::read(RecentCuts::NONE);
+        // A late write of a planned cut that was then not made: the part
+        // may hold it, so the count this boot holds, none, goes out again.
+        part.unknown(at(100));
+        assert!(
+            !part.due(RecentCuts::NONE, at(1_099)),
+            "not before the retry"
+        );
+        assert!(part.due(RecentCuts::NONE, at(1_100)), "even the same cuts");
+        part.landed(RecentCuts::NONE);
+        assert!(!part.due(RecentCuts::NONE, at(1_200)));
+        assert!(part.due(one, at(1_200)));
     }
 }

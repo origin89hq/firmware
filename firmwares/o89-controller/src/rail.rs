@@ -23,10 +23,10 @@ use embassy_stm32::gpio::{Flex, Level, Output, Pull, Speed};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Ticker};
+use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootLine, Clock, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine, RailSequencer,
-    RecentCuts, Recovery, StrapRoute, Task,
+    BootLine, Clock, CutsOnPart, EnLine, Lines, ModuleBoot, ModuleReset, RailEvent, RailLine,
+    RailSequencer, RecentCuts, Recovery, StrapRoute, Task,
 };
 
 use crate::REVISION;
@@ -146,16 +146,13 @@ impl Pins {
     }
 }
 
-/// How long after a failed keep the rail task tries the cuts again.
-const KEEP_RETRY: Duration = Duration::from_secs(1);
-
 /// The rail task: the sequencer's lines from here on. The boot power-on
 /// was applied by `main` before this task was spawned; `kept` is the
 /// ladder's cuts as the part holds them, carried to this boot.
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentCuts) {
+pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, kept: RecentCuts) {
     let mut ticker = Ticker::every(PERIOD);
-    let mut retry_at: Option<Instant> = None;
+    let mut on_part = CutsOnPart::read(kept);
     loop {
         ticker.next().await;
         let now = Uptime.now();
@@ -170,11 +167,15 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentC
                     let cuts = planned.recent_cuts(now);
                     match recorder::keep_cuts(cuts).await {
                         Ok(()) => {
-                            kept = cuts;
+                            on_part.landed(cuts);
                             sequencer = planned;
+                            // The lines move at the end of this turn: the
+                            // whole off time runs from here (L-111).
+                            sequencer.start_cut(Uptime.now());
                         }
                         Err(why) => {
                             defmt::error!("rail: the cut's count not kept: {}; no cut", why);
+                            on_part.unknown(Uptime.now());
                             recovery = Recovery::Deferred;
                         }
                     }
@@ -234,20 +235,19 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, mut kept: RecentC
             }
         }
         // A cut is kept before it is made, above; what changes here is the
-        // cut this boot's reset counts, and a cut that aged out, which must
-        // be off the part before a boot could carry it again (F-017). A
-        // write that fails is tried again a second later.
+        // cut this boot's reset counts, a cut that aged out, which must be
+        // off the part before a boot could carry it again, and a write that
+        // did not land, whose part is rewritten a retry later (F-017).
         let cuts = sequencer.recent_cuts(now);
-        if cuts != kept && retry_at.is_none_or(|at| Instant::now() >= at) {
+        if on_part.due(cuts, now) {
             match recorder::keep_cuts(cuts).await {
                 Ok(()) => {
                     defmt::info!("rail: {} cuts in the last hour kept", cuts.count());
-                    kept = cuts;
-                    retry_at = None;
+                    on_part.landed(cuts);
                 }
                 Err(why) => {
                     defmt::error!("rail: the ladder's cuts not kept: {}", why);
-                    retry_at = Instant::now().checked_add(KEEP_RETRY);
+                    on_part.unknown(Uptime.now());
                 }
             }
         }

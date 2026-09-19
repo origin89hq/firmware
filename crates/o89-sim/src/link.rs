@@ -153,10 +153,13 @@ impl Bench {
                                 Recovery::Cycling { .. } if !self.keeps_land => {
                                     recovery = Recovery::Deferred;
                                 }
-                                Recovery::Cycling { .. }
-                                | Recovery::LeftOnAndRaised
-                                | Recovery::Busy
-                                | Recovery::Deferred => self.rail = planned,
+                                Recovery::Cycling { .. } => {
+                                    self.rail = planned;
+                                    self.rail.start_cut(self.now);
+                                }
+                                Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
+                                    self.rail = planned;
+                                }
                             }
                             if matches!(recovery, Recovery::Cycling { .. }) {
                                 // The module loses its power with the rail.
