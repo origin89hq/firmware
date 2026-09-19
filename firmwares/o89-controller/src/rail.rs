@@ -153,6 +153,7 @@ impl Pins {
 pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, kept: RecentCuts) {
     let mut ticker = Ticker::every(PERIOD);
     let mut on_part = CutsOnPart::read(kept);
+    let mut keeper = recorder::CutsKeeper::new();
     loop {
         ticker.next().await;
         let now = Uptime.now();
@@ -165,7 +166,7 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, kept: RecentCuts)
                 let mut recovery = planned.recover(now);
                 if let Recovery::Cycling { .. } = recovery {
                     let cuts = planned.recent_cuts(now);
-                    match recorder::keep_cuts(cuts).await {
+                    match keeper.keep(cuts).await {
                         Ok(()) => {
                             on_part.landed(cuts);
                             sequencer = planned;
@@ -240,7 +241,7 @@ pub async fn run(mut pins: Pins, mut sequencer: RailSequencer, kept: RecentCuts)
         // did not land, whose part is rewritten a retry later (F-017).
         let cuts = sequencer.recent_cuts(now);
         if on_part.due(cuts, now) {
-            match recorder::keep_cuts(cuts).await {
+            match keeper.keep(cuts).await {
                 Ok(()) => {
                     defmt::info!("rail: {} cuts in the last hour kept", cuts.count());
                     on_part.landed(cuts);

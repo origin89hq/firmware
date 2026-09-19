@@ -16,7 +16,7 @@ use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Ticker, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, with_timeout};
 use km43::{Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
 use o89_core::{Class, LinkEvent, RecentCuts, Ring, SCRATCH, Store, Task};
 
@@ -40,11 +40,12 @@ const PERIOD: Duration = Duration::from_millis(100);
 static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
 
 /// The recovery ladder's cuts, to be kept on the FRAM before the rail
-/// moves. One at a time: the rail task waits for the answer.
-static CUTS: Signal<CriticalSectionRawMutex, RecentCuts> = Signal::new();
+/// moves, under the request's number. One at a time: the rail task waits
+/// for the answer.
+static CUTS: Signal<CriticalSectionRawMutex, (u32, RecentCuts)> = Signal::new();
 
-/// The answer to [`CUTS`].
-static CUTS_KEPT: Signal<CriticalSectionRawMutex, Result<(), NotKept>> = Signal::new();
+/// The answer to [`CUTS`], under the number of the request it answers.
+static CUTS_KEPT: Signal<CriticalSectionRawMutex, (u32, Result<(), NotKept>)> = Signal::new();
 
 /// How long the rail task waits for the cuts to land: a write the recorder
 /// takes at once, behind at most one ring append or mailbox request, and an
@@ -62,18 +63,43 @@ pub enum NotKept {
     Late,
 }
 
-/// Keep the ladder's cuts on the FRAM (F-017), and wait for them to land
-/// or for the deadline. A request the recorder has not started by then is
-/// withdrawn; one it has started may still land, which the caller counts
-/// as not knowing what the part holds.
-pub async fn keep_cuts(cuts: RecentCuts) -> Result<(), NotKept> {
-    CUTS_KEPT.reset();
-    CUTS.signal(cuts);
-    if let Ok(kept) = with_timeout(KEEP_DEADLINE, CUTS_KEPT.wait()).await {
-        kept
-    } else {
-        CUTS.reset();
-        Err(NotKept::Late)
+/// The rail task's side of keeping the ladder's cuts: each request
+/// numbered, so an answer to one abandoned late is never taken for the
+/// answer to the next.
+pub struct CutsKeeper {
+    next: u32,
+}
+
+impl CutsKeeper {
+    /// No request made yet.
+    pub const fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    /// Keep `cuts` on the FRAM (F-017), and wait for them to land or for
+    /// the deadline. A request the recorder has not started by then is
+    /// withdrawn; one it has started may still land, which the caller
+    /// counts as not knowing what the part holds.
+    pub async fn keep(&mut self, cuts: RecentCuts) -> Result<(), NotKept> {
+        let request = self.next;
+        self.next = self.next.wrapping_add(1);
+        CUTS.signal((request, cuts));
+        let deadline = Instant::now().checked_add(KEEP_DEADLINE);
+        // Bounded by the deadline: every turn takes an answer, and an
+        // answer to an earlier request is passed over.
+        loop {
+            let left = deadline.map_or(Duration::from_ticks(0), |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            match with_timeout(left, CUTS_KEPT.wait()).await {
+                Ok((answered, kept)) if answered == request => return kept,
+                Ok(_) => {}
+                Err(_) => {
+                    CUTS.reset();
+                    return Err(NotKept::Late);
+                }
+            }
+        }
     }
 }
 
@@ -162,7 +188,7 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
                 })
                 .await;
             }
-            Either::Second(cuts) => {
+            Either::Second((request, cuts)) => {
                 let kept = match store.as_mut() {
                     Some(store) => store
                         .cuts
@@ -171,7 +197,7 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
                         .map_err(|_| NotKept::Refused),
                     None => Err(NotKept::NoStore),
                 };
-                CUTS_KEPT.signal(kept);
+                CUTS_KEPT.signal((request, kept));
             }
         }
         check_in(Task::Recorder);
