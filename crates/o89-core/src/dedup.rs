@@ -32,7 +32,7 @@ use crate::body::{Malformed, Reader, Writer};
 use crate::tick::{Millis, Tick};
 
 /// How long a command is remembered.
-pub const WINDOW: Millis = Millis::from_millis(600_000);
+pub const DEDUP_WINDOW: Millis = Millis::from_millis(600_000);
 
 /// The most live entries one client may hold: half the table, so it can
 /// only be globally full when at least two clients are jointly filling it,
@@ -311,7 +311,7 @@ impl Dedup {
     /// Whether an entry is still inside the window at `now`.
     fn inside(entry: &Entry, now: Tick) -> bool {
         now.since(entry.inserted)
-            .is_some_and(|since| since < WINDOW)
+            .is_some_and(|since| since < DEDUP_WINDOW)
     }
 
     /// The table as the part holds it: every entry, vacant ones as zeros.
