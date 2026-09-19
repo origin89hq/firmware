@@ -132,7 +132,8 @@ crates/
                            PZEM-016, VE.Direct text, Pylontech CAN, DS18B20.
                            Tested against committed captures.
   o89-sim/                 The simulated site: seasons, faults, the hostile
-                           comms processor, crash-at-every-step.
+                           comms processor on o89-comms-core's own link,
+                           crash-at-every-step.
   o89-dev/                 The bench tool: the FRAM, the NOR and the rail's pin
                            over SWD, through the firmware's mailbox.
   xtask/                   The gate.
@@ -619,7 +620,8 @@ through it and counts it, and a count far from the bench's baseline of about
 1 140 refusals per module boot, the ESP-IDF bootloader's log included, means
 the link is wrong (#2). The state machine takes decoded frames and
 ticks and answers typed actions, so the whole rulebook runs on the host
-against a hostile peer with a named capability set: linked once the
+against a hostile peer, the comms processor's own link with a named
+capability set on top: linked once the
 controller's own `LinkUp` is answered and not before, a changed `boot_id`
 dropping every connection, a heartbeat every two seconds answered at once,
 the ladder measured from the peer's last answer to a request of the

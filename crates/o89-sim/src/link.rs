@@ -17,9 +17,9 @@ use km43::{
     Version,
 };
 use o89_core::{
-    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason,
-    HEARTBEAT_PERIOD, Identity, Link, LinkEvent, LinkText, Millis, Note, Outgoing, RailEvent,
-    RailLine, RailSequencer, Recovery, Revision, Tick,
+    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Link,
+    LinkEvent, LinkText, Millis, Note, Outgoing, RailEvent, RailLine, RailSequencer, Recovery,
+    Revision, Tick,
 };
 
 use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
@@ -50,7 +50,6 @@ struct Bench {
     writer: FrameWriter,
     rail: RailSequencer,
     install_in_flight: bool,
-    next_comms_beat: Tick,
     /// Everything the link asked for, with the tick it asked at.
     asked: Vec<(Tick, Action)>,
     /// What each tick asked for by itself, apart from the answers to frames
@@ -77,7 +76,6 @@ impl Bench {
             writer: FrameWriter::new(),
             rail,
             install_in_flight: false,
-            next_comms_beat: Tick::from_millis(u64::MAX),
             asked: Vec::new(),
             ticked: Vec::new(),
             noise: 0,
@@ -102,15 +100,15 @@ impl Bench {
                     self.perform(actions);
                     let bytes = self.comms.boot(now).expect("the peer boots");
                     self.module_booted = true;
-                    self.next_comms_beat = now.after(HEARTBEAT_PERIOD).expect("fits");
                     self.feed(&bytes);
                 }
                 RailEvent::PowerCycled { .. } | RailEvent::Unrecoverable => {}
             }
         }
-        if self.module_booted && now.since(self.next_comms_beat).is_some() {
-            self.next_comms_beat = now.after(HEARTBEAT_PERIOD).expect("fits");
-            let bytes = self.comms.heartbeat(now).expect("the peer beats");
+        if self.module_booted {
+            // The peer on its own clock: its statement and retries, its
+            // beats once linked.
+            let bytes = self.comms.tick(now).expect("the peer's frames build");
             self.feed(&bytes);
         }
         let late = self.comms.drain(now);
@@ -352,6 +350,34 @@ fn l_031_the_last_statement_is_kept_through_a_drop() {
         fw,
         "fw_comms is the last successful statement's"
     );
+}
+
+#[test]
+fn l_033_the_controller_and_the_comms_processors_own_link_come_up_together_and_stay_up() {
+    // Capabilities: none; the peer is the comms processor's link as the
+    // module runs it.
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(3_000));
+    assert!(bench.link.is_up(), "the controller is linked");
+    assert!(bench.comms.is_linked(), "and so is the comms processor");
+    bench.run_for(Millis::from_millis(60_000));
+    assert!(bench.link.is_up() && bench.comms.is_linked(), "a minute on");
+    assert!(bench.cuts().is_empty(), "nothing was cut");
+    // Each side beat on its own clock and heard the other's answers.
+    let beats = bench
+        .comms
+        .sent
+        .iter()
+        .filter(|kind| **kind == LinkMessageType::Heartbeat)
+        .count();
+    assert!(beats >= 30, "the comms processor beat {beats} times");
+    let answered = bench
+        .comms
+        .heard
+        .iter()
+        .filter(|h| matches!(h, Heard::HeartbeatAck { .. }))
+        .count();
+    assert!(answered >= 30, "the controller answered {answered} of them");
 }
 
 #[test]
@@ -732,9 +758,11 @@ fn l_111_a_peer_that_talks_but_cannot_hear_is_cut_at_sixty_seconds() {
 }
 #[test]
 fn l_033_heartbeats_alone_do_not_bring_the_link_up_and_a_statement_does() {
-    // Capabilities: statement withheld.
+    // Capabilities: statement withheld; beats regardless of a link, which
+    // the comms processor's own link never does.
     let mut bench = Bench::new(Capabilities {
         statement: Statement::Withheld,
+        beats: Beats::Regardless,
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(10_000));

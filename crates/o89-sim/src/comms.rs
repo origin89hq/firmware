@@ -1,15 +1,20 @@
 //! The hostile comms processor: the other end of the link, on a laptop,
 //! with a named set of things it can do to the controller.
 //!
-//! Every test declares the capabilities it uses, so a test that passes with
-//! a peer that answers nothing says so in its first line. What it can do:
-//! answer nothing, withhold its statement, withhold heartbeats, deliver
-//! late, speak the ROM's text before its own `LinkUp`, cut a frame in half
-//! before every frame, speak another version, claim to be a controller,
-//! and reboot with a new `boot_id`. It builds its frames with `km43`'s own
-//! writers, so what the controller reads is what a real peer would have
-//! sent, and a frame it cannot build is an error a test reads, never a
-//! panic in this crate.
+//! What it does honestly is the comms processor's own link,
+//! `o89_comms_core::Link`, the state machine the module runs: its statement
+//! and the retries of it, its heartbeats once linked, its answers, each of
+//! the controller's answers matched to a request of its own. So the
+//! controller's tests run against the peer the firmware is, and a rule
+//! written for that side is written once. What it may do on top is named,
+//! and every test declares what it uses: answer nothing, hear nothing while
+//! still talking, withhold its statement or its heartbeats, beat without a
+//! link, deliver late, speak the ROM's text before its own `LinkUp`, cut a
+//! frame in half before every frame, speak another version, claim to be a
+//! controller, reboot with a new `boot_id`, and put on the wire the frames a
+//! real peer would not. It builds those with `km43`'s own writers, so what
+//! the controller reads is what a real peer would have sent, and a frame it
+//! cannot build is an error a test reads, never a panic in this crate.
 
 use std::collections::VecDeque;
 
@@ -18,17 +23,19 @@ use km43::{
     Incoming, LinkEnvelope, LinkHeader, LinkMessageType, LinkTransport, LinkUp, MAX_FRAME,
     MessageType, Received, ReqId, SessionId, Side, Version,
 };
-use o89_core::{Millis, Tick};
+use o89_comms_core::{Frame, Identity, Link as CommsLink};
+use o89_core::{HEARTBEAT_PERIOD, Millis, OURS, Tick};
 
 /// Whether the peer answers at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answers {
-    /// Everything it should.
+    /// Everything its link says.
     Everything,
     /// Nothing: it reads and stays silent.
     Nothing,
-    /// Its own statement and heartbeats, and nothing of the controller's
-    /// answered: a comms processor whose receiver has hung.
+    /// Whatever its link says of its own accord, and nothing of the
+    /// controller's heard: a comms processor whose receiver has hung,
+    /// stating itself forever because no answer reaches it.
     TalksOnly,
 }
 
@@ -44,8 +51,12 @@ pub enum Statement {
 /// Whether the peer beats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Beats {
-    /// Its own every two seconds, the controller's answered.
+    /// As its link does: its own every two seconds once linked, the
+    /// controller's answered.
     Given,
+    /// As its link does, and every two seconds while unlinked too: a peer
+    /// that beats without having been answered.
+    Regardless,
     /// None sent, none answered.
     Withheld,
 }
@@ -170,18 +181,29 @@ pub enum Heard {
     },
 }
 
+/// The firmware text and board it states, as the comms firmware would.
+const IDENTITY_FW: &str = "0.1.0-sim+g89abcdef";
+/// The board it states.
+const IDENTITY_HW: &str = "controller-a rev A";
+
+/// Request ids for the frames it puts on the wire outside its own link:
+/// far from the link's own, which count up from one.
+const INJECTED_FROM: u32 = 0x4000_0000;
+
 /// The peer.
 pub struct HostileComms {
     caps: Capabilities,
     boot_id: u32,
     boots: u32,
     booted_at: Tick,
+    /// The comms processor's link, from its boot until its power goes.
+    link: Option<CommsLink>,
     reader: FrameReader,
     writer: FrameWriter,
-    next_req: u32,
+    next_injected: u32,
+    /// When it next beats without a link, for [`Beats::Regardless`].
+    next_unlinked_beat: Tick,
     outbox: VecDeque<(Tick, Vec<u8>)>,
-    /// Powered and past its boot: an unpowered module hears nothing.
-    booted: bool,
     /// Everything decoded from the controller.
     pub heard: Vec<Heard>,
     /// Every frame kind it put on the wire, in order.
@@ -197,11 +219,12 @@ impl HostileComms {
             boot_id: 0,
             boots: 0,
             booted_at: Tick::ZERO,
+            link: None,
             reader: FrameReader::new(),
             writer: FrameWriter::new(),
-            next_req: 1,
+            next_injected: INJECTED_FROM,
+            next_unlinked_beat: Tick::ZERO,
             outbox: VecDeque::new(),
-            booted: false,
             heard: Vec::new(),
             sent: Vec::new(),
         }
@@ -213,6 +236,13 @@ impl HostileComms {
         self.boot_id
     }
 
+    /// Whether its own link is up: its statement answered by the
+    /// controller's current boot (L-033).
+    #[must_use]
+    pub fn is_linked(&self) -> bool {
+        self.link.as_ref().is_some_and(CommsLink::is_linked)
+    }
+
     /// What it may do, to change mid-test.
     pub fn capabilities(&mut self) -> &mut Capabilities {
         &mut self.caps
@@ -221,19 +251,21 @@ impl HostileComms {
     /// The rail was cut: the module loses power, hears nothing, and drops
     /// whatever it had not yet put on the wire.
     pub fn power_off(&mut self) {
-        self.booted = false;
+        self.link = None;
         self.outbox.clear();
         self.reader = FrameReader::new();
     }
 
-    /// The peer boots: a new `boot_id`, the ROM's text, then its `LinkUp`.
-    /// Answers the bytes the controller sees.
+    /// The peer boots: a new `boot_id`, the ROM's text, then whatever its
+    /// link says first, which is its `LinkUp`. Answers the bytes the
+    /// controller sees.
     pub fn boot(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
         self.boots = self.boots.wrapping_add(1);
         // Distinct per boot and never zero, as a random draw would be.
         self.boot_id = 0x5EED_0000u32.wrapping_add(self.boots.wrapping_mul(0x9E37));
         self.booted_at = now;
-        self.booted = true;
+        self.link = Some(CommsLink::new(now));
+        self.next_unlinked_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
         self.reader = FrameReader::new();
         self.outbox.clear();
         let mut bytes = Vec::new();
@@ -247,28 +279,37 @@ impl HostileComms {
         if self.caps.rom_text > 0 {
             bytes.push(0);
         }
-        if self.talking() && self.caps.statement == Statement::Given {
-            let req_id = self.take_req();
-            let frame = self.link_up(LinkMessageType::LinkUp, req_id)?;
-            bytes.extend(self.queue(frame, now));
-        }
+        bytes.extend(self.tick(now)?);
         Ok(bytes)
     }
 
-    const fn answering(&self) -> bool {
-        matches!(self.caps.answers, Answers::Everything)
-    }
-
-    /// Whether it says anything of its own accord.
-    const fn talking(&self) -> bool {
-        matches!(self.caps.answers, Answers::Everything | Answers::TalksOnly)
+    /// Time passed on its own clock: what its link says of its own accord,
+    /// a statement or its retry, or a heartbeat once linked, and, with
+    /// [`Beats::Regardless`], a heartbeat every two seconds while unlinked.
+    pub fn tick(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
+        let mut bytes = Vec::new();
+        let Some(link) = self.link.as_mut() else {
+            return Ok(bytes);
+        };
+        let linked = link.is_linked();
+        if let Some(frame) = link.tick(now) {
+            bytes.extend(self.emit(frame, now)?);
+        }
+        if !linked
+            && self.caps.beats == Beats::Regardless
+            && now.since(self.next_unlinked_beat).is_some()
+        {
+            self.next_unlinked_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
+            bytes.extend(self.heartbeat(now)?);
+        }
+        Ok(bytes)
     }
 
     /// Bytes from the controller. Answers what goes back now; frames held
     /// by a delay come out of [`drain`](Self::drain) when their time comes.
     pub fn take(&mut self, bytes: &[u8], now: Tick) -> Result<Vec<u8>, Broken> {
         let mut out = Vec::new();
-        if !self.booted {
+        if self.link.is_none() {
             return Ok(out);
         }
         for byte in bytes {
@@ -277,9 +318,17 @@ impl HostileComms {
                 Received::Frame(frame) => frame.to_vec(),
                 Received::Nothing | Received::Dropped(_) | Received::Abandoned => continue,
             };
-            let answers = self.react(&frame, now)?;
-            for answer in answers {
-                out.extend(self.queue(answer, now));
+            self.overhear(&frame);
+            // A receiver that has hung hears nothing, and its link with it.
+            if self.caps.answers == Answers::TalksOnly {
+                continue;
+            }
+            let answer = match (self.link.as_mut(), LinkEnvelope::decode(&frame)) {
+                (Some(link), Ok(envelope)) => link.received(envelope, now),
+                (None, _) | (_, Err(_)) => None,
+            };
+            if let Some(answer) = answer {
+                out.extend(self.emit(answer, now)?);
             }
         }
         out.extend(self.drain(now));
@@ -300,21 +349,24 @@ impl HostileComms {
         out
     }
 
-    /// Its own heartbeat, on its own clock.
+    /// A heartbeat outside its link's own cadence, under a request id its
+    /// link does not track: its answer counts for nothing on this side.
+    /// Nothing from a peer that answers nothing or withholds its beats.
     pub fn heartbeat(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
-        if !self.talking() || self.caps.beats == Beats::Withheld {
+        if self.caps.answers == Answers::Nothing || self.caps.beats == Beats::Withheld {
             return Ok(Vec::new());
         }
-        let req_id = self.take_req();
-        let frame = self.heartbeat_frame(LinkMessageType::Heartbeat, req_id, now)?;
-        Ok(self.queue(frame, now))
+        let req_id = self.take_injected();
+        let frame = self.build(Frame::Heartbeat { req_id }, now)?;
+        Ok(self.wire(&frame, Some(LinkMessageType::Heartbeat), now))
     }
 
-    /// Its statement again, with the `boot_id` it already has (L-030).
+    /// Its statement again, with the `boot_id` it already has (L-030), under
+    /// a request id its link does not track.
     pub fn restate(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
-        let frame = self.link_up(LinkMessageType::LinkUp, req_id)?;
-        Ok(self.queue(frame, now))
+        let req_id = self.take_injected();
+        let frame = self.build(Frame::LinkUp { req_id }, now)?;
+        Ok(self.wire(&frame, Some(LinkMessageType::LinkUp), now))
     }
 
     /// An error of its own about something of ours: session 0, request 0,
@@ -357,13 +409,13 @@ impl HostileComms {
         req_id: ReqId,
         now: Tick,
     ) -> Result<Vec<u8>, Broken> {
-        let frame = self.heartbeat_frame(LinkMessageType::HeartbeatAck, req_id, now)?;
-        Ok(self.queue(frame, now))
+        let frame = self.build(Frame::HeartbeatAck { req_id }, now)?;
+        Ok(self.wire(&frame, Some(LinkMessageType::HeartbeatAck), now))
     }
 
     /// A connection announced with this handle.
     pub fn announce_connection(&mut self, conn: u16, now: Tick) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
+        let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let len = ClientUp {
             conn,
@@ -378,7 +430,7 @@ impl HostileComms {
 
     /// A time offer.
     pub fn offer_time(&mut self, unix_ms: u64, now: Tick) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
+        let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let len = ClockOffer {
             unix_ms,
@@ -399,7 +451,7 @@ impl HostileComms {
         kind: LinkMessageType,
         now: Tick,
     ) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
+        let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let cbor = header(kind, req_id)
             .write(0, &mut dst)
@@ -412,7 +464,7 @@ impl HostileComms {
     /// A `CommsRelease` request, which only a controller may send: a frame
     /// from the wrong side.
     pub fn send_from_the_wrong_side(&mut self, now: Tick) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
+        let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let cbor = header(LinkMessageType::CommsRelease, req_id)
             .write(0, &mut dst)
@@ -424,7 +476,7 @@ impl HostileComms {
 
     /// A heartbeat stamped with a session it should not carry (L-012).
     pub fn beat_on_a_session(&mut self, session: u16, now: Tick) -> Result<Vec<u8>, Broken> {
-        let req_id = self.take_req();
+        let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let len = Heartbeat {
             uptime_s: 1,
@@ -443,10 +495,105 @@ impl HostileComms {
         Ok(self.queue(frame, now))
     }
 
-    fn react(&mut self, frame: &[u8], now: Tick) -> Result<Vec<Vec<u8>>, Broken> {
-        let mut answers = Vec::new();
+    /// A frame its link asks for, put on the wire as the capabilities
+    /// allow: nothing at all from a peer that answers nothing, no statement
+    /// from one that withholds it, no beat from one that withholds those.
+    fn emit(&mut self, frame: Frame, now: Tick) -> Result<Vec<u8>, Broken> {
+        let (kind, statement, beat) = match frame {
+            Frame::LinkUp { .. } => (Some(LinkMessageType::LinkUp), true, false),
+            Frame::LinkUpAck { .. } => (Some(LinkMessageType::LinkUpAck), true, false),
+            Frame::Heartbeat { .. } => (Some(LinkMessageType::Heartbeat), false, true),
+            Frame::HeartbeatAck { .. } => (Some(LinkMessageType::HeartbeatAck), false, true),
+            Frame::DownloadRefused { .. } => {
+                (Some(LinkMessageType::EnterDownloadAck), false, false)
+            }
+            Frame::CloseReport { .. } => (Some(LinkMessageType::CloseConnectionAck), false, false),
+            Frame::NetFailed { .. } => (Some(LinkMessageType::NetConfigAck), false, false),
+            Frame::Refuse { .. } => (None, false, false),
+        };
+        let silent = match self.caps.answers {
+            Answers::Nothing => true,
+            Answers::Everything | Answers::TalksOnly => false,
+        };
+        if silent
+            || (statement && self.caps.statement == Statement::Withheld)
+            || (beat && self.caps.beats == Beats::Withheld)
+        {
+            return Ok(Vec::new());
+        }
+        let whole = self.build(frame, now)?;
+        Ok(self.wire(&whole, kind, now))
+    }
+
+    /// `frame` as the wire carries it. Built by its link, as the module
+    /// would, unless the peer claims another version or the other side, in
+    /// which case its statements say so.
+    fn build(&mut self, frame: Frame, now: Tick) -> Result<Vec<u8>, Broken> {
+        let honest = self.caps.version == OURS && self.caps.claims == Claims::Comms;
+        if !honest {
+            if let Frame::LinkUp { req_id } = frame {
+                return self.claimed_statement(LinkMessageType::LinkUp, req_id);
+            }
+            if let Frame::LinkUpAck { req_id } = frame {
+                return self.claimed_statement(LinkMessageType::LinkUpAck, req_id);
+            }
+        }
+        let me = Identity {
+            fw: IDENTITY_FW,
+            hw: IDENTITY_HW,
+            boot_id: self.boot_id,
+        };
+        let mut dst = [0u8; MAX_FRAME];
+        let built = match self.link.as_ref() {
+            Some(link) => link.build(frame, &me, now, &mut self.writer, &mut dst),
+            // Before its boot, or after its power went: the frame as a link
+            // started then would build it.
+            None => {
+                CommsLink::new(self.booted_at).build(frame, &me, now, &mut self.writer, &mut dst)
+            }
+        };
+        let len = built.map_err(|_| Broken::Frame)?;
+        Ok(dst.get(..len).ok_or(Broken::Frame)?.to_vec())
+    }
+
+    /// A statement with the version and the side the peer claims.
+    fn claimed_statement(
+        &mut self,
+        kind: LinkMessageType,
+        req_id: ReqId,
+    ) -> Result<Vec<u8>, Broken> {
+        let mut envelope = [0u8; MAX_FRAME];
+        let role = match self.caps.claims {
+            Claims::Comms => Side::Comms,
+            Claims::Controller => Side::Controller,
+        };
+        let net_version = match self.caps.claims {
+            Claims::Comms => Some(0),
+            Claims::Controller => None,
+        };
+        let len = LinkUp {
+            version: self.caps.version,
+            role,
+            fw: IDENTITY_FW,
+            boot_id: self.boot_id,
+            hw: IDENTITY_HW,
+            net_version,
+        }
+        .write(header(kind, req_id), &mut envelope)
+        .map_err(|_| Broken::Body)?;
+        let payload = envelope.get(..len).ok_or(Broken::Body)?;
+        let mut dst = [0u8; MAX_FRAME];
+        let len = self
+            .writer
+            .write(payload, &mut dst)
+            .map_err(|_| Broken::Frame)?;
+        Ok(dst.get(..len).ok_or(Broken::Frame)?.to_vec())
+    }
+
+    /// What the controller sent, written down for the test to read.
+    fn overhear(&mut self, frame: &[u8]) {
         let Ok(envelope) = LinkEnvelope::decode(frame) else {
-            return Ok(answers);
+            return;
         };
         let opcode = envelope.opcode();
         let req_id = envelope.req_id();
@@ -455,7 +602,7 @@ impl HostileComms {
             // envelope admits; the body is read as the client path reads
             // it, from the same bytes.
             let Ok(client) = Envelope::decode(frame) else {
-                return Ok(answers);
+                return;
             };
             let header = client.header();
             if let Ok(hint) = ErrorBody::from_envelope(client) {
@@ -470,105 +617,47 @@ impl HostileComms {
                     req_id: header.req_id,
                 });
             }
-            return Ok(answers);
+            return;
         }
-        match LinkMessageType::try_from(opcode) {
+        let heard = match LinkMessageType::try_from(opcode) {
             Ok(LinkMessageType::LinkUp) => {
-                let Ok(theirs) = LinkUp::decode(envelope) else {
-                    return Ok(answers);
-                };
-                self.heard.push(Heard::LinkUp {
+                LinkUp::decode(envelope).ok().map(|theirs| Heard::LinkUp {
                     req_id,
                     boot_id: theirs.boot_id,
                     fw: theirs.fw.to_owned(),
                     version: theirs.version,
-                });
-                if self.answering() && self.caps.statement == Statement::Given {
-                    answers.push(self.link_up(LinkMessageType::LinkUpAck, req_id)?);
-                }
+                })
             }
             Ok(LinkMessageType::LinkUpAck) => {
-                let Ok(theirs) = LinkUp::decode(envelope) else {
-                    return Ok(answers);
-                };
-                self.heard.push(Heard::LinkUpAck {
-                    req_id,
-                    boot_id: theirs.boot_id,
-                });
+                LinkUp::decode(envelope)
+                    .ok()
+                    .map(|theirs| Heard::LinkUpAck {
+                        req_id,
+                        boot_id: theirs.boot_id,
+                    })
             }
             Ok(LinkMessageType::Heartbeat) => {
-                let Ok(beat) = Heartbeat::decode(envelope) else {
-                    return Ok(answers);
-                };
-                self.heard.push(Heard::Heartbeat {
-                    req_id,
-                    uptime_s: beat.uptime_s,
-                    conns: beat.conns,
-                });
-                if self.answering() && self.caps.beats == Beats::Given {
-                    answers.push(self.heartbeat_frame(
-                        LinkMessageType::HeartbeatAck,
+                Heartbeat::decode(envelope)
+                    .ok()
+                    .map(|beat| Heard::Heartbeat {
                         req_id,
-                        now,
-                    )?);
-                }
+                        uptime_s: beat.uptime_s,
+                        conns: beat.conns,
+                    })
             }
-            Ok(LinkMessageType::HeartbeatAck) => {
-                self.heard.push(Heard::HeartbeatAck { req_id });
-            }
-            Ok(_) | Err(()) => {
-                let outcome = first_value(envelope);
-                self.heard.push(Heard::Other {
-                    opcode,
-                    req_id,
-                    outcome,
-                });
-            }
-        }
-        Ok(answers)
-    }
-
-    fn link_up(&mut self, kind: LinkMessageType, req_id: ReqId) -> Result<Vec<u8>, Broken> {
-        let mut dst = [0u8; MAX_FRAME];
-        let role = match self.caps.claims {
-            Claims::Comms => Side::Comms,
-            Claims::Controller => Side::Controller,
+            Ok(LinkMessageType::HeartbeatAck) => Some(Heard::HeartbeatAck { req_id }),
+            Ok(_) | Err(()) => Some(Heard::Other {
+                opcode,
+                req_id,
+                outcome: first_value(envelope),
+            }),
         };
-        let net_version = match self.caps.claims {
-            Claims::Comms => Some(0),
-            Claims::Controller => None,
-        };
-        let len = LinkUp {
-            version: self.caps.version,
-            role,
-            fw: "0.1.0-sim+g89abcdef",
-            boot_id: self.boot_id,
-            hw: "controller-a rev A",
-            net_version,
+        if let Some(heard) = heard {
+            self.heard.push(heard);
         }
-        .write(header(kind, req_id), &mut dst)
-        .map_err(|_| Broken::Body)?;
-        self.frame(&dst, len, Some(kind))
     }
 
-    fn heartbeat_frame(
-        &mut self,
-        kind: LinkMessageType,
-        req_id: ReqId,
-        now: Tick,
-    ) -> Result<Vec<u8>, Broken> {
-        let mut dst = [0u8; MAX_FRAME];
-        let uptime_s = now.since(self.booted_at).map_or(0, |up| {
-            u32::try_from(up.as_millis() / 1_000).unwrap_or(u32::MAX)
-        });
-        let len = Heartbeat { uptime_s, conns: 0 }
-            .write(header(kind, req_id), &mut dst)
-            .map_err(|_| Broken::Body)?;
-        self.frame(&dst, len, Some(kind))
-    }
-
-    /// Frame the first `len` bytes of `payload`, with a cut frame in front
-    /// of it when the capability says so.
+    /// Frame the first `len` bytes of `payload` for the wire.
     fn frame(
         &mut self,
         payload: &[u8],
@@ -581,22 +670,32 @@ impl HostileComms {
             .writer
             .write(payload, &mut dst)
             .map_err(|_| Broken::Frame)?;
-        let whole = dst.get(..len).ok_or(Broken::Frame)?;
+        Ok(self.cut(dst.get(..len).ok_or(Broken::Frame)?, kind))
+    }
+
+    /// A whole frame as the wire carries it, with a cut frame in front of it
+    /// when the capability says so, and its kind written down.
+    fn cut(&mut self, whole: &[u8], kind: Option<LinkMessageType>) -> Vec<u8> {
         let mut out = Vec::new();
         if self.caps.frames == Frames::CutBeforeEach {
             // The pair pulled mid-frame: the head of this frame, then the
             // line idle, which the receiver's timeout ends as a delimiter
             // would. Here the delimiter is written, which is the same run
             // ended the same way.
-            let cut = whole.get(..len / 2).ok_or(Broken::Frame)?;
-            out.extend_from_slice(cut);
+            out.extend_from_slice(whole.get(..whole.len() / 2).unwrap_or(&[]));
             out.push(0);
         }
         out.extend_from_slice(whole);
         if let Some(kind) = kind {
             self.sent.push(kind);
         }
-        Ok(out)
+        out
+    }
+
+    /// A whole frame onto the wire, now or after the delay.
+    fn wire(&mut self, whole: &[u8], kind: Option<LinkMessageType>, now: Tick) -> Vec<u8> {
+        let framed = self.cut(whole, kind);
+        self.queue(framed, now)
     }
 
     fn queue(&mut self, frame: Vec<u8>, now: Tick) -> Vec<u8> {
@@ -610,9 +709,11 @@ impl HostileComms {
         }
     }
 
-    fn take_req(&mut self) -> ReqId {
-        let req = ReqId(self.next_req);
-        self.next_req = self.next_req.wrapping_add(1);
+    /// A request id its link never issued, for a frame put on the wire
+    /// outside it.
+    fn take_injected(&mut self) -> ReqId {
+        let req = ReqId(self.next_injected);
+        self.next_injected = self.next_injected.wrapping_add(1);
         req
     }
 }
@@ -633,4 +734,52 @@ fn first_value(envelope: LinkEnvelope<'_>) -> Option<u8> {
         return None;
     }
     body.u8().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every heartbeat the peer put on the wire in five seconds from its
+    /// boot, ticked every ten milliseconds, before anyone answers it.
+    fn beats_in_five_seconds(caps: Capabilities) -> usize {
+        let mut peer = HostileComms::new(caps);
+        let _ = peer.boot(Tick::ZERO).expect("the peer boots");
+        for ms in (10..=5_000).step_by(10) {
+            let _ = peer.tick(Tick::from_millis(ms)).expect("the peer ticks");
+        }
+        let _ = peer.heartbeat(Tick::from_millis(5_000)).expect("builds");
+        peer.sent
+            .iter()
+            .filter(|kind| **kind == LinkMessageType::Heartbeat)
+            .count()
+    }
+
+    #[test]
+    fn a_peer_that_beats_regardless_beats_without_a_link() {
+        let beats = beats_in_five_seconds(Capabilities {
+            beats: Beats::Regardless,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 3, "two on its clock and the one injected");
+    }
+
+    #[test]
+    fn a_peer_that_answers_nothing_beats_nothing_even_regardless() {
+        let beats = beats_in_five_seconds(Capabilities {
+            answers: Answers::Nothing,
+            beats: Beats::Regardless,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 0);
+    }
+
+    #[test]
+    fn a_peer_that_withholds_its_beats_injects_none_either() {
+        let beats = beats_in_five_seconds(Capabilities {
+            beats: Beats::Withheld,
+            ..Capabilities::default()
+        });
+        assert_eq!(beats, 0);
+    }
 }
