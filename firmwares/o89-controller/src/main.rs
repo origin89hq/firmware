@@ -31,6 +31,7 @@ mod fault;
 mod first;
 mod fram;
 mod last_words;
+mod mailbox;
 mod nor;
 mod panic;
 mod pvd;
@@ -107,6 +108,8 @@ const _: () = {
 async fn main(spawner: Spawner) {
     // 1. The lines with a hazard, before anything else.
     first::generator_and_bus_lines();
+    // The bench tool's mailbox is not there until the recorder serves it.
+    mailbox::clear();
 
     // 2. Why the part reset, and what the previous run said last.
     let cause = ResetCause::from_flags(reset::take_flags());
@@ -249,12 +252,11 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(store, nor) {
+    if let Ok(token) = recorder::run(store, fram, nor) {
         spawner.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");
     }
-    let _fram = fram;
 
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
     supervisor::check_in(Task::Control);

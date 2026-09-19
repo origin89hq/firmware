@@ -15,8 +15,12 @@
 //! `heapless::String` are exactly what the house asks for. So the sources are
 //! read as identifier tokens with comments stripped — spacing, generics and a
 //! comment inside a path change nothing — over `src/` and `tests/` alike,
-//! because the domain tests are held to the rule too, and the resolved
-//! features of every reachable dependency are read from cargo. A `Vec` with
+//! because the domain tests are held to the rule too, and the features every
+//! reachable dependency resolves with are read from `cargo tree` for the
+//! crate alone, on each target. A resolution over the whole workspace would
+//! unify what the other members ask for, and the bench tool's probe library
+//! wants `defmt` with `alloc`: that is the laptop's build, not the part's,
+//! and a build of the crate for the part never sees it. A `Vec` with
 //! neither root in reach does not compile, which is the compiler holding the
 //! other half.
 //!
@@ -36,7 +40,7 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, PackageId, TargetKind};
 
 use crate::cross::no_std_crates;
-use crate::repo::Repo;
+use crate::repo::{CORTEX_M0, RISCV, Repo};
 
 /// The crate that decides.
 const CORE: &str = "o89-core";
@@ -90,12 +94,10 @@ fn links(kinds: &[DependencyKind]) -> Links {
     }
 }
 
-/// The resolved graph as adjacency by package id, with each id's name and
-/// the features it was resolved with.
+/// The resolved graph as adjacency by package id, with each id's name.
 struct Graph {
     edges: BTreeMap<PackageId, Vec<(PackageId, Links)>>,
     names: BTreeMap<PackageId, String>,
-    features: BTreeMap<PackageId, Vec<String>>,
 }
 
 impl Graph {
@@ -143,21 +145,7 @@ impl Graph {
                 )
             })
             .collect();
-        let features = resolve
-            .nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.id.clone(),
-                    node.features.iter().map(ToString::to_string).collect(),
-                )
-            })
-            .collect();
-        Ok(Self {
-            edges,
-            names,
-            features,
-        })
+        Ok(Self { edges, names })
     }
 
     /// Every package id reachable from `from`, in the order found.
@@ -203,24 +191,52 @@ impl Graph {
             })
             .collect()
     }
+}
 
-    /// The first reachable dependency resolved with an `alloc` or `std`
-    /// feature, and the feature.
-    fn alloc_feature_reachable(&self, from: &PackageId) -> Option<(String, String)> {
-        self.reachable_ids(from).into_iter().find_map(|id| {
-            let feature = self
-                .features
-                .get(&id)?
-                .iter()
-                .find(|feature| ALLOC_ROOTS.contains(&feature.as_str()))?;
-            let name = self
-                .names
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| id.to_string());
-            Some((name, feature.clone()))
-        })
+/// Every package a build of `name` alone for `target` would link, one a
+/// line as `name vX.Y.Z (path)|feature,feature`: the crate's own features
+/// all on, its normal and its test dependencies followed, procedural macros
+/// left out because they run on the laptop. `cargo tree` resolves features
+/// as a build of the named package would, which a workspace-wide resolution
+/// does not.
+fn tree_features(repo: &Repo, name: &str, target: &str) -> Result<String> {
+    let output = repo
+        .cargo()
+        .args(["tree", "--manifest-path"])
+        .arg(repo.host_manifest())
+        .args(["-p", name, "--all-features", "--target", target])
+        .args([
+            "-e",
+            "normal,dev,no-proc-macro",
+            "--prefix",
+            "none",
+            "--no-dedupe",
+        ])
+        .args(["-f", "{p}|{f}"])
+        .output()
+        .with_context(|| format!("running cargo tree for {name} on {target}"))?;
+    if !output.status.success() {
+        bail!(
+            "cargo tree for {name} on {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
+    String::from_utf8(output.stdout).context("cargo tree wrote something other than text")
+}
+
+/// The first package in a tree resolved with an `alloc` or `std` feature,
+/// and the feature. A feature is matched whole: `allocator-api` is not
+/// `alloc`.
+fn alloc_feature_in(tree: &str) -> Option<(String, &'static str)> {
+    tree.lines().find_map(|line| {
+        let (package, features) = line.split_once('|')?;
+        let feature = features
+            .split(',')
+            .map(str::trim)
+            .find_map(|feature| ALLOC_ROOTS.iter().copied().find(|root| *root == feature))?;
+        let name = package.split_whitespace().next()?.to_owned();
+        Some((name, feature))
+    })
 }
 
 /// The source with every comment removed, line and block alike, block
@@ -334,10 +350,13 @@ pub fn check(repo: &Repo) -> Result<()> {
         {
             bail!("{name} depends on {hal}: a domain crate names no peripheral");
         }
-        if let Some((dep, feature)) = graph.alloc_feature_reachable(&package.id) {
-            bail!(
-                "{name} reaches {dep} with its {feature:?} feature on: an allocator arriving through a dependency is still an allocator"
-            );
+        for target in [CORTEX_M0, RISCV] {
+            let tree = tree_features(repo, &name, target)?;
+            if let Some((dep, feature)) = alloc_feature_in(&tree) {
+                bail!(
+                    "{name} reaches {dep} with its {feature:?} feature on for {target}: an allocator arriving through a dependency is still an allocator"
+                );
+            }
         }
         let crate_dir = package
             .manifest_path
@@ -393,15 +412,7 @@ mod tests {
             )
         })
         .collect();
-        let features = [("sync-b", vec!["alloc"])]
-            .into_iter()
-            .map(|(repr, features)| (id(repr), features.into_iter().map(str::to_owned).collect()))
-            .collect();
-        Graph {
-            edges,
-            names,
-            features,
-        }
+        Graph { edges, names }
     }
 
     #[test]
@@ -461,15 +472,7 @@ mod tests {
             )
         })
         .collect();
-        let features = [("alloc-lib", vec!["alloc"])]
-            .into_iter()
-            .map(|(repr, features)| (id(repr), features.into_iter().map(str::to_owned).collect()))
-            .collect();
-        Graph {
-            edges,
-            names,
-            features,
-        }
+        Graph { edges, names }
     }
 
     #[test]
@@ -483,7 +486,6 @@ mod tests {
         assert!(reached.contains("lib"));
         assert!(!reached.contains("lib-helper"));
         assert!(!reached.contains("alloc-lib"));
-        assert_eq!(graph.alloc_feature_reachable(&id("app")), None);
         // Checked from `lib` itself, its helper is its own.
         let from_lib = graph.reachable(&id("lib")).expect("a complete graph");
         assert!(from_lib.contains("alloc-lib"));
@@ -504,9 +506,32 @@ mod tests {
 
     #[test]
     fn f_081_an_allocator_arriving_through_a_dependency_feature_is_found() {
-        let found = diamond().alloc_feature_reachable(&id("app"));
-        assert_eq!(found, Some(("sync".to_owned(), "alloc".to_owned())));
-        assert_eq!(diamond().alloc_feature_reachable(&id("sync-a")), None);
+        let tree = "o89-core v0.0.0 (/ws/crates/o89-core)|defmt\n\
+                    crc v3.4.0|\n\
+                    defmt v1.1.1|alloc,unstable-test\n";
+        assert_eq!(alloc_feature_in(tree), Some(("defmt".to_owned(), "alloc")));
+        let with_std = "o89-core v0.0.0 (/ws/crates/o89-core)|\n\
+                        serde v1.0.0|default, std\n";
+        assert_eq!(
+            alloc_feature_in(with_std),
+            Some(("serde".to_owned(), "std"))
+        );
+    }
+
+    #[test]
+    fn f_081_a_tree_with_no_allocator_feature_is_clean_and_so_is_an_empty_one() {
+        let tree = "o89-core v0.0.0 (/ws/crates/o89-core)|defmt\n\
+                    digest v0.11.3|block-api,default,mac\n\
+                    defmt v1.1.1|\n";
+        assert_eq!(alloc_feature_in(tree), None);
+        assert_eq!(alloc_feature_in(""), None);
+    }
+
+    #[test]
+    fn f_081_a_feature_merely_containing_the_word_is_not_the_allocator() {
+        let tree = "lib v1.0.0|allocator-api,no-std,std-compat\n";
+        assert_eq!(alloc_feature_in(tree), None);
+        assert_eq!(alloc_feature_in("no pipe on this line\n"), None);
     }
 
     #[test]

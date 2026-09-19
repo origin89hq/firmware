@@ -3,7 +3,7 @@
 # never tries to build a Cortex-M0+ or a RISC-V crate for the laptop.
 [workspace]
 resolver = "3"
-members = ["crates/o89-core", "crates/o89-sim", "xtask"]
+members = ["crates/o89-core", "crates/o89-dev", "crates/o89-sim", "xtask"]
 exclude = ["firmwares"]
 
 [workspace.package]
@@ -27,6 +27,15 @@ embedded-storage-async = "=0.4.1"
 anyhow = "1"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
+# The bench tool's link to the controller: the same release as the `probe-rs`
+# binary the recipes flash with, pinned so that the two agree on the target.
+probe-rs = "=0.32.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The printed secret is thirty-two bytes from the operating system's
+# generator, shown once in hex.
+getrandom = "0.3"
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 syn = { version = "3", features = ["full", "visit"] }
 toml = "1"

@@ -118,8 +118,8 @@ crates/
                            Tested against committed captures.
   o89-sim/                 The simulated site: seasons, faults, the hostile
                            comms processor, crash-at-every-step.
-  o89-dev/                 The bench tool: flashes both chips, streams defmt,
-                           reads the FRAM and the NOR ring over SWD.
+  o89-dev/                 The bench tool: the FRAM, the NOR and the rail's pin
+                           over SWD, through the firmware's mailbox.
   xtask/                   The gate.
 firmwares/
   Cargo.toml               firmware workspace, excluded from the root
@@ -663,6 +663,19 @@ raises the record to it.
 History at full resolution is a client's job. The controller keeps enough to
 survive a long disconnection, which is a different requirement from keeping
 a year.
+
+**The bench reaches the parts through the firmware, never around it.** The
+last 4 KB of RAM is a mailbox the recorder task polls: the host lands a
+request over SWD, read these bytes, write these, erase this block, reboot,
+and its sequence last; the recorder serves it through the same seams the
+store and the ring use, and lands the same sequence as its answer. So a
+write from the bench meets the voltage detector's refusal as the firmware's
+own would, and the bytes it writes are framed by this crate's own records
+on the host: the epoch and the secret a unit leaves the bench with are
+records the boot reads exactly as it reads its own. The firmware moves
+bytes and decides nothing about them; what they mean is the host's, in the
+same `o89-core`. The region is one the runtime never loads or zeroes and the
+stack never reaches, at the address both sides share from one constant.
 
 ### The event log ring
 

@@ -59,6 +59,8 @@ live with, are in [origin89hq/hardware](https://github.com/origin89hq/hardware/i
 | Path | What it is |
 | --- | --- |
 | `crates/o89-core` | The controller's decisions: `no_std`, no allocator, names no peripheral, host-tested |
+| `crates/o89-sim` | The simulated site: the storage seams with a step counter, every write path crashed at every step |
+| `crates/o89-dev` | The bench tool: the FRAM, the NOR and the rail's pin over the probe, through the firmware's mailbox (`just dev-ping`) |
 | `xtask/` | The gate `cargo test` cannot be: cross-compiles, dependency rules, the three images measured against their slots |
 | `firmwares/` | Its own workspace: `o89-boot` and `o89-controller` for the STM32G0B1RE, `o89-comms` for the ESP32-C6 |
 | `docs/sizes.tsv` | What each image cost, per commit, as the `.bin` and never the ELF |
