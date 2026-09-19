@@ -187,6 +187,18 @@ of ours allocates, and the gate refuses `alloc` in our modules. Source:
 USART1 and switches back to the link's afterwards. Source: [#4][i4],
 [hardware#6][h6]. M3.
 
+**F-039** — The controller's `boot_id` is SHA-256 over the part's unique id
+and the boot count, truncated to the field's width. The boot count is kept
+on the FRAM and advanced from the stored value when the boot record is
+written, saturating at `u32::MAX`, so before saturation it is a new input at
+every boot; with no RNG and no secret in it, a unit without a provisioned
+secret still states itself. Two boots share a
+value with the chance two random draws would, one in 2^32, which is the
+bound the field's width gives any scheme; what L-040 forbids is a value
+that rests on RAM and comes back the same by construction, not one that
+repeats by chance. Its secrecy is nothing (L-020). Source: KM43 L-040,
+[#3][plan] §4.2. M3.
+
 ## Sessions and provisioning
 
 **F-040** — Three distinct gestures — open the pairing window, arm the floor
