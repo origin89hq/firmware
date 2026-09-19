@@ -33,7 +33,7 @@ use crate::last_words::LastWords;
 use crate::map;
 use crate::network::{NETWORK_BYTES, Network};
 use crate::panic_record::{PANIC_RECORD_BYTES, PanicRecord};
-use crate::rail::{RECENT_CUTS_BYTES, RecentCuts};
+use crate::rail::{CUTS_RECORD_BYTES, CutsRecord};
 use crate::release::{COMMS_RELEASE_BYTES, CommsRelease};
 use crate::run_reason::{RUN_REASON_BYTES, RunReason};
 use crate::secret::{SECRET_BYTES, Secret};
@@ -62,8 +62,9 @@ pub struct Store {
     /// The network master copy.
     pub network: Kept<Network, NETWORK_BYTES>,
     /// The recovery ladder's cuts of the last hour, carried as made at
-    /// this boot's start (F-017).
-    pub cuts: Kept<RecentCuts, RECENT_CUTS_BYTES>,
+    /// this boot's start, and the boot count they were written at (F-017,
+    /// F-018).
+    pub cuts: Kept<CutsRecord, CUTS_RECORD_BYTES>,
 }
 
 /// Why the boot has no epoch. No key derives without one, so every `Pair`
@@ -212,7 +213,7 @@ impl Store {
         let mut release =
             Kept::<CommsRelease, COMMS_RELEASE_BYTES>::read(map::COMMS_RELEASE, fram).await?;
         let network = Kept::<Network, NETWORK_BYTES>::read(map::NETWORK, fram).await?;
-        let mut cuts = Kept::<RecentCuts, RECENT_CUTS_BYTES>::read(map::RECENT_CUTS, fram).await?;
+        let mut cuts = Kept::<CutsRecord, CUTS_RECORD_BYTES>::read(map::RECENT_CUTS, fram).await?;
 
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
@@ -311,14 +312,17 @@ impl Store {
 /// (F-017).
 fn restart_windows(
     release: &mut Kept<CommsRelease, COMMS_RELEASE_BYTES>,
-    cuts: &mut Kept<RecentCuts, RECENT_CUTS_BYTES>,
+    cuts: &mut Kept<CutsRecord, CUTS_RECORD_BYTES>,
 ) {
     if let Some(held) = release.present() {
         let rebased = held.rebased();
         release.rebase(rebased);
     }
     if let Some(held) = cuts.present() {
-        let rebased = held.rebased();
+        let rebased = CutsRecord {
+            cuts: held.cuts.rebased(),
+            ..*held
+        };
         cuts.rebase(rebased);
     }
 }
@@ -603,11 +607,14 @@ mod tests {
     #[test]
     fn f_017_a_boot_reads_the_ladders_cuts_and_carries_them_from_its_own_start() {
         let mut part = Part::fresh();
-        let (mut store, _) = boot(&mut part, None);
+        let (mut store, report) = boot(&mut part, None);
         assert_eq!(store.cuts.held(), &Held::Absent);
         assert_eq!(
-            RecentCuts::carried(store.cuts.held()),
-            RecentCuts::NONE,
+            CutsRecord::carried(store.cuts.held(), report.boot),
+            crate::CarriedCuts {
+                cuts: crate::RecentCuts::NONE,
+                missed: 0
+            },
             "a fresh unit has made no cut"
         );
         let seq = crate::RailSequencer::new(crate::Revision::B);
@@ -615,11 +622,20 @@ mod tests {
             panic!("a cut");
         };
         let kept = cut.cuts();
-        block_on(store.cuts.write(&mut part, kept)).expect("the supply is fine");
-        let (store, _) = boot(&mut part, None);
-        let carried = RecentCuts::carried(store.cuts.held());
-        assert_eq!(carried.count(), 1);
-        assert_eq!(carried, kept.rebased(), "moved to this boot's tick zero");
+        let record = CutsRecord {
+            boot: store.boots.present().copied(),
+            cuts: kept,
+        };
+        block_on(store.cuts.write(&mut part, record)).expect("the supply is fine");
+        let (store, report) = boot(&mut part, None);
+        let carried = CutsRecord::carried(store.cuts.held(), report.boot);
+        assert_eq!(carried.missed, 0, "written at the boot before this one");
+        assert_eq!(carried.cuts.count(), 1);
+        assert_eq!(
+            carried.cuts,
+            kept.rebased(),
+            "moved to this boot's tick zero"
+        );
     }
 
     #[test]

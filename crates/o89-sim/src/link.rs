@@ -17,9 +17,9 @@ use km43::{
     Version,
 };
 use o89_core::{
-    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Link,
-    LinkEvent, LinkText, Millis, Note, Outgoing, Plan, RailEvent, RailLine, RailSequencer,
-    Recovery, Revision, Tick,
+    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Keep,
+    Link, LinkEvent, LinkText, Millis, NotKept, Note, Outgoing, Rail, RailEvent, RailLine,
+    RailRequest, RailSequencer, Recovery, Revision, Tick,
 };
 
 use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
@@ -48,7 +48,7 @@ struct Bench {
     comms: HostileComms,
     reader: FrameReader,
     writer: FrameWriter,
-    rail: RailSequencer,
+    rail: Rail,
     install_in_flight: bool,
     /// Everything the link asked for, with the tick it asked at.
     asked: Vec<(Tick, Action)>,
@@ -69,8 +69,9 @@ impl Bench {
     /// up when it settles.
     fn new(caps: Capabilities) -> Self {
         let now = Tick::from_millis(1_000);
-        let mut rail = RailSequencer::new(Revision::A);
-        let _ = rail.power_on(now);
+        let mut sequencer = RailSequencer::new(Revision::A);
+        let _ = sequencer.power_on(now);
+        let rail = Rail::new(sequencer, None);
         Self {
             now,
             link: Link::new(identity(), now),
@@ -97,7 +98,8 @@ impl Bench {
     fn step(&mut self) {
         self.now = self.now.after(STEP).expect("fits");
         let now = self.now;
-        if let Some(event) = self.rail.tick(now) {
+        let turn = self.rail.turn(now, None, None);
+        if let Some(event) = turn.event {
             match event {
                 RailEvent::Settled => {
                     let actions = self.link.module_settled(now);
@@ -145,16 +147,27 @@ impl Bench {
                             to_comms.push_back(dst[..len].to_vec());
                         }
                         Action::CutRail => {
-                            // As the adapter does: planned, and the cut
-                            // made only once its count has landed.
-                            let recovery = match self.rail.plan_recovery(self.now) {
-                                Plan::Cut(cut) if self.keeps_land => {
-                                    cut.make(&mut self.rail, self.now)
+                            // As the adapter does: the rail turned with the
+                            // request, and the count it hands out answered
+                            // by the recorder at once, landed or not.
+                            let asked = self.rail.turn(self.now, Some(RailRequest::Recover), None);
+                            let turn = match asked.keep {
+                                Some(keep @ Keep::Cut(_)) => {
+                                    let kept = if self.keeps_land {
+                                        Ok(())
+                                    } else {
+                                        Err(NotKept::Refused)
+                                    };
+                                    self.rail.turn(self.now, None, Some((keep, kept)))
                                 }
-                                Plan::Cut(_) => Recovery::Deferred,
-                                Plan::LeftOnAndRaised => Recovery::LeftOnAndRaised,
-                                Plan::Busy => Recovery::Busy,
+                                Some(Keep::Changed(_)) | None => asked,
                             };
+                            assert_eq!(
+                                (asked.event, turn.event),
+                                (None, None),
+                                "the step's own turn moved time"
+                            );
+                            let recovery = turn.recovered.expect("a recovery is answered");
                             if matches!(recovery, Recovery::Cycling { .. }) {
                                 // The module loses its power with the rail.
                                 self.comms.power_off();

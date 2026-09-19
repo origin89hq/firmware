@@ -901,10 +901,11 @@ it has booted and applies its policy from there:
   shape, and is on the probe's log until then. The cuts of the last hour
   are on the FRAM before the rail goes off, and a cut whose count does not
   land is not made and the ladder asks again. The rail task never waits on
-  the part for it: a module reset asked while the count goes out is served
-  at once, and the cut planned before it is not made. A boot carries the
-  cuts as made at its own start, so a controller that resets between rungs
-  still reaches the third (F-017).
+  the part for it: a module reset asked while the count goes out, or in the
+  turn it lands, is served first, and the cut planned before it is not
+  made. That order is `o89-core`'s `Rail`, which the simulator's bench runs
+  too. A boot carries the cuts as made at its own start, so a controller
+  that resets between rungs still reaches the third (F-017).
 - A bank-voltage threshold below which the radio stays off, so the weakest
   bank in February is not also carrying a radio nobody is using. The
   threshold and its hysteresis are configuration values that have not been
@@ -930,7 +931,9 @@ rail defaults **off** through every controller reset, so each reset reboots
 the module, costs a Wi-Fi association and is a switch-on event; a crash loop
 at the 8 s watchdog is 450 rail cycles an hour against the ladder's three
 deliberate ones. Those resets are counted as the ladder's cuts, so three of
-them inside an hour are its third rung (F-018). Switching the rail on after minutes off corrupted the
+them inside an hour are its third rung (F-018), even when a reset comes
+before the boot's own record lands: the record names the boot count it was
+written at, and the next boot counts every boot in between. Switching the rail on after minutes off corrupted the
 controller within milliseconds, 22 of 22 times on the bench, while short
 cycles pass hundreds of times
 ([origin89hq/hardware#5](https://github.com/origin89hq/hardware/issues/5)).

@@ -20,13 +20,14 @@
 //! The cuts of the last hour outlive a controller reset: the adapter keeps
 //! [`RecentCuts`] on the FRAM before the rail goes off, and a boot carries
 //! them as made at its own start, the P-121 rule for every window measured
-//! on the tick. On revision A the reset that began the boot is one of them
-//! (F-017, F-018).
+//! on the tick. On revision A the reset that began the boot is one of them,
+//! and so is the reset that began every boot since the record was written,
+//! which the boot count tells (F-017, F-018).
 //!
 //! cites: F-004, F-005
 
 use crate::body::{Body, Held, Malformed};
-use crate::{Millis, RailThroughReset, Revision, ThirdRung, Tick};
+use crate::{BootCount, Millis, RailThroughReset, Revision, ThirdRung, Tick};
 
 /// What the rail line is asked to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,17 +165,18 @@ impl PlannedCut {
         cut.recent_cuts(self.at)
     }
 
-    /// Make the cut, its count kept: the lines move at `at`, and the whole
-    /// off time runs from there (L-111). A sequencer that moved since the
-    /// plan, a module reset served while the count went out, is left as it
-    /// is and the cut is [`Recovery::Deferred`]: it was planned for a
-    /// module that is no longer as it was.
+    /// Make the cut, its count kept: the lines move at `at`, the whole off
+    /// time runs from there (L-111), and the cut counts for the hour from
+    /// there (L-112). The count kept named the request's instant, a moment
+    /// earlier, and the adapter's next write corrects it. A sequencer that
+    /// moved since the plan, a module reset served while the count went
+    /// out, is left as it is and the cut is [`Recovery::Deferred`]: it was
+    /// planned for a module that is no longer as it was.
     pub fn make(self, sequencer: &mut RailSequencer, at: Tick) -> Recovery {
         if *sequencer != self.asked {
             return Recovery::Deferred;
         }
-        let (count, off_for) = sequencer.cut(self.at, self.off_for);
-        sequencer.start_cut(at);
+        let (count, off_for) = sequencer.cut(at, self.off_for);
         Recovery::Cycling { count, off_for }
     }
 }
@@ -254,19 +256,6 @@ impl RecentCuts {
     /// record that does not read counts as (F-017).
     pub const FULL: Self = Self([Some(Tick::ZERO); CYCLES_BEFORE_THE_THIRD_RUNG]);
 
-    /// The cuts a boot starts from, given the record as it read: its cuts,
-    /// none for a record never written, and the full ladder for one that is
-    /// there and does not read, because a count the part lost is never
-    /// taken as zero.
-    #[must_use]
-    pub const fn carried(held: &Held<Self>) -> Self {
-        match held {
-            Held::Present(cuts) => *cuts,
-            Held::Absent => Self::NONE,
-            Held::Corrupt | Held::Malformed(_) => Self::FULL,
-        }
-    }
-
     /// Every cut moved to this boot's start (P-121): the previous boot's
     /// tick means nothing on this one, and the start is the latest the cut
     /// can have been.
@@ -294,6 +283,14 @@ impl RecentCuts {
         cuts.0
             .sort_unstable_by_key(|cut| cut.map_or(u64::MAX, Tick::as_millis));
         cuts
+    }
+}
+
+#[cfg(test)]
+impl RecentCuts {
+    /// One cut, at `at`.
+    pub(crate) const fn one_at(at: Tick) -> Self {
+        Self([Some(at), None, None])
     }
 }
 
@@ -325,6 +322,96 @@ impl Body<RECENT_CUTS_BYTES> for RecentCuts {
         }
         Ok(cuts)
     }
+}
+
+/// The bytes a [`CutsRecord`] takes: the boot count, then the cuts.
+pub const CUTS_RECORD_BYTES: usize = 4 + RECENT_CUTS_BYTES;
+
+/// The ladder's record on the FRAM (F-017, F-018): the cuts of the last
+/// hour, and the boot count the part held when they were written. Every
+/// boot counted after that one began with a reset, and none of their own
+/// records landed; the boot that reads the record counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CutsRecord {
+    /// The boot count on the part when the record was written: the
+    /// writer's own once it has landed, the one before otherwise, and none
+    /// on a part that never held one.
+    pub boot: Option<BootCount>,
+    /// The cuts of the last hour, on the writer's tick.
+    pub cuts: RecentCuts,
+}
+
+impl CutsRecord {
+    /// What the boot numbered `boot` carries of the record as it read: its
+    /// cuts as made at this boot's start, and the boots between its writer
+    /// and this one. None for a record never written, which no boot before
+    /// this one kept; the full ladder for one that is there and does not
+    /// read, or that names this boot or a later one, because a count the
+    /// part lost is never taken as zero.
+    #[must_use]
+    pub fn carried(held: &Held<Self>, boot: BootCount) -> CarriedCuts {
+        let (cuts, kept_at) = match held {
+            Held::Present(record) => (record.cuts.rebased(), record.boot.map_or(0, BootCount::get)),
+            Held::Absent => (RecentCuts::NONE, 0),
+            Held::Corrupt | Held::Malformed(_) => return CarriedCuts::FULL,
+        };
+        match boot
+            .get()
+            .checked_sub(kept_at)
+            .and_then(|after| after.checked_sub(1))
+        {
+            Some(missed) => CarriedCuts { cuts, missed },
+            None => CarriedCuts::FULL,
+        }
+    }
+}
+
+impl Body<CUTS_RECORD_BYTES> for CutsRecord {
+    fn encode(&self) -> [u8; CUTS_RECORD_BYTES] {
+        let mut bytes = [0u8; CUTS_RECORD_BYTES];
+        let (boot, cuts) = bytes.split_at_mut(4);
+        boot.copy_from_slice(&self.boot.map_or(0, BootCount::get).to_le_bytes());
+        cuts.copy_from_slice(&self.cuts.encode());
+        bytes
+    }
+
+    /// A boot count of zero is none; the cuts decode as [`RecentCuts`] do.
+    fn decode(bytes: &[u8; CUTS_RECORD_BYTES]) -> Result<Self, Malformed> {
+        let (boot, cuts) = bytes.split_first_chunk::<4>().ok_or(Malformed { at: 0 })?;
+        let boot = match u32::from_le_bytes(*boot) {
+            0 => None,
+            _ => Some(BootCount::decode(boot)?),
+        };
+        let cuts = cuts
+            .first_chunk::<RECENT_CUTS_BYTES>()
+            .ok_or(Malformed { at: 4 })?;
+        let cuts = RecentCuts::decode(cuts).map_err(|malformed| Malformed {
+            at: malformed.at.saturating_add(4),
+        })?;
+        Ok(Self { boot, cuts })
+    }
+}
+
+/// What a boot carries of the ladder (F-017, F-018): the cuts the part
+/// kept, as made at this boot's start, and how many boots since the one
+/// that kept them began with a reset whose own record never landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CarriedCuts {
+    /// The cuts the part kept, at this boot's tick zero.
+    pub cuts: RecentCuts,
+    /// The boots between the one that kept them and this one.
+    pub missed: u32,
+}
+
+impl CarriedCuts {
+    /// The full ladder: what a record that does not read, or a boot with
+    /// no store, carries.
+    pub const FULL: Self = Self {
+        cuts: RecentCuts::FULL,
+        missed: 0,
+    };
 }
 
 /// How long after a write of the cuts that did not land the next is tried.
@@ -402,24 +489,23 @@ impl RailSequencer {
 
     /// Start from the cuts a previous boot kept, carried as made at this
     /// boot's start (F-017). On a board whose rail is off through a reset,
-    /// the reset that began this boot cut the rail too, and is counted as
-    /// a cut at `now` (F-018).
-    pub fn carry(&mut self, carried: RecentCuts, now: Tick) {
-        self.cycles = carried.0;
+    /// the reset that began this boot cut the rail too, and so did the one
+    /// that began every boot the record missed; each is a cut at `now`
+    /// (F-018).
+    pub fn carry(&mut self, carried: CarriedCuts, now: Tick) {
+        self.cycles = carried.cuts.0;
         match self.revision.rail_through_reset() {
-            RailThroughReset::Off => self.remember_cut(now),
+            RailThroughReset::Off => {
+                // Bounded by the ladder's slots: past them, every slot
+                // already holds a cut at `now`.
+                let missed = usize::try_from(carried.missed)
+                    .unwrap_or(usize::MAX)
+                    .min(CYCLES_BEFORE_THE_THIRD_RUNG);
+                for _ in 0..=missed {
+                    self.remember_cut(now);
+                }
+            }
             RailThroughReset::On => {}
-        }
-    }
-
-    /// The cut just planned starts at `at`, when the adapter moves the
-    /// lines (L-111). Nothing changes outside a cut.
-    fn start_cut(&mut self, at: Tick) {
-        if let Phase::Cut { off_for, .. } = self.phase {
-            self.phase = Phase::Cut {
-                until: at.after(off_for).unwrap_or(at),
-                off_for,
-            };
         }
     }
 
@@ -976,8 +1062,20 @@ mod tests {
     /// A sequencer on `revision` at the start of a boot that carries
     /// `kept`, powered and settled.
     fn booted(revision: Revision, kept: RecentCuts) -> RailSequencer {
+        carried(
+            revision,
+            CarriedCuts {
+                cuts: kept.rebased(),
+                missed: 0,
+            },
+        )
+    }
+
+    /// A sequencer on `revision` at the start of a boot that carries
+    /// `carried`, powered and settled.
+    fn carried(revision: Revision, carried: CarriedCuts) -> RailSequencer {
         let mut seq = RailSequencer::new(revision);
-        seq.carry(kept.rebased(), at(0));
+        seq.carry(carried, at(0));
         let _ = seq.power_on(at(0));
         let _ = run(&mut seq, 0, 200);
         seq
@@ -1016,19 +1114,92 @@ mod tests {
         assert_eq!(seq.recent_cuts(at(3_600_001)), RecentCuts::NONE);
     }
 
+    fn boot(count: u32) -> BootCount {
+        BootCount::decode(&count.to_le_bytes()).expect("not zero")
+    }
+
     #[test]
     fn f_017_a_record_that_does_not_read_counts_as_the_full_ladder() {
-        assert_eq!(RecentCuts::carried(&Held::Corrupt), RecentCuts::FULL);
         assert_eq!(
-            RecentCuts::carried(&Held::Malformed(Malformed { at: 0 })),
-            RecentCuts::FULL
+            CutsRecord::carried(&Held::Corrupt, boot(9)),
+            CarriedCuts::FULL
         );
-        assert_eq!(RecentCuts::carried(&Held::Absent), RecentCuts::NONE);
+        assert_eq!(
+            CutsRecord::carried(&Held::Malformed(Malformed { at: 0 }), boot(9)),
+            CarriedCuts::FULL
+        );
         let one = RecentCuts([Some(at(7)), None, None]);
-        assert_eq!(RecentCuts::carried(&Held::Present(one)), one);
+        let record = CutsRecord {
+            boot: Some(boot(8)),
+            cuts: one,
+        };
+        assert_eq!(
+            CutsRecord::carried(&Held::Present(record), boot(9)),
+            CarriedCuts {
+                cuts: one.rebased(),
+                missed: 0
+            }
+        );
         // Full, a revision A boot's first request is the third rung.
-        let mut seq = booted(Revision::A, RecentCuts::carried(&Held::Corrupt));
+        let mut seq = carried(Revision::A, CutsRecord::carried(&Held::Corrupt, boot(9)));
         assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
+    }
+
+    #[test]
+    fn f_018_a_record_counts_the_boots_since_it_was_written_and_one_that_names_a_later_boot_is_full()
+     {
+        let none_at = |kept_at: Option<BootCount>| {
+            Held::Present(CutsRecord {
+                boot: kept_at,
+                cuts: RecentCuts::NONE,
+            })
+        };
+        let missed = |held: &Held<CutsRecord>, count: u32| CutsRecord::carried(held, boot(count));
+        // Written at boot 5: boots 6 and 7 wrote nothing that landed.
+        assert_eq!(missed(&none_at(Some(boot(5))), 8).missed, 2);
+        // Written by a boot whose own count did not land, under the count
+        // before it, which this boot takes again.
+        assert_eq!(missed(&none_at(Some(boot(5))), 6).missed, 0);
+        // Never written: every boot before this one missed it; a fresh
+        // unit's first boot missed none.
+        assert_eq!(
+            missed(&Held::Absent, 1),
+            CarriedCuts {
+                cuts: RecentCuts::NONE,
+                missed: 0
+            }
+        );
+        assert_eq!(missed(&Held::Absent, 4).missed, 3);
+        assert_eq!(missed(&none_at(None), 3).missed, 2);
+        // A record from this boot's count or a later one: the counts
+        // disagree, and the ladder is full.
+        assert_eq!(missed(&none_at(Some(boot(6))), 6), CarriedCuts::FULL);
+        assert_eq!(missed(&none_at(Some(boot(9))), 6), CarriedCuts::FULL);
+    }
+
+    #[test]
+    fn f_018_on_revision_a_every_boot_the_record_missed_is_a_cut() {
+        // Two boots whose writes never landed, then this one: the third
+        // rung at the first request.
+        let carried_cuts = CarriedCuts {
+            cuts: RecentCuts::NONE,
+            missed: 2,
+        };
+        let mut seq = carried(Revision::A, carried_cuts);
+        assert_eq!(seq.recent_cuts(at(0)).count(), 3);
+        assert_eq!(recover(&mut seq, at(60_000)), Recovery::LeftOnAndRaised);
+        // Revision B keeps its rail through a reset: no boot is a cut.
+        let seq = carried(Revision::B, carried_cuts);
+        assert_eq!(seq.recent_cuts(at(0)), RecentCuts::NONE);
+        // However many were missed, the ladder holds three.
+        let seq = carried(
+            Revision::A,
+            CarriedCuts {
+                cuts: RecentCuts::NONE,
+                missed: u32::MAX,
+            },
+        );
+        assert_eq!(seq.recent_cuts(at(0)).count(), 3);
     }
 
     #[test]
@@ -1038,11 +1209,21 @@ mod tests {
             RecentCuts([Some(at(1_000)), None, None]),
             RecentCuts([Some(at(1)), Some(at(2)), Some(at(u64::MAX))]),
         ] {
-            assert_eq!(RecentCuts::decode(&cuts.encode()), Ok(cuts));
+            for kept_at in [None, Some(BootCount::FIRST), Some(boot(u32::MAX))] {
+                let record = CutsRecord {
+                    boot: kept_at,
+                    cuts,
+                };
+                assert_eq!(CutsRecord::decode(&record.encode()), Ok(record));
+            }
         }
-        let mut bytes = RecentCuts::FULL.encode();
-        bytes[0] = 4;
-        assert_eq!(RecentCuts::decode(&bytes), Err(Malformed { at: 0 }));
+        let mut bytes = CutsRecord {
+            boot: Some(boot(3)),
+            cuts: RecentCuts::FULL,
+        }
+        .encode();
+        bytes[4] = 4;
+        assert_eq!(CutsRecord::decode(&bytes), Err(Malformed { at: 4 }));
     }
 
     #[test]
@@ -1098,11 +1279,28 @@ mod tests {
             run(&mut seq, 7_500, 7_500)[0],
             Some((7_500, RailEvent::PowerCycled { count: 1 }))
         );
-        // Outside a cut it moves nothing.
-        let mut up = booted(Revision::B, RecentCuts::NONE);
-        let before = up;
-        up.start_cut(at(3_000));
-        assert_eq!(up, before);
+    }
+
+    #[test]
+    fn l_112_a_cut_counts_for_the_hour_from_when_its_lines_moved() {
+        let mut seq = booted(Revision::B, RecentCuts::NONE);
+        let Plan::Cut(cut) = seq.plan_recovery(at(1_000)) else {
+            panic!("a cut");
+        };
+        // Kept as planned at the request; made when the count landed.
+        assert_eq!(cut.cuts(), RecentCuts([Some(at(1_000)), None, None]));
+        let _ = cut.make(&mut seq, at(2_500));
+        assert_eq!(
+            seq.recent_cuts(at(3_601_000)).count(),
+            1,
+            "an hour from the request"
+        );
+        assert_eq!(
+            seq.recent_cuts(at(3_602_500)).count(),
+            1,
+            "an hour from the lines"
+        );
+        assert_eq!(seq.recent_cuts(at(3_602_501)), RecentCuts::NONE);
     }
 
     #[test]

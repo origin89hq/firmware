@@ -16,8 +16,8 @@ use km43::{ClientId, ClientKind, Counter, Epoch};
 use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS};
 use o89_core::{
     Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
-    ChallengeCounter, ClientTable, EPOCH_BYTES, Fingerprint, Held, Kept, Label, LastWords, Paired,
-    PanicRecorded, PanicSite, Plan, RECENT_CUTS_BYTES, RailSequencer, RecentCuts, Recovery,
+    CUTS_RECORD_BYTES, ChallengeCounter, ClientTable, CutsRecord, EPOCH_BYTES, Fingerprint, Held,
+    Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Plan, RailSequencer, Recovery,
     Revision, Store, Tick,
 };
 
@@ -26,7 +26,7 @@ use crate::{Crashes, SimFram, crash_at_every_step};
 type Epochs = Kept<Epoch, EPOCH_BYTES>;
 type Clients = Kept<ClientTable, CLIENT_TABLE_BYTES>;
 type Counters = Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>;
-type Cuts = Kept<RecentCuts, RECENT_CUTS_BYTES>;
+type Cuts = Kept<CutsRecord, CUTS_RECORD_BYTES>;
 
 fn client(n: u32) -> ClientId {
     ClientId::new(n).expect("a nonzero client")
@@ -295,7 +295,8 @@ fn f_017_a_ladder_write_cut_at_any_step_keeps_the_cuts_before_it_or_after_it() {
     ));
     let mut start = with_one_phone();
     let mut cuts = block_on(Cuts::read(RECENT_CUTS, &mut start)).expect("the part answers");
-    block_on(cuts.write(&mut start, one)).expect("the supply is steady");
+    let record = |cuts| CutsRecord { boot: None, cuts };
+    block_on(cuts.write(&mut start, record(one))).expect("the supply is steady");
     let mut after = seq;
     for ms in 90_001..=95_200 {
         let _ = after.tick(Tick::from_millis(ms));
@@ -310,24 +311,81 @@ fn f_017_a_ladder_write_cut_at_any_step_keeps_the_cuts_before_it_or_after_it() {
         &start,
         |part| {
             let mut cuts = block_on(Cuts::read(RECENT_CUTS, part)).map_err(|_| ())?;
-            block_on(cuts.write(part, two)).map_err(|_| ())
+            block_on(cuts.write(part, record(two))).map_err(|_| ())
         },
         |part, step| {
-            let (store, _) = block_on(Store::boot(part, None)).expect("the part is back");
-            let carried = RecentCuts::carried(store.cuts.held());
+            let (store, report) = block_on(Store::boot(part, None)).expect("the part is back");
+            let carried = CutsRecord::carried(store.cuts.held(), report.boot);
+            assert_eq!(carried.missed, 0, "cut at {step}: the part's first boot");
             assert!(
-                carried == one.rebased() || carried == two.rebased(),
+                carried.cuts == one.rebased() || carried.cuts == two.rebased(),
                 "cut at {step}: {carried:?}"
             );
         },
     )
     .expect("the path runs uncut");
-    // Four bytes clearing the magic, four of sequence, twenty-five of body,
+    // Four bytes clearing the magic, four of sequence, twenty-nine of body,
     // four of CRC, four of magic.
     assert_eq!(
         crashes,
         Crashes {
-            steps: 4 + 4 + 25 + 4 + 4
+            steps: 4 + 4 + 29 + 4 + 4
         }
     );
+}
+
+/// One boot of a revision A controller as `main` runs it up to its
+/// ladder's write: the store read, the cuts carried with this boot's own
+/// reset, and the record handed back to write.
+fn boot_on_revision_a(part: &mut SimFram) -> (Store, CutsRecord) {
+    let (store, report) = block_on(Store::boot(part, None)).expect("the part answers");
+    let mut seq = RailSequencer::new(Revision::A);
+    seq.carry(
+        CutsRecord::carried(store.cuts.held(), report.boot),
+        Tick::ZERO,
+    );
+    let record = CutsRecord {
+        boot: store.boots.present().copied(),
+        cuts: seq.recent_cuts(Tick::ZERO),
+    };
+    (store, record)
+}
+
+#[test]
+fn f_018_three_resets_are_the_third_rung_though_every_boots_ladder_write_after_the_first_is_cut() {
+    // The first boot's record lands; each boot after it is cut at step k
+    // of its own, for every k, and the third boot still counts three.
+    let mut start = SimFram::fresh();
+    let (mut store, first) = boot_on_revision_a(&mut start);
+    assert_eq!(first.cuts.count(), 1, "the first boot's own reset");
+    block_on(store.cuts.write(&mut start, first)).expect("the supply is steady");
+    let mut whole = start.clone();
+    whole.reboot();
+    let (mut store, second) = boot_on_revision_a(&mut whole);
+    let before = whole.bytes_written();
+    block_on(store.cuts.write(&mut whole, second)).expect("the supply is steady");
+    let steps = whole.bytes_written() - before;
+    assert_eq!(steps, 4 + 4 + 29 + 4 + 4);
+    for step in 0..steps {
+        let mut part = start.clone();
+        for boot in 2..=3 {
+            part.reboot();
+            let (mut store, record) = boot_on_revision_a(&mut part);
+            assert_eq!(record.cuts.count(), boot, "cut at {step}: boot {boot}");
+            part.cut_after(step);
+            let _ = block_on(store.cuts.write(&mut part, record));
+        }
+        part.reboot();
+        let (store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
+        let mut seq = RailSequencer::new(Revision::A);
+        seq.carry(
+            CutsRecord::carried(store.cuts.held(), report.boot),
+            Tick::ZERO,
+        );
+        assert_eq!(
+            seq.plan_recovery(Tick::from_millis(60_000)),
+            Plan::LeftOnAndRaised,
+            "cut at {step}: the fourth boot's first request"
+        );
+    }
 }

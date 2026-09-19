@@ -112,16 +112,19 @@ this allowance (`B-20`, [hardware#51][h51]). M1; held through M7.
 
 **F-017** — The recovery ladder's cuts of the last hour outlive a controller
 reset: they are written to the FRAM before the rail goes off, and a cut
-whose count does not land is not made; a boot carries each of them as made
-at its own start (P-121), and a record that does not read counts as the
-three cuts L-112 stops at. A reset therefore never lowers
-the count; it can keep a cut in the count for up to an hour longer than it
-was. Source: [#49][i49], KM43 L-112. M3.
+whose count does not land is not made; a cut counts for the hour from when
+its lines move. A boot carries each of them as made at its own start
+(P-121), and a record that does not read counts as the three cuts L-112
+stops at. A reset therefore never lowers the count; it can keep a cut in
+the count for up to an hour longer than it was. Source: [#49][i49], KM43
+L-112. M3.
 
 **F-018** — On revision A the reset that began a boot is one of the ladder's
 cuts, because the rail is off through every controller reset: three resets
-inside an hour are the third rung. Source: [#49][i49], [hardware#48][h48].
-M3.
+inside an hour are the third rung. The ladder's record names the boot count
+it was written at, and every boot counted since whose own record never
+landed is a cut too. A reset before a boot's count lands is not counted.
+Source: [#49][i49], [hardware#48][h48]. M3.
 
 ## Persistence
 

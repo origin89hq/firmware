@@ -15,7 +15,7 @@ use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Address, FRAM_BYTES, Record};
 use crate::network::NETWORK_BYTES;
 use crate::panic_record::PANIC_RECORD_BYTES;
-use crate::rail::RECENT_CUTS_BYTES;
+use crate::rail::CUTS_RECORD_BYTES;
 use crate::release::COMMS_RELEASE_BYTES;
 use crate::run_reason::RUN_REASON_BYTES;
 use crate::secret::SECRET_BYTES;
@@ -67,7 +67,7 @@ pub const CLIENT_TABLE: Record<CLIENT_TABLE_BYTES> = Record::at(magic(*b"CLNT"),
 /// off so a controller reset does not lower the count L-112 is judged on
 /// (F-017). Before the configuration sections, which nothing has written
 /// yet, so that adding it moved nothing a part holds.
-pub const RECENT_CUTS: Record<RECENT_CUTS_BYTES> = Record::at(magic(*b"LADR"), CLIENT_TABLE.end());
+pub const RECENT_CUTS: Record<CUTS_RECORD_BYTES> = Record::at(magic(*b"LADR"), CLIENT_TABLE.end());
 
 /// The site configuration section (P-102).
 pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), RECENT_CUTS.end());
@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(CHALLENGE_COUNTER.end(), Address(72));
         assert_eq!(
             usize::from(RECENT_CUTS.end().0),
-            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(RECENT_CUTS_BYTES)
+            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(CUTS_RECORD_BYTES)
         );
         assert_eq!(
             usize::from(SITE_CONFIG.end().0),
