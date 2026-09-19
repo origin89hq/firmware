@@ -156,9 +156,14 @@ P-085's order, F-025 on the reset path. M2.
 `PB6` (TX), `PB7` (RX), `PB3` (RTS) and `PB4` (CTS), to the module's UART0.
 Source: [hardware#13][h13], [#2][i2]. M3.
 
-**F-031** — The ROM's boot text, arriving on the link at its own baud after
-every module reset, is resynchronised through and counted, and the count per
-boot is logged; a count far from one is a link fault. Source: [#2][i2]. M3.
+**F-031** — The boot text arriving on the link at the ROM's baud after every
+module reset, the ROM's and the second-stage bootloader's, is resynchronised
+through and counted, and the count per boot is logged. The bench fixed the
+baseline at about 1 140 refusals per boot with the ESP-IDF bootloader's log
+(2026-09-19 §4 and §5); a count far from that baseline, in either direction,
+is a link fault. The count is of the boots the link task hears at its own
+rate; a boot into the ROM's loader for the bench is bridged at the ROM's rate,
+byte for byte, and never counted. Source: [#2][i2]. M3.
 
 **F-032** — The comms firmware re-arms the RTC watchdog as the first statement
 after `esp_hal::init`, which disables every watchdog. A hang becomes a reset
@@ -186,8 +191,14 @@ of ours allocates, and the gate refuses `alloc` in our modules. Source:
 [#3][plan] §3. M3.
 
 **F-038** — The bench flashing path through the STM32 speaks the ROM's baud on
-USART1 and switches back to the link's afterwards. Source: [#4][i4],
-[hardware#6][h6]. M3.
+USART1 and switches back to the link's afterwards. It enters the ROM by one
+of two routes the controller performs: the window the comms firmware opens
+(L-190 to L-192), or IO9 held low across a reset, which on revision A needs
+IO8 held high by a wire and on revision B works alone. The ROM never waits
+in its loader by itself: a module with no bootable app reboots through its
+second-stage bootloader forever, so a module that runs nothing that honours
+the window is reached by the strap or not at all. Source: [#4][i4],
+[hardware#6][h6], [#1][i1]. M3.
 
 **F-039** — The controller's `boot_id` is SHA-256 over the part's unique id
 and the boot count, truncated to the field's width. The boot count is kept

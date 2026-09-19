@@ -17,7 +17,10 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use o89_core::mailbox::{DATA_BYTES, MAGIC, MAILBOX_ADDRESS, Op, Status, VERSION, offset};
+use o89_core::mailbox::{
+    DATA_BYTES, DownloadEntry, MAGIC, MAILBOX_ADDRESS, Op, RING_BYTES, Ring, Status, VERSION,
+    offset,
+};
 use o89_core::{Address, FRAM_BYTES, Fram, Refused};
 use probe_rs::probe::list::Lister;
 use probe_rs::{MemoryInterface, Permissions, Session};
@@ -34,7 +37,14 @@ pub struct Link {
     session: Session,
     /// The sequence of the last request, which the answer carries.
     seq: u32,
+    /// The lease on the bridge, as last written, and when.
+    lease: u32,
+    renewed: Option<Instant>,
 }
+
+/// How often the lease on the bridge is renewed while it is read; the
+/// firmware lets it lapse after a minute unrenewed.
+const LEASE_RENEW: Duration = Duration::from_secs(1);
 
 /// What the firmware answered.
 struct Answer {
@@ -52,6 +62,19 @@ impl Answer {
             Status::SupplyFalling => bail!("{what}: refused, the supply is falling"),
             Status::Bus => bail!("{what}: the bus refused"),
             Status::NoNor => bail!("{what}: the ring did not open; the NOR is not there"),
+            Status::NoModuleAnswer => {
+                bail!("{what}: the module did not answer EnterDownload inside its window")
+            }
+            Status::LinkBusy => bail!("{what}: the link task did not take the request"),
+            Status::NoStore => bail!(
+                "{what}: the controller booted without its store, so its link is down (F-039); the FRAM comes first"
+            ),
+            Status::BridgeRefused => bail!(
+                "{what}: the controller's USART1 refused the ROM's configuration; the module was reset normally"
+            ),
+            Status::ModuleRefused => bail!(
+                "{what}: the module answered refused_outside_window: it runs an image whose window had closed when the knock arrived"
+            ),
         }
     }
 }
@@ -96,7 +119,12 @@ impl Link {
         let session = probe
             .attach(TARGET, Permissions::default())
             .context("attaching to the controller")?;
-        let mut link = Self { session, seq: 0 };
+        let mut link = Self {
+            session,
+            seq: 0,
+            lease: 0,
+            renewed: None,
+        };
         link.check()?;
         Ok(link)
     }
@@ -217,9 +245,18 @@ impl Link {
         match answer.status {
             Status::Ok => Ok(()),
             Status::SupplyFalling => Err(Refused::SupplyFalling),
-            Status::UnknownOp | Status::OutOfRange | Status::Bus | Status::NoNor => Err(
-                Refused::Bus(anyhow!("writing the FRAM: {:?}", answer.status)),
-            ),
+            Status::UnknownOp
+            | Status::OutOfRange
+            | Status::Bus
+            | Status::NoNor
+            | Status::NoModuleAnswer
+            | Status::LinkBusy
+            | Status::NoStore
+            | Status::BridgeRefused
+            | Status::ModuleRefused => Err(Refused::Bus(anyhow!(
+                "writing the FRAM: {:?}",
+                answer.status
+            ))),
         }
     }
 
@@ -249,6 +286,81 @@ impl Link {
         self.request(Op::EraseNorBlock, block, 0, &[])?
             .ok("erasing a block")?;
         Ok(())
+    }
+
+    /// Put the module into its ROM's download mode through the link, the
+    /// firmware performing the reset and the knock (KM43 L-192), and bridge
+    /// its UART to the rings. `reason` is `download_reason` as the registry
+    /// numbers it.
+    pub fn download(&mut self, reason: u8, entry: DownloadEntry) -> Result<()> {
+        self.request(Op::Download, u32::from(reason), entry.code(), &[])?
+            .ok("entering download mode")?;
+        Ok(())
+    }
+
+    /// End the bridge: the module reset normally, the link back.
+    pub fn normal(&mut self) -> Result<()> {
+        self.request(Op::Normal, 0, 0, &[])?
+            .ok("returning the module to normal")?;
+        Ok(())
+    }
+
+    /// Bytes for the module, as many as the ring has room for; how many
+    /// were taken. The rest is the caller's to offer again.
+    pub fn bridge_write(&mut self, bytes: &[u8]) -> Result<usize> {
+        let mut core = self.session.core(0)?;
+        let write = core.read_word_32(field(offset::TO_MODULE_WRITE))?;
+        let read = core.read_word_32(field(offset::TO_MODULE_READ))?;
+        let count = Ring::room(write, read).min(bytes.len());
+        let mut index = write;
+        let mut rest = bytes.get(..count).unwrap_or(&[]);
+        // Bounded by the count: at most two runs, one either side of the wrap.
+        while !rest.is_empty() {
+            let run = Ring::contiguous(index, rest.len());
+            let (chunk, after) = rest.split_at(run.min(rest.len()));
+            let at = field(offset::TO_MODULE_DATA)
+                .saturating_add(u64::try_from(Ring::index(index)).unwrap_or(0));
+            core.write_8(at, chunk)?;
+            index = Ring::advanced(index, chunk.len());
+            rest = after;
+        }
+        if count > 0 {
+            core.write_word_32(field(offset::TO_MODULE_WRITE), index)?;
+        }
+        Ok(count)
+    }
+
+    /// Bytes from the module, appended to `into`; how many.
+    pub fn bridge_read(&mut self, into: &mut Vec<u8>) -> Result<usize> {
+        let mut core = self.session.core(0)?;
+        let write = core.read_word_32(field(offset::FROM_MODULE_WRITE))?;
+        let read = core.read_word_32(field(offset::FROM_MODULE_READ))?;
+        let count = Ring::available(write, read);
+        let mut index = read;
+        let mut left = count;
+        let mut chunk = [0u8; RING_BYTES];
+        // Bounded by the count: at most two runs, one either side of the wrap.
+        while left > 0 {
+            let run = Ring::contiguous(index, left);
+            let room = chunk.get_mut(..run).context("a run inside the ring")?;
+            let at = field(offset::FROM_MODULE_DATA)
+                .saturating_add(u64::try_from(Ring::index(index)).unwrap_or(0));
+            core.read_8(at, room)?;
+            into.extend_from_slice(room);
+            index = Ring::advanced(index, run);
+            left = left.saturating_sub(run);
+        }
+        if count > 0 {
+            core.write_word_32(field(offset::FROM_MODULE_READ), index)?;
+        }
+        // Every reader of the bridge renews the lease, so a host holds the
+        // bridge exactly as long as it keeps reading it.
+        if self.renewed.is_none_or(|at| at.elapsed() >= LEASE_RENEW) {
+            self.lease = self.lease.wrapping_add(1);
+            core.write_word_32(field(offset::BRIDGE_LEASE), self.lease)?;
+            self.renewed = Some(Instant::now());
+        }
+        Ok(count)
     }
 
     /// Ask the firmware to reset the part. The answer lands a moment

@@ -99,6 +99,14 @@ strap is unconnected, so the only wire-free way into serial download is
 firmware on the comms processor honouring a request from the controller. That
 window runs before anything that can crash, and is never triggered by bytes
 in the relayed client stream. It is the first requirement, not a feature.
+The other route, IO9 held low across a reset the controller performs, is in
+the rail sequencer for both revisions and is the bench's on revision A, with
+a wire holding IO8 high; on revision B (hardware#48) it works alone, and
+whether the firmware may take it by itself is the board's `StrapRoute`
+policy. The bench of 2026-09-19 showed why both exist: a flash that died
+after esptool's erase left the module with a bootloader and no app, which
+reboots forever and never enters the ROM's loader, and only the strap reached
+it.
 
 ## Repository layout
 
@@ -607,8 +615,9 @@ rows and challenges, network configuration push, time offers with the floor,
 cap and rate limit, and the comms release flow. The adapter owns the bytes
 and the rail pin. The ROM's boot text arrives on the link at 115200 after
 every module reset while the link runs at 921600; the framer resynchronises
-through it and counts it, and a count that is not near one per module boot
-means the link is wrong (#2). The state machine takes decoded frames and
+through it and counts it, and a count far from the bench's baseline of about
+1 140 refusals per module boot, the ESP-IDF bootloader's log included, means
+the link is wrong (#2). The state machine takes decoded frames and
 ticks and answers typed actions, so the whole rulebook runs on the host
 against a hostile peer with a named capability set: linked once the
 controller's own `LinkUp` is answered and not before, a changed `boot_id`
@@ -726,7 +735,8 @@ survive a long disconnection, which is a different requirement from keeping
 a year.
 
 **The bench reaches the parts through the firmware, never around it.** The
-last 4 KB of RAM is a mailbox the recorder task polls: the host lands a
+last 8 KB of RAM is a mailbox the recorder task polls, with the two rings of
+the module's bridge and the host's lease on it at its end: the host lands a
 request over SWD, read these bytes, write these, erase this block, reboot,
 and its sequence last; the recorder serves it through the same seams the
 store and the ring use, and lands the same sequence as its answer. So a

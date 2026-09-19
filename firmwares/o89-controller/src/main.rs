@@ -189,6 +189,7 @@ async fn main(spawner: Spawner) {
     let mut rail = rail::Pins::new(
         Output::new(b.module.rail, Level::Low, Speed::Low),
         Flex::new(b.module.en),
+        Flex::new(b.module.boot),
     );
     let mut sequencer = RailSequencer::new(REVISION);
     rail.apply(sequencer.power_on(Uptime.now()));

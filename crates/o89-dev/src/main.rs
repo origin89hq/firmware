@@ -13,13 +13,58 @@
 //! The probe-rs release is the one the recipes flash with, pinned in the
 //! workspace manifest.
 
+mod flash;
 mod link;
 mod rail;
 mod store;
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use o89_core::Revision;
+use o89_core::mailbox::DownloadEntry;
+
+/// The route into the module's ROM, on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Entry {
+    /// Knock at the window the comms firmware opens.
+    Knock,
+    /// Hold IO9 low across the reset; IO8 must be high, a wire on revision A.
+    Strap,
+    /// Reset and listen; the ROM never enters its loader by itself.
+    Reset,
+}
+
+impl From<Entry> for DownloadEntry {
+    fn from(entry: Entry) -> Self {
+        match entry {
+            Entry::Knock => Self::Knock,
+            Entry::Strap => Self::Strap,
+            Entry::Reset => Self::Reset,
+        }
+    }
+}
+
+/// The routes into the ROM's loader, the only ones a flash can take: a plain
+/// reset boots whatever the module holds, and the ROM never waits in its
+/// loader by itself, so esptool would find nothing to talk to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FlashEntry {
+    /// Knock at the window the comms firmware opens.
+    Knock,
+    /// Hold IO9 low across the reset; IO8 must be high, a wire on revision A.
+    Strap,
+}
+
+impl From<FlashEntry> for DownloadEntry {
+    fn from(entry: FlashEntry) -> Self {
+        match entry {
+            FlashEntry::Knock => Self::Knock,
+            FlashEntry::Strap => Self::Strap,
+        }
+    }
+}
 
 use crate::link::Link;
 
@@ -81,6 +126,39 @@ enum Command {
     },
     /// Reset the controller through the firmware.
     Reboot,
+    /// FLASH the comms image onto the module through the controller: the
+    /// module is reset into its ROM's download mode by the firmware, and
+    /// esptool writes the merged image, bootloader and partition table
+    /// included, at address 0.
+    FlashComms {
+        /// The comms ELF, as `cargo build --release -p o89-comms` leaves it.
+        elf: PathBuf,
+        /// The partition table.
+        #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../firmwares/o89-comms/partitions.csv"))]
+        partitions: PathBuf,
+        /// The route into the ROM: the window the comms firmware opens, or
+        /// the strap for a module that runs nothing that answers, which on
+        /// revision A needs IO8 held high by a wire.
+        #[arg(long, value_enum, default_value_t = FlashEntry::Knock)]
+        entry: FlashEntry,
+    },
+    /// LISTEN to the module through the bridge: the module is reset by the
+    /// firmware and whatever it says on its UART0 for `seconds` is printed,
+    /// then it is reset normally. What the ROM prints says which mode it
+    /// booted into.
+    CommsListen {
+        /// How long to listen.
+        #[arg(long, default_value_t = 3)]
+        seconds: u64,
+        /// The route in: a plain reset by default, to hear what the module
+        /// boots into.
+        #[arg(long, value_enum, default_value_t = Entry::Reset)]
+        entry: Entry,
+        /// Exit without giving the module back, as a host that died
+        /// would: the fault the firmware's reclaim and idle close answer.
+        #[arg(long)]
+        leave_open: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -184,6 +262,24 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Reboot => link.reboot(),
+        Command::FlashComms {
+            elf,
+            partitions,
+            entry,
+        } => {
+            // One file per invocation: two benches on two probes must not
+            // hand esptool each other's image.
+            let merged =
+                std::env::temp_dir().join(format!("o89-comms-merged-{}.bin", std::process::id()));
+            flash::merge(&elf, &partitions, &merged)?;
+            println!("merged image at {}", merged.display());
+            flash::flash(&mut link, &merged, entry.into())
+        }
+        Command::CommsListen {
+            seconds,
+            entry,
+            leave_open,
+        } => flash::listen(&mut link, seconds, entry.into(), leave_open),
     }
 }
 
@@ -201,5 +297,50 @@ fn dump(from: u32, bytes: &[u8]) {
             print!(" {byte:02x}");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn a_flash_takes_the_knock_or_the_strap_and_refuses_a_plain_reset() {
+        let knock = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
+        assert!(matches!(
+            knock.command,
+            Command::FlashComms {
+                entry: FlashEntry::Knock,
+                ..
+            }
+        ));
+        let strap =
+            Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "strap"])
+                .expect("parses");
+        assert!(matches!(
+            strap.command,
+            Command::FlashComms {
+                entry: FlashEntry::Strap,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "reset"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn listening_still_takes_the_plain_reset() {
+        let listen = Cli::try_parse_from(["o89-dev", "comms-listen"]).expect("parses");
+        assert!(matches!(
+            listen.command,
+            Command::CommsListen {
+                entry: Entry::Reset,
+                ..
+            }
+        ));
     }
 }

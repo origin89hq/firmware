@@ -387,6 +387,38 @@ fn l_033_a_request_before_the_link_is_up_is_refused_with_258() {
 }
 
 #[test]
+fn l_113_a_module_taken_for_a_flash_suspends_the_ladder_and_records_no_loss() {
+    // Capabilities: none; the bench takes the module once the link is up to
+    // install an image through its ROM, which is an install in flight.
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(3_000));
+    assert!(bench.link.is_up());
+    let taken = bench.link.module_taken();
+    assert!(!bench.link.is_up());
+    let actions: Vec<Action> = (&taken).into_iter().copied().collect();
+    assert_eq!(
+        actions,
+        vec![Action::DropConnections(DropReason::ModuleTaken)],
+        "connections drop, and no loss is logged"
+    );
+    // Ninety seconds with the module in its ROM: nothing is said to it,
+    // nothing is recorded, and the rail is never cut.
+    let mut now = bench.now;
+    for _ in 0..9_000 {
+        now = now.after(STEP).expect("fits");
+        let ticked = bench.link.tick(now, false);
+        assert_eq!((&ticked).into_iter().count(), 0, "silent at {now:?}");
+    }
+    // Given back, the module is stated to as after any power-up.
+    let settled = bench.link.module_settled(now);
+    assert!(
+        (&settled)
+            .into_iter()
+            .any(|action| matches!(action, Action::Send(Outgoing::LinkUp { .. })))
+    );
+}
+
+#[test]
 fn l_181_an_error_from_the_peer_is_noted_and_never_answered() {
     // Capabilities: none.
     let mut bench = Bench::new(Capabilities::default());

@@ -140,6 +140,8 @@ pub enum DropReason {
     LinkLost,
     /// The comms processor came back with another `boot_id` (L-041).
     CommsRebooted,
+    /// The bench took the module into its ROM (F-038).
+    ModuleTaken,
 }
 
 /// A record the ring gets.
@@ -463,6 +465,25 @@ impl Link {
     #[must_use]
     pub const fn last_heard(&self) -> Option<Tick> {
         self.last_heard
+    }
+
+    /// The bench took the module into its ROM (F-038). Whatever the link
+    /// was, it is down and every connection goes, and nothing is recorded
+    /// as lost, because the controller did it on purpose; nothing is said
+    /// and no silence is measured until [`Link::module_settled`] reports the
+    /// module reset normally.
+    pub fn module_taken(&mut self) -> Actions {
+        let mut actions = Actions::NONE;
+        if let Phase::Up { .. } = self.phase {
+            actions.push(Action::DropConnections(DropReason::ModuleTaken));
+        }
+        self.phase = Phase::Down { next_linkup: None };
+        // A request to a module in its ROM will never be answered, and no
+        // answer to a beat before it counts.
+        self.requests.forget();
+        self.beats.forget();
+        self.cut_pending = false;
+        actions
     }
 
     /// What the rail sequencer answered a [`Action::CutRail`] with.

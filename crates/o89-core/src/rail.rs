@@ -19,7 +19,7 @@
 //!
 //! cites: F-004, F-005
 
-use crate::{Millis, Revision, ThirdRung, Tick};
+use crate::{Millis, RailThroughReset, Revision, ThirdRung, Tick};
 
 /// What the rail line is asked to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,19 @@ pub enum EnLine {
     Released,
 }
 
-/// The two lines, as the adapter should drive them right now.
+/// What the `BOOT` strap, the module's IO9, is asked to be. Never driven
+/// high, for the same reason as `EN` (F-003): low across a reset selects
+/// the ROM's download mode, and the module's own pull-up owns it released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BootLine {
+    /// Driven low: the ROM reads it at the reset and enters download mode.
+    HeldLow,
+    /// High-impedance: a normal boot.
+    Released,
+}
+
+/// The three lines, as the adapter should drive them right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Lines {
@@ -51,6 +63,20 @@ pub struct Lines {
     pub rail: RailLine,
     /// `EN`.
     pub en: EnLine,
+    /// `BOOT`, IO9.
+    pub boot: BootLine,
+}
+
+/// Which boot a module reset is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ModuleBoot {
+    /// The straps released: the module boots its firmware.
+    Normal,
+    /// IO9 held low across the reset: the ROM's serial download mode, the
+    /// strapping route into the window (F-038). On revision A it needs
+    /// IO8 held high by a wire (hardware#6); revision B wires that pull-up.
+    Download,
 }
 
 /// What a step of the sequence wants written down.
@@ -104,12 +130,37 @@ const HOUR: Millis = Millis::from_millis(60 * 60 * 1_000);
 /// Cycles in an hour after which the third rung applies (L-112).
 const CYCLES_BEFORE_THE_THIRD_RUNG: usize = 3;
 
+/// What a request to reset the module, rail on, did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a reset nobody waits for is a window nobody uses"]
+pub enum ModuleReset {
+    /// `EN` is held low; the rail stays on, and the module boots when it
+    /// is released, which is the `Settled` the tick reports.
+    Holding,
+    /// The rail is off or in a cycle: nothing to reset.
+    NotPowered,
+}
+
+/// How long `EN` is held for a reset with the rail on: the RC on the line
+/// is 10 ms, and the module wants its reset held for more than that.
+pub const EN_HELD: Millis = Millis::from_millis(50);
+
+/// How long the strap stays low after `EN` is released: the reset's RC is
+/// 10 ms and the ROM reads its straps as it comes out of reset, so a
+/// hundred is ten of those.
+pub const STRAP_HELD: Millis = Millis::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Rail off, `EN` held low, until the moment the rail comes back.
     Cut { until: Tick },
-    /// Rail on, `EN` held low, until the rail has settled.
-    Rising { until: Tick },
+    /// Rail on, `EN` held low, until the rail has settled; the strap held
+    /// with it when the boot is for download.
+    Rising { until: Tick, strap: bool },
+    /// Rail on, `EN` released, the strap still low until the ROM has read
+    /// it.
+    Strapping { until: Tick },
     /// Rail on, `EN` released.
     Up,
     /// Rail off and nothing scheduled: the state before the first power-on.
@@ -130,9 +181,9 @@ impl RailSequencer {
     /// reset, off on revision A and on on revision B.
     #[must_use]
     pub const fn new(revision: Revision) -> Self {
-        let phase = match revision {
-            Revision::A => Phase::Off,
-            Revision::B => Phase::Up,
+        let phase = match revision.rail_through_reset() {
+            RailThroughReset::Off => Phase::Off,
+            RailThroughReset::On => Phase::Up,
         };
         Self {
             revision,
@@ -148,6 +199,7 @@ impl RailSequencer {
         if let Phase::Off = self.phase {
             self.phase = Phase::Rising {
                 until: now.after(SETTLE).unwrap_or(now),
+                strap: false,
             };
         }
         self.lines()
@@ -155,7 +207,7 @@ impl RailSequencer {
 
     /// The ladder asks for a recovery: a cut, or the third rung.
     pub fn recover(&mut self, now: Tick) -> Recovery {
-        if let Phase::Cut { .. } | Phase::Rising { .. } = self.phase {
+        if let Phase::Cut { .. } | Phase::Rising { .. } | Phase::Strapping { .. } = self.phase {
             return Recovery::Busy;
         }
         let recent = self.cycles_within(HOUR, now);
@@ -168,6 +220,34 @@ impl RailSequencer {
         self.cut(now, CUT)
     }
 
+    /// Reset the module with the rail on: `EN` held low for [`EN_HELD`],
+    /// then released, which is a module boot the link sees as `Settled`.
+    /// The bench's way into the download window (KM43 L-192), which is
+    /// sent only after a reset the controller performed.
+    pub fn reset_module(&mut self, now: Tick, boot: ModuleBoot) -> ModuleReset {
+        let held = now.after(EN_HELD).unwrap_or(now);
+        match self.phase {
+            Phase::Up | Phase::Rising { .. } | Phase::Strapping { .. } => {
+                // A reset asked while the rail is still settling keeps the
+                // settling's deadline when it is the later one: EN is never
+                // released before the rail has settled (F-004, F-006).
+                let until = match self.phase {
+                    Phase::Rising { until, .. } => until.max(held),
+                    Phase::Up | Phase::Strapping { .. } | Phase::Cut { .. } | Phase::Off => held,
+                };
+                self.phase = Phase::Rising {
+                    until,
+                    strap: match boot {
+                        ModuleBoot::Normal => false,
+                        ModuleBoot::Download => true,
+                    },
+                };
+                ModuleReset::Holding
+            }
+            Phase::Cut { .. } | Phase::Off => ModuleReset::NotPowered,
+        }
+    }
+
     /// Advance by time: the rail comes back at the end of a cut, and `EN`
     /// is released once the rail has settled.
     pub fn tick(&mut self, now: Tick) -> Option<RailEvent> {
@@ -175,39 +255,76 @@ impl RailSequencer {
             Phase::Cut { until } if now >= until => {
                 self.phase = Phase::Rising {
                     until: now.after(SETTLE).unwrap_or(now),
+                    strap: false,
                 };
                 let count = self.cycles_within(HOUR, now);
                 Some(RailEvent::PowerCycled {
                     count: u8::try_from(count).unwrap_or(u8::MAX),
                 })
             }
-            Phase::Rising { until } if now >= until => {
+            Phase::Rising { until, strap: true } if now >= until => {
+                // `EN` released with the strap still low: the ROM reads it
+                // as the reset lets go. The rail has settled and the module
+                // is booting, which is what the link waits for; the strap
+                // is released on its own clock, and the ROM's first words
+                // are on the UART the link builds now.
+                self.phase = Phase::Strapping {
+                    until: now.after(STRAP_HELD).unwrap_or(now),
+                };
+                Some(RailEvent::Settled)
+            }
+            Phase::Rising {
+                until,
+                strap: false,
+            } if now >= until => {
                 self.phase = Phase::Up;
                 Some(RailEvent::Settled)
             }
-            Phase::Cut { .. } | Phase::Rising { .. } | Phase::Up | Phase::Off => None,
+            Phase::Strapping { until } if now >= until => {
+                self.phase = Phase::Up;
+                None
+            }
+            Phase::Cut { .. }
+            | Phase::Rising { .. }
+            | Phase::Strapping { .. }
+            | Phase::Up
+            | Phase::Off => None,
         }
     }
 
-    /// How the two lines should be driven right now.
+    /// How the three lines should be driven right now.
     #[must_use]
     pub const fn lines(&self) -> Lines {
         match self.phase {
             Phase::Cut { .. } => Lines {
                 rail: RailLine::Off,
                 en: EnLine::HeldLow,
+                boot: BootLine::Released,
             },
-            Phase::Rising { .. } => Lines {
+            Phase::Rising { strap: false, .. } => Lines {
                 rail: RailLine::On,
                 en: EnLine::HeldLow,
+                boot: BootLine::Released,
+            },
+            Phase::Rising { strap: true, .. } => Lines {
+                rail: RailLine::On,
+                en: EnLine::HeldLow,
+                boot: BootLine::HeldLow,
+            },
+            Phase::Strapping { .. } => Lines {
+                rail: RailLine::On,
+                en: EnLine::Released,
+                boot: BootLine::HeldLow,
             },
             Phase::Up => Lines {
                 rail: RailLine::On,
                 en: EnLine::Released,
+                boot: BootLine::Released,
             },
             Phase::Off => Lines {
                 rail: RailLine::Off,
                 en: EnLine::Released,
+                boot: BootLine::Released,
             },
         }
     }
@@ -216,7 +333,7 @@ impl RailSequencer {
     /// configured (F-006).
     #[must_use]
     pub const fn settled(&self) -> bool {
-        matches!(self.phase, Phase::Up)
+        matches!(self.phase, Phase::Up | Phase::Strapping { .. })
     }
 
     fn cut(&mut self, now: Tick, off_for: Millis) -> Recovery {
@@ -298,7 +415,8 @@ mod tests {
             seq.lines(),
             Lines {
                 rail: RailLine::Off,
-                en: EnLine::HeldLow
+                en: EnLine::HeldLow,
+                boot: BootLine::Released
             }
         );
         // Through the cut and the rise, EN never leaves low while the rail
@@ -316,7 +434,8 @@ mod tests {
             seq.lines(),
             Lines {
                 rail: RailLine::On,
-                en: EnLine::Released
+                en: EnLine::Released,
+                boot: BootLine::Released
             }
         );
     }
@@ -330,7 +449,8 @@ mod tests {
             seq.power_on(at(0)),
             Lines {
                 rail: RailLine::On,
-                en: EnLine::HeldLow
+                en: EnLine::HeldLow,
+                boot: BootLine::Released
             }
         );
         assert_eq!(run(&mut seq, 0, 99), NONE);
@@ -436,5 +556,150 @@ mod tests {
         assert!(matches!(seq.recover(at(1_000)), Recovery::Cycling { .. }));
         assert_eq!(seq.recover(at(2_000)), Recovery::Busy);
         assert_eq!(seq.lines().rail, RailLine::Off);
+    }
+
+    #[test]
+    fn a_module_reset_holds_en_with_the_rail_on_and_settles_when_released() {
+        let mut rail = RailSequencer::new(Revision::A);
+        let _ = rail.power_on(Tick::from_millis(0));
+        assert_eq!(rail.tick(Tick::from_millis(100)), Some(RailEvent::Settled));
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(1_000), ModuleBoot::Normal),
+            ModuleReset::Holding
+        );
+        assert_eq!(
+            rail.lines(),
+            Lines {
+                rail: RailLine::On,
+                en: EnLine::HeldLow,
+                boot: BootLine::Released
+            }
+        );
+        assert_eq!(rail.tick(Tick::from_millis(1_040)), None);
+        assert_eq!(
+            rail.tick(Tick::from_millis(1_050)),
+            Some(RailEvent::Settled)
+        );
+        assert_eq!(
+            rail.lines(),
+            Lines {
+                rail: RailLine::On,
+                en: EnLine::Released,
+                boot: BootLine::Released
+            }
+        );
+    }
+
+    #[test]
+    fn a_strapped_reset_holds_the_boot_line_low_across_the_reset_and_releases_it_after() {
+        let mut rail = RailSequencer::new(Revision::A);
+        let _ = rail.power_on(Tick::from_millis(0));
+        assert_eq!(rail.tick(Tick::from_millis(100)), Some(RailEvent::Settled));
+        assert_eq!(rail.lines().boot, BootLine::Released, "a normal boot");
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(1_000), ModuleBoot::Download),
+            ModuleReset::Holding
+        );
+        assert_eq!(
+            rail.lines(),
+            Lines {
+                rail: RailLine::On,
+                en: EnLine::HeldLow,
+                boot: BootLine::HeldLow,
+            },
+            "the strap is low before the reset lets go"
+        );
+        // `EN` released, the strap still low for the ROM to read: settled
+        // for the link, which builds its UART in time for the ROM's banner.
+        assert_eq!(
+            rail.tick(Tick::from_millis(1_050)),
+            Some(RailEvent::Settled)
+        );
+        assert!(rail.settled());
+        assert_eq!(
+            rail.lines(),
+            Lines {
+                rail: RailLine::On,
+                en: EnLine::Released,
+                boot: BootLine::HeldLow,
+            }
+        );
+        assert!(matches!(
+            rail.recover(Tick::from_millis(1_060)),
+            Recovery::Busy
+        ));
+        assert_eq!(rail.tick(Tick::from_millis(1_140)), None);
+        assert_eq!(rail.tick(Tick::from_millis(1_150)), None);
+        assert_eq!(
+            rail.lines(),
+            Lines {
+                rail: RailLine::On,
+                en: EnLine::Released,
+                boot: BootLine::Released,
+            },
+            "released once read"
+        );
+        // A normal reset after it never touches the strap.
+        let _ = rail.reset_module(Tick::from_millis(2_000), ModuleBoot::Normal);
+        assert_eq!(rail.lines().boot, BootLine::Released);
+        let _ = rail.tick(Tick::from_millis(2_050));
+        assert_eq!(rail.lines().boot, BootLine::Released);
+    }
+
+    #[test]
+    fn f_004_a_reset_asked_while_the_rail_settles_never_releases_en_early() {
+        let mut rail = RailSequencer::new(Revision::A);
+        let _ = rail.power_on(Tick::from_millis(0));
+        // Ten milliseconds into the rail's settling, a reset for download.
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(10), ModuleBoot::Download),
+            ModuleReset::Holding
+        );
+        assert_eq!(rail.lines().en, EnLine::HeldLow);
+        // Its own fifty milliseconds would end at 60; the rail settles at 100.
+        assert_eq!(rail.tick(Tick::from_millis(60)), None);
+        assert_eq!(rail.lines().en, EnLine::HeldLow, "EN still held at 60 ms");
+        assert_eq!(rail.tick(Tick::from_millis(99)), None);
+        assert_eq!(
+            rail.tick(Tick::from_millis(100)),
+            Some(RailEvent::Settled),
+            "released with the settling, strap still low"
+        );
+        assert_eq!(rail.lines().boot, BootLine::HeldLow);
+        // Late in the settling, the reset's own hold is the later deadline.
+        let mut late = RailSequencer::new(Revision::A);
+        let _ = late.power_on(Tick::from_millis(0));
+        let _ = late.reset_module(Tick::from_millis(90), ModuleBoot::Normal);
+        assert_eq!(late.tick(Tick::from_millis(100)), None);
+        assert_eq!(late.tick(Tick::from_millis(140)), Some(RailEvent::Settled));
+    }
+
+    #[test]
+    fn a_module_reset_with_the_rail_off_or_cut_resets_nothing_and_counts_no_cycle() {
+        let mut rail = RailSequencer::new(Revision::A);
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(0), ModuleBoot::Normal),
+            ModuleReset::NotPowered
+        );
+        let _ = rail.power_on(Tick::from_millis(0));
+        let _ = rail.tick(Tick::from_millis(100));
+        let cycling = rail.recover(Tick::from_millis(200));
+        assert!(matches!(cycling, Recovery::Cycling { count: 1, .. }));
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(300), ModuleBoot::Normal),
+            ModuleReset::NotPowered
+        );
+        // The reset is not a rail cycle: the ladder's count does not move.
+        let _ = rail.tick(Tick::from_millis(5_200));
+        let _ = rail.tick(Tick::from_millis(5_300));
+        assert_eq!(
+            rail.reset_module(Tick::from_millis(6_000), ModuleBoot::Normal),
+            ModuleReset::Holding
+        );
+        let _ = rail.tick(Tick::from_millis(6_050));
+        assert!(matches!(
+            rail.recover(Tick::from_millis(7_000)),
+            Recovery::Cycling { count: 2, .. }
+        ));
     }
 }

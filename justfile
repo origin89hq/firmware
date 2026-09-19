@@ -60,6 +60,7 @@ skills-sync:
 
 chip := "STM32G0B1RETx"
 controller_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-controller"
+comms_elf := "firmwares/target/riscv32imac-unknown-none-elf/release/o89-comms"
 boot_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-boot"
 boot_bin := "firmwares/target/thumbv6m-none-eabi/release/o89-boot.bin"
 
@@ -208,3 +209,27 @@ dev-erase-nor block count="1" *args:
 # RESET the controller through the firmware's mailbox.
 dev-reboot *args:
     cargo run -q -p o89-dev -- {{args}} reboot
+
+# FLASH the comms image onto the module through the controller (F-038):
+# the firmware resets the module, knocks inside its download window and
+# bridges the ROM's UART to the mailbox; esptool writes the merged image,
+# bootloader and partition table included, at address 0. Effect: whatever
+# the module ran is replaced; the module reboots on the new image when
+# esptool is done. Recovery: run it again with `--entry strap` and, on
+# revision A, a wire holding IO8 high (hardware#6): a transfer that dies
+# after the erase leaves a module that boots nothing and never enters the
+# ROM's loader by itself, which is #1. Needs `uvx` for esptool. The images
+# are built first, so what is flashed is the source as it stands.
+#
+# FLASH the comms image onto the module through the controller; replaces what it ran.
+dev-flash-comms *args: sizes
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} {{args}}
+
+# LISTEN to the module through the bridge: the firmware resets it, by
+# `--entry reset` (the default), `knock` or `strap`, and prints what it
+# says on its UART0 for a few seconds, then resets it normally. Effect: two
+# module resets. Recovery: none needed.
+#
+# LISTEN to what the module says after a reset, through the controller.
+dev-comms-listen *args:
+    cargo run -q -p o89-dev -- comms-listen {{args}}

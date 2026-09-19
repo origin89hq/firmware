@@ -9,10 +9,11 @@
 MEMORY
 {
   FLASH : ORIGIN = 0x08002000, LENGTH = 248K
-  RAM   : ORIGIN = 0x20000000, LENGTH = 140K
-  /* The bench tool's mailbox: the last 4 KiB, out of the stack's way and
-   * never loaded or zeroed by the runtime, at the address o89-core names. */
-  MAILBOX : ORIGIN = 0x20023000, LENGTH = 4K
+  RAM   : ORIGIN = 0x20000000, LENGTH = 136K
+  /* The bench tool's mailbox and the bridge's rings: the last 8 KiB, out
+   * of the stack's way and never loaded or zeroed by the runtime, at the
+   * address o89-core names. */
+  MAILBOX : ORIGIN = 0x20022000, LENGTH = 8K
 }
 
 /* The vector table is 0xBC bytes. Right after it, at 0xC0, the linker writes

@@ -8,6 +8,13 @@
 //! an `if` in an adapter. `BOARD-A.md` carries the whole table with the
 //! issues behind each row.
 //!
+//! This file is the whole list of what revision A makes the firmware do
+//! differently: every method below has an arm per revision and nothing else
+//! in the tree matches on [`Revision`]. The `B` arms are written from the
+//! hardware repository's decisions before a revision B board exists, so
+//! moving to one is the constant in the board module and a bench that
+//! confirms each arm, not a search.
+//!
 //! cites: F-005, F-012, F-014
 
 use crate::Millis;
@@ -20,6 +27,20 @@ pub enum Revision {
     A,
     /// The rework decided on origin89hq/hardware#48 and #51.
     B,
+}
+
+/// Whether the strap alone enters the ROM's serial download mode, which
+/// the board decides: the controller drives IO9, and the ROM wants IO8 high
+/// with it, or it picks its USB-only mode (hardware#6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum StrapRoute {
+    /// IO8 floats and reads low: the route works only with a wire holding
+    /// IO8 high, so it is the bench's, never the firmware's own.
+    NeedsIo8Wire,
+    /// IO8 is pulled up (hardware#48): the strap alone is enough, and the
+    /// firmware may take this route by itself.
+    Wired,
 }
 
 /// What the module rail does through a controller reset, which the board
@@ -87,6 +108,16 @@ impl Revision {
         match self {
             Self::A => REVISION_A_LONGEST_OFF,
             Self::B => THIRD_RUNG_CUT,
+        }
+    }
+
+    /// How the ROM's strapping route into download mode is reached on this
+    /// board: with IO9 held low across a reset, the ROM reads IO8 too.
+    #[must_use]
+    pub const fn strap_route(self) -> StrapRoute {
+        match self {
+            Self::A => StrapRoute::NeedsIo8Wire,
+            Self::B => StrapRoute::Wired,
         }
     }
 
