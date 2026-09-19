@@ -27,9 +27,9 @@
 
 use km43::{
     ClientConnected, ClientDisconnected, ClientDown, ClientDownAck, ClientUp, ClientUpAck,
-    ClockOffer, ErrorBody, EventKind, FrameError, FrameWriter, Header, Heartbeat, Incoming, Intake,
-    LinkEnvelope, LinkError, LinkErrorCode, LinkHeader, LinkMessageType, LinkUp, MAX_INFLIGHT,
-    MAX_LINK_TEXT, MessageType, ReqId, SessionId, Side, TimeOffer, TimeVerdict, Version, arriving,
+    ClockOffer, EventKind, FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkError, LinkErrorCode,
+    LinkMessageType, LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, ReqId, Side, TimeOffer, TimeVerdict,
+    Version, arriving,
 };
 use sha2::{Digest, Sha256};
 
@@ -37,27 +37,17 @@ use crate::BootCount;
 use crate::rail::Recovery;
 use crate::text::Text;
 use crate::tick::{Millis, Tick};
+use o89_link::{
+    Beats, LINK_ENVELOPE, Overdue, Requests, crosses_mismatch, frame_refusal, is_peer_refusal,
+    link_header, refused_before_link,
+};
 
-/// A heartbeat every two seconds (L-100).
-pub const HEARTBEAT_PERIOD: Millis = Millis::from_millis(2_000);
-/// Three missed heartbeats: the link is dead (L-100, L-110).
-pub const DEAD_AFTER: Millis = Millis::from_millis(6_000);
+pub use o89_link::{
+    ATTEMPTS, DEAD_AFTER, EncodeError, HEARTBEAT_PERIOD, LINKUP_PERIOD, OURS, RESPONSE_TIMEOUT,
+};
 
-/// The heartbeats whose answers still count: three periods, the whole of
-/// the dead-link timer (L-100).
-const BEATS_REMEMBERED: usize = 3;
 /// Sixty seconds of silence: the rail is cut (L-111).
 pub const CUT_AFTER: Millis = Millis::from_millis(60_000);
-/// A request unanswered this long has failed (L-015).
-pub const RESPONSE_TIMEOUT: Millis = Millis::from_millis(500);
-/// Attempts before a request is given up (L-015).
-pub const ATTEMPTS: u8 = 3;
-/// How often `LinkUp` goes out while the link is down: the cadence L-120
-/// gives the other side, so both are built to one number.
-pub const LINKUP_PERIOD: Millis = Millis::from_millis(2_000);
-
-/// The version of the link this firmware speaks.
-pub const OURS: Version = Version::V1_0;
 
 /// A text field on this link: 32 bytes (`fw`, `hw`).
 pub type LinkText = Text<MAX_LINK_TEXT>;
@@ -342,24 +332,6 @@ impl<'a> IntoIterator for &'a Actions {
     }
 }
 
-/// Why a frame did not encode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncodeError {
-    /// The body would not write.
-    Body,
-    /// The envelope would not frame into `dst`.
-    Frame(FrameError),
-}
-
-/// A request of ours the peer has not answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Outstanding {
-    req_id: ReqId,
-    kind: LinkMessageType,
-    sent: Tick,
-    attempts: u8,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Nothing exchanged, or the link fell: `LinkUp` goes out on its
@@ -402,11 +374,11 @@ pub struct Link {
     cut_pending: bool,
     /// The third rung was raised and not yet cleared by the link coming up.
     raised: bool,
-    outstanding: [Option<Outstanding>; MAX_INFLIGHT],
-    /// The request ids of the last heartbeats sent, newest first: only an
-    /// answer to one of these is the peer heard (L-100). An answer to a
-    /// beat older than these is older than the dead-link timer.
-    beats_sent: [Option<ReqId>; BEATS_REMEMBERED],
+    /// Our requests in flight (L-014, L-015).
+    requests: Requests<MAX_INFLIGHT>,
+    /// Our last heartbeats: only the first answer to one of these is the
+    /// peer heard (L-100).
+    beats: Beats,
     next_req_id: u32,
     /// Refusals and abandoned runs since the module last booted (F-031).
     noise: u32,
@@ -430,8 +402,8 @@ impl Link {
             earliest_cut: now.after(CUT_AFTER).unwrap_or(now),
             cut_pending: false,
             raised: false,
-            outstanding: [None; MAX_INFLIGHT],
-            beats_sent: [None; BEATS_REMEMBERED],
+            requests: Requests::NONE,
+            beats: Beats::NONE,
             next_req_id: 1,
             noise: 0,
             conns: 0,
@@ -516,10 +488,7 @@ impl Link {
     /// A frame from the peer, decoded by the adapter.
     pub fn received(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Actions {
         let mut actions = Actions::NONE;
-        if envelope.opcode() == MessageType::ErrorResponse as u8
-            && envelope.session() == SessionId::None
-            && envelope.req_id() == ReqId(0)
-        {
+        if is_peer_refusal(&envelope) {
             // The peer refused something of ours. It stays on the UART and is
             // never answered with another error (L-181); it carries no
             // request id to match, so nothing waits on it. An error with a
@@ -540,7 +509,7 @@ impl Link {
             compat: Compat::MajorMismatch { .. },
             ..
         } = self.phase
-            && !link_local_only(kind)
+            && !crosses_mismatch(Side::Controller, kind)
         {
             Self::refuse(LinkErrorCode::LinkMajorMismatch, &mut actions);
             return actions;
@@ -556,7 +525,7 @@ impl Link {
                 Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
             },
             LinkMessageType::LinkUpAck => {
-                if !self.awaiting(req_id, LinkMessageType::LinkUp) {
+                if !self.requests.awaits(req_id, LinkMessageType::LinkUp) {
                     actions.push(Action::Note(Note::UnexpectedAck(kind)));
                     return actions;
                 }
@@ -566,7 +535,7 @@ impl Link {
                 match LinkUp::decode(envelope) {
                     Ok(theirs) => {
                         if let Some((peer, compat)) = Self::accept(&theirs, &mut actions) {
-                            let _ = self.answered(req_id, LinkMessageType::LinkUp);
+                            let _ = self.requests.answered(req_id, LinkMessageType::LinkUp);
                             self.linked(peer, compat, now, &mut actions);
                         }
                     }
@@ -589,17 +558,13 @@ impl Link {
                 // Heard only as the first answer to a beat of ours, which it
                 // uses up: an answer to nothing, or one replayed, proves
                 // nothing about whether the peer hears.
-                Ok(_) => match self
-                    .beats_sent
-                    .iter_mut()
-                    .find(|sent| **sent == Some(req_id))
-                {
-                    Some(sent) => {
-                        *sent = None;
+                Ok(_) => {
+                    if self.beats.answered(req_id) {
                         self.heard(now);
+                    } else {
+                        actions.push(Action::Note(Note::UnexpectedAck(kind)));
                     }
-                    None => actions.push(Action::Note(Note::UnexpectedAck(kind))),
-                },
+                }
                 Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
             },
             LinkMessageType::ClientConnected
@@ -607,9 +572,12 @@ impl Link {
             | LinkMessageType::TimeOffer => self.answer(kind, envelope, &mut actions),
             LinkMessageType::CloseConnectionAck
             | LinkMessageType::NetConfigAck
-            | LinkMessageType::CommsReleaseAck => {
-                // Requests this firmware does not send yet, so nothing waits;
-                // an acknowledgement nobody asked for is not a heartbeat.
+            | LinkMessageType::CommsReleaseAck
+            | LinkMessageType::EnterDownloadAck => {
+                // Requests this firmware does not send yet, so nothing
+                // waits; the download request is the bench tool's, through
+                // its own path, and an acknowledgement nobody asked for is
+                // not a heartbeat.
                 actions.push(Action::Note(Note::UnexpectedAck(kind)));
             }
             LinkMessageType::ClientConnectedAck
@@ -617,7 +585,8 @@ impl Link {
             | LinkMessageType::CloseConnection
             | LinkMessageType::NetConfig
             | LinkMessageType::TimeOfferAck
-            | LinkMessageType::CommsRelease => {
+            | LinkMessageType::CommsRelease
+            | LinkMessageType::EnterDownload => {
                 // `arriving` refuses these at this side; an arm so that a
                 // change to the direction table lands here and not in a
                 // wildcard.
@@ -635,6 +604,10 @@ impl Link {
     /// refused with 258. Until the session layer and the clock exist every
     /// answer is a refusal the peer can act on, never silence.
     fn answer(&mut self, kind: LinkMessageType, envelope: LinkEnvelope<'_>, actions: &mut Actions) {
+        if !self.is_up() && refused_before_link(Side::Controller, kind) {
+            Self::refuse(LinkErrorCode::BeforeLinkUp, actions);
+            return;
+        }
         let req_id = envelope.req_id();
         let outgoing = match kind {
             LinkMessageType::ClientConnected => ClientUp::decode(envelope).map(|_| {
@@ -645,10 +618,6 @@ impl Link {
                 };
                 Outgoing::ClientUpAck { req_id, outcome }
             }),
-            LinkMessageType::ClientDisconnected | LinkMessageType::TimeOffer if !self.is_up() => {
-                Self::refuse(LinkErrorCode::BeforeLinkUp, actions);
-                return;
-            }
             LinkMessageType::ClientDisconnected => {
                 ClientDown::decode(envelope).map(|_| Outgoing::ClientDownAck {
                     req_id,
@@ -673,7 +642,9 @@ impl Link {
             | LinkMessageType::NetConfigAck
             | LinkMessageType::TimeOfferAck
             | LinkMessageType::CommsRelease
-            | LinkMessageType::CommsReleaseAck => {
+            | LinkMessageType::CommsReleaseAck
+            | LinkMessageType::EnterDownload
+            | LinkMessageType::EnterDownloadAck => {
                 // Not a request of the peer's; `received` never sends these
                 // here, and an arm keeps a new opcode from landing in a
                 // wildcard.
@@ -771,17 +742,19 @@ impl Link {
                 self.heartbeat(LinkMessageType::HeartbeatAck, req_id, now, &mut envelope)
             }
             Outgoing::ClientUpAck { req_id, outcome } => ClientUpAck { outcome }.write(
-                header(LinkMessageType::ClientConnectedAck, req_id),
+                link_header(LinkMessageType::ClientConnectedAck, req_id),
                 &mut envelope,
             ),
             Outgoing::ClientDownAck { req_id, outcome } => ClientDownAck { outcome }.write(
-                header(LinkMessageType::ClientDisconnectedAck, req_id),
+                link_header(LinkMessageType::ClientDisconnectedAck, req_id),
                 &mut envelope,
             ),
-            Outgoing::TimeVerdict { req_id, outcome } => TimeVerdict { outcome }
-                .write(header(LinkMessageType::TimeOfferAck, req_id), &mut envelope),
+            Outgoing::TimeVerdict { req_id, outcome } => TimeVerdict { outcome }.write(
+                link_header(LinkMessageType::TimeOfferAck, req_id),
+                &mut envelope,
+            ),
             Outgoing::Refuse { code } => {
-                return Self::refusal(code, writer, dst);
+                return frame_refusal(code, writer, dst);
             }
         }
         .map_err(|_: LinkError| EncodeError::Body)?;
@@ -803,7 +776,7 @@ impl Link {
             hw: self.identity.hw.as_str(),
             net_version: None,
         }
-        .write(header(kind, req_id), dst)
+        .write(link_header(kind, req_id), dst)
     }
 
     fn heartbeat(
@@ -817,36 +790,13 @@ impl Link {
             uptime_s: self.uptime_s(now),
             conns: self.conns,
         }
-        .write(header(kind, req_id), dst)
-    }
-
-    fn refusal(
-        code: LinkErrorCode,
-        writer: &mut FrameWriter,
-        dst: &mut [u8],
-    ) -> Result<usize, EncodeError> {
-        let mut envelope = [0u8; LINK_ENVELOPE];
-        let len = ErrorBody {
-            code: Incoming::LinkLocal(code),
-            detail: "",
-        }
-        .write(
-            Header {
-                kind: MessageType::ErrorResponse,
-                session: SessionId::None,
-                req_id: ReqId(0),
-            },
-            &mut envelope,
-        )
-        .map_err(|_| EncodeError::Body)?;
-        let payload = envelope.get(..len).ok_or(EncodeError::Body)?;
-        writer.write(payload, dst).map_err(EncodeError::Frame)
+        .write(link_header(kind, req_id), dst)
     }
 
     /// Seconds since boot, saturating (key 1 of a heartbeat).
     fn uptime_s(&self, now: Tick) -> u32 {
         now.since(self.boot)
-            .map_or(0, |up| up.as_millis().checked_div(1_000).unwrap_or(0))
+            .map_or(0, Millis::as_secs)
             .try_into()
             .unwrap_or(u32::MAX)
     }
@@ -917,7 +867,7 @@ impl Link {
         if let Phase::Up { peer: known, .. } = self.phase
             && known.boot_id != peer.boot_id
         {
-            self.beats_sent = [None; BEATS_REMEMBERED];
+            self.beats.forget();
             actions.push(Action::DropConnections(DropReason::CommsRebooted));
         }
         self.note_rom_text(actions);
@@ -956,7 +906,7 @@ impl Link {
 
     fn down(&mut self, why: DropReason, now: Tick, actions: &mut Actions) {
         // A beat of the link that fell is answered by nothing that counts.
-        self.beats_sent = [None; BEATS_REMEMBERED];
+        self.beats.forget();
         self.phase = Phase::Down {
             next_linkup: Some(now),
         };
@@ -971,10 +921,7 @@ impl Link {
         // missed, and three of those are the dead link (L-100), not a
         // request to retry (L-015).
         let req_id = self.take_req_id();
-        self.beats_sent.rotate_right(1);
-        if let Some(newest) = self.beats_sent.first_mut() {
-            *newest = Some(req_id);
-        }
+        self.beats.sent(req_id);
         actions.push(Action::Send(Outgoing::Heartbeat { req_id }));
     }
 
@@ -985,12 +932,7 @@ impl Link {
         // One `LinkUp` outstanding at a time: a second before the first is
         // answered or given up would be two statements in flight for one
         // answer.
-        if self
-            .outstanding
-            .iter()
-            .flatten()
-            .any(|request| request.kind == LinkMessageType::LinkUp)
-        {
+        if self.requests.in_flight(LinkMessageType::LinkUp) {
             return;
         }
         if let Some(req_id) = self.request(LinkMessageType::LinkUp, now) {
@@ -1000,16 +942,11 @@ impl Link {
 
     /// Issue a request, or nothing when four are outstanding (L-014).
     fn request(&mut self, kind: LinkMessageType, now: Tick) -> Option<ReqId> {
-        let free = self.outstanding.iter().position(Option::is_none)?;
+        if self.requests.is_full() {
+            return None;
+        }
         let req_id = self.take_req_id();
-        let slot = self.outstanding.get_mut(free)?;
-        *slot = Some(Outstanding {
-            req_id,
-            kind,
-            sent: now,
-            attempts: 1,
-        });
-        Some(req_id)
+        self.requests.issue(kind, req_id, now).then_some(req_id)
     }
 
     fn take_req_id(&mut self) -> ReqId {
@@ -1017,14 +954,6 @@ impl Link {
         // Wraps, and may recur: nothing here carries a MAC (L-013).
         self.next_req_id = self.next_req_id.wrapping_add(1);
         req_id
-    }
-
-    /// An answer arrived: whether a request of that kind and id was waiting.
-    /// Whether a request of ours with this id is waiting for its answer.
-    fn awaiting(&self, req_id: ReqId, kind: LinkMessageType) -> bool {
-        self.outstanding.iter().any(|slot| {
-            slot.is_some_and(|request| request.req_id == req_id && request.kind == kind)
-        })
     }
 
     /// The code an error frame carries, if its body reads.
@@ -1039,67 +968,49 @@ impl Link {
         body.u16().ok()
     }
 
-    fn answered(&mut self, req_id: ReqId, kind: LinkMessageType) -> bool {
-        let Some(slot) = self.outstanding.iter_mut().find(|slot| {
-            slot.is_some_and(|request| request.req_id == req_id && request.kind == kind)
-        }) else {
-            return false;
-        };
-        *slot = None;
-        true
-    }
-
     /// Requests unanswered for the timeout go again with the same id, up to
     /// the attempts; past that they are given up (L-015).
     fn retry(&mut self, now: Tick, actions: &mut Actions) {
-        for slot in &mut self.outstanding {
-            let Some(request) = slot else {
-                continue;
-            };
-            let overdue = now
-                .since(request.sent)
-                .is_some_and(|waited| waited.as_millis() >= RESPONSE_TIMEOUT.as_millis());
-            if !overdue {
-                continue;
-            }
-            if request.attempts >= ATTEMPTS {
-                // Given up. The only request tracked before M4 is a
-                // `LinkUp`, which goes out only while unlinked, so there is
-                // no link for L-015 to take down; the first request sent
-                // while linked brings that arm, and heartbeats unanswered
-                // take a link down at six seconds meanwhile (L-100).
-                actions.push(Action::Note(Note::RequestFailed(request.kind)));
-                *slot = None;
-                continue;
-            }
-            request.attempts = request.attempts.saturating_add(1);
-            request.sent = now;
-            let outgoing = match request.kind {
-                LinkMessageType::LinkUp => Outgoing::LinkUp {
-                    req_id: request.req_id,
-                },
-                LinkMessageType::LinkUpAck
-                | LinkMessageType::Heartbeat
-                | LinkMessageType::HeartbeatAck
-                | LinkMessageType::ClientConnected
-                | LinkMessageType::ClientConnectedAck
-                | LinkMessageType::ClientDisconnected
-                | LinkMessageType::ClientDisconnectedAck
-                | LinkMessageType::CloseConnection
-                | LinkMessageType::CloseConnectionAck
-                | LinkMessageType::NetConfig
-                | LinkMessageType::NetConfigAck
-                | LinkMessageType::TimeOffer
-                | LinkMessageType::TimeOfferAck
-                | LinkMessageType::CommsRelease
-                | LinkMessageType::CommsReleaseAck => {
-                    // Nothing else is issued as a request yet; the arm lands
-                    // here when one is.
-                    *slot = None;
-                    continue;
+        // Bounded: each call moves one request on, and no more than
+        // `MAX_INFLIGHT` are in flight to move.
+        for _ in 0..MAX_INFLIGHT {
+            match self.requests.overdue(now) {
+                None => return,
+                Some(Overdue::GivenUp { kind, .. }) => {
+                    // The only request tracked before M4 is a `LinkUp`, which
+                    // goes out only while unlinked, so there is no link for
+                    // L-015 to take down; the first request sent while linked
+                    // brings that arm, and heartbeats unanswered take a link
+                    // down at six seconds meanwhile (L-100).
+                    actions.push(Action::Note(Note::RequestFailed(kind)));
                 }
-            };
-            actions.push(Action::Send(outgoing));
+                Some(Overdue::Resend { kind, req_id }) => match kind {
+                    LinkMessageType::LinkUp => {
+                        actions.push(Action::Send(Outgoing::LinkUp { req_id }));
+                    }
+                    LinkMessageType::LinkUpAck
+                    | LinkMessageType::Heartbeat
+                    | LinkMessageType::HeartbeatAck
+                    | LinkMessageType::ClientConnected
+                    | LinkMessageType::ClientConnectedAck
+                    | LinkMessageType::ClientDisconnected
+                    | LinkMessageType::ClientDisconnectedAck
+                    | LinkMessageType::CloseConnection
+                    | LinkMessageType::CloseConnectionAck
+                    | LinkMessageType::NetConfig
+                    | LinkMessageType::NetConfigAck
+                    | LinkMessageType::TimeOffer
+                    | LinkMessageType::TimeOfferAck
+                    | LinkMessageType::CommsRelease
+                    | LinkMessageType::CommsReleaseAck
+                    | LinkMessageType::EnterDownload
+                    | LinkMessageType::EnterDownloadAck => {
+                        // Nothing else is issued as a request yet; the arm
+                        // lands here when one is.
+                        let _ = self.requests.answered(req_id, kind);
+                    }
+                },
+            }
         }
     }
 
@@ -1109,34 +1020,12 @@ impl Link {
     }
 }
 
-/// The envelopes this side writes are small: two texts of 32, a handful of
-/// integers, a refusal with no detail. A quarter of the payload cap holds
-/// every one with room, and keeps a kilobyte off the task's stack.
-const LINK_ENVELOPE: usize = 256;
-
-const fn header(kind: LinkMessageType, req_id: ReqId) -> LinkHeader {
-    LinkHeader {
-        kind,
-        session: SessionId::None,
-        req_id,
-    }
-}
-
-/// What still crosses under a major mismatch at the controller (L-050).
-const fn link_local_only(kind: LinkMessageType) -> bool {
-    matches!(
-        kind,
-        LinkMessageType::LinkUp
-            | LinkMessageType::LinkUpAck
-            | LinkMessageType::Heartbeat
-            | LinkMessageType::HeartbeatAck
-            | LinkMessageType::CommsReleaseAck
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use km43::{Envelope, FrameReader, LinkEnvelope, MAX_FRAME, MessageType, Received};
+    use km43::{
+        Envelope, ErrorBody, FrameReader, Incoming, LinkEnvelope, MAX_FRAME, MessageType, Received,
+        SessionId,
+    };
 
     use super::*;
     use crate::{BOOT_COUNT_BYTES, Body};
@@ -1354,16 +1243,6 @@ impl defmt::Format for Outgoing {
                 defmt::write!(f, "TimeVerdict({=u32}, {=u8})", req_id.0, *outcome as u8);
             }
             Self::Refuse { code } => defmt::write!(f, "Refuse({=u16})", *code as u16),
-        }
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for EncodeError {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        match self {
-            Self::Body => defmt::write!(f, "Body"),
-            Self::Frame(_) => defmt::write!(f, "Frame"),
         }
     }
 }

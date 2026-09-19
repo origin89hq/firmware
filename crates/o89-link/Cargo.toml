@@ -1,0 +1,23 @@
+[package]
+name = "o89-link"
+version = "0.0.0"
+description = "The link's mechanics both processors share, deciding nothing: the tick, the request and heartbeat bookkeeping, and the rules every link-local frame meets"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `defmt::Format` on the tick types, for the controller's log. Off on the
+# host and on the comms processor, which prints nothing.
+defmt = ["dep:defmt"]
+
+# Below both cores and reaching neither: `o89-core` and `o89-comms-core`
+# depend on this, and the comms processor must never reach `o89-core`.
+[dependencies]
+km43.workspace = true
+defmt = { workspace = true, optional = true }
+
+[lints]
+workspace = true

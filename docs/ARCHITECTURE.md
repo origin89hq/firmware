@@ -113,6 +113,13 @@ crates/
   o89-core/                no_std, no alloc. Decisions, tables, the link-local
                            state machines, the log ring, configuration slots.
                            Names no peripheral. Host-tested.
+  o89-comms-core/          no_std, no alloc. The comms processor's decisions:
+                           the download window's intake and its link-local
+                           state machine. Never reaches o89-core. Host-tested.
+  o89-link/                no_std, no alloc. The link's mechanics both cores
+                           share and neither decides by: the tick, the
+                           requests and beats in flight, the rules every
+                           link-local frame meets. Host-tested.
   o89-drivers/             no_std device dialects: Modbus RTU, EPEver, PZEM DC,
                            PZEM-016, VE.Direct text, Pylontech CAN, DS18B20.
                            Tested against committed captures.
@@ -169,7 +176,10 @@ leaves and contains no `if` about a generator, a threshold or a timeout. That
 is what makes shadow mode a flag and a simulated winter a unit test, and the
 gate enforces it: `cargo xtask check` refuses `o89-comms` depending on
 `o89-core`, and any domain crate depending on a HAL crate or reaching for the
-allocator. If logic needs a board to test, the seam is in the wrong place.
+allocator. The comms processor's own decisions are `o89-comms-core`'s, and
+what the two sides' links share, the tick and the bookkeeping of requests
+and beats, is `o89-link`'s, below both cores, so it is written once. If
+logic needs a board to test, the seam is in the wrong place.
 
 **Time is a tick, not a clock.** Every duration is measured on a monotonic
 millisecond count since boot that a clock write cannot move, because the wall
@@ -856,6 +866,7 @@ shows. An output without a declared fail state is not configured.
 | `RUN`, `KICK`: the generator contact, through board B | Open | Board B's run-enable monostable drops the contact when the kick stops; the firmware drives both lines low at the reset vector before anything else, and the bootloader does the same | ST's system bootloader on an empty flash can drive `RUN` high and pulse `KICK` (origin89hq/hardware#30), so there is never an empty-flash window: dual-bank swap, and `o89-boot` written at manufacture into both banks. Revision B pulls both down at the MCU (A-34). Any reset opens the contact on revision A; revision B's ride-through is 15 s (B-20), and a resumed automatic start re-raises `RUN` within 3 s (F-016) |
 | The three RS-485 transmit lines | High, idle | Firmware, from the reset vector | Through reset the drivers float and hold the buses low (origin89hq/hardware#28). Every image configures all three USARTs |
 | The module lines: transmit, RTS, `EN`, `BOOT` | Inputs, or driven low; never high | Firmware | Input or low from before the rail drops until after it is up, so nothing back-powers an unpowered module (origin89hq/hardware#17, F-003). `EN` is driven low on purpose across every rail cycle and released after the rail settles (origin89hq/hardware#14) |
+| The comms processor's UART0 transmit and RTS, GPIO16 and GPIO5 | Not driven: high-impedance through the module's reset, a brown-out that resets it, and with the rail off | The ESP32-C6's pads (datasheet v1.5, table 2-1); neither net has a pull on board A | Released from reset, GPIO16 is the ROM's UART0 transmit, enabled with a weak pull-up and idle high, and GPIO5 an input with no pull, until the firmware's second statement makes them UART0's TX and RTS. So the controller's `PB7` and `PB4` float while the module is held in reset or unpowered, when USART1 is down (F-003, F-006), and `PB4` floats from the module's reset until the firmware takes its RTS: a controller write there may be held by a CTS reading high, and every write has a deadline and every request a retry (L-015, L-192) |
 | The module rail, `V3V3_ESP` | **On** (L-114) | The board, per revision (A-23); the controller once booted | Below |
 | The VE.Direct receive pull-ups | Off | Firmware | 3.3 V products only, by configuration (origin89hq/hardware#27) |
 | The lamp | Whatever the board leaves it through reset (`BOARD-A.md`) | The supervisor drives the pattern | A lamp showing nothing is a controller that has not reached its supervisor. No hazard |
@@ -970,9 +981,9 @@ and no half-copied window; an interrupted copy is exactly the empty-flash
 window origin89hq/hardware#30 describes, which is why `embassy-boot`'s
 copy-based scheme is not used. The HAL erases and programs either bank but
 never writes option bytes on this part; the bootloader does that through the
-PAC in one audited function, one of the three `unsafe` sites in the firmware,
-with the bootloader's jump into the application and the comms processor's
-download-register write.
+PAC in one audited function, one of the four `unsafe` sites in the firmware,
+with the bootloader's jump into the application, the controller's hard-fault
+handler, and the poll of the supervisor's executor from its interrupt.
 
 The invariants that make A/B what it claims:
 
@@ -1021,17 +1032,33 @@ rolls back independently, and the two are never offline at once.
    reset re-opens the window.
 2. UART0 opened at the link baud with RTS/CTS, before the radio, before the
    scheduler.
-3. **The download window.** For a fixed period the firmware listens for a
-   link-local `EnterDownload` frame from the controller
-   ([origin89hq/km43#30](https://github.com/origin89hq/km43/issues/30)) and
-   for nothing else. On one it acknowledges, sets the ROM's force-download
-   flag (`LP_AON.SYS_CFG` bit 30, the crate's one `unsafe`) and resets into
-   the ROM. It never scans the relayed client stream for anything. The window
-   runs before any code that can crash for a reason of ours.
-4. The scheduler, the heap for the radio blobs, the Wi-Fi station on the
-   cached network, the TRNG seeded from the ADC source so `boot_id` is random
-   before the RF subsystem is up (L-040).
+3. **The download window.** For 1.5 s from its own start the firmware
+   listens for a link-local `EnterDownload` frame from the controller
+   (KM43 L-190 to L-192, from
+   [origin89hq/km43#30](https://github.com/origin89hq/km43/issues/30)) and
+   for nothing else. On one it acknowledges `entering`, sets the ROM's
+   force-download flag (`LP_AON.SYS_CFG` bit 30, a field write the register
+   crate makes safe) and resets into the ROM. It never scans the relayed
+   client stream for anything, and after the window a request is answered
+   `refused_outside_window` and never acted on. The window runs before any
+   code that can crash for a reason of ours, and its having run is what
+   confirms an OTA slot in pending verification (F-036): the proof an image
+   is safe to keep is that it honours the window.
+4. The scheduler (`esp-rtos`, with the embassy executor the link runs on,
+   entered from the HAL's bare entry only now, so nothing of either runs
+   before the window),
+   the heap for the radio blobs, the Wi-Fi station on the cached network,
+   the TRNG seeded from the ADC source so `boot_id` is random before the RF
+   subsystem is up (L-040).
 5. `LinkUp`, then the heartbeat, then transports.
+
+**Nothing on this side prints.** The module's only wire on board A is the
+link, and a console on it would put a person's text into a CRC (#2). What
+the comms processor does is read on the controller's log, its `LinkUp`
+carrying its firmware and `boot_id`; a panic is an immediate reset, a fault
+a hang the watchdog ends the same way, and either shows on the controller
+as a new `boot_id` and the ROM's text counted once. A console on UART1's
+unconnected pins is a bench addition when the radio work needs one.
 
 **A heap only for the radio.** The radio blobs cannot run without one; our
 own code there is written as if it had none, and `o89-comms` never depends
@@ -1039,8 +1066,8 @@ on `o89-core`, which the gate refuses.
 
 **Partitions and recovery.** `otadata`, two OTA slots, a **factory** slot
 that OTA never writes and that always carries the window, a single-network
-credential record, and a web-assets partition; three 2 MB slots and the
-assets fit an 8 MB module. The factory slot is the frozen first release, not
+credential record, and a web-assets partition (`firmwares/o89-comms/partitions.csv`);
+three 2 MB slots and the assets fit an 8 MB module. The factory slot is the frozen first release, not
 a minimal image: a recovery path has to be proven and immutable, and a
 shipped release is both. An OTA image that boots and never confirms healthy
 is rolled back by the ESP-IDF bootloader to the image that was running, which

@@ -112,6 +112,18 @@ run-controller-bench:
 run-controller-bench-halting:
     cd firmwares/o89-controller && cargo run --release --features bench,panic-probe
 
+# FLASH and run the comms image on an ESP32-C6 devkit over the devkit's own
+# USB serial, with espflash's monitor. Never board A: its module has no
+# serial wire but the link, and the image reaches it through the controller.
+# Run from the crate's directory, where the runner finds `partitions.csv`.
+# Effect: the devkit's flash is replaced, partition table included.
+# Recovery: run it again, holding the devkit's BOOT button through its reset
+# if the image does not start.
+#
+# FLASH and run the comms image on a devkit over its own USB serial; never board A.
+run-comms-devkit:
+    cd firmwares/o89-comms && cargo run --release
+
 # Read the defmt log of whatever the controller is running, without flashing
 # or resetting it: the way to read a boot record after a reset the probe did
 # not cause. `elf` is the image on the part, for the log's strings.
