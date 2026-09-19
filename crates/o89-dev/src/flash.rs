@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::layout::{ImageState, OTADATA_LEN, Table, otadata_no_slot, otadata_selecting};
+use crate::layout::{ImageState, OTADATA_LEN, Role, Table, otadata_no_slot, otadata_selecting};
 use crate::link::Link;
 
 /// `download_reason` as the registry numbers `bench`.
@@ -49,7 +49,7 @@ const DRAIN: Duration = Duration::from_millis(500);
 /// table declares. Slot zero always: which slot the bench uses is not
 /// what these runs are about, and a fixed one is a number the operator can
 /// read off `dev-nor`-style dumps without asking what ran last.
-const BENCH_SLOT: u32 = 0;
+const BENCH_SLOT: u8 = 0;
 const OTA_SLOTS: u32 = 2;
 
 /// What the flash writes, and where.
@@ -129,12 +129,12 @@ impl Drop for Scratch {
 /// window, so a transfer that dies anywhere in there leaves a module the
 /// controller can knock at again with no wire on it.
 pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
-    let otadata = table.find("otadata")?;
+    let otadata = table.find(Role::OTA_DATA)?;
     if otadata.size != OTADATA_LEN {
         bail!("{otadata} is not the {OTADATA_LEN:#x} bytes the bootloader reads");
     }
-    let name = format!("ota_{BENCH_SLOT}");
-    let slot = table.find(&name)?;
+    let role = Role::ota(BENCH_SLOT);
+    let slot = table.find(role)?;
     let app_len = u32::try_from(
         std::fs::metadata(app)
             .with_context(|| format!("measuring {}", app.display()))?
@@ -150,13 +150,13 @@ pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
     let selecting = scratch.file("otadata-slot.bin");
     std::fs::write(
         &selecting,
-        otadata_selecting(BENCH_SLOT, OTA_SLOTS, ImageState::New)?,
+        otadata_selecting(u32::from(BENCH_SLOT), OTA_SLOTS, ImageState::New)?,
     )
     .with_context(|| format!("writing {}", selecting.display()))?;
     let plan = Plan {
         says: format!(
-            "writing the application into {name} at {:#x}; the bootloader, the partition table and the factory image stay",
-            slot.offset
+            "writing the application into {} ({role}) at {:#x}; the bootloader, the partition table and the factory image stay",
+            slot.name, slot.offset
         ),
         passes: vec![
             vec![
@@ -199,7 +199,7 @@ const PARTITION_TABLE_END: u32 = 0x9000;
 /// because it is the property the operator is relying on and a slot
 /// offset read out of the wrong row would not otherwise show.
 pub fn keeps_the_recovery_image(plan: &Plan, table: &Table) -> Result<()> {
-    let factory = table.find("factory")?;
+    let factory = table.find(Role::FACTORY)?;
     let factory_end = factory.end()?;
     for write in plan.passes.iter().flatten() {
         let end = write

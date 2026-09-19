@@ -149,6 +149,12 @@ enum Command {
         /// the recovery image alone, or the whole flash, which replaces it.
         #[arg(long, value_enum, default_value_t = Layout::Slot)]
         layout: Layout,
+        /// Acknowledge that `--layout whole` replaces the factory image
+        /// that carries the download window. Required for that layout, and
+        /// meaningless for the slot one. `just dev-flash-comms-whole`
+        /// passes it, having asked first.
+        #[arg(long)]
+        yes: bool,
     },
     /// LISTEN to the module through the bridge: the module is reset by the
     /// firmware and whatever it says on its UART0 for `seconds` is printed,
@@ -191,6 +197,27 @@ enum StoreCommand {
 }
 
 impl Layout {
+    /// Refuse the whole flash unless the operator said so in as many
+    /// words.
+    ///
+    /// The recipe asks before it runs, but the recipe is not the only way
+    /// in: this binary is run directly on the bench, and the one route
+    /// that takes the download window away should not be reachable by a
+    /// flag nobody had to think about.
+    fn permitted(self, yes: bool) -> Result<()> {
+        match self {
+            Self::Slot => Ok(()),
+            Self::Whole if yes => Ok(()),
+            Self::Whole => bail!(
+                "--layout whole replaces the bootloader, the partition table and the factory \
+                 image that carries the download window; from the first erase until it finishes \
+                 the module boots nothing, and on revision A recovering one that boots nothing \
+                 needs a wire holding IO8 high. Pass --yes, or use `just dev-flash-comms-whole`, \
+                 which asks."
+            ),
+        }
+    }
+
     /// The route into the ROM this layout is for, when nobody named one.
     ///
     /// The whole route replaces the factory image, so the modules it
@@ -305,9 +332,11 @@ fn main() -> Result<()> {
             partitions,
             entry,
             layout,
+            yes,
         } => {
             // The generated files live for this flash and go with it.
             let scratch = flash::Scratch::new()?;
+            layout.permitted(yes)?;
             let entry = entry.unwrap_or_else(|| layout.entry());
             let plan = match layout {
                 Layout::Slot => {
@@ -376,6 +405,20 @@ mod tests {
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "reset"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn f_036_the_whole_flash_is_refused_until_the_operator_says_so_in_as_many_words() {
+        let error = format!("{:#}", Layout::Whole.permitted(false).expect_err("refused"));
+        assert!(error.contains("download window"), "{error}");
+        assert!(error.contains("--yes"), "{error}");
+        Layout::Whole
+            .permitted(true)
+            .expect("said in as many words");
+        // The slot route takes no acknowledgement either way: it keeps the
+        // image the acknowledgement is about.
+        Layout::Slot.permitted(false).expect("nothing to lose");
+        Layout::Slot.permitted(true).expect("nothing to lose");
     }
 
     #[test]

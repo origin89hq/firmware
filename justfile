@@ -232,8 +232,11 @@ dev-reboot *args:
 # the source as it stands.
 #
 # FLASH the comms image into an OTA slot; the recovery image is kept.
+# `--layout` is fixed here, so `--layout whole` in the arguments is refused
+# rather than silently taking the destructive route past this recipe's
+# promise; the whole flash is `dev-flash-comms-whole`, behind its confirm.
 dev-flash-comms *args: sizes
-    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} {{args}}
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH THE WHOLE MODULE FLASH from address 0: the bootloader, the partition
 # table and the factory image with it. For bringing a module up the first
@@ -248,7 +251,8 @@ dev-flash-comms *args: sizes
 # FLASH THE WHOLE MODULE FLASH, factory image included; leaves no way back but the strap.
 [confirm("Replace the whole module flash, the factory image that carries the download window included? A transfer that dies leaves the strap as the only way in.")]
 dev-flash-comms-whole *args: sizes
-    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout whole {{args}}
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout whole --yes {{args}}
+
 
 # LISTEN to the module through the bridge: the firmware resets it, by
 # `--entry reset` (the default), `knock` or `strap`, and prints what it

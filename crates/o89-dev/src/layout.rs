@@ -57,11 +57,64 @@ pub enum ImageState {
     New = 0x0,
 }
 
-/// A partition, as the table names it.
+/// What the bootloader matches a partition on: its type and subtype.
+///
+/// The name in the table's first column is a label the bootloader never
+/// reads. A row called `ota_0` that is not an `app`/`ota_0` row is not the
+/// partition the bootloader would boot, so looking a slot up by name is
+/// asking a different question from the one that decides where the module
+/// starts. This asks the bootloader's question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Role {
+    /// `app` is 0 and `data` is 1.
+    kind: u8,
+    /// What kind of app or data, in that type's numbering.
+    subtype: u8,
+}
+
+impl Role {
+    /// `data`/`ota`: the two entries that say which slot runs.
+    pub const OTA_DATA: Self = Self {
+        kind: 1,
+        subtype: 0x00,
+    };
+    /// `app`/`factory`: the image OTA never writes, which carries the
+    /// download window.
+    pub const FACTORY: Self = Self {
+        kind: 0,
+        subtype: 0x00,
+    };
+
+    /// `app`/`ota_<slot>`, counted from zero.
+    #[must_use]
+    pub fn ota(slot: u8) -> Self {
+        Self {
+            kind: 0,
+            subtype: 0x10_u8.saturating_add(slot),
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.kind, self.subtype) {
+            (1, 0x00) => f.write_str("data/ota"),
+            (0, 0x00) => f.write_str("app/factory"),
+            (0, sub @ 0x10..=0x1f) => write!(f, "app/ota_{}", sub.saturating_sub(0x10)),
+            (kind, subtype) => write!(f, "type {kind:#04x} subtype {subtype:#04x}"),
+        }
+    }
+}
+
+/// A partition, as the table declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partition {
-    /// The name in the table's first column.
+    /// The name in the table's first column, for saying which row this is.
     pub name: String,
+    /// The type and subtype, when they are ones this tool knows. A row
+    /// whose type or subtype it does not know is `None` and matches
+    /// nothing, so an unfamiliar table is refused rather than guessed at.
+    pub role: Option<Role>,
     /// The first byte of the partition in the flash.
     pub offset: u32,
     /// How many bytes it spans.
@@ -108,18 +161,36 @@ impl Table {
         Ok(Self { partitions })
     }
 
-    /// The partition of that name, or an error naming the ones there are.
-    pub fn find(&self, name: &str) -> Result<&Partition> {
-        self.partitions
+    /// The partition the bootloader would match for `role`, or an error
+    /// naming the rows there are.
+    ///
+    /// A table declaring the role twice is refused: which of them the
+    /// bootloader takes is its business, and a tool that wrote to the
+    /// other one would report a success the module did not have.
+    pub fn find(&self, role: Role) -> Result<&Partition> {
+        let mut matching = self
+            .partitions
             .iter()
-            .find(|partition| partition.name == name)
-            .with_context(|| {
-                let names: Vec<&str> = self.partitions.iter().map(|p| p.name.as_str()).collect();
-                format!(
-                    "no partition named {name:?}; the table has {}",
-                    names.join(", ")
-                )
-            })
+            .filter(|partition| partition.role == Some(role));
+        let found = matching.next().with_context(|| {
+            let rows: Vec<String> = self
+                .partitions
+                .iter()
+                .map(|p| match p.role {
+                    Some(role) => format!("{} ({role})", p.name),
+                    None => format!("{} (a type this tool does not know)", p.name),
+                })
+                .collect();
+            format!("no {role} partition; the table has {}", rows.join(", "))
+        })?;
+        if let Some(again) = matching.next() {
+            bail!(
+                "the table declares {role} twice, as {} and as {}",
+                found.name,
+                again.name
+            );
+        }
+        Ok(found)
     }
 }
 
@@ -132,12 +203,13 @@ impl Partition {
         if name.is_empty() {
             bail!("a row with no name");
         }
-        let _kind = fields.next().context("a row with no type")?;
-        let _subtype = fields.next().context("a row with no subtype")?;
+        let kind = fields.next().context("a row with no type")?;
+        let subtype = fields.next().context("a row with no subtype")?;
         let offset = fields.next().context("a row with no offset")?;
         let size = fields.next().context("a row with no size")?;
         Ok(Self {
             name: name.to_owned(),
+            role: role(kind, subtype),
             offset: number(offset).context("the offset")?,
             size: number(size).context("the size")?,
         })
@@ -159,6 +231,64 @@ impl fmt::Display for Partition {
             self.name, self.offset, self.size
         )
     }
+}
+
+/// The type and subtype of a row, when both are ones this tool knows.
+///
+/// Only the roles it looks up need to resolve; anything else is `None`,
+/// which matches no lookup, so an unknown row can never be mistaken for a
+/// slot. Both may be written as the names ESP-IDF uses or as numbers, as
+/// the table format allows.
+fn role(kind: &str, subtype: &str) -> Option<Role> {
+    let kind = match kind {
+        "app" => 0,
+        "data" => 1,
+        other => small(other)?,
+    };
+    // The two are separate numberings: `app`'s 0 is the factory image and
+    // `data`'s 0 is the OTA state, and they are only the same byte.
+    let subtype = match kind {
+        0 => app_subtype(subtype),
+        1 => data_subtype(subtype),
+        _ => None,
+    }
+    .or_else(|| small(subtype))?;
+    Some(Role { kind, subtype })
+}
+
+/// An `app` subtype by the name ESP-IDF gives it.
+fn app_subtype(name: &str) -> Option<u8> {
+    match name {
+        "factory" => Some(0x00),
+        "test" => Some(0x20),
+        _ => match name.strip_prefix("ota_")?.parse::<u8>().ok()? {
+            slot if slot < 16 => Some(0x10_u8.saturating_add(slot)),
+            _ => None,
+        },
+    }
+}
+
+/// A `data` subtype by the name ESP-IDF gives it.
+fn data_subtype(name: &str) -> Option<u8> {
+    match name {
+        "ota" => Some(0x00),
+        "phy" => Some(0x01),
+        "nvs" => Some(0x02),
+        "coredump" => Some(0x03),
+        "nvs_keys" => Some(0x04),
+        "efuse" => Some(0x05),
+        "undefined" => Some(0x06),
+        "esphttpd" => Some(0x80),
+        "fat" => Some(0x81),
+        "spiffs" => Some(0x82),
+        "littlefs" => Some(0x83),
+        _ => None,
+    }
+}
+
+/// A field written as a number, when it fits a type or subtype byte.
+fn small(field: &str) -> Option<u8> {
+    u8::try_from(number(field).ok()?).ok()
 }
 
 /// A `0x`-prefixed or decimal number, or one with `K` or `M` after it, as
@@ -260,7 +390,7 @@ creds,     data, nvs,     0x610000, 0x6000,
     #[test]
     fn a_table_is_read_past_its_comments_and_blank_lines() {
         let table = Table::parse(BOARD_A).expect("the table parses");
-        let slot = table.find("ota_0").expect("ota_0 is there");
+        let slot = table.find(Role::ota(0)).expect("ota_0 is there");
         assert_eq!(slot.offset, 0x0021_0000);
         assert_eq!(slot.size, 0x0020_0000);
         assert_eq!(slot.end().expect("it ends"), 0x0041_0000);
@@ -269,9 +399,49 @@ creds,     data, nvs,     0x610000, 0x6000,
     #[test]
     fn a_partition_the_table_does_not_have_names_the_ones_it_does() {
         let table = Table::parse(BOARD_A).expect("the table parses");
-        let error = format!("{:#}", table.find("ota_2").expect_err("no ota_2"));
-        assert!(error.contains("ota_0"), "{error}");
-        assert!(error.contains("factory"), "{error}");
+        let error = format!("{:#}", table.find(Role::ota(2)).expect_err("no ota_2"));
+        assert!(error.contains("app/ota_2"), "{error}");
+        assert!(error.contains("ota_0 (app/ota_0)"), "{error}");
+        assert!(error.contains("factory (app/factory)"), "{error}");
+    }
+
+    #[test]
+    fn f_036_a_row_merely_named_like_a_slot_is_not_the_slot_the_bootloader_boots() {
+        // The bootloader matches on type and subtype; the name is a label
+        // it never reads. A tool that matched the name would write the
+        // application into this row and report a success the module did
+        // not have, because the bootloader would go on booting elsewhere.
+        let table = Table::parse(
+            "otadata, data, ota,     0x9000,   0x2000,\n\
+             factory, app,  factory, 0x10000,  0x200000,\n\
+             ota_0,   data, nvs,     0x210000, 0x6000,\n",
+        )
+        .expect("the table parses");
+        let error = format!("{:#}", table.find(Role::ota(0)).expect_err("not a slot"));
+        assert!(error.contains("no app/ota_0 partition"), "{error}");
+        assert!(error.contains("ota_0 (type 0x01 subtype 0x02)"), "{error}");
+    }
+
+    #[test]
+    fn a_table_that_declares_a_role_twice_is_refused() {
+        let table = Table::parse(
+            "first,  app, ota_0, 0x210000, 0x200000,\n\
+             second, app, ota_0, 0x410000, 0x200000,\n",
+        )
+        .expect("the table parses");
+        let error = format!("{:#}", table.find(Role::ota(0)).expect_err("twice"));
+        assert!(error.contains("twice"), "{error}");
+    }
+
+    #[test]
+    fn a_role_is_read_from_names_or_from_numbers() {
+        let table = Table::parse(
+            "otadata, 1,   0,     0x9000,   0x2000,\n\
+             slot,    0,   0x10,  0x210000, 0x200000,\n",
+        )
+        .expect("the table parses");
+        assert_eq!(table.find(Role::OTA_DATA).expect("otadata").offset, 0x9000);
+        assert_eq!(table.find(Role::ota(0)).expect("slot").offset, 0x0021_0000);
     }
 
     #[test]
@@ -296,12 +466,30 @@ creds,     data, nvs,     0x610000, 0x6000,
     #[test]
     fn sizes_are_read_in_hex_decimal_and_with_a_scale() {
         let table = Table::parse(
-            "a, data, nvs, 0x1000, 0x2000,\nb, data, nvs, 4096, 8192,\nc, data, nvs, 0x10000, 2M,\n",
+            "a, data, ota, 0x1000, 0x2000,\nb, data, phy, 4096, 8192,\nc, data, nvs, 0x10000, 2M,\n",
         )
         .expect("the table parses");
-        assert_eq!(table.find("a").expect("a").size, 0x2000);
-        assert_eq!(table.find("b").expect("b").size, 8192);
-        assert_eq!(table.find("c").expect("c").size, 2 * 1024 * 1024);
+        assert_eq!(table.find(Role::OTA_DATA).expect("a").size, 0x2000);
+        assert_eq!(
+            table
+                .find(Role {
+                    kind: 1,
+                    subtype: 0x01
+                })
+                .expect("b")
+                .size,
+            8192
+        );
+        assert_eq!(
+            table
+                .find(Role {
+                    kind: 1,
+                    subtype: 0x02
+                })
+                .expect("c")
+                .size,
+            2 * 1024 * 1024
+        );
     }
 
     /// The ROM's `crc32_le(0xffffffff, ..)`, written out the way the ROM
