@@ -19,11 +19,19 @@ use esp_hal::uart::{Uart, UartTx};
 use km43::{FrameReader, FrameWriter, LinkEnvelope, MAX_FRAME, Received};
 use o89_comms_core::{Frame, Identity, Link, Tick};
 
-/// This firmware, as key 4 of every `LinkUp`; the controller reports it as
-/// `fw_comms` (L-031).
-const FW: &str = concat!("o89-comms ", env!("CARGO_PKG_VERSION"));
-/// The module, as key 6.
-const HW: &str = "esp32c6 module";
+/// This firmware, as key 4 of every `LinkUp`: its version with the commit
+/// it was built from, which the build script reads from git (L-034). The
+/// controller reports it as `fw_comms` (L-031).
+const FW: &str = env!("O89_LINK_VERSION");
+/// The board the module sits on, as key 6: its name and revision as
+/// origin89hq/hardware writes them (L-034). Revision A is the only board
+/// this firmware has run on.
+#[cfg(not(feature = "devkit"))]
+const HW: &str = "controller-a rev A";
+/// The board the module sits on, as key 6: an Espressif devkit on its own
+/// USB serial, which no hardware repository names (L-034).
+#[cfg(feature = "devkit")]
+const HW: &str = "esp32-c6 devkit";
 const _: () = {
     assert!(FW.len() <= km43::MAX_LINK_TEXT);
     assert!(HW.len() <= km43::MAX_LINK_TEXT);
