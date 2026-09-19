@@ -7,10 +7,23 @@
 //! written to the last words once, the lamp shows the fault, and nothing
 //! pets the part, which resets about eight seconds later with the blame in
 //! RAM for the next boot to read (F-007, F-008).
+//!
+//! **It runs from an interrupt, above the thread executor.** The tasks it
+//! judges are cooperative, and a bus transfer that never returns blocks
+//! the executor they share; a supervisor on that executor would then never
+//! run, the watchdog would still reset the part, and the boot after would
+//! have no name to blame. From its own interrupt the supervisor keeps
+//! running through a blocked executor, so the watchdog is the floor and
+//! the blame is still written. The line is `CEC`, which nothing on this
+//! board drives, at the lowest interrupt priority, so the time driver and
+//! every bus come first and the supervisor never delays them.
 
 use core::cell::Cell;
 
+use embassy_executor::{InterruptExecutor, SpawnError};
 use embassy_stm32::gpio::Output;
+use embassy_stm32::interrupt;
+use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::peripherals::IWDG;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_sync::blocking_mutex::CriticalSectionMutex;
@@ -18,6 +31,28 @@ use embassy_time::{Duration, Instant, Ticker};
 use o89_core::{Blame, Clock, Feed, LastWords, Millis, Pattern, Rollcall, Task, Tick};
 
 use crate::last_words;
+
+/// The supervisor's own executor, driven by the `CEC` interrupt.
+static EXECUTOR: InterruptExecutor = InterruptExecutor::new();
+
+#[interrupt]
+fn CEC() {
+    // SAFETY: the one place this executor is polled, from the interrupt
+    // `start` unmasked for it and nowhere else.
+    unsafe { EXECUTOR.on_interrupt() }
+}
+
+/// Start the supervisor on its own executor, above the thread executor.
+pub fn start(
+    wdg: IndependentWatchdog<'static, IWDG>,
+    status: Output<'static>,
+    fault: Output<'static>,
+) -> Result<(), SpawnError> {
+    interrupt::CEC.set_priority(Priority::P3);
+    let spawner = EXECUTOR.start(interrupt::CEC);
+    spawner.spawn(run(wdg, status, fault)?);
+    Ok(())
+}
 
 /// How long the part may go unfed before it resets.
 pub const WATCHDOG_US: u32 = 8_000_000;

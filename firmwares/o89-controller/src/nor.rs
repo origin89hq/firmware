@@ -114,8 +114,11 @@ impl Nor {
         [command, a2, a1, a0]
     }
 
-    /// The three identification bytes.
-    pub fn jedec(&mut self) -> Result<[u8; 3], NorError> {
+    /// The three identification bytes, once the part is ready to answer:
+    /// a reset in the middle of a program or an erase leaves the part
+    /// powered and busy, and a busy part ignores the identification.
+    pub async fn jedec(&mut self) -> Result<[u8; 3], NorError> {
+        self.wait_ready(ERASE_DEADLINE).await?;
         let mut id = [0u8; 3];
         self.transaction(&[CMD_JEDEC], &[], &mut id)?;
         Ok(id)

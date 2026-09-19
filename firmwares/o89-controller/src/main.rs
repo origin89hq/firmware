@@ -37,6 +37,10 @@ mod pvd;
 mod rail;
 mod recorder;
 mod reset;
+#[expect(
+    unsafe_code,
+    reason = "the supervisor's executor is polled from the interrupt started for it; the one call is under a SAFETY line"
+)]
 mod supervisor;
 
 use defmt_rtt as _;
@@ -201,10 +205,9 @@ async fn main(spawner: Spawner) {
 
     supervisor::check_in(Task::Supervisor);
     // The pool holds one supervisor and this is its only spawn; an unfed
-    // watchdog is the answer if it ever refuses.
-    if let Ok(token) = supervisor::run(wdg, status, fault) {
-        spawner.spawn(token);
-    } else {
+    // watchdog is the answer if it ever refuses. It runs from its own
+    // interrupt, so a task that blocks this executor is still named.
+    if supervisor::start(wdg, status, fault).is_err() {
         defmt::error!("the supervisor did not spawn; the watchdog will reset the part");
     }
 
@@ -259,10 +262,12 @@ async fn main(spawner: Spawner) {
             bench::Step::Run => {}
             bench::Step::Starve => {
                 defmt::warn!(
-                    "watchdog proof: the control tick stops checking in on purpose; the part resets in about 8 s and the next boot names it"
+                    "watchdog proof: the control tick blocks the executor on purpose; the part resets in about 8 s and the next boot names it"
                 );
+                // A spin, not a yield: the whole thread executor is held,
+                // and only a supervisor above it can still name this task.
                 loop {
-                    ticker.next().await;
+                    cortex_m::asm::nop();
                 }
             }
             bench::Step::Panic => {

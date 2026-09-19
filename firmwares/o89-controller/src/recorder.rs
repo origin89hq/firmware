@@ -30,7 +30,7 @@ const PERIOD: Duration = Duration::from_secs(10);
 pub async fn run(store: Option<Store>, mut nor: Nor) {
     let mut scratch = [0u8; SCRATCH];
     defmt::info!("recorder: identifying the NOR");
-    let jedec = nor.jedec();
+    let jedec = nor.jedec().await;
     defmt::info!("recorder: identification answered {}", jedec);
     let ring = match jedec {
         Ok(JEDEC) => {

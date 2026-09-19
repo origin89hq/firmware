@@ -327,7 +327,11 @@ control, link, recorder (the only owner of the FRAM and NOR buses), one per
 RS-485 channel, CAN, one per VE.Direct port, 1-Wire, ADC, selector, lamp.
 Bounded channels between them, `static_cell` for what the executor needs, no
 allocator. Nothing blocks; a bus that hangs is a task that misses its
-check-in, which is a reset, which is the fail state.
+check-in, which is a reset, which is the fail state. The supervisor runs
+from its own interrupt above the thread executor, so a transfer that never
+returns and holds the executor is still a task named in the last words
+before the watchdog fires: the watchdog is the floor either way, the blame
+is what the next boot reads.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
 fed from a timer interrupt is a watchdog that does not work.
