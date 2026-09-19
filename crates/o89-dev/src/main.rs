@@ -14,6 +14,7 @@
 //! workspace manifest.
 
 mod flash;
+mod layout;
 mod link;
 mod rail;
 mod store;
@@ -128,8 +129,8 @@ enum Command {
     Reboot,
     /// FLASH the comms image onto the module through the controller: the
     /// module is reset into its ROM's download mode by the firmware, and
-    /// esptool writes the merged image, bootloader and partition table
-    /// included, at address 0.
+    /// esptool writes the application into an OTA slot, leaving the
+    /// factory image that carries the download window where it is.
     FlashComms {
         /// The comms ELF, as `cargo build --release -p o89-comms` leaves it.
         elf: PathBuf,
@@ -141,6 +142,10 @@ enum Command {
         /// revision A needs IO8 held high by a wire.
         #[arg(long, value_enum, default_value_t = FlashEntry::Knock)]
         entry: FlashEntry,
+        /// What is written: the application into an OTA slot, which leaves
+        /// the recovery image alone, or the whole flash, which replaces it.
+        #[arg(long, value_enum, default_value_t = Layout::Slot)]
+        layout: Layout,
     },
     /// LISTEN to the module through the bridge: the module is reset by the
     /// firmware and whatever it says on its UART0 for `seconds` is printed,
@@ -180,6 +185,21 @@ enum StoreCommand {
         #[arg(long)]
         replace: bool,
     },
+}
+
+/// What a flash writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Layout {
+    /// The application into an OTA slot. The bootloader, the partition
+    /// table and the factory image stay, so the download window survives a
+    /// transfer that dies (F-084).
+    Slot,
+    /// The whole flash from address zero, the factory image with it: how a
+    /// module is brought up the first time, and how one whose recovery
+    /// image is gone is restored. Until it finishes the module boots
+    /// nothing, and a module that boots nothing is reached by the strap
+    /// with a wire on revision A, or not at all (#1).
+    Whole,
 }
 
 /// The board revision on the command line.
@@ -266,14 +286,24 @@ fn main() -> Result<()> {
             elf,
             partitions,
             entry,
+            layout,
         } => {
-            // One file per invocation: two benches on two probes must not
-            // hand esptool each other's image.
-            let merged =
-                std::env::temp_dir().join(format!("o89-comms-merged-{}.bin", std::process::id()));
-            flash::merge(&elf, &partitions, &merged)?;
-            println!("merged image at {}", merged.display());
-            flash::flash(&mut link, &merged, entry.into())
+            // The generated files live for this flash and go with it.
+            let scratch = flash::Scratch::new()?;
+            let plan = match layout {
+                Layout::Slot => {
+                    let table = layout::Table::read(&partitions)?;
+                    let app = scratch.file("o89-comms.bin");
+                    flash::app_image(&elf, &app)?;
+                    flash::plan_slot(&table, &app, &scratch)?
+                }
+                Layout::Whole => {
+                    let merged = scratch.file("o89-comms-merged.bin");
+                    flash::merge(&elf, &partitions, &merged)?;
+                    flash::plan_whole(&merged)?
+                }
+            };
+            flash::flash(&mut link, &plan, entry.into())
         }
         Command::CommsListen {
             seconds,
@@ -330,6 +360,31 @@ mod tests {
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "reset"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn f_084_a_flash_writes_a_slot_unless_the_whole_flash_is_asked_for_by_name() {
+        let plain = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
+        assert!(
+            matches!(
+                plain.command,
+                Command::FlashComms {
+                    layout: Layout::Slot,
+                    ..
+                }
+            ),
+            "the recovery image is kept unless something asks for it to go"
+        );
+        let whole =
+            Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--layout", "whole"])
+                .expect("parses");
+        assert!(matches!(
+            whole.command,
+            Command::FlashComms {
+                layout: Layout::Whole,
+                ..
+            }
+        ));
     }
 
     #[test]

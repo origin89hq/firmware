@@ -341,6 +341,17 @@ M0.
 left alone; a pin lives in exactly two places that cannot disagree. Source:
 [#3][plan] §6. M1.
 
+**F-084** — The bench flashing path writes the application into an OTA slot
+and names that slot in `otadata` only once the application has landed; before
+it erases the slot it blanks the `otadata`, so from the first erase until the
+last write the module boots the factory image. The bootloader, the partition
+table and the factory image are replaced only by a route named for replacing
+them. The state written is `New`, which a bootloader with rollback holds
+against the image until it confirms itself, which `o89-comms` does after its
+window and not before. A transfer that dies leaves a module the controller can
+knock at with no wire on it, which is what the erase at address zero did not.
+Source: [#1][i1], F-036, bench 2026-09-19. M3.
+
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6
 [h13]: https://github.com/origin89hq/hardware/issues/13

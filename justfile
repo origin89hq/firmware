@@ -220,20 +220,34 @@ dev-erase-nor block count="1" *args:
 dev-reboot *args:
     cargo run -q -p o89-dev -- {{args}} reboot
 
-# FLASH the comms image onto the module through the controller (F-038):
-# the firmware resets the module, knocks inside its download window and
-# bridges the ROM's UART to the mailbox; esptool writes the merged image,
-# bootloader and partition table included, at address 0. Effect: whatever
-# the module ran is replaced; the module reboots on the new image when
-# esptool is done. Recovery: run it again with `--entry strap` and, on
-# revision A, a wire holding IO8 high (hardware#6): a transfer that dies
-# after the erase leaves a module that boots nothing and never enters the
-# ROM's loader by itself, which is #1. Needs `uvx` for esptool. The images
-# are built first, so what is flashed is the source as it stands.
+# FLASH the comms image into an OTA slot of the module, through the
+# controller (F-038, F-084): the firmware resets the module, knocks inside its
+# download window and bridges the ROM's UART to the mailbox; esptool blanks
+# the otadata, writes the application into `ota_0`, and names the slot once it
+# has landed. Effect: the module reboots on the new application; the
+# bootloader, the partition table and the factory image are untouched.
+# Recovery: run it again. A transfer that dies leaves the module booting the
+# factory image, which honours the window, so the next run needs no wire.
+# Needs `uvx` for esptool. The images are built first, so what is flashed is
+# the source as it stands.
 #
-# FLASH the comms image onto the module through the controller; replaces what it ran.
+# FLASH the comms image into an OTA slot; the recovery image is kept.
 dev-flash-comms *args: sizes
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} {{args}}
+
+# FLASH THE WHOLE MODULE FLASH from address 0: the bootloader, the partition
+# table and the factory image with it. For bringing a module up the first
+# time, or restoring one whose factory image is gone. Effect: everything the
+# module held is replaced, and from the first erase until esptool finishes it
+# boots nothing. Recovery: run it again with `--entry strap` and, on revision
+# A, a wire holding IO8 high (hardware#6), because a module that boots nothing
+# never enters the ROM's loader by itself (#1). Use `dev-flash-comms` for
+# ordinary work.
+#
+# FLASH THE WHOLE MODULE FLASH, factory image included; leaves no way back but the strap.
+[confirm("Replace the whole module flash, the factory image that carries the download window included? A transfer that dies leaves the strap as the only way in.")]
+dev-flash-comms-whole *args: sizes
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout whole {{args}}
 
 # LISTEN to the module through the bridge: the firmware resets it, by
 # `--entry reset` (the default), `knock` or `strap`, and prints what it

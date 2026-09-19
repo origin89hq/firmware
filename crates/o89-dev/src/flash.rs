@@ -11,11 +11,16 @@
 //! `LinkUp`. Nothing here speaks the ROM's protocol itself: `esptool` is
 //! the reference implementation, and a second one would be a second
 //! opinion about a flash layout.
+//!
+//! What is written, and in what order, is [`Plan`]. By default it is an
+//! application into an OTA slot with the factory image left alone (F-084),
+//! because that image carries the download window and is the way back into
+//! a module with no wire on it (F-036, #1).
 
 use o89_core::mailbox::DownloadEntry;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::layout::{ImageState, OTADATA_LEN, Table, otadata_no_slot, otadata_selecting};
 use crate::link::Link;
 
 /// `download_reason` as the registry numbers `bench`.
@@ -39,37 +45,252 @@ const ESPTOOL_DEADLINE: Duration = Duration::from_mins(10);
 /// before the bridge is closed.
 const DRAIN: Duration = Duration::from_millis(500);
 
-/// The image, merged with the bootloader and the partition table by
-/// `espflash`, without the padding to the flash's end.
+/// The OTA slot the bench writes, counted from zero, and how many the
+/// table declares. Slot zero always: which slot the bench uses is not
+/// what these runs are about, and a fixed one is a number the operator can
+/// read off `dev-nor`-style dumps without asking what ran last.
+const BENCH_SLOT: u32 = 0;
+const OTA_SLOTS: u32 = 2;
+
+/// What the flash writes, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Write {
+    /// The address in the module's flash.
+    pub at: u32,
+    /// How many bytes land there.
+    pub len: u32,
+    /// The file holding them.
+    pub file: PathBuf,
+}
+
+/// The writes, in passes. Each pass is one `esptool` run, and `esptool`
+/// writes a pass's entries in the order they are given. The split into
+/// passes is what makes the order survive a run that dies: everything a
+/// later pass does is known not to have happened when an earlier one is
+/// still going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// What the operator is told before the module is touched.
+    pub says: String,
+    /// The passes, in order.
+    pub passes: Vec<Vec<Write>>,
+}
+
+/// Where the generated files live for the length of one flash, removed
+/// when this drops however the flash ended.
+#[derive(Debug)]
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A directory of this flash's own: two benches on two probes must
+    /// not hand `esptool` each other's image, and neither must two flashes
+    /// of one process.
+    pub fn new() -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("o89-dev-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    /// A file inside it, by name.
+    pub fn file(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Nobody to report to in a drop, and a directory that outlives one
+        // run is picked up by the next.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The application alone, into an OTA slot, with the bootloader, the
+/// partition table and the factory image left where they are (F-084).
+///
+/// Three writes in two passes, and the order is the point:
+///
+/// 1. the `otadata` blanked, so the bootloader runs the factory image;
+/// 2. the application into the slot;
+/// 3. the `otadata` naming the slot, once the application has landed.
+///
+/// Between 1 and 3 the module boots the factory image, which honours the
+/// window, so a transfer that dies anywhere in there leaves a module the
+/// controller can knock at again with no wire on it.
+pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
+    let otadata = table.find("otadata")?;
+    if otadata.size != OTADATA_LEN {
+        bail!("{otadata} is not the {OTADATA_LEN:#x} bytes the bootloader reads");
+    }
+    let name = format!("ota_{BENCH_SLOT}");
+    let slot = table.find(&name)?;
+    let app_len = u32::try_from(
+        std::fs::metadata(app)
+            .with_context(|| format!("measuring {}", app.display()))?
+            .len(),
+    )
+    .context("an application that fits a u32")?;
+    if app_len > slot.size {
+        bail!("the application is {app_len} bytes and {slot} holds it not");
+    }
+    let blank = scratch.file("otadata-blank.bin");
+    std::fs::write(&blank, otadata_no_slot())
+        .with_context(|| format!("writing {}", blank.display()))?;
+    let selecting = scratch.file("otadata-slot.bin");
+    std::fs::write(
+        &selecting,
+        otadata_selecting(BENCH_SLOT, OTA_SLOTS, ImageState::New)?,
+    )
+    .with_context(|| format!("writing {}", selecting.display()))?;
+    let plan = Plan {
+        says: format!(
+            "writing the application into {name} at {:#x}; the bootloader, the partition table and the factory image stay",
+            slot.offset
+        ),
+        passes: vec![
+            vec![
+                Write {
+                    at: otadata.offset,
+                    len: OTADATA_LEN,
+                    file: blank,
+                },
+                Write {
+                    at: slot.offset,
+                    len: app_len,
+                    file: app.to_path_buf(),
+                },
+            ],
+            vec![Write {
+                at: otadata.offset,
+                len: OTADATA_LEN,
+                file: selecting,
+            }],
+        ],
+    };
+    keeps_the_recovery_image(&plan, table)?;
+    Ok(plan)
+}
+
+/// The flash's first bytes, which the second-stage bootloader is loaded
+/// from and which no route but the whole one may touch. The partition
+/// table declares nothing below its own offset, so this is the one
+/// boundary the table cannot state.
+const BOOTLOADER_END: u32 = 0x8000;
+
+/// Every write in `plan` stays clear of the factory image and of the
+/// bootloader in front of it (F-036, F-084): the two things that let a
+/// module with no wire on it be reached again.
+///
+/// Asserted on the plan rather than trusted from the code that built it,
+/// because it is the property the operator is relying on and a slot
+/// offset read out of the wrong row would not otherwise show.
+pub fn keeps_the_recovery_image(plan: &Plan, table: &Table) -> Result<()> {
+    let factory = table.find("factory")?;
+    let factory_end = factory.end()?;
+    for write in plan.passes.iter().flatten() {
+        let end = write
+            .at
+            .checked_add(write.len)
+            .with_context(|| format!("a write at {:#x} that runs past the flash", write.at))?;
+        if write.at < BOOTLOADER_END {
+            bail!(
+                "a write of {} bytes at {:#x} reaches the bootloader",
+                write.len,
+                write.at
+            );
+        }
+        if write.at < factory_end && end > factory.offset {
+            bail!(
+                "a write of {} bytes at {:#x} reaches {factory}, which carries the download window",
+                write.len,
+                write.at
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The whole flash from address zero: the bootloader, the partition table
+/// and the factory image with it.
+///
+/// This is how a module is brought up the first time and how one whose
+/// recovery image is gone is restored, and it is the only route that
+/// replaces that image. It has no safe point: from the first erase until
+/// the write completes the module boots nothing, and a module that boots
+/// nothing is reached by the strap with a wire on revision A, or not at
+/// all (F-038, #1).
+pub fn plan_whole(merged: &Path) -> Result<Plan> {
+    let len = u32::try_from(
+        std::fs::metadata(merged)
+            .with_context(|| format!("measuring {}", merged.display()))?
+            .len(),
+    )
+    .context("an image that fits a u32")?;
+    Ok(Plan {
+        says: "writing the whole flash from 0x0: the bootloader, the partition table and the \
+               factory image are replaced, and until it finishes the module boots nothing"
+            .to_owned(),
+        passes: vec![vec![Write {
+            at: 0,
+            len,
+            file: merged.to_path_buf(),
+        }]],
+    })
+}
+
+/// The merged image `plan_whole` writes: the bootloader and the partition
+/// table with the application at its factory offset, without the padding
+/// to the flash's end.
 pub fn merge(elf: &Path, partitions: &Path, out: &Path) -> Result<()> {
-    let status = Command::new("espflash")
-        .args([
-            "save-image",
-            "--chip",
-            "esp32c6",
-            "--merge",
-            "--skip-padding",
-        ])
-        .args(["--flash-size", "8mb", "--partition-table"])
-        .arg(partitions)
-        .arg(elf)
-        .arg(out)
-        .status()
-        .context("running espflash save-image (install with `cargo install espflash --locked`)")?;
+    espflash(
+        &["--merge", "--skip-padding", "--partition-table"],
+        Some(partitions),
+        elf,
+        out,
+    )
+}
+
+/// The application image alone, as the bootloader loads it from a slot.
+pub fn app_image(elf: &Path, out: &Path) -> Result<()> {
+    espflash(&[], None, elf, out)
+}
+
+fn espflash(extra: &[&str], partitions: Option<&Path>, elf: &Path, out: &Path) -> Result<()> {
+    let mut command = Command::new("espflash");
+    command
+        .args(["save-image", "--chip", "esp32c6", "--flash-size", "8mb"])
+        .args(extra);
+    if let Some(partitions) = partitions {
+        command.arg(partitions);
+    }
+    let status =
+        command.arg(elf).arg(out).status().context(
+            "running espflash save-image (install with `cargo install espflash --locked`)",
+        )?;
     if !status.success() {
         bail!("espflash save-image failed: {status}");
     }
     Ok(())
 }
 
-/// Flash `merged` onto the module through the controller. With `knock`
-/// the firmware asks the module's own window; without it the module is
-/// through its window, or with the strap held for a module that runs
-/// nothing that answers.
-pub fn flash(link: &mut Link, merged: &Path, entry: DownloadEntry) -> Result<()> {
+/// Carry out `plan` on the module through the controller. With `knock`
+/// the firmware asks the module's own window; with the strap it holds IO9
+/// low across a reset, for a module that runs nothing that answers.
+pub fn flash(link: &mut Link, plan: &Plan, entry: DownloadEntry) -> Result<()> {
+    println!("{}", plan.says);
     link.download(REASON_BENCH, entry)?;
     println!("module in download mode; the bridge is up");
-    let outcome = run_esptool(link, merged);
+    let mut outcome = Ok(());
+    for (number, pass) in plan.passes.iter().enumerate() {
+        let number = number.saturating_add(1);
+        outcome = run_esptool(link, pass)
+            .with_context(|| format!("pass {number} of {}", plan.passes.len()));
+        if outcome.is_err() {
+            break;
+        }
+    }
     // The module goes back whatever esptool did: a half-written image is
     // the bootloader's to refuse, and a module left in the ROM is a
     // module nobody can reach.
@@ -144,11 +365,11 @@ pub fn listen(link: &mut Link, seconds: u64, entry: DownloadEntry, leave_open: b
     Ok(())
 }
 
-fn run_esptool(link: &mut Link, merged: &Path) -> Result<()> {
+fn run_esptool(link: &mut Link, writes: &[Write]) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("opening the relay socket")?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let (mut esptool, from_esptool) = spawn_esptool(port, merged)?;
+    let (mut esptool, from_esptool) = spawn_esptool(port, writes)?;
     let mut relay = Relay {
         listener,
         client: None,
@@ -212,11 +433,12 @@ impl Drop for Esptool {
 }
 
 /// `esptool` against the socket, its output lines on a channel.
-fn spawn_esptool(port: u16, merged: &Path) -> Result<(Esptool, mpsc::Receiver<String>)> {
+fn spawn_esptool(port: u16, writes: &[Write]) -> Result<(Esptool, mpsc::Receiver<String>)> {
     let esptool = std::env::var("O89_ESPTOOL").unwrap_or_else(|_| "uvx esptool".to_owned());
     let mut words = esptool.split_whitespace();
     let program = words.next().context("an esptool command")?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(words)
         .args(["--chip", "esp32c6", "--port"])
         .arg(format!("socket://127.0.0.1:{port}"))
@@ -225,8 +447,19 @@ fn spawn_esptool(port: u16, merged: &Path) -> Result<(Esptool, mpsc::Receiver<St
         ])
         // The ROM's own loader: the stub would be one more image to move over
         // the bridge, and the 176 KB take under a minute without it.
-        .args(["--no-stub", "write-flash", "0x0"])
-        .arg(merged)
+        .args(["--no-stub", "write-flash"]);
+    // In the order given, which is the order they land: what a pass writes
+    // first is what a pass that dies has already done.
+    for write in writes {
+        println!(
+            "  {} bytes at {:#x} from {}",
+            write.len,
+            write.at,
+            write.file.display()
+        );
+        command.arg(format!("{:#x}", write.at)).arg(&write.file);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -366,5 +599,135 @@ mod tests {
         assert!(exists(pid), "a zombie until reaped");
         drop(Esptool(child));
         assert!(!exists(pid), "reaped as the guard dropped");
+    }
+}
+
+#[cfg(test)]
+mod plans {
+    use super::*;
+    use crate::layout::Table;
+
+    /// The table the comms image is built against.
+    const BOARD_A: &str = "\
+otadata, data, ota,     0x9000,   0x2000,
+factory, app,  factory, 0x10000,  0x200000,
+ota_0,   app,  ota_0,   0x210000, 0x200000,
+ota_1,   app,  ota_1,   0x410000, 0x200000,
+";
+
+    /// A file of `len` bytes standing in for a built application.
+    fn application(scratch: &Scratch, len: usize) -> PathBuf {
+        let path = scratch.file("app.bin");
+        std::fs::write(&path, vec![0u8; len]).expect("the scratch takes a file");
+        path
+    }
+
+    fn board_a() -> Table {
+        Table::parse(BOARD_A).expect("the table parses")
+    }
+
+    #[test]
+    fn f_084_the_otadata_is_blanked_before_the_slot_is_erased_and_named_after_it_lands() {
+        let scratch = Scratch::new().expect("a scratch");
+        let table = board_a();
+        let plan = plan_slot(&table, &application(&scratch, 176_272), &scratch).expect("a plan");
+        let first = plan.passes.first().expect("a first pass");
+        let second = plan.passes.get(1).expect("a second pass");
+        assert_eq!(
+            plan.passes.len(),
+            2,
+            "the otadata is named in a pass of its own"
+        );
+        // The blank goes out before the slot is touched.
+        assert_eq!(first.first().expect("a blank").at, 0x9000);
+        assert_eq!(first.get(1).expect("the application").at, 0x0021_0000);
+        // And the slot is named only once the application has landed.
+        assert_eq!(second.first().expect("the otadata").at, 0x9000);
+        let blank = std::fs::read(&first.first().expect("a blank").file).expect("it is there");
+        assert!(blank.iter().all(|byte| *byte == 0xff), "no slot chosen");
+        let naming =
+            std::fs::read(&second.first().expect("the otadata").file).expect("it is there");
+        assert_ne!(naming.first(), Some(&0xff), "a slot chosen");
+    }
+
+    #[test]
+    fn f_036_the_slot_route_writes_neither_the_factory_image_nor_the_bootloader() {
+        let scratch = Scratch::new().expect("a scratch");
+        let table = board_a();
+        let plan = plan_slot(&table, &application(&scratch, 176_272), &scratch).expect("a plan");
+        keeps_the_recovery_image(&plan, &table).expect("the recovery image is untouched");
+        for write in plan.passes.iter().flatten() {
+            assert!(write.at >= 0x8000, "{:#x} is in the bootloader", write.at);
+            let end = write.at + write.len;
+            assert!(
+                write.at >= 0x0021_0000 || end <= 0x0001_0000,
+                "{:#x}..{end:#x} overlaps the factory image",
+                write.at
+            );
+        }
+    }
+
+    #[test]
+    fn f_036_a_plan_that_reaches_the_factory_image_is_refused() {
+        let plan = Plan {
+            says: String::new(),
+            passes: vec![vec![Write {
+                at: 0x000f_f000,
+                len: 0x2000,
+                file: PathBuf::from("app.bin"),
+            }]],
+        };
+        let error = format!(
+            "{:#}",
+            keeps_the_recovery_image(&plan, &board_a()).expect_err("refused")
+        );
+        assert!(error.contains("download window"), "{error}");
+    }
+
+    #[test]
+    fn the_whole_route_is_the_one_that_replaces_the_image_the_slot_route_keeps() {
+        let scratch = Scratch::new().expect("a scratch");
+        let merged = application(&scratch, 176_272);
+        let plan = plan_whole(&merged).expect("a plan");
+        assert_eq!(plan.passes.len(), 1, "no safe point to split on");
+        let error = format!(
+            "{:#}",
+            keeps_the_recovery_image(&plan, &board_a()).expect_err("refused")
+        );
+        assert!(error.contains("bootloader"), "{error}");
+    }
+
+    #[test]
+    fn an_application_too_large_for_its_slot_is_refused_before_the_module_is_touched() {
+        let scratch = Scratch::new().expect("a scratch");
+        let table = board_a();
+        let app = application(&scratch, 0x0020_0001);
+        let error = format!(
+            "{:#}",
+            plan_slot(&table, &app, &scratch).expect_err("refused")
+        );
+        assert!(error.contains("ota_0"), "{error}");
+    }
+
+    #[test]
+    fn a_table_with_no_otadata_of_the_size_the_bootloader_reads_is_refused() {
+        let scratch = Scratch::new().expect("a scratch");
+        let table = Table::parse(
+            "otadata, data, ota, 0x9000, 0x1000,\nfactory, app, factory, 0x10000, 0x200000,\nota_0, app, ota_0, 0x210000, 0x200000,\n",
+        )
+        .expect("the table parses");
+        let app = application(&scratch, 1024);
+        assert!(plan_slot(&table, &app, &scratch).is_err());
+    }
+
+    #[test]
+    fn a_scratch_takes_its_files_with_it() {
+        let path = {
+            let scratch = Scratch::new().expect("a scratch");
+            let file = application(&scratch, 16);
+            assert!(file.exists());
+            file
+        };
+        assert!(!path.exists(), "the scratch was removed with its files");
     }
 }
