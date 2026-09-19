@@ -2,11 +2,14 @@
 //!
 //! The words are atomics because the host writes them over SWD while the
 //! part runs, and the region is one the runtime never loads or zeroes, so
-//! the boot writes the magic and the version itself. The recorder polls
-//! the request sequence; a request is served through the same seams the
-//! store and the ring use, so a write from the bench meets the voltage
-//! detector's refusal exactly as the firmware's own would. The layout and
-//! the address are `o89_core::mailbox`'s, shared with the host.
+//! a reset leaves the last run's magic there. The boot clears it as its
+//! first act and the recorder writes it back when it is ready to serve:
+//! a host that attaches in between sees no mailbox, rather than a request
+//! nobody answers until its deadline. The recorder polls the request
+//! sequence; a request is served through the same seams the store and the
+//! ring use, so a write from the bench meets the voltage detector's
+//! refusal exactly as the firmware's own would. The layout and the address
+//! are `o89_core::mailbox`'s, shared with the host.
 
 use core::sync::atomic::Ordering;
 
@@ -52,6 +55,12 @@ static MAILBOX: Mailbox = Mailbox {
     length: AtomicU32::new(0),
     data: [const { AtomicU8::new(0) }; DATA_BYTES],
 };
+
+/// No mailbox: the first thing the boot does, so that the magic a reset
+/// left in RAM does not invite a request before anyone serves one.
+pub fn clear() {
+    MAILBOX.magic.store(0, Ordering::Release);
+}
 
 /// Write the magic and the version, and answer nothing outstanding: a
 /// request the host left across a reset is stale.

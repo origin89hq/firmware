@@ -112,6 +112,8 @@ async fn main(spawner: Spawner) {
     // 2. Why the part reset, and what the previous run said last.
     let cause = ResetCause::from_flags(reset::take_flags());
     let words = last_words::take();
+    // The bench tool's mailbox is not there until the recorder serves it.
+    mailbox::clear();
 
     // 3. The clocks.
     let mut config = embassy_stm32::Config::default();
