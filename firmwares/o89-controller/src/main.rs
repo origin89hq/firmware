@@ -53,8 +53,8 @@ use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Ticker};
 use o89_core::{
-    BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Pull as DeclaredPull,
-    RailSequencer, ResetCause, RtcClock, Store, Task,
+    Blame, BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Millis,
+    Pull as DeclaredPull, RailSequencer, ResetCause, RtcClock, Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -154,8 +154,18 @@ async fn main(spawner: Spawner) {
     // is what the boot decides on, and the boot count and the last words
     // are written down here. A bus that does not answer leaves no store,
     // and the boot goes on to the fail state as it would with one.
+    // The supervisor is not running yet, so this phase bounds itself: every
+    // transfer is cut by the driver's timeout, three times the longest one
+    // the store makes, and the phase is written to the last words as a
+    // provisional blame until the store is read, so a boot the watchdog
+    // cuts short here is still named by the boot after (F-016).
     let mut i2c_config = i2c::Config::default();
     i2c_config.frequency = Hertz::khz(400);
+    i2c_config.timeout = Duration::from_millis(100);
+    last_words::write(LastWords::Starved(Blame {
+        task: Task::Boot,
+        overdue: Millis::ZERO,
+    }));
     let mut fram = Fram::new(I2c::new_blocking(
         b.i2c2, b.fram_scl, b.fram_sda, i2c_config,
     ));
@@ -177,6 +187,7 @@ async fn main(spawner: Spawner) {
             None
         }
     };
+    last_words::clear();
 
     // 7. Every output this image drives, to its declared fail state. Held
     // for the life of this task, which never returns; a bus takes its

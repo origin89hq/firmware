@@ -309,6 +309,10 @@ role; `BOARD-A.md` maps them to pins.
    gets its first epoch, a table under another epoch is cleared (F-026),
    the boot count climbs, the last words are written down with it, and
    every window measured on the tick restarts at zero (P-121).
+   The supervisor is not running yet, so this phase bounds itself: every
+   FRAM transfer is cut by the driver's timeout, and `Boot` is written to
+   the last words as a provisional blame until the store is read, so a
+   boot the watchdog cuts short here is named by the boot after.
    **NOR scan**: the log ring's head and the time floor, the newest
    timestamped record (L-140).
 7. **Outputs to their declared fail state**, per output, from configuration,
