@@ -75,24 +75,30 @@ where
     pub rx: Peri<'static, R>,
 }
 
+/// USART1, the module's UART0 (origin89hq/hardware#13).
+pub type EspUsart = p::USART1;
+/// `ESP_TX`, PB6.
+pub type EspTx = p::PB6;
+/// `ESP_RX`, PB7.
+pub type EspRx = p::PB7;
+/// `ESP_RTS`, PB3.
+pub type EspRts = p::PB3;
+/// `ESP_CTS`, PB4.
+pub type EspCts = p::PB4;
+
 /// The link to the module, and the lines into it that are inputs until the
 /// rail is up (F-003).
 pub struct Module {
     /// USART1, the module's UART0.
-    #[expect(dead_code, reason = "taken in M3, the link")]
-    pub usart: Peri<'static, p::USART1>,
+    pub usart: Peri<'static, EspUsart>,
     /// `ESP_TX`, to the module's RXD0.
-    #[expect(dead_code, reason = "taken in M3, the link")]
-    pub tx: Peri<'static, p::PB6>,
+    pub tx: Peri<'static, EspTx>,
     /// `ESP_RX`, from the module's TXD0.
-    #[expect(dead_code, reason = "taken in M3, the link")]
-    pub rx: Peri<'static, p::PB7>,
+    pub rx: Peri<'static, EspRx>,
     /// `ESP_RTS`, to the module's IO4.
-    #[expect(dead_code, reason = "taken in M3, the link")]
-    pub rts: Peri<'static, p::PB3>,
+    pub rts: Peri<'static, EspRts>,
     /// `ESP_CTS`, from the module's IO5.
-    #[expect(dead_code, reason = "taken in M3, the link")]
-    pub cts: Peri<'static, p::PB4>,
+    pub cts: Peri<'static, EspCts>,
     /// `ESP_EN`, held low across every rail cycle (F-004).
     pub en: Peri<'static, p::PC2>,
     /// `ESP_BOOT`, the IO9 strap.

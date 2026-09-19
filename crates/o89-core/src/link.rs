@@ -78,7 +78,10 @@ pub type LinkText = Text<MAX_LINK_TEXT>;
 pub struct BootId(u32);
 
 impl BootId {
-    /// The id for this boot, from what makes it unique.
+    /// The id for this boot, from what makes it unique. A count is
+    /// required by the signature: a boot without a written one, a part
+    /// whose FRAM did not answer or whose new count did not land, has no
+    /// id to state and no link (F-039).
     #[must_use]
     pub fn derive(unique: &[u8], boot: BootCount) -> Self {
         let mut hasher = Sha256::new();
@@ -288,7 +291,8 @@ pub struct Actions {
 }
 
 impl Actions {
-    const NONE: Self = Self {
+    /// Nothing to do.
+    pub const NONE: Self = Self {
         items: [None; ACTIONS],
         len: 0,
         dropped: 0,

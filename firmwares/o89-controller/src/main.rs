@@ -10,9 +10,10 @@
 //! generator and bus lines through the registers as the first statement;
 //! the reset cause read and cleared and the last words taken, both before
 //! the HAL; the clocks, with the LSE asserted; the watchdog, fed only by the
-//! rollcall; the voltage detector; the store read off the FRAM, before any
-//! output moves; every output to its declared fail state; the module rail
-//! sequence; the recorder with the NOR; then the control tick. The other
+//! rollcall; the voltage detector; the module rail back on, with `EN` held,
+//! before any bus; the store read off the FRAM; every output to its
+//! declared fail state; the rail task and the link; the recorder with the
+//! NOR; then the control tick. The other
 //! buses arrive with the milestones that name them. The `bench` build adds
 //! the one-shot proofs: a starvation on a boot the watchdog did not cause,
 //! and a panic on the boot that follows, so three boots in a row show the
@@ -31,6 +32,7 @@ mod fault;
 mod first;
 mod fram;
 mod last_words;
+mod link;
 mod mailbox;
 mod nor;
 mod panic;
@@ -52,10 +54,11 @@ use embassy_stm32::spi::Spi;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{i2c, spi};
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Ticker, Timer};
 use o89_core::{
-    Blame, BootRecord, Bus, Clock, Contact, FailState, Feedback, LastWords, Line, Millis,
-    Pull as DeclaredPull, RailSequencer, ResetCause, RtcClock, Store, Task,
+    Blame, BootId, BootRecord, Bus, Clock, Contact, FailState, Feedback, Identity, LastWords, Line,
+    LinkText, Millis, Pull as DeclaredPull, RailSequencer, ResetCause, Revision, RtcClock, SETTLE,
+    Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -103,6 +106,26 @@ const _: () = {
         FailState::DrivenHigh
     ));
 };
+
+/// This firmware, as key 4 of every `LinkUp` it sends (L-031's other half).
+const FW: &str = concat!("o89-controller ", env!("CARGO_PKG_VERSION"));
+/// The board, as key 6.
+const HW: &str = match REVISION {
+    Revision::A => "board A rev A",
+    Revision::B => "board A rev B",
+};
+const _: () = {
+    assert!(FW.len() <= km43::MAX_LINK_TEXT);
+    assert!(HW.len() <= km43::MAX_LINK_TEXT);
+};
+
+/// A link text from a constant the assertion above has bounded.
+fn link_text(text: &str) -> LinkText {
+    match LinkText::new(text) {
+        Ok(text) => text,
+        Err(_) => LinkText::EMPTY,
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -153,9 +176,28 @@ async fn main(spawner: Spawner) {
     // 5. The voltage detector.
     pvd::arm();
 
-    // 6. The store, off the FRAM, before any output moves: the run reason
-    // is what the boot decides on, and the boot count and the last words
-    // are written down here. A bus that does not answer leaves no store,
+    // 5a. The module rail, before any bus, with EN held low from the
+    // instant the pins are taken so the rail never rises with the module's
+    // reset released. Revision A drops the rail through every reset, so
+    // the path from reset to here is how long a reset keeps the module
+    // off, and one that lands inside a five-second cut adds exactly this
+    // to it (F-005): no bus and no store on the way, only the clocks, the
+    // watchdog and the detector. The boot then waits the rail's settling
+    // before the FRAM is touched, so that on a cold boot, the switch-on
+    // after a long off that corrupted the part within milliseconds on the
+    // bench (origin89hq/hardware#5), nothing that writes is running.
+    let mut rail = rail::Pins::new(
+        Output::new(b.module.rail, Level::Low, Speed::Low),
+        Flex::new(b.module.en),
+    );
+    let mut sequencer = RailSequencer::new(REVISION);
+    rail.apply(sequencer.power_on(Uptime.now()));
+    defmt::info!("rail: powering the module, EN held low");
+    Timer::after(Duration::from_millis(SETTLE.as_millis())).await;
+
+    // 6. The store, off the FRAM, before any other output moves: the run
+    // reason is what the boot decides on, and the boot count and the last
+    // words are written down here. A bus that does not answer leaves no store,
     // and the boot goes on to the fail state as it would with one.
     // The supervisor is not running yet, so this phase bounds itself: every
     // transfer is cut by the driver's timeout, three times the longest one
@@ -172,6 +214,7 @@ async fn main(spawner: Spawner) {
     let mut fram = Fram::new(I2c::new_blocking(
         b.i2c2, b.fram_scl, b.fram_sda, i2c_config,
     ));
+    let mut boot_count = None;
     let store = match Store::boot(&mut fram, words).await {
         Ok((store, report)) => {
             defmt::info!("store: {}", report);
@@ -179,6 +222,13 @@ async fn main(spawner: Spawner) {
                 defmt::info!("run reason: {}", reason);
             } else {
                 defmt::info!("run reason: none on the part");
+            }
+            // A count that did not land on the part is the same count
+            // again next boot, which is the `boot_id` L-040 forbids; only
+            // a written one names this boot (F-039).
+            boot_count = report.boot_recorded.is_ok().then_some(report.boot);
+            if boot_count.is_none() {
+                defmt::error!("store: the boot count was not written; no boot_id this boot");
             }
             Some(store)
         }
@@ -191,6 +241,18 @@ async fn main(spawner: Spawner) {
         }
     };
     last_words::clear();
+    // What this side says about itself on the link (F-039). No boot count
+    // is no `boot_id`: a hash over the unique id alone would come back the
+    // same after the reboot L-040 exists to make visible, so a part whose
+    // FRAM did not answer, or whose new count did not land, has no
+    // identity and no link. Its module is powered all the same: on revision
+    // A, a rail kept off and switched on at a later boot is what F-005
+    // forbids.
+    let identity = boot_count.map(|boot| Identity {
+        fw: link_text(FW),
+        hw: link_text(HW),
+        boot_id: BootId::derive(&embassy_stm32::uid::uid(), boot),
+    });
 
     // 7. Every output this image drives, to its declared fail state. Held
     // for the life of this task, which never returns; a bus takes its
@@ -225,17 +287,13 @@ async fn main(spawner: Spawner) {
         defmt::error!("the supervisor did not spawn; the watchdog will reset the part");
     }
 
-    // 9. The module rail sequence: the module powered with EN held low,
-    // released once the rail has settled. The boot lines are applied here,
-    // before the task exists, so EN is held from the instant the pins are
-    // taken and the rail never rises with the module's reset released.
-    let mut rail = rail::Pins::new(
-        Output::new(b.module.rail, Level::Low, Speed::Low),
-        Flex::new(b.module.en),
-    );
-    let mut sequencer = RailSequencer::new(REVISION);
-    rail.apply(sequencer.power_on(Uptime.now()));
-    defmt::info!("rail: powering the module, EN held low");
+    // 9. The module rail sequence, powered since 5a: the task releases EN
+    // once the rail has settled, which it already has.
+    if identity.is_none() {
+        defmt::error!(
+            "link: no boot count, so no boot_id (F-039); the module is powered and the link stays down"
+        );
+    }
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
@@ -243,6 +301,22 @@ async fn main(spawner: Spawner) {
         spawner.spawn(token);
     } else {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");
+    }
+
+    // 9a. The link, which builds its UART only once the rail task says the
+    // rail has settled (F-006), and drops it before every cut (F-003).
+    supervisor::check_in(Task::Link);
+    let link_pins = link::Pins {
+        usart: b.module.usart,
+        tx: b.module.tx,
+        rx: b.module.rx,
+        rts: b.module.rts,
+        cts: b.module.cts,
+    };
+    if let Ok(token) = link::run(link_pins, identity) {
+        spawner.spawn(token);
+    } else {
+        defmt::error!("the link task did not spawn; the watchdog will reset the part");
     }
 
     // 9b. The recorder, with the NOR: the ring is opened and the boot

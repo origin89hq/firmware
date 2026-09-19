@@ -10,9 +10,11 @@
 //!
 //! cites: F-023
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, TrySendError};
 use embassy_time::{Duration, Ticker};
-use km43::{Event, EventKind, LogSeq};
-use o89_core::{Class, Ring, SCRATCH, Store, Task};
+use km43::{Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
+use o89_core::{Class, LinkEvent, Ring, SCRATCH, Store, Task};
 
 use crate::fram::Fram;
 use crate::mailbox;
@@ -27,6 +29,18 @@ const _: () = assert!((RING_BLOCKS as usize) * SECTOR <= 16 * 1024 * 1024);
 /// How often the task looks at the mailbox and checks in; its window on
 /// the roll is thirty seconds.
 const PERIOD: Duration = Duration::from_millis(100);
+
+/// Events waiting for the ring, from the tasks that raise them. As deep
+/// as the protocol's event queue; a task whose event does not fit is told
+/// so and says so, and nothing is evicted.
+static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
+
+/// Queue an event for the ring, or hand it back when the queue is full.
+pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
+    EVENTS.try_send(event).map_err(|refused| match refused {
+        TrySendError::Full(event) => event,
+    })
+}
 
 /// The recorder task: the only owner of the FRAM and the NOR, and so the
 /// one that serves the bench tool's mailbox.
@@ -85,6 +99,17 @@ pub async fn run(store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     check_in(Task::Recorder);
     loop {
         ticker.next().await;
+        // Bounded by the queue's depth: what arrives meanwhile waits a turn.
+        for _ in 0..MAX_EVENT_QUEUE {
+            let Ok(event) = EVENTS.try_receive() else {
+                break;
+            };
+            if let Some(ring) = ring.as_mut() {
+                append(ring, &mut scratch, event.kind()).await;
+            } else {
+                defmt::error!("recorder: no ring; {} not recorded", event);
+            }
+        }
         mailbox::serve(mailbox::Parts {
             fram: &mut fram,
             ring: ring.as_mut(),
@@ -96,25 +121,33 @@ pub async fn run(store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     }
 }
 
-/// The class A boot record, with the body the schema will give it once
-/// origin89hq/km43#32 settles what a boot record carries: an empty map
-/// until then, which is a record that says a boot happened at this
-/// sequence and nothing it should not.
+/// The class A boot record.
 async fn boot_record(ring: &mut Ring<Nor>, scratch: &mut [u8]) {
+    append(ring, scratch, EventKind::BOOT).await;
+}
+
+/// One class A record of `kind`, with the body the schema will give it
+/// once origin89hq/km43#32 settles what each carries: an empty map until
+/// then, which is a record that says the thing happened at this sequence
+/// and nothing it should not. The count a power cycle carries (L-111) is
+/// on the probe's log until then; a body written under a layout of this
+/// firmware's own would persist on a unit past the schema that replaces
+/// it, which is the one place nothing shipped does not apply.
+async fn append(ring: &mut Ring<Nor>, scratch: &mut [u8], kind: EventKind) {
     let mut payload = [0u8; 32];
-    let Ok(event) = Event::new(LogSeq(ring.next_seq()), None, EventKind::BOOT, &[0xA0]) else {
-        defmt::error!("boot record: the event did not build");
+    let Ok(event) = Event::new(LogSeq(ring.next_seq()), None, kind, &[0xA0]) else {
+        defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
         return;
     };
     let Ok(len) = event.encode(&mut payload) else {
-        defmt::error!("boot record: the event did not encode");
+        defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
         return;
     };
     match ring
         .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
         .await
     {
-        Ok(seq) => defmt::info!("boot record: seq {}", seq),
-        Err(error) => defmt::error!("boot record: not appended: {}", error),
+        Ok(seq) => defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq),
+        Err(error) => defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error),
     }
 }

@@ -47,9 +47,11 @@ high into an unpowered module back-powers it through its input protection;
 only after the rail has settled. The RC alone does not reset a module whose
 rail was cut briefly. Source: [hardware#14][h14]. M1.
 
-**F-005** — On revision A the rail is never off for more than 5 seconds.
+**F-005** — On revision A no cut leaves the rail off for more than 5
+seconds, and a controller reset, which drops the rail on this board, has it
+back on before any bus is up, so a reset inside a cut adds only that path.
 Switching it on after minutes off corrupts the STM32's control flow within
-milliseconds, 22 times of 22. Where L-112 asks for a fifteen-minute cut, the
+milliseconds, 22 times of 22; switch-ons after up to 33 s off passed. Where L-112 asks for a fifteen-minute cut, the
 controller stops cycling, leaves the rail on, raises `0x0803` and logs which
 policy it applied. Source: [hardware#5][h5], [km43#36][k36]. M1, M3.
 
@@ -196,8 +198,13 @@ secret still states itself. Two boots share a
 value with the chance two random draws would, one in 2^32, which is the
 bound the field's width gives any scheme; what L-040 forbids is a value
 that rests on RAM and comes back the same by construction, not one that
-repeats by chance. Its secrecy is nothing (L-020). Source: KM43 L-040,
-[#3][plan] §4.2. M3.
+repeats by chance. Its secrecy is nothing (L-020). A boot without a
+written count, which is a FRAM that did not answer or a new count that
+did not land on it, has no `boot_id`: the link stays down, because an id over the unique id
+alone would come back the same after the reboot L-040 exists to make
+visible. The module is powered as on every boot: on revision A a rail kept
+off and switched on at a later boot is what F-005 forbids.
+Source: KM43 L-040, [#3][plan] §4.2. M3.
 
 ## Sessions and provisioning
 
