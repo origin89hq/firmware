@@ -243,10 +243,14 @@ dev-flash-comms *args: sizes
 # time, or restoring one whose factory image is gone. Both boot nothing and
 # answer no knock, so this enters by the strap, which on revision A needs a
 # wire holding IO8 high (hardware#6); pass `--entry knock` to replace the
-# factory image of a module that is running. Effect: everything the module
-# held is replaced, and from the first erase until esptool finishes it boots
-# nothing. Recovery: run it again, with the wire. Use `dev-flash-comms` for
-# ordinary work.
+# factory image of a module that is running. Effect: the bootloader, the
+# partition table, the `otadata` and the factory image are replaced, and from
+# the first erase until esptool finishes the module boots nothing. It is not
+# an erase of the part: the image stops where the factory app ends, so both
+# OTA slots, the credential record and the assets are left exactly as they
+# were. A module flashed this way still holds the credentials it held before,
+# and this is not the way to clear them. Recovery: run it again, with the
+# wire. Use `dev-flash-comms` for ordinary work.
 #
 # FLASH THE WHOLE MODULE FLASH, factory image included; leaves no way back but the strap.
 [confirm("Replace the whole module flash, the factory image that carries the download window included? A transfer that dies leaves the strap as the only way in.")]
