@@ -359,7 +359,12 @@ table in the repository, which says only what the next whole flash would
 install. The two are compared and any disagreement about the partitions
 being written is reported, because a repository whose table has moved on is
 a whole flash somebody has not run. A table this tool cannot read whole is
-refused rather than partly believed. Without this the guard of F-084 checks
+refused rather than partly believed: its checksum is recomputed the way the
+bootloader recomputes it and a table that fails it is refused, since offsets
+from a table the bootloader would reject are offsets to write nothing at,
+and every partition is bounded by the flash the module has. A table with no
+checksum entry is still read, because ESP-IDF makes it optional and the
+bootloader accepts one without. Without this the guard of F-084 checks
 the factory range the repository claims while the bytes land on the
 module's, so a table change alone could erase the recovery image and report
 that it stayed. Source: [#1][i1], F-084, review of [#58][p58]. M3.

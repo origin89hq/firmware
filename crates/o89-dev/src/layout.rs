@@ -23,6 +23,10 @@ pub const OTADATA_LEN: u32 = 0x2000;
 /// table's entries are the same width, which is why this is shared.
 const ENTRY_LEN: usize = 32;
 
+/// The flash the module has (F-036), which bounds every partition in a
+/// table read off it.
+const FLASH_LEN: u32 = 8 * 1024 * 1024;
+
 /// The sector the bootloader reads the partition table out of.
 pub const TABLE_AT: u32 = 0x8000;
 /// How much of it is read back.
@@ -162,21 +166,38 @@ impl Table {
     /// not act on.
     pub fn parse_installed(bytes: &[u8]) -> Result<Self> {
         let mut partitions = Vec::new();
+        let mut checksummed = false;
+        let mut ended = false;
         // Bounded: one turn per 32-byte entry in the sector.
         for (number, entry) in bytes.as_chunks::<ENTRY_LEN>().0.iter().enumerate() {
-            let magic = entry.get(..2).unwrap_or(&[]);
-            match magic {
+            match entry.get(..4).unwrap_or(&[]) {
                 // A partition.
-                [0xaa, 0x50] => partitions.push(Partition::parse_installed(entry)?),
-                // The MD5 of everything before it: not a partition.
-                [0xeb, 0xeb] => {}
-                // Erased: the end of the table.
-                [ERASED, ERASED] => break,
+                [0xaa, 0x50, _, _] => {
+                    let partition = Partition::parse_installed(entry)?;
+                    partition.within_the_flash()?;
+                    partitions.push(partition);
+                }
+                // The checksum of everything before it: not a partition.
+                [0xeb, 0xeb, _, _] => {
+                    if checksummed {
+                        bail!("the module's partition table holds more than one checksum");
+                    }
+                    verify(bytes, number, entry)?;
+                    checksummed = true;
+                }
+                // The end of the table: magic, type and subtype all erased.
+                [ERASED, ERASED, ERASED, ERASED] => {
+                    ended = true;
+                    break;
+                }
                 _ => bail!(
                     "entry {number} of the module's partition table is neither a partition, \
-                     an MD5 nor the end of the table"
+                     a checksum nor the end of the table"
                 ),
             }
+        }
+        if !ended {
+            bail!("the module's partition table has no terminating entry");
         }
         if partitions.is_empty() {
             bail!("the module's partition table holds no partitions");
@@ -283,6 +304,21 @@ impl Partition {
         })
     }
 
+    /// The partition lies inside the flash the module has, which is the
+    /// bootloader's own check on a table it reads.
+    fn within_the_flash(&self) -> Result<()> {
+        let end = self.end()?;
+        if self.offset > FLASH_LEN || end > FLASH_LEN {
+            bail!(
+                "the partition {} runs from {:#x} to {end:#x}, past the module's {FLASH_LEN:#x} \
+                 bytes of flash",
+                self.name,
+                self.offset
+            );
+        }
+        Ok(())
+    }
+
     /// The byte after the partition's last.
     pub fn end(&self) -> Result<u32> {
         self.offset
@@ -299,6 +335,34 @@ impl fmt::Display for Partition {
             self.name, self.offset, self.size
         )
     }
+}
+
+/// The checksum entry at `number`, against the entries before it.
+///
+/// The same computation the bootloader makes: MD5 over the bytes of every
+/// entry ahead of this one, compared with the sixteen in this entry's
+/// second half. A table whose checksum does not match is one the
+/// bootloader refuses, and offsets from a table the bootloader refuses are
+/// offsets to write nothing at — F-085 rests on this table being the one
+/// the module will actually boot by.
+///
+/// A table with no checksum entry at all is not refused: ESP-IDF makes it
+/// optional, and the bootloader accepts one without.
+fn verify(bytes: &[u8], number: usize, entry: &[u8; ENTRY_LEN]) -> Result<()> {
+    let before = bytes
+        .get(..number.saturating_mul(ENTRY_LEN))
+        .context("a checksum entry past the end of the table")?;
+    let computed = <md5::Md5 as md5::Digest>::digest(before);
+    let stated = entry
+        .get(ENTRY_LEN / 2..)
+        .context("a checksum entry with no checksum in it")?;
+    if stated != computed.as_slice() {
+        bail!(
+            "the module's partition table does not match its own checksum, so the bootloader \
+             would refuse it too"
+        );
+    }
+    Ok(())
 }
 
 /// The type and subtype of a row, when both are ones this tool knows.
@@ -478,14 +542,21 @@ creds,     data, nvs,     0x610000, 0x6000,
         entry
     }
 
-    /// A whole sector: the rows, the MD5 entry the tool writes after them,
-    /// and erased bytes to the end.
+    /// The checksum entry ESP-IDF appends: the magic, erased padding, and
+    /// the MD5 of everything before it.
+    fn checksum_entry(before: &[u8]) -> Vec<u8> {
+        let mut entry = vec![0xeb, 0xeb];
+        entry.extend_from_slice(&[ERASED; 14]);
+        entry.extend_from_slice(&<md5::Md5 as md5::Digest>::digest(before));
+        entry
+    }
+
+    /// A whole sector: the rows, the checksum entry after them, and erased
+    /// bytes to the end.
     fn installed_sector(rows: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes: Vec<u8> = rows.concat();
-        let mut md5 = vec![0xeb, 0xeb];
-        md5.extend_from_slice(&[ERASED; 14]);
-        md5.extend_from_slice(&[0u8; 16]);
-        bytes.extend_from_slice(&md5);
+        let checksum = checksum_entry(&bytes);
+        bytes.extend_from_slice(&checksum);
         bytes.resize(TABLE_LEN as usize, ERASED);
         bytes
     }
@@ -508,6 +579,109 @@ creds,     data, nvs,     0x610000, 0x6000,
             table.find(Role::FACTORY).expect("factory").offset,
             0x0001_0000
         );
+    }
+
+    /// The table `espflash` really lays down for this product, read back
+    /// as the tool reads it off a module. See `fixtures/README.md`.
+    const REAL_TABLE: &[u8] = include_bytes!("../fixtures/partition-table.bin");
+
+    #[test]
+    fn f_085_the_table_espflash_really_writes_is_read_and_its_checksum_agrees() {
+        // Against the generator's own bytes, so that the checksum this
+        // recomputes is the one ESP-IDF computes and not one this
+        // repository invented to match its own reader.
+        let table = Table::parse_installed(REAL_TABLE).expect("the real table parses");
+        assert_eq!(table.find(Role::OTA_DATA).expect("otadata").offset, 0x9000);
+        assert_eq!(
+            table.find(Role::FACTORY).expect("factory").offset,
+            0x0001_0000
+        );
+        assert_eq!(table.find(Role::ota(0)).expect("ota_0").offset, 0x0021_0000);
+        assert_eq!(table.find(Role::ota(1)).expect("ota_1").offset, 0x0041_0000);
+    }
+
+    #[test]
+    fn f_085_one_flipped_bit_in_the_real_table_is_refused() {
+        let mut corrupted = REAL_TABLE.to_vec();
+        // The low byte of ota_0's offset, in the third entry.
+        corrupted[64 + 4] ^= 0x10;
+        let error = format!(
+            "{:#}",
+            Table::parse_installed(&corrupted).expect_err("refused")
+        );
+        assert!(error.contains("own checksum"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_table_that_does_not_match_its_own_checksum_is_refused() {
+        // A corrupted offset the bootloader would reject is one this tool
+        // must not plan from, however consistent the rest of the table
+        // looks: it would be writing by a map the module does not use.
+        let mut sector = installed_sector(&[
+            installed_entry(1, 0x00, 0x9000, 0x2000, "otadata"),
+            installed_entry(0, 0x00, 0x0001_0000, 0x0020_0000, "factory"),
+            installed_entry(0, 0x10, 0x0021_0000, 0x0020_0000, "ota_0"),
+        ]);
+        Table::parse_installed(&sector).expect("sound before the corruption");
+        // Move ota_0 on top of the factory image, as corruption might.
+        sector[64 + 4] = 0x00;
+        sector[64 + 5] = 0x00;
+        sector[64 + 6] = 0x01;
+        let error = format!(
+            "{:#}",
+            Table::parse_installed(&sector).expect_err("refused")
+        );
+        assert!(error.contains("own checksum"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_table_with_no_checksum_at_all_is_still_read() {
+        // ESP-IDF makes the checksum optional and the bootloader accepts a
+        // table without one, so refusing it here would refuse a module the
+        // bootloader is perfectly happy with.
+        let mut bytes: Vec<u8> = [
+            installed_entry(1, 0x00, 0x9000, 0x2000, "otadata"),
+            installed_entry(0, 0x10, 0x0021_0000, 0x0020_0000, "ota_0"),
+        ]
+        .concat();
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        let table = Table::parse_installed(&bytes).expect("read without a checksum");
+        assert_eq!(table.find(Role::ota(0)).expect("ota_0").offset, 0x0021_0000);
+    }
+
+    #[test]
+    fn a_table_with_two_checksums_is_refused() {
+        let rows = [installed_entry(1, 0x00, 0x9000, 0x2000, "otadata")];
+        let mut bytes: Vec<u8> = rows.concat();
+        let checksum = checksum_entry(&bytes);
+        bytes.extend_from_slice(&checksum);
+        bytes.extend_from_slice(&checksum);
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
+        assert!(error.contains("more than one checksum"), "{error}");
+    }
+
+    #[test]
+    fn a_table_that_never_ends_is_refused() {
+        let rows = [installed_entry(1, 0x00, 0x9000, 0x2000, "otadata")];
+        let mut bytes: Vec<u8> = rows.concat();
+        let checksum = checksum_entry(&bytes);
+        bytes.extend_from_slice(&checksum);
+        // No erased entry after it: the table runs to the end of what was
+        // read, which the bootloader calls missing a terminating entry.
+        let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
+        assert!(error.contains("terminating entry"), "{error}");
+    }
+
+    #[test]
+    fn a_partition_past_the_end_of_the_flash_is_refused() {
+        let sector =
+            installed_sector(&[installed_entry(0, 0x10, 0x00ff_0000, 0x0020_0000, "ota_0")]);
+        let error = format!(
+            "{:#}",
+            Table::parse_installed(&sector).expect_err("refused")
+        );
+        assert!(error.contains("past the module's"), "{error}");
     }
 
     #[test]
