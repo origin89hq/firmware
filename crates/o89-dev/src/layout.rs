@@ -210,7 +210,31 @@ impl Table {
         if partitions.is_empty() {
             bail!("the module's partition table holds no partitions");
         }
-        Ok(Self { partitions })
+        let table = Self { partitions };
+        table.no_overlaps()?;
+        Ok(table)
+    }
+
+    /// No two partitions share a byte.
+    ///
+    /// The bootloader does not check this and a hand-made table can pass
+    /// its checksum with ranges that overlap. It matters here because the
+    /// slot route's promise is that it touches the `otadata` and the slot
+    /// and nothing else: a slot overlapping the credential record would
+    /// see the application written straight through it, past a guard that
+    /// is only watching the recovery image. A table whose rows disagree
+    /// about who owns a byte is one this tool cannot keep that promise
+    /// against, so it refuses it.
+    fn no_overlaps(&self) -> Result<()> {
+        let mut ordered: Vec<&Partition> = self.partitions.iter().collect();
+        ordered.sort_by_key(|partition| partition.offset);
+        for pair in ordered.windows(2) {
+            let [first, next] = pair else { continue };
+            if first.end()? > next.offset {
+                bail!("the module's partition table overlaps: {first} runs into {next}");
+            }
+        }
+        Ok(())
     }
 
     /// The table's rows, by the text of the file.
@@ -699,6 +723,27 @@ creds,     data, nvs,     0x610000, 0x6000,
         // read, which the bootloader calls missing a terminating entry.
         let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
         assert!(error.contains("terminating entry"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_table_whose_partitions_overlap_is_refused() {
+        // Checksum-valid and every row inside the flash, but ota_0 runs
+        // through the credential record. Writing the application would
+        // destroy credentials while the recovery-image guard, watching
+        // only the factory image, saw nothing wrong.
+        let sector = installed_sector(&[
+            installed_entry(1, 0x00, 0x9000, 0x2000, "otadata"),
+            installed_entry(0, 0x00, 0x0001_0000, 0x0020_0000, "factory"),
+            installed_entry(0, 0x10, 0x0060_0000, 0x0020_0000, "ota_0"),
+            installed_entry(1, 0x02, 0x0061_0000, 0x6000, "creds"),
+        ]);
+        let error = format!(
+            "{:#}",
+            Table::parse_installed(&sector).expect_err("refused")
+        );
+        assert!(error.contains("overlaps"), "{error}");
+        assert!(error.contains("ota_0"), "{error}");
+        assert!(error.contains("creds"), "{error}");
     }
 
     #[test]
