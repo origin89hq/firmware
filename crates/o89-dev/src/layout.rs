@@ -29,8 +29,15 @@ const FLASH_LEN: u32 = 8 * 1024 * 1024;
 
 /// The sector the bootloader reads the partition table out of.
 pub const TABLE_AT: u32 = 0x8000;
-/// How much of it is read back.
+/// How much of it is read back: the whole sector, of which only the first
+/// [`TABLE_DATA_LEN`] bytes are the table.
 pub const TABLE_LEN: u32 = 0x1000;
+/// How much of that sector is the table. ESP-IDF's own limit: the rest of
+/// the sector is left for a signature, and the bootloader stops looking
+/// for a terminating entry here.
+const TABLE_DATA_LEN: usize = 0xc00;
+/// Entries the bootloader will read, the terminating one included.
+const MAX_ENTRIES: usize = TABLE_DATA_LEN / ENTRY_LEN;
 
 /// The erased byte, which is what a sector reads as before anything is
 /// programmed into it, and what "no slot chosen" is written as.
@@ -168,8 +175,18 @@ impl Table {
         let mut partitions = Vec::new();
         let mut checksummed = false;
         let mut ended = false;
-        // Bounded: one turn per 32-byte entry in the sector.
-        for (number, entry) in bytes.as_chunks::<ENTRY_LEN>().0.iter().enumerate() {
+        // Bounded: one turn per entry the bootloader would read. Past
+        // `MAX_ENTRIES` is past the table as far as the bootloader is
+        // concerned — it stops looking for the terminating entry there and
+        // calls the table invalid — so a row beyond it is not one to plan
+        // by, and a terminator beyond it is not one that terminates.
+        for (number, entry) in bytes
+            .as_chunks::<ENTRY_LEN>()
+            .0
+            .iter()
+            .take(MAX_ENTRIES)
+            .enumerate()
+        {
             match entry.get(..4).unwrap_or(&[]) {
                 // A partition.
                 [0xaa, 0x50, _, _] if !checksummed => {
@@ -711,6 +728,40 @@ creds,     data, nvs,     0x610000, 0x6000,
         bytes.resize(TABLE_LEN as usize, ERASED);
         let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
         assert!(error.contains("after the checksum"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_table_whose_terminator_is_past_the_bootloaders_reach_is_refused() {
+        // ESP-IDF gives the table 0xC00 bytes, the terminating entry
+        // included. A row at the last index with the terminator after it
+        // is a table the bootloader calls invalid for having no
+        // terminator, so its offsets are not offsets to write by.
+        let mut rows = Vec::new();
+        for slot in 0..u32::try_from(MAX_ENTRIES).expect("a small count") {
+            let at = 0x0001_0000 + slot * 0x1000;
+            rows.push(installed_entry(1, 0x02, at, 0x1000, "filler"));
+        }
+        let mut bytes: Vec<u8> = rows.concat();
+        assert_eq!(bytes.len(), TABLE_DATA_LEN, "the table's data is full");
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
+        assert!(error.contains("terminating entry"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_table_that_fills_its_room_but_still_terminates_is_read() {
+        // One fewer row, so the terminator lands on the last index the
+        // bootloader reads. This is the boundary the case above sits just
+        // past, and it has to keep working.
+        let mut rows = Vec::new();
+        for slot in 0..u32::try_from(MAX_ENTRIES - 1).expect("a small count") {
+            let at = 0x0001_0000 + slot * 0x1000;
+            rows.push(installed_entry(1, 0x02, at, 0x1000, "filler"));
+        }
+        let mut bytes: Vec<u8> = rows.concat();
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        let table = Table::parse_installed(&bytes).expect("read");
+        assert_eq!(table.partitions.len(), MAX_ENTRIES - 1);
     }
 
     #[test]
