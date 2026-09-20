@@ -264,14 +264,21 @@ async fn fault_cycle(pins: &mut Pins) {
     /// How long the rail stays on between trials.
     const ON: Duration = Duration::from_secs(10);
 
+    // `EN` and `BOOT` are left as inputs throughout, which is what the
+    // self-test that found the fault did: origin89hq/hardware#5 says
+    // nothing holds the rail up after ten minutes "since the self-test
+    // leaves the module's EN and BOOT pins untouched", and every fault it
+    // saw came while the module was up in its ROM. Holding `EN` low would
+    // keep the module in reset, draw a different current at switch-on and
+    // reproduce a different experiment.
     let off = Lines {
         rail: RailLine::Off,
-        en: EnLine::HeldLow,
+        en: EnLine::Released,
         boot: BootLine::Released,
     };
     let on = Lines {
         rail: RailLine::On,
-        en: EnLine::HeldLow,
+        en: EnLine::Released,
         boot: BootLine::Released,
     };
     pvd::latch_crossings();
@@ -296,6 +303,14 @@ async fn fault_cycle(pins: &mut Pins) {
             check_in(Task::Rail);
             Timer::after(PERIOD).await;
         }
+        // USART1 up before the edge, with the module unpowered and
+        // holding the line low. #5 names the receive path as a suspect it
+        // could not exclude precisely because the self-test enabled the
+        // UART just before `PC5` went high; the production order is the
+        // other way round, so an experiment that kept it would be testing
+        // the one arrangement the fault was never seen in.
+        say(RailWord::Settled);
+        Timer::after(Duration::from_millis(200)).await;
         // Cleared at the last instant, so what the flags hold afterwards
         // is this edge and nothing before it.
         pvd::clear_crossings();
