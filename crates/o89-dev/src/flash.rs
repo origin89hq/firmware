@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::layout::{
-    ImageState, OTADATA_LEN, Role, TABLE_AT, TABLE_LEN, Table, otadata_no_slot, otadata_selecting,
+    ImageState, OTADATA_LEN, Partition, Role, TABLE_AT, TABLE_LEN, Table, otadata_no_slot,
+    otadata_selecting,
 };
 use crate::link::Link;
 
@@ -180,6 +181,18 @@ pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
             }],
         ],
     };
+    // Each write inside the partition it is for, by the sectors it
+    // erases: the plan's promise is the two partitions and nothing else.
+    for pass in &plan.passes {
+        for write in pass {
+            let partition = if write.at == otadata.offset {
+                otadata
+            } else {
+                slot
+            };
+            within(write, partition)?;
+        }
+    }
     keeps_the_recovery_image(&plan, table)?;
     Ok(plan)
 }
@@ -191,6 +204,51 @@ pub fn plan_slot(table: &Table, app: &Path, scratch: &Scratch) -> Result<Plan> {
 /// the one without the other. The table declares nothing below its own
 /// offset, so this is the one boundary the table cannot state.
 const PARTITION_TABLE_END: u32 = 0x9000;
+
+/// The flash's erase unit. `write-flash` erases every sector a range
+/// touches before it programs it, so the bytes a write leaves changed are
+/// its range rounded out to these, and that is the range a guard has to
+/// judge. A partition boundary that is not on one of these is a write
+/// that necessarily disturbs its neighbour.
+const SECTOR: u32 = 0x1000;
+
+/// The sectors a write erases: its range rounded out to whole sectors.
+fn erased(write: &Write) -> Result<(u32, u32)> {
+    let end = write
+        .at
+        .checked_add(write.len)
+        .with_context(|| format!("a write at {:#x} that runs past the flash", write.at))?;
+    let first = write
+        .at
+        .checked_div(SECTOR)
+        .and_then(|s| s.checked_mul(SECTOR));
+    let first = first.context("a sector that fits")?;
+    let last = end
+        .checked_next_multiple_of(SECTOR)
+        .with_context(|| format!("a write ending at {end:#x} that rounds past the flash"))?;
+    Ok((first, last))
+}
+
+/// The sectors `write` erases lie inside `partition`.
+///
+/// What the plan promises is that it writes the `otadata` and the slot and
+/// nothing else. The logical range saying so is not enough: the erase is
+/// what changes the flash, and a partition that does not begin and end on
+/// a sector cannot be written without taking bytes from whoever is next to
+/// it.
+fn within(write: &Write, partition: &Partition) -> Result<()> {
+    let (first, last) = erased(write)?;
+    let end = partition.end()?;
+    if first < partition.offset || last > end {
+        bail!(
+            "writing {} bytes at {:#x} erases {first:#x} to {last:#x}, which is not inside \
+             {partition}",
+            write.len,
+            write.at
+        );
+    }
+    Ok(())
+}
 
 /// Every write in `plan` stays clear of the factory image, of the
 /// partition table that points at it, and of the bootloader that reads
@@ -204,20 +262,19 @@ pub fn keeps_the_recovery_image(plan: &Plan, table: &Table) -> Result<()> {
     let factory = table.find(Role::FACTORY)?;
     let factory_end = factory.end()?;
     for write in plan.passes.iter().flatten() {
-        let end = write
-            .at
-            .checked_add(write.len)
-            .with_context(|| format!("a write at {:#x} that runs past the flash", write.at))?;
-        if write.at < PARTITION_TABLE_END {
+        // The sectors the write erases, not the bytes it means to change.
+        let (first, end) = erased(write)?;
+        if first < PARTITION_TABLE_END {
             bail!(
-                "a write of {} bytes at {:#x} reaches the bootloader or the partition table",
+                "a write of {} bytes at {:#x} erases into the bootloader or the partition table",
                 write.len,
                 write.at
             );
         }
-        if write.at < factory_end && end > factory.offset {
+        if first < factory_end && end > factory.offset {
             bail!(
-                "a write of {} bytes at {:#x} reaches {factory}, which carries the download window",
+                "a write of {} bytes at {:#x} erases into {factory}, which carries the \
+                 download window",
                 write.len,
                 write.at
             );
@@ -811,6 +868,49 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
                 write.at
             );
         }
+    }
+
+    #[test]
+    fn f_084_a_slot_that_does_not_end_on_a_sector_is_refused() {
+        // `write-flash` erases whole sectors, so a slot ending mid-sector
+        // cannot be written without erasing into whatever is next to it.
+        // The logical range would have looked clean.
+        let table = Table::parse(
+            "otadata, data, ota,     0x9000,   0x2000,\n\
+             factory, app,  factory, 0x10000,  0x200000,\n\
+             ota_0,   app,  ota_0,   0x210000, 0x1b880,\n\
+             creds,   data, nvs,     0x22b880, 0x6000,\n",
+        )
+        .expect("the table parses");
+        let scratch = Scratch::new().expect("a scratch");
+        // Fills the slot exactly, and its last sector runs past the slot.
+        let app = application(&scratch, 0x1b880);
+        let error = format!(
+            "{:#}",
+            plan_slot(&table, &app, &scratch).expect_err("refused")
+        );
+        assert!(error.contains("erases"), "{error}");
+        assert!(error.contains("ota_0"), "{error}");
+    }
+
+    #[test]
+    fn f_084_the_sectors_a_write_erases_are_its_range_rounded_out() {
+        let write = Write {
+            at: 0x0021_0000,
+            len: 112_832,
+            file: PathBuf::from("app.bin"),
+        };
+        let (first, last) = erased(&write).expect("a range");
+        assert_eq!(first, 0x0021_0000, "already on a sector");
+        assert_eq!(last, 0x0022_C000, "rounded up past 0x22b8c0");
+        // And a write that starts mid-sector erases from the sector's own
+        // first byte, which is earlier than it was asked to touch.
+        let ragged = Write {
+            at: 0x0021_0004,
+            len: 16,
+            file: PathBuf::from("app.bin"),
+        };
+        assert_eq!(erased(&ragged).expect("a range").0, 0x0021_0000);
     }
 
     #[test]
