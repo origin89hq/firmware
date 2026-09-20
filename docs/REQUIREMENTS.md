@@ -378,6 +378,17 @@ after costs only the part-frame, which the reader abandons once it is told
 how long the line has been silent. No input panics, and nothing on this path
 allocates. Source: KM43 P-030, [#3][plan] §M3 exit. M3.
 
+**F-087** — The link carries ten thousand worst-case frames at 921600 with
+no CRC failure and no overrun, and the same run with the flow control lifted
+does not. A worst-case frame is the longest payload KM43 allows with no
+delimiter byte in it, so COBS adds its most and the wire carries its most
+per frame; the module sends them in batches between turns of its link loop,
+so the controller's requests are still answered and the ladder never cuts
+the rail mid-run. The controller counts frames whose CRC held, frames
+refused between delimiters, part-frames abandoned and the UART's own
+overruns, apart, because a counter that added them would hide whichever was
+rarer. Source: KM43 VERIFICATION §8, [#3][plan] §M3 exit. M3.
+
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6
 [h13]: https://github.com/origin89hq/hardware/issues/13

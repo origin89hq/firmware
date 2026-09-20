@@ -45,6 +45,9 @@ uncovered = [
     "F-072",
     "F-073",
     "F-074",
+    # Needs the board: it is a measurement of the real UART at 921600.
+    # It leaves this list for a `hardware` declaration when the bench runs.
+    "F-087",
 ]
 
 # Kinds: `hardware` — a dated bench log stands in for the test; `spec-check`
