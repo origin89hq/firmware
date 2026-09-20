@@ -146,6 +146,12 @@ impl Pins {
 /// is one a later boot that reads the part does not carry (F-017).
 #[embassy_executor::task]
 pub async fn run(mut pins: Pins, mut rail: Rail) {
+    // Never returns: the experiment owns the pins for the life of the
+    // image (#62). The sequencer below it is the production path and is
+    // compiled beside it, which is what keeps this image honest about
+    // being the same firmware with one thing replaced.
+    #[cfg(feature = "rail-fault")]
+    fault_cycle(&mut pins).await;
     let mut ticker = Ticker::every(PERIOD);
     let mut keeper = recorder::CutsKeeper::new();
     loop {
@@ -229,4 +235,105 @@ fn answer_recovery(recovery: Recovery) {
         }
     }
     say(RailWord::Recovered(recovery));
+}
+
+/// The rail switch-on fault (#62).
+///
+/// origin89hq/hardware#5 is that driving `PC5` high after the module rail
+/// has been off for ten minutes corrupts this part within milliseconds, 22
+/// of 22 times, while the module is still in its ROM. Revision B answers it
+/// with a slew-limited switch on the assumption that inrush is the cause,
+/// and that assumption has never been measured.
+///
+/// This holds the rail off for the ten minutes the fault needs, drives it
+/// on, and says what the detector saw across the edge. Nothing here decides
+/// anything: the sequencer and the ladder do not run while it does, because
+/// it owns the pins instead of them.
+#[cfg(feature = "rail-fault")]
+async fn fault_cycle(pins: &mut Pins) {
+    use crate::pvd;
+    use embassy_time::{Instant, Timer};
+
+    /// How long the rail is off before the edge. The fault needs ten
+    /// minutes; `hardware#5` found nothing at shorter times, and the
+    /// sessions of the 19th and 20th cycled it for five seconds all day
+    /// without once reproducing it.
+    const OFF: Duration = Duration::from_secs(600);
+    /// How long the edge is watched closely before the trial is called.
+    const WATCH: Duration = Duration::from_secs(2);
+    /// How long the rail stays on between trials.
+    const ON: Duration = Duration::from_secs(10);
+
+    let off = Lines {
+        rail: RailLine::Off,
+        en: EnLine::HeldLow,
+        boot: BootLine::Released,
+    };
+    let on = Lines {
+        rail: RailLine::On,
+        en: EnLine::HeldLow,
+        boot: BootLine::Released,
+    };
+    pvd::latch_crossings();
+    let mut trial: u32 = 0;
+    // Bounded by the bench: it runs until the part is reflashed, and each
+    // turn is `OFF + WATCH + ON`.
+    loop {
+        trial = trial.saturating_add(1);
+        pins.apply(off);
+        defmt::info!(
+            "rail fault: trial {}, the rail is off for {} s",
+            trial,
+            OFF.as_secs()
+        );
+        let Some(until) = Instant::now().checked_add(OFF) else {
+            continue;
+        };
+        // Bounded by `OFF`; the roll is kept through the wait, because a
+        // task that stops checking in is a part the watchdog resets and
+        // this one waits ten minutes on purpose.
+        while Instant::now() < until {
+            check_in(Task::Rail);
+            Timer::after(PERIOD).await;
+        }
+        // Cleared at the last instant, so what the flags hold afterwards
+        // is this edge and nothing before it.
+        pvd::clear_crossings();
+        let below_before = pvd::supply_is_below_level();
+        pins.apply(on);
+        defmt::info!(
+            "rail fault: trial {}, PC5 driven high; below the level before the edge: {}",
+            trial,
+            below_before
+        );
+        let Some(until) = Instant::now().checked_add(WATCH) else {
+            continue;
+        };
+        while Instant::now() < until {
+            check_in(Task::Rail);
+            Timer::after(PERIOD).await;
+        }
+        let (rising, falling) = pvd::crossings();
+        defmt::info!(
+            "rail fault: trial {}, across the edge the detector latched falling={} rising={}, below now={}",
+            trial,
+            falling,
+            rising,
+            pvd::supply_is_below_level()
+        );
+        if !falling {
+            defmt::info!(
+                "rail fault: trial {}, no crossing of {} at switch-on",
+                trial,
+                "the level"
+            );
+        }
+        let Some(until) = Instant::now().checked_add(ON) else {
+            continue;
+        };
+        while Instant::now() < until {
+            check_in(Task::Rail);
+            Timer::after(PERIOD).await;
+        }
+    }
 }

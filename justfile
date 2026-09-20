@@ -31,6 +31,7 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features no-flow -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features rail-fault -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:
@@ -282,6 +283,22 @@ run-controller-frames:
 # FLASH and run the controller with the frames bench and no flow control; it has to lose frames.
 run-controller-frames-no-flow:
     cd firmwares/o89-controller && cargo run --release --features no-flow
+
+# FLASH and run the RAIL SWITCH-ON EXPERIMENT (#62, origin89hq/hardware#5):
+# holds the module rail off for ten minutes, drives `PC5` high, and reports
+# whether the voltage detector latched a crossing across that edge. The
+# detector's EXTI pending bit is set by hardware and survives a part that
+# corrupts, so it can also be read afterwards over the probe:
+# `probe-rs read b32 0x40021810 1 --chip STM32G0B1RETx` is the falling
+# register, bit 16. Effect: the sequencer and the ladder do not drive the
+# rail; the module is held off for ten minutes at a time and the controller
+# may corrupt itself on the edge, which is the point. Safe setup: board B
+# plugged with 12 V off beforehand, and nothing on CN10 but instrumentation.
+# Recovery: `just flash-controller` restores the ordinary image.
+#
+# FLASH and run the rail switch-on experiment; it corrupts the controller on purpose.
+run-controller-rail-fault:
+    cd firmwares/o89-controller && cargo run --release --features rail-fault
 
 # FLASH the comms image built with the frames bench onto the module, into
 # its OTA slot (F-087): once the link is up the module sends ten thousand

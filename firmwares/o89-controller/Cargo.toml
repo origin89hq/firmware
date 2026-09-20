@@ -31,6 +31,14 @@ frames = ["dep:o89-link"]
 # the flow control was never what was holding the peer off. Only with
 # `frames`, and never on a unit that ships.
 no-flow = ["frames"]
+
+# The rail switch-on fault (#62, origin89hq/hardware#5): holds the module
+# rail off for ten minutes, drives it on, and reports whether the voltage
+# detector latched a crossing over that edge. Replaces the rail task, so
+# the sequencer and the ladder do not drive the rail while it runs. Board
+# B is plugged with 12 V off, and the experiment corrupts the controller
+# on purpose, so nothing but instrumentation belongs on CN10.
+rail-fault = []
 # Halts on a panic with the message on the probe instead of writing the last
 # words and resetting. For chasing a panic at the bench, and nothing else: a
 # bench run that proves the panic path runs without it.

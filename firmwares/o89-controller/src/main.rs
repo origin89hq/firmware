@@ -336,6 +336,10 @@ async fn main(spawner: Spawner) {
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
+    #[cfg(feature = "rail-fault")]
+    defmt::warn!(
+        "rail fault: this image runs the switch-on experiment (#62); the sequencer and the ladder do not drive the rail"
+    );
     if let Ok(token) = rail::run(rail, Rail::new(sequencer, on_part)) {
         spawner.spawn(token);
     } else {
