@@ -237,6 +237,76 @@ fn answer_recovery(recovery: Recovery) {
     say(RailWord::Recovered(recovery));
 }
 
+/// Say whether the edge disturbed anything.
+#[cfg(feature = "rail-fault")]
+fn report_disturbance(trial: u32, page: usize, disturbed: u32, first_at: usize, cleared: u32) {
+    if disturbed > 0 || cleared > 0 {
+        defmt::error!(
+            "rail fault: trial {}, RAM DISTURBED: {} of {} canary bytes wrong, first at {}, {} clears left rubbish",
+            trial,
+            disturbed,
+            page,
+            first_at,
+            cleared
+        );
+    } else {
+        defmt::info!(
+            "rail fault: trial {}, {} canary bytes intact and every clear held across the edge",
+            trial,
+            page
+        );
+    }
+}
+
+/// What a canary byte should hold at `at`. Not a constant fill: a pattern
+/// that differs byte to byte catches a run written from somewhere else,
+/// which a page of one value would hide.
+#[cfg(feature = "rail-fault")]
+fn stamp_of(at: usize) -> u8 {
+    // `at` indexes a 1 KiB page; its low byte is all this needs, and
+    // taking it by truncation rather than by a cast keeps the lint that
+    // watches casts meaningful elsewhere.
+    let low = u8::try_from(at & 0xff).unwrap_or(0);
+    low.wrapping_mul(31).wrapping_add(7)
+}
+
+/// Read the canary back: how many bytes are not what was stamped, and
+/// where the first of them is.
+#[cfg(feature = "rail-fault")]
+fn canary_read_back(canary: &[u8]) -> (u32, usize) {
+    let mut disturbed = 0u32;
+    let mut first_at = 0usize;
+    for (at, byte) in canary.iter().enumerate() {
+        if *byte != stamp_of(at) {
+            if disturbed == 0 {
+                first_at = at;
+            }
+            disturbed = disturbed.saturating_add(1);
+        }
+    }
+    (disturbed, first_at)
+}
+
+/// Clear and re-read `scratch` flat out until `until`, counting the
+/// clears that left something behind (#62).
+///
+/// No await in it: the fault arrives within milliseconds of the line
+/// moving, and a loop that yielded would be somewhere else when it did.
+/// This is the shape of the work `__aeabi_memclr8` was doing in
+/// origin89hq/hardware#5 when it took a branch its code cannot produce.
+#[cfg(feature = "rail-fault")]
+fn busy_until_checked(scratch: &mut [u8], until: embassy_time::Instant) -> u32 {
+    let mut cleared = 0u32;
+    while embassy_time::Instant::now() < until {
+        scratch.fill(0xa5);
+        scratch.fill(0);
+        if scratch.iter().any(|byte| *byte != 0) {
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    cleared
+}
+
 /// The rail switch-on fault (#62).
 ///
 /// origin89hq/hardware#5 is that driving `PC5` high after the module rail
@@ -263,6 +333,14 @@ async fn fault_cycle(pins: &mut Pins) {
     const WATCH: Duration = Duration::from_secs(2);
     /// How long the rail stays on between trials.
     const ON: Duration = Duration::from_secs(10);
+    /// How long the CPU works flat out across the edge, with no await in
+    /// it: the fault arrives within milliseconds of the line moving.
+    const BUSY: Duration = Duration::from_millis(50);
+    /// The page stamped before the edge and read back after.
+    const CANARY: usize = 1024;
+    /// The buffer cleared and checked in the busy loop. 264 bytes is the
+    /// size of the one `__aeabi_memclr8` was zeroing in #5.
+    const SCRATCH: usize = 264;
 
     // `EN` and `BOOT` are left as inputs throughout, which is what the
     // self-test that found the fault did: origin89hq/hardware#5 says
@@ -282,6 +360,8 @@ async fn fault_cycle(pins: &mut Pins) {
         boot: BootLine::Released,
     };
     pvd::latch_crossings();
+    let mut canary = [0u8; CANARY];
+    let mut scratch = [0u8; SCRATCH];
     let mut trial: u32 = 0;
     // Bounded by the bench: it runs until the part is reflashed, and each
     // turn is `OFF + WATCH + ON`.
@@ -303,12 +383,22 @@ async fn fault_cycle(pins: &mut Pins) {
             check_in(Task::Rail);
             Timer::after(PERIOD).await;
         }
+        // Stamped last, so the page holds this trial's pattern and not a
+        // previous trial's when the edge arrives.
+        for (at, byte) in canary.iter_mut().enumerate() {
+            *byte = stamp_of(at);
+        }
         // USART1 up before the edge, with the module unpowered and
         // holding the line low. #5 names the receive path as a suspect it
         // could not exclude precisely because the self-test enabled the
         // UART just before `PC5` went high; the production order is the
         // other way round, so an experiment that kept it would be testing
         // the one arrangement the fault was never seen in.
+        // Stamped last, so the page holds this trial's pattern and not a
+        // previous trial's when the edge arrives.
+        for (at, byte) in canary.iter_mut().enumerate() {
+            *byte = stamp_of(at);
+        }
         say(RailWord::Settled);
         Timer::after(Duration::from_millis(200)).await;
         // Cleared at the last instant, so what the flags hold afterwards
@@ -321,6 +411,22 @@ async fn fault_cycle(pins: &mut Pins) {
             trial,
             below_before
         );
+        // The work the edge lands on, and a page of RAM to land in.
+        //
+        // origin89hq/hardware#5 caught the fault inside `__aeabi_memclr8`
+        // zeroing a 264-byte buffer "a few instructions after `PC5` goes
+        // high", and in a return through a function the self-test happened
+        // to be in. This firmware is doing none of that at the edge — it
+        // logs and awaits a timer — so a disturbance could be arriving and
+        // landing nowhere anyone would see. This gives it somewhere to
+        // land: a page stamped before the edge and read back after, and a
+        // scratch cleared and checked in a tight loop across it, which is
+        // the shape of the work the fault was found in.
+        let Some(busy_until) = Instant::now().checked_add(BUSY) else {
+            continue;
+        };
+        let cleared = busy_until_checked(&mut scratch, busy_until);
+        let (disturbed, first_at) = canary_read_back(&canary);
         let Some(until) = Instant::now().checked_add(WATCH) else {
             continue;
         };
@@ -328,6 +434,7 @@ async fn fault_cycle(pins: &mut Pins) {
             check_in(Task::Rail);
             Timer::after(PERIOD).await;
         }
+        report_disturbance(trial, canary.len(), disturbed, first_at, cleared);
         let (rising, falling) = pvd::crossings();
         defmt::info!(
             "rail fault: trial {}, across the edge the detector latched falling={} rising={}, below now={}",
