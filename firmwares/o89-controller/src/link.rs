@@ -346,24 +346,9 @@ async fn episode(
     // episode's end, by a cut or by a stall, would merge into this one's
     // first frame and count its noise against the wrong boot (F-031).
     reader.discard();
-    let mut config = Config::default();
-    config.baudrate = BAUD;
-    let uart = match BufferedUart::new_with_rtscts(
-        pins.usart.reborrow(),
-        pins.rx.reborrow(),
-        pins.tx.reborrow(),
-        pins.rts.reborrow(),
-        pins.cts.reborrow(),
-        Irqs,
-        &mut rings.tx[..],
-        &mut rings.rx[..],
-        config,
-    ) {
+    let uart = match open(pins, rings) {
         Ok(uart) => uart,
-        Err(error) => {
-            defmt::error!("link: USART1 refused its configuration: {}", error);
-            return Ended::Refused;
-        }
+        Err(ended) => return ended,
     };
     let (mut tx, mut rx) = uart.split();
     if let Some(ended) = perform(link, &mut tx, writer, &first).await {
@@ -371,6 +356,8 @@ async fn episode(
     }
     let mut chunk = [0u8; 64];
     let mut last_byte = Instant::now();
+    #[cfg(feature = "frames")]
+    let mut counts = frames::Counts::new();
     // Bounded by the cut the state machine asks for, and every turn by the
     // tick: the read waits `TICK` at most.
     loop {
@@ -379,9 +366,13 @@ async fn episode(
         match with_timeout(TICK, rx.read(&mut chunk)).await {
             Ok(Ok(count)) => {
                 last_byte = Instant::now();
+                #[cfg(feature = "frames")]
+                counts.report();
                 for byte in chunk.get(..count).unwrap_or(&[]) {
                     let ended = match reader.push(*byte) {
                         Received::Frame(frame) => {
+                            #[cfg(feature = "frames")]
+                            counts.frame();
                             if let Ok(envelope) = LinkEnvelope::decode(frame) {
                                 let was_up = link.is_up();
                                 let actions = link.received(envelope, Uptime.now());
@@ -399,7 +390,15 @@ async fn episode(
                                 None
                             }
                         }
-                        Received::Dropped(_) | Received::Abandoned => {
+                        Received::Dropped(_) => {
+                            #[cfg(feature = "frames")]
+                            counts.dropped();
+                            link.noise();
+                            None
+                        }
+                        Received::Abandoned => {
+                            #[cfg(feature = "frames")]
+                            counts.abandoned();
                             link.noise();
                             None
                         }
@@ -412,6 +411,8 @@ async fn episode(
             }
             Ok(Err(error)) => {
                 // An overrun or a line error: the bytes it lost are noise.
+                #[cfg(feature = "frames")]
+                counts.error(error);
                 note_rx_error(error);
                 link.noise();
             }
@@ -887,5 +888,112 @@ fn note_rx_error(error: Error) {
         }
         Error::BufferTooLong => defmt::error!("link: read buffer too long"),
         _ => defmt::warn!("link: receive error {}", error),
+    }
+}
+
+/// USART1 at the link's rate with its flow control, or why not.
+///
+/// Its own function because the episode that runs on it is long enough
+/// without it, and because the one place the pins and the rings are handed
+/// to the driver is worth being able to find.
+fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>, Ended> {
+    let mut config = Config::default();
+    config.baudrate = BAUD;
+    BufferedUart::new_with_rtscts(
+        pins.usart.reborrow(),
+        pins.rx.reborrow(),
+        pins.tx.reborrow(),
+        pins.rts.reborrow(),
+        pins.cts.reborrow(),
+        Irqs,
+        &mut rings.tx[..],
+        &mut rings.rx[..],
+        config,
+    )
+    .map_err(|error| {
+        defmt::error!("link: USART1 refused its configuration: {}", error);
+        Ended::Refused
+    })
+}
+
+/// The frames bench: what the link read, counted (F-087).
+///
+/// Four numbers, kept apart because they mean different things. A frame is
+/// one whose CRC held between two delimiters; a drop is bytes between two
+/// delimiters that were not a frame, which is what a CRC failure looks
+/// like from here; an abandon is a part-frame nothing followed; an overrun
+/// is the UART losing bytes before the task read them, which is the flow
+/// control not doing its job. "Ten thousand frames with zero CRC
+/// failures" is the first at ten thousand and the rest at nought.
+#[cfg(feature = "frames")]
+mod frames {
+    use embassy_stm32::usart::Error;
+    use embassy_time::{Duration, Instant};
+
+    /// How often the tally is logged while bytes are arriving.
+    const EVERY: Duration = Duration::from_secs(1);
+
+    pub struct Counts {
+        frames: u32,
+        dropped: u32,
+        abandoned: u32,
+        overruns: u32,
+        others: u32,
+        next: Instant,
+    }
+
+    impl Counts {
+        pub fn new() -> Self {
+            Self {
+                frames: 0,
+                dropped: 0,
+                abandoned: 0,
+                overruns: 0,
+                others: 0,
+                next: Instant::now(),
+            }
+        }
+
+        pub fn frame(&mut self) {
+            self.frames = self.frames.saturating_add(1);
+        }
+
+        pub fn dropped(&mut self) {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+
+        pub fn abandoned(&mut self) {
+            self.abandoned = self.abandoned.saturating_add(1);
+        }
+
+        /// An overrun counted apart from every other line error: it is the
+        /// one that says the flow control was not holding the peer off.
+        pub fn error(&mut self, error: Error) {
+            // Not our enum, and marked non-exhaustive by its crate, as
+            // `note_rx_error` says above.
+            match error {
+                Error::Overrun => self.overruns = self.overruns.saturating_add(1),
+                _ => self.others = self.others.saturating_add(1),
+            }
+        }
+
+        /// The tally, at most once a second, and only while something is
+        /// arriving: a quiet line has nothing to say and a log that
+        /// repeated itself would bury the run.
+        pub fn report(&mut self) {
+            let now = Instant::now();
+            if now < self.next {
+                return;
+            }
+            self.next = now.checked_add(EVERY).unwrap_or(now);
+            defmt::info!(
+                "frames: {} read, {} refused, {} abandoned, {} overruns, {} other line errors",
+                self.frames,
+                self.dropped,
+                self.abandoned,
+                self.overruns,
+                self.others
+            );
+        }
     }
 }

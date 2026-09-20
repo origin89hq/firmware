@@ -59,6 +59,8 @@ pub async fn run(
     };
     let mut link = Link::new(now());
     let mut chunk = [0u8; 64];
+    #[cfg(feature = "frames")]
+    let mut frames = frames::Blast::new();
     // Bounded per turn: a read waits `TICK` at most, and the tick follows.
     loop {
         rwdt.feed();
@@ -75,6 +77,11 @@ pub async fn run(
         if let Some(frame) = link.tick(now()) {
             send(&link, &me, frame, &mut tx, &mut writer).await;
         }
+        // Between turns, not inside one: the link's own frames go first,
+        // so the controller's heartbeats are answered through the run and
+        // its ladder never cuts the rail (F-087).
+        #[cfg(feature = "frames")]
+        frames.batch(&link, &mut tx, &mut writer).await;
         // A read that is ready at once does not yield: a controller that
         // floods the UART would otherwise hold the executor every turn.
         yield_now().await;
@@ -117,4 +124,61 @@ async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) {
         }
     }
     let _ = tx.flush_async().await;
+}
+
+/// The frames bench: worst-case frames at the link's rate, counted at the
+/// controller (F-087).
+#[cfg(feature = "frames")]
+mod frames {
+    use super::{UartTx, write_all};
+    use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
+    use o89_comms_core::Link;
+    use o89_link::worst_case;
+
+    /// How many the run sends.
+    const TOTAL: u32 = 10_000;
+    /// How many leave per turn of the link's loop. Sized so a batch is
+    /// about a second of wire time at 921600, which keeps the controller's
+    /// heartbeats answered well inside the ladder's patience while the
+    /// wire itself never idles inside a batch.
+    const PER_TURN: u32 = 100;
+
+    /// The run's state: how many have left, and nothing else.
+    pub struct Blast {
+        sent: u32,
+    }
+
+    impl Blast {
+        pub const fn new() -> Self {
+            Self { sent: 0 }
+        }
+
+        /// One batch, once the link is up and until the run is done.
+        ///
+        /// The payload is the worst case for the wire and is not an
+        /// envelope, so the controller reads each as a frame whose CRC
+        /// held and refuses it above: that is the point, since what is
+        /// being measured is the wire and not the protocol.
+        pub async fn batch(
+            &mut self,
+            link: &Link,
+            tx: &mut UartTx<'static, esp_hal::Async>,
+            writer: &mut FrameWriter,
+        ) {
+            if !link.is_linked() || self.sent >= TOTAL {
+                return;
+            }
+            let mut payload = [0u8; MAX_PAYLOAD];
+            let mut wire = [0u8; MAX_FRAME];
+            // Bounded: `PER_TURN` frames, or the rest of the run.
+            for _ in 0..PER_TURN.min(TOTAL.saturating_sub(self.sent)) {
+                worst_case(&mut payload, self.sent.wrapping_add(1));
+                let Ok(len) = writer.write(&payload, &mut wire) else {
+                    return;
+                };
+                write_all(tx, wire.get(..len).unwrap_or(&[])).await;
+                self.sent = self.sent.saturating_add(1);
+            }
+        }
+    }
 }

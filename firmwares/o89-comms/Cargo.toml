@@ -12,6 +12,13 @@ publish.workspace = true
 # comms processor that could reach a decision is one that could make one.
 # `cargo xtask check` refuses the dependency.
 [features]
+# The frames bench (F-087): once the link is up the module sends ten
+# thousand worst-case frames at the link's rate, in batches between turns
+# of its loop so the controller's heartbeats are still answered and the
+# recovery ladder never cuts the rail mid-run. The controller counts what
+# arrives (`just run-controller-frames`). Never on a unit that ships: it
+# puts megabytes on the link and answers nothing with them.
+frames = ["dep:o89-link"]
 # The image for an ESP32-C6 devkit on its own USB serial (`just
 # run-comms-devkit`): the same firmware, stating the devkit as its board in
 # every `LinkUp` rather than board A (L-034). Nothing else moves.
@@ -39,6 +46,9 @@ static_cell.workspace = true
 km43.workspace = true
 # The window's and the link's rules, where the host tests them.
 o89-comms-core = { path = "../../crates/o89-comms-core" }
+# The worst-case payload, written once so a test and a bench mean the same
+# thing by it. Only the frames bench needs it.
+o89-link = { path = "../../crates/o89-link", optional = true }
 
 [lints]
 workspace = true

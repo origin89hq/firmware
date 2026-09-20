@@ -28,6 +28,8 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:
@@ -257,6 +259,34 @@ dev-flash-comms *args: sizes
 dev-flash-comms-whole *args: sizes
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout whole --yes {{args}}
 
+
+# FLASH and run the controller with the frames bench's counters (F-087):
+# the production image plus a tally of what the link read — frames whose
+# CRC held, frames refused, part-frames abandoned, UART overruns — logged
+# each second while bytes arrive. Effect: as `run-controller`, then the
+# log. Pair it with `dev-flash-comms-frames` on the module, which is what
+# sends the frames. Recovery: `just flash-controller` restores the
+# ordinary image.
+#
+# FLASH and run the controller with the frames bench's counters.
+run-controller-frames:
+    cd firmwares/o89-controller && cargo run --release --features frames
+
+# FLASH the comms image built with the frames bench onto the module, into
+# its OTA slot (F-087): once the link is up the module sends ten thousand
+# worst-case frames at the link's rate, in batches between turns of its
+# loop so the controller's heartbeats are still answered and the ladder
+# never cuts the rail mid-run. Effect: the module replaces its slot image
+# and then puts about 10 MB on the link over roughly two minutes; it
+# answers the link normally throughout and does nothing else. Recovery:
+# `just dev-flash-comms` puts the ordinary image back; the factory image
+# is untouched either way. Run `run-controller-frames` first, so something
+# is counting.
+#
+# FLASH the module with the frames bench; it sends 10 000 frames once linked.
+dev-flash-comms-frames *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features frames
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # LISTEN to the module through the bridge: the firmware resets it, by
 # `--entry reset` (the default), `knock` or `strap`, and prints what it

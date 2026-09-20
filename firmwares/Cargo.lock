@@ -1490,6 +1490,7 @@ dependencies = [
  "esp-storage",
  "km43",
  "o89-comms-core",
+ "o89-link",
  "static_cell",
 ]
 
