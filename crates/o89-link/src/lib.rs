@@ -18,8 +18,10 @@ mod beats;
 mod requests;
 mod rules;
 mod tick;
+mod wire;
 
 pub use beats::*;
 pub use requests::*;
 pub use rules::*;
 pub use tick::*;
+pub use wire::*;
