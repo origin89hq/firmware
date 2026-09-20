@@ -107,7 +107,9 @@ async fn send(
     let Ok(len) = link.build(frame, me, now(), writer, &mut bytes) else {
         return;
     };
-    let _ = with_timeout(
+    // A frame that does not leave is one the controller retries or the
+    // ladder counts, so nothing here acts on the answer.
+    let _left = with_timeout(
         WRITE_DEADLINE,
         write_all(tx, bytes.get(..len).unwrap_or(&[])),
     )
@@ -115,15 +117,17 @@ async fn send(
 }
 
 /// The whole frame out of the pin, in as many writes as the FIFO takes.
-async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) {
+/// Whether all of it left: a caller that counts what it put on the wire
+/// must not count a frame the pin refused.
+async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) -> bool {
     // Bounded by the bytes: every turn writes at least one or stops.
     while !bytes.is_empty() {
         match tx.write_async(bytes).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return false,
             Ok(n) => bytes = bytes.get(n..).unwrap_or(&[]),
         }
     }
-    let _ = tx.flush_async().await;
+    tx.flush_async().await.is_ok()
 }
 
 /// The frames bench: worst-case frames at the link's rate, counted at the
@@ -133,7 +137,7 @@ mod frames {
     use super::{UartTx, write_all};
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
     use o89_comms_core::Link;
-    use o89_link::worst_case;
+    use o89_link::{stamp, worst_case};
 
     /// How many the run sends.
     const TOTAL: u32 = 10_000;
@@ -172,11 +176,23 @@ mod frames {
             let mut wire = [0u8; MAX_FRAME];
             // Bounded: `PER_TURN` frames, or the rest of the run.
             for _ in 0..PER_TURN.min(TOTAL.saturating_sub(self.sent)) {
-                worst_case(&mut payload, self.sent.wrapping_add(1));
+                let number = self.sent.wrapping_add(1);
+                worst_case(&mut payload, number);
+                // Its own number in it, so the controller reports which
+                // frames arrived rather than how many, and a run short of
+                // its total says whether the wire lost them or the pin
+                // never took them.
+                stamp(&mut payload, number);
                 let Ok(len) = writer.write(&payload, &mut wire) else {
                     return;
                 };
-                write_all(tx, wire.get(..len).unwrap_or(&[])).await;
+                // Counted only once it is on the wire. A frame the pin
+                // refused is one the controller never sees, and counting
+                // it would make the run look longer than it was and the
+                // wire look worse than it is.
+                if !write_all(tx, wire.get(..len).unwrap_or(&[])).await {
+                    return;
+                }
                 self.sent = self.sent.saturating_add(1);
             }
         }
