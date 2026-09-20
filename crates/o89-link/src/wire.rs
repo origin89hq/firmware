@@ -40,6 +40,35 @@ pub fn worst_case(payload: &mut [u8], seed: u32) {
     }
 }
 
+/// How many bytes of a worst-case payload carry its number.
+pub const STAMP_BYTES: usize = 4;
+
+/// Stamp `payload` with `number`, keeping it delimiter-free.
+///
+/// Seven bits a byte with the top bit set, so no byte of the stamp is the
+/// delimiter and the payload is still the worst case COBS can be given.
+/// Four bytes carry twenty-eight bits, which is more than any run counts.
+pub fn stamp(payload: &mut [u8], number: u32) {
+    for (at, byte) in payload.iter_mut().take(STAMP_BYTES).enumerate() {
+        let shift = u32::try_from(at).unwrap_or(0).saturating_mul(7);
+        let bits = number.checked_shr(shift).unwrap_or(0) & 0x7f;
+        *byte = u8::try_from(bits).unwrap_or(0) | 0x80;
+    }
+}
+
+/// The number [`stamp`] wrote, or `None` if the payload is too short.
+#[must_use]
+pub fn stamped(payload: &[u8]) -> Option<u32> {
+    let bytes = payload.get(..STAMP_BYTES)?;
+    let mut number = 0u32;
+    for (at, byte) in bytes.iter().enumerate() {
+        let shift = u32::try_from(at).unwrap_or(0).saturating_mul(7);
+        let bits = u32::from(*byte & 0x7f);
+        number |= bits.checked_shl(shift).unwrap_or(0);
+    }
+    Some(number)
+}
+
 #[cfg(test)]
 mod tests {
     use km43::{FrameReader, FrameWriter, MAX_FRAME, Received, max_frame_len};
@@ -73,6 +102,22 @@ mod tests {
                 Received::Nothing => {}
             }
         }
+    }
+
+    #[test]
+    fn a_stamped_payload_reads_back_its_number_and_holds_no_delimiter() {
+        for number in [0u32, 1, 2, 127, 128, 9_999, 10_000, 0x0fff_ffff] {
+            let mut payload = [0u8; MAX_PAYLOAD];
+            worst_case(&mut payload, 3);
+            stamp(&mut payload, number);
+            assert_eq!(stamped(&payload), Some(number), "number {number}");
+            assert!(
+                !payload.contains(&DELIMITER),
+                "the stamp put a delimiter in the body, number {number}"
+            );
+        }
+        // Too short to carry one, and says so rather than inventing one.
+        assert_eq!(stamped(&[0x80, 0x80]), None);
     }
 
     #[test]

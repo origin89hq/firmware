@@ -30,6 +30,7 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features no-flow -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:
@@ -271,6 +272,16 @@ dev-flash-comms-whole *args: sizes
 # FLASH and run the controller with the frames bench's counters.
 run-controller-frames:
     cd firmwares/o89-controller && cargo run --release --features frames
+
+# FLASH and run the controller with the frames bench and NO FLOW CONTROL
+# (F-087): USART1 opened without RTS and CTS, which is the half of the rule
+# that has to fail. Effect: as `run-controller-frames`, with nothing holding
+# the module off; frames are refused and the link may drop. Recovery:
+# `just flash-controller` restores the ordinary image.
+#
+# FLASH and run the controller with the frames bench and no flow control; it has to lose frames.
+run-controller-frames-no-flow:
+    cd firmwares/o89-controller && cargo run --release --features no-flow
 
 # FLASH the comms image built with the frames bench onto the module, into
 # its OTA slot (F-087): once the link is up the module sends ten thousand

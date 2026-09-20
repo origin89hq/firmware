@@ -372,7 +372,7 @@ async fn episode(
                     let ended = match reader.push(*byte) {
                         Received::Frame(frame) => {
                             #[cfg(feature = "frames")]
-                            counts.frame();
+                            counts.frame(frame);
                             if let Ok(envelope) = LinkEnvelope::decode(frame) {
                                 let was_up = link.is_up();
                                 let actions = link.received(envelope, Uptime.now());
@@ -383,6 +383,8 @@ async fn episode(
                                     && let Some(peer) = link.peer()
                                 {
                                     defmt::info!("link: up; the module is {}", peer);
+                                    #[cfg(feature = "frames")]
+                                    counts.linked();
                                 }
                                 perform(link, &mut tx, writer, &actions).await
                             } else {
@@ -899,7 +901,8 @@ fn note_rx_error(error: Error) {
 fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>, Ended> {
     let mut config = Config::default();
     config.baudrate = BAUD;
-    BufferedUart::new_with_rtscts(
+    #[cfg(not(feature = "no-flow"))]
+    let opened = BufferedUart::new_with_rtscts(
         pins.usart.reborrow(),
         pins.rx.reborrow(),
         pins.tx.reborrow(),
@@ -909,8 +912,25 @@ fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>
         &mut rings.tx[..],
         &mut rings.rx[..],
         config,
-    )
-    .map_err(|error| {
+    );
+    // The bench's other half: the lines left alone, so nothing holds the
+    // module off and the ring is all there is between it and the task.
+    #[cfg(feature = "no-flow")]
+    let opened = {
+        defmt::warn!(
+            "link: USART1 without flow control; this is the bench that has to lose frames"
+        );
+        BufferedUart::new(
+            pins.usart.reborrow(),
+            pins.rx.reborrow(),
+            pins.tx.reborrow(),
+            &mut rings.tx[..],
+            &mut rings.rx[..],
+            Irqs,
+            config,
+        )
+    };
+    opened.map_err(|error| {
         defmt::error!("link: USART1 refused its configuration: {}", error);
         Ended::Refused
     })
@@ -929,6 +949,8 @@ fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>
 mod frames {
     use embassy_stm32::usart::Error;
     use embassy_time::{Duration, Instant};
+    use km43::MAX_PAYLOAD;
+    use o89_link::stamped;
 
     /// How often the tally is logged while bytes are arriving.
     const EVERY: Duration = Duration::from_secs(1);
@@ -940,6 +962,21 @@ mod frames {
         overruns: u32,
         others: u32,
         next: Instant,
+        /// The highest number a bench frame carried, and how many of them
+        /// arrived. The two together say what a count alone cannot: a run
+        /// that stops short with no gap never left the module, and one
+        /// with a gap lost frames on the wire.
+        highest: u32,
+        stamped: u32,
+        /// How many times the link came up. More than one means it went
+        /// down, and a run measured across that is a different run.
+        ups: u32,
+        /// The tally when the link came up, so the run can be read apart
+        /// from what came before it. The ROM's boot text arrives at the
+        /// wrong baud and is refused by the hundred (F-031); counting it
+        /// against the wire would make a sound link look like a faulty
+        /// one, and hide a real refusal among a thousand expected ones.
+        at_link: Option<(u32, u32, u32, u32, u32)>,
     }
 
     impl Counts {
@@ -951,11 +988,54 @@ mod frames {
                 overruns: 0,
                 others: 0,
                 next: Instant::now(),
+                highest: 0,
+                stamped: 0,
+                ups: 0,
+                at_link: None,
             }
         }
 
-        pub fn frame(&mut self) {
+        /// The link came up: what follows is the run.
+        ///
+        /// Only the first sets the baseline. A link that comes up again
+        /// mid-run is a link that went down, which is news in itself and
+        /// is counted; re-baselining there would make the tally smaller
+        /// than the run it is supposed to contain, and the two lines would
+        /// stop being comparable.
+        pub fn linked(&mut self) {
+            self.ups = self.ups.saturating_add(1);
+            if self.at_link.is_some() {
+                defmt::warn!(
+                    "frames: the link came up again mid-run; this is the {}th",
+                    self.ups
+                );
+                return;
+            }
+            self.at_link = Some((
+                self.frames,
+                self.dropped,
+                self.abandoned,
+                self.overruns,
+                self.others,
+            ));
+            self.next = Instant::now();
+        }
+
+        /// A frame whose CRC held, and the number it carries when it is
+        /// one of the bench's own.
+        pub fn frame(&mut self, frame: &[u8]) {
             self.frames = self.frames.saturating_add(1);
+            // The bench's frames are the only ones that fill the payload,
+            // and the link's own are far shorter, so a stamp is read only
+            // from one of the run's.
+            if frame.len() < MAX_PAYLOAD {
+                return;
+            }
+            let Some(number) = stamped(frame) else {
+                return;
+            };
+            self.stamped = self.stamped.saturating_add(1);
+            self.highest = self.highest.max(number);
         }
 
         pub fn dropped(&mut self) {
@@ -986,14 +1066,34 @@ mod frames {
                 return;
             }
             self.next = now.checked_add(EVERY).unwrap_or(now);
-            defmt::info!(
-                "frames: {} read, {} refused, {} abandoned, {} overruns, {} other line errors",
-                self.frames,
-                self.dropped,
-                self.abandoned,
-                self.overruns,
-                self.others
-            );
+            if let Some((frames, dropped, abandoned, overruns, others)) = self.at_link {
+                defmt::info!(
+                    "frames since the link came up: {} read, {} refused, {} abandoned, {} overruns, {} other line errors",
+                    self.frames.saturating_sub(frames),
+                    self.dropped.saturating_sub(dropped),
+                    self.abandoned.saturating_sub(abandoned),
+                    self.overruns.saturating_sub(overruns),
+                    self.others.saturating_sub(others)
+                );
+                if self.highest > 0 {
+                    defmt::info!(
+                        "frames of the run: {} arrived, highest numbered {}, {} missing, link up {} time(s)",
+                        self.stamped,
+                        self.highest,
+                        self.highest.saturating_sub(self.stamped),
+                        self.ups
+                    );
+                }
+            } else {
+                defmt::info!(
+                    "frames before the link came up: {} read, {} refused, {} abandoned, {} overruns, {} other line errors",
+                    self.frames,
+                    self.dropped,
+                    self.abandoned,
+                    self.overruns,
+                    self.others
+                );
+            }
         }
     }
 }

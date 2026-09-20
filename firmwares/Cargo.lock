@@ -1519,6 +1519,7 @@ dependencies = [
  "embedded-storage-async",
  "km43",
  "o89-core",
+ "o89-link",
  "panic-probe",
  "portable-atomic",
  "static_cell",
