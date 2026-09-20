@@ -172,16 +172,13 @@ impl Table {
         for (number, entry) in bytes.as_chunks::<ENTRY_LEN>().0.iter().enumerate() {
             match entry.get(..4).unwrap_or(&[]) {
                 // A partition.
-                [0xaa, 0x50, _, _] => {
+                [0xaa, 0x50, _, _] if !checksummed => {
                     let partition = Partition::parse_installed(entry)?;
                     partition.within_the_flash()?;
                     partitions.push(partition);
                 }
                 // The checksum of everything before it: not a partition.
-                [0xeb, 0xeb, _, _] => {
-                    if checksummed {
-                        bail!("the module's partition table holds more than one checksum");
-                    }
+                [0xeb, 0xeb, _, _] if !checksummed => {
                     verify(bytes, number, entry)?;
                     checksummed = true;
                 }
@@ -190,6 +187,17 @@ impl Table {
                     ended = true;
                     break;
                 }
+                // Anything in an entry's place after the checksum, a second
+                // checksum included. The checksum covers what is ahead of
+                // it and nothing behind it, so a row here is one nobody
+                // signed and one the bootloader counts past the end of the
+                // table. Using it would mean writing by a map the module
+                // does not boot by; ignoring it would mean saying nothing
+                // about a table that is not what it claims to be.
+                _ if checksummed => bail!(
+                    "entry {number} of the module's partition table comes after the checksum, \
+                     which does not cover it"
+                ),
                 _ => bail!(
                     "entry {number} of the module's partition table is neither a partition, \
                      a checksum nor the end of the table"
@@ -658,7 +666,27 @@ creds,     data, nvs,     0x610000, 0x6000,
         bytes.extend_from_slice(&checksum);
         bytes.resize(TABLE_LEN as usize, ERASED);
         let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
-        assert!(error.contains("more than one checksum"), "{error}");
+        assert!(error.contains("after the checksum"), "{error}");
+    }
+
+    #[test]
+    fn f_085_a_partition_appended_after_the_checksum_is_refused() {
+        // The checksum covers what is ahead of it. A row after it is one
+        // nobody signed, and the bootloader counts it past the end of the
+        // table, so a tool that used it would erase whatever it pointed at
+        // — the credential record, say — and report a slot written that
+        // the module never boots from.
+        let rows = [
+            installed_entry(1, 0x00, 0x9000, 0x2000, "otadata"),
+            installed_entry(0, 0x00, 0x0001_0000, 0x0020_0000, "factory"),
+        ];
+        let mut bytes: Vec<u8> = rows.concat();
+        let checksum = checksum_entry(&bytes);
+        bytes.extend_from_slice(&checksum);
+        bytes.extend_from_slice(&installed_entry(0, 0x10, 0x0061_0000, 0x6000, "ota_0"));
+        bytes.resize(TABLE_LEN as usize, ERASED);
+        let error = format!("{:#}", Table::parse_installed(&bytes).expect_err("refused"));
+        assert!(error.contains("after the checksum"), "{error}");
     }
 
     #[test]
