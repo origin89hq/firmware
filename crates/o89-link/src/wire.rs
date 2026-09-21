@@ -75,6 +75,32 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn every_numbered_bench_frame_survives_framing() {
+        let mut writer = FrameWriter::new();
+        let mut reader = FrameReader::new();
+        let mut payload = [0; MAX_PAYLOAD];
+        let mut wire = [0; MAX_FRAME];
+        let mut arrived = 0;
+        for number in 1..=10_000 {
+            worst_case(&mut payload, number);
+            stamp(&mut payload, number);
+            let len = writer.write(&payload, &mut wire).expect("frames");
+            for &byte in &wire[..len] {
+                match reader.push(byte) {
+                    Received::Frame(frame) => {
+                        assert_eq!(frame, payload);
+                        assert_eq!(stamped(frame), Some(number));
+                        arrived += 1;
+                    }
+                    Received::Nothing => {}
+                    other => panic!("frame {number}: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(arrived, 10_000);
+    }
+
     /// One frame of `payload` bytes on the wire, worst case, by `seed`.
     fn frame(seed: u32, payload_len: usize, wire: &mut [u8; MAX_FRAME]) -> usize {
         let mut payload = [0u8; MAX_PAYLOAD];
@@ -171,6 +197,14 @@ mod tests {
                     next_wire.get(..next_len).expect("fits"),
                     &mut seen,
                 );
+                assert_eq!(
+                    seen.frames, 0,
+                    "merged fragment accepted: payload {payload_len}, cut {cut}"
+                );
+                assert_eq!(
+                    seen.dropped, 1,
+                    "merged fragment not refused: payload {payload_len}, cut {cut}"
+                );
                 let after_cut = seen.frames;
                 feed(
                     &mut reader,
@@ -181,10 +215,6 @@ mod tests {
                     seen.frames.saturating_sub(after_cut),
                     1,
                     "the frame after the loss was not read whole: payload {payload_len}, cut {cut}"
-                );
-                assert!(
-                    seen.frames <= 2,
-                    "more frames than were sent whole: payload {payload_len}, cut {cut}"
                 );
             }
         }

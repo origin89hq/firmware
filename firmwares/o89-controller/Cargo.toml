@@ -20,9 +20,10 @@ bench = []
 
 # The frames bench (F-087): counts what the link reads — frames whose CRC
 # held, frames refused between delimiters, part-frames abandoned and the
-# UART's own overruns — and logs them each second. The counterpart of
-# `o89-comms`'s `frames`. Production layout; it changes nothing but the
-# counting, so the ladder and everything else behave as they ship.
+# read-reported UART errors — and logs changed tallies each second. The
+# pinned driver does not expose hardware errors or ring overflow (#66).
+# The counterpart of `o89-comms`'s `frames`. Production layout; it changes
+# only the counting, so the ladder and everything else behave as they ship.
 frames = ["dep:o89-link"]
 
 # The frames bench with the flow control lifted (F-087): USART1 opened

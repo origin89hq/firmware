@@ -80,7 +80,11 @@ fn main() -> ! {
     let wired = Config::default()
         .with_baudrate(BAUD)
         .with_hw_flow_ctrl(HwFlowControl {
-            cts: CtsConfig::Enabled,
+            cts: if cfg!(feature = "no-flow") {
+                CtsConfig::Disabled
+            } else {
+                CtsConfig::Enabled
+            },
             rts: RtsConfig::Enabled(RTS_AT),
         })
         .with_rx(RxConfig::default().with_fifo_full_threshold(32));

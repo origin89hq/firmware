@@ -20,7 +20,9 @@
 //! recorder's DMA had (#39): the bench decided this, and the note under
 //! `docs/bench/` carries it. At 921600 that is a byte every eleven
 //! microseconds at the busiest, which the part can take and the log shows
-//! it taking; the count of overruns is what says otherwise.
+//! it taking. The pinned buffered driver does not return hardware errors
+//! from reads and silently discards bytes when its software ring is full;
+//! zero read errors therefore do not establish a lossless link (#63).
 
 use embassy_futures::yield_now;
 use embassy_stm32::gpio::{Flex, Pull};
@@ -203,6 +205,8 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
     let mut link = Link::new(identity, Uptime.now());
     let mut reader = FrameReader::new();
     let mut writer = FrameWriter::new();
+    #[cfg(feature = "frames")]
+    let mut counts = frames::Counts::new();
     let mut resume = false;
     check_in(Task::Link);
     loop {
@@ -267,6 +271,8 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                 &mut reader,
                 &mut writer,
                 first,
+                #[cfg(feature = "frames")]
+                &mut counts,
             )
             .await;
             match ended {
@@ -341,6 +347,7 @@ async fn episode(
     reader: &mut FrameReader,
     writer: &mut FrameWriter,
     first: Actions,
+    #[cfg(feature = "frames")] counts: &mut frames::Counts,
 ) -> Ended {
     // A new UART starts a new run: the tail of a frame cut off by the last
     // episode's end, by a cut or by a stall, would merge into this one's
@@ -356,8 +363,6 @@ async fn episode(
     }
     let mut chunk = [0u8; 64];
     let mut last_byte = Instant::now();
-    #[cfg(feature = "frames")]
-    let mut counts = frames::Counts::new();
     // Bounded by the cut the state machine asks for, and every turn by the
     // tick: the read waits `TICK` at most.
     loop {
@@ -366,8 +371,6 @@ async fn episode(
         match with_timeout(TICK, rx.read(&mut chunk)).await {
             Ok(Ok(count)) => {
                 last_byte = Instant::now();
-                #[cfg(feature = "frames")]
-                counts.report();
                 for byte in chunk.get(..count).unwrap_or(&[]) {
                     let ended = match reader.push(*byte) {
                         Received::Frame(frame) => {
@@ -392,15 +395,11 @@ async fn episode(
                                 None
                             }
                         }
-                        Received::Dropped(_) => {
+                        refused @ (Received::Dropped(_) | Received::Abandoned) => {
                             #[cfg(feature = "frames")]
-                            counts.dropped();
-                            link.noise();
-                            None
-                        }
-                        Received::Abandoned => {
-                            #[cfg(feature = "frames")]
-                            counts.abandoned();
+                            counts.refused(refused);
+                            #[cfg(not(feature = "frames"))]
+                            let _ = refused;
                             link.noise();
                             None
                         }
@@ -423,10 +422,14 @@ async fn episode(
                 // how long the line has been quiet.
                 let quiet = u32::try_from(last_byte.elapsed().as_millis()).unwrap_or(u32::MAX);
                 if let Received::Abandoned = reader.tick(None, quiet) {
+                    #[cfg(feature = "frames")]
+                    counts.abandoned();
                     link.noise();
                 }
             }
         }
+        #[cfg(feature = "frames")]
+        counts.report();
         if let Some(asked) = bench_download() {
             return Ended::Download(asked);
         }
@@ -942,17 +945,18 @@ fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>
 /// one whose CRC held between two delimiters; a drop is bytes between two
 /// delimiters that were not a frame, which is what a CRC failure looks
 /// like from here; an abandon is a part-frame nothing followed; an overrun
-/// is the UART losing bytes before the task read them, which is the flow
-/// control not doing its job. "Ten thousand frames with zero CRC
-/// failures" is the first at ten thousand and the rest at nought.
+/// is an error returned by the read API. The pinned buffered driver does
+/// not propagate hardware errors or software ring overflow through that API.
+/// Passing F-087 needs every numbered frame and no framing failures; zero
+/// read errors alone cannot establish either.
 #[cfg(feature = "frames")]
 mod frames {
     use embassy_stm32::usart::Error;
     use embassy_time::{Duration, Instant};
-    use km43::MAX_PAYLOAD;
+    use km43::{MAX_PAYLOAD, Received};
     use o89_link::stamped;
 
-    /// How often the tally is logged while bytes are arriving.
+    /// The minimum interval between changed tallies.
     const EVERY: Duration = Duration::from_secs(1);
 
     pub struct Counts {
@@ -962,6 +966,7 @@ mod frames {
         overruns: u32,
         others: u32,
         next: Instant,
+        dirty: bool,
         /// The highest number a bench frame carried, and how many of them
         /// arrived. The two together say what a count alone cannot: a run
         /// that stops short with no gap never left the module, and one
@@ -981,6 +986,9 @@ mod frames {
 
     impl Counts {
         pub fn new() -> Self {
+            defmt::warn!(
+                "frames: UART error counts are read errors only; the buffered driver does not expose hardware errors or ring overflow"
+            );
             Self {
                 frames: 0,
                 dropped: 0,
@@ -988,6 +996,7 @@ mod frames {
                 overruns: 0,
                 others: 0,
                 next: Instant::now(),
+                dirty: false,
                 highest: 0,
                 stamped: 0,
                 ups: 0,
@@ -1003,6 +1012,7 @@ mod frames {
         /// than the run it is supposed to contain, and the two lines would
         /// stop being comparable.
         pub fn linked(&mut self) {
+            self.dirty = true;
             self.ups = self.ups.saturating_add(1);
             if self.at_link.is_some() {
                 defmt::warn!(
@@ -1024,6 +1034,7 @@ mod frames {
         /// A frame whose CRC held, and the number it carries when it is
         /// one of the bench's own.
         pub fn frame(&mut self, frame: &[u8]) {
+            self.dirty = true;
             self.frames = self.frames.saturating_add(1);
             // The bench's frames are the only ones that fill the payload,
             // and the link's own are far shorter, so a stamp is read only
@@ -1038,17 +1049,26 @@ mod frames {
             self.highest = self.highest.max(number);
         }
 
-        pub fn dropped(&mut self) {
-            self.dropped = self.dropped.saturating_add(1);
+        pub fn refused(&mut self, received: Received<'_>) {
+            match received {
+                Received::Dropped(_) => {
+                    self.dirty = true;
+                    self.dropped = self.dropped.saturating_add(1);
+                }
+                Received::Abandoned => self.abandoned(),
+                Received::Frame(_) | Received::Nothing => {}
+            }
         }
 
         pub fn abandoned(&mut self) {
+            self.dirty = true;
             self.abandoned = self.abandoned.saturating_add(1);
         }
 
         /// An overrun counted apart from every other line error: it is the
         /// one that says the flow control was not holding the peer off.
         pub fn error(&mut self, error: Error) {
+            self.dirty = true;
             // Not our enum, and marked non-exhaustive by its crate, as
             // `note_rx_error` says above.
             match error {
@@ -1057,14 +1077,15 @@ mod frames {
             }
         }
 
-        /// The tally, at most once a second, and only while something is
-        /// arriving: a quiet line has nothing to say and a log that
-        /// repeated itself would bury the run.
+        /// Changed tallies at most once a second, even after the line goes
+        /// quiet: the final frame and timeouts must not need another byte
+        /// to be reported. An unchanged tally stays quiet.
         pub fn report(&mut self) {
             let now = Instant::now();
-            if now < self.next {
+            if !self.dirty || now < self.next {
                 return;
             }
+            self.dirty = false;
             self.next = now.checked_add(EVERY).unwrap_or(now);
             if let Some((frames, dropped, abandoned, overruns, others)) = self.at_link {
                 defmt::info!(

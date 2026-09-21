@@ -18,7 +18,9 @@ publish.workspace = true
 # recovery ladder never cuts the rail mid-run. The controller counts what
 # arrives (`just run-controller-frames`). Never on a unit that ships: it
 # puts megabytes on the link and answers nothing with them.
-frames = ["dep:o89-link"]
+frames = ["dep:o89-link", "o89-comms-core/frames"]
+# Bench sender ignores CTS; pair with the controller's no-flow image.
+no-flow = ["frames"]
 # The image for an ESP32-C6 devkit on its own USB serial (`just
 # run-comms-devkit`): the same firmware, stating the devkit as its board in
 # every `LinkUp` rather than board A (L-034). Nothing else moves.

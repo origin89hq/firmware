@@ -70,11 +70,15 @@ pub async fn run(
                     && let Ok(envelope) = LinkEnvelope::decode(frame)
                     && let Some(answer) = link.received(envelope, now())
                 {
+                    #[cfg(feature = "frames")]
+                    frames.start.observe(answer);
                     send(&link, &me, answer, &mut tx, &mut writer).await;
                 }
             }
         }
         if let Some(frame) = link.tick(now()) {
+            #[cfg(feature = "frames")]
+            frames.start.observe(frame);
             send(&link, &me, frame, &mut tx, &mut writer).await;
         }
         // Between turns, not inside one: the link's own frames go first,
@@ -134,9 +138,10 @@ async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) -> bool {
 /// controller (F-087).
 #[cfg(feature = "frames")]
 mod frames {
-    use super::{UartTx, write_all};
+    use super::{UartTx, WRITE_DEADLINE, write_all};
+    use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
-    use o89_comms_core::Link;
+    use o89_comms_core::{FrameBenchStart, Link};
     use o89_link::{stamp, worst_case};
 
     /// How many the run sends.
@@ -147,17 +152,25 @@ mod frames {
     /// wire itself never idles inside a batch.
     const PER_TURN: u32 = 100;
 
-    /// The run's state: how many have left, and nothing else.
+    /// The start gate and how many numbered frames have left.
     pub struct Blast {
         sent: u32,
+        failed: bool,
+        pub start: FrameBenchStart,
     }
 
     impl Blast {
         pub const fn new() -> Self {
-            Self { sent: 0 }
+            Self {
+                sent: 0,
+                failed: false,
+                start: FrameBenchStart::new(),
+            }
         }
 
-        /// One batch, once the link is up and until the run is done.
+        /// One batch, once the controller has sent a valid heartbeat and
+        /// until the run is done. Its heartbeat proves its own handshake
+        /// completed before a batch can hold off reads for about a second.
         ///
         /// The payload is the worst case for the wire and is not an
         /// envelope, so the controller reads each as a frame whose CRC
@@ -169,7 +182,7 @@ mod frames {
             tx: &mut UartTx<'static, esp_hal::Async>,
             writer: &mut FrameWriter,
         ) {
-            if !link.is_linked() || self.sent >= TOTAL {
+            if !self.start.ready(link.is_linked()) || self.sent >= TOTAL || self.failed {
                 return;
             }
             let mut payload = [0u8; MAX_PAYLOAD];
@@ -190,7 +203,15 @@ mod frames {
                 // refused is one the controller never sees, and counting
                 // it would make the run look longer than it was and the
                 // wire look worse than it is.
-                if !write_all(tx, wire.get(..len).unwrap_or(&[])).await {
+                let left = with_timeout(
+                    WRITE_DEADLINE,
+                    write_all(tx, wire.get(..len).unwrap_or(&[])),
+                )
+                .await;
+                if !matches!(left, Ok(true)) {
+                    // A timed-out flush may still leave bytes in the FIFO.
+                    // End this run rather than retrying a possibly sent number.
+                    self.failed = true;
                     return;
                 }
                 self.sent = self.sent.saturating_add(1);
