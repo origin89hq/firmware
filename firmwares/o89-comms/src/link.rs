@@ -146,11 +146,10 @@ mod frames {
 
     /// How many the run sends.
     const TOTAL: u32 = 10_000;
-    /// How many leave per turn of the link's loop. Sized so a batch is
-    /// about a second of wire time at 921600, which keeps the controller's
-    /// heartbeats answered well inside the ladder's patience while the
-    /// wire itself never idles inside a batch.
-    const PER_TURN: u32 = 100;
+    /// At most 800 ms of blocked writes per batch, below both heartbeat
+    /// cadence and the eight-second watchdog, even under sustained CTS.
+    const PER_TURN: u32 = 4;
+    const _: () = assert!(PER_TURN as u64 * WRITE_DEADLINE.as_millis() < 1000);
 
     /// The start gate and how many numbered frames have left.
     pub struct Blast {
@@ -164,13 +163,13 @@ mod frames {
             Self {
                 sent: 0,
                 failed: false,
-                start: FrameBenchStart::new(),
+                start: FrameBenchStart::new(cfg!(feature = "no-flow")),
             }
         }
 
         /// One batch, once the controller has sent a valid heartbeat and
         /// until the run is done. Its heartbeat proves its own handshake
-        /// completed before a batch can hold off reads for about a second.
+        /// completed, and its firmware identity must match this bench mode.
         ///
         /// The payload is the worst case for the wire and is not an
         /// envelope, so the controller reads each as a frame whose CRC
@@ -182,6 +181,7 @@ mod frames {
             tx: &mut UartTx<'static, esp_hal::Async>,
             writer: &mut FrameWriter,
         ) {
+            self.start.controller(link.controller_bench_mode());
             if !self.start.ready(link.is_linked()) || self.sent >= TOTAL || self.failed {
                 return;
             }

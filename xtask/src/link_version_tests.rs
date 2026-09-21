@@ -88,3 +88,13 @@ fn l_034_a_pre_release_with_no_room_for_dirty_fails_the_build() {
         "0.1.0-rc.1+g25be7cfc"
     );
 }
+
+#[test]
+fn bench_modes_preserve_a_writable_version_even_when_dirty() {
+    for version in ["0.0.0-bf", "0.0.0-bn"] {
+        for dirty in [false, true] {
+            let text = link_version(version, HEAD, dirty).expect("bench version fits");
+            assert!(km43_writes(&text), "{text}");
+        }
+    }
+}

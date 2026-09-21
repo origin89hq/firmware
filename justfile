@@ -305,7 +305,8 @@ dev-flash-comms-frames *args:
 # FLASH the no-flow bench sender into its OTA slot. CTS is disabled in the
 # sender so an undriven controller RTS cannot stall it. Recovery is the same
 # as `dev-flash-comms-frames`. Flash this while the controller still has
-# flow control, then start `run-controller-frames-no-flow`.
+# flow control, then start `run-controller-frames-no-flow`. The sender waits
+# for that controller's matching bench identity and a validated heartbeat.
 dev-flash-comms-frames-no-flow *args:
     cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}

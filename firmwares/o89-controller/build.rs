@@ -17,8 +17,18 @@ mod link_version;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let out = PathBuf::from(env::var("OUT_DIR")?);
+    let package_version = env::var("CARGO_PKG_VERSION")?;
+    // A mode-specific prerelease arms only the matching bench sender.
+    // Two letters leave room for `.dirty` within L-034's eight-byte cap.
+    let version = if env::var_os("CARGO_FEATURE_NO_FLOW").is_some() {
+        format!("{package_version}-bn")
+    } else if env::var_os("CARGO_FEATURE_FRAMES").is_some() {
+        format!("{package_version}-bf")
+    } else {
+        package_version
+    };
     link_version::emit(
-        &env::var("CARGO_PKG_VERSION")?,
+        &version,
         &[
             ".",
             "../link_version.rs",
