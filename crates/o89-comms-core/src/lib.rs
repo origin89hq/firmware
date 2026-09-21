@@ -17,9 +17,13 @@
 
 #![no_std]
 
+#[cfg(any(test, feature = "frames"))]
+mod frame_bench;
 mod link;
 mod window;
 
+#[cfg(any(test, feature = "frames"))]
+pub use frame_bench::FrameBenchStart;
 pub use link::*;
 pub use o89_link::{EncodeError, Millis, Tick};
 pub use window::*;

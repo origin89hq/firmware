@@ -28,6 +28,10 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features no-flow -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:
@@ -257,6 +261,55 @@ dev-flash-comms *args: sizes
 dev-flash-comms-whole *args: sizes
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout whole --yes {{args}}
 
+
+# FLASH and run the controller with the frames bench's counters (F-087):
+# the production image plus a tally of what the link read — frames whose
+# CRC held, frames refused, part-frames abandoned, read-reported errors —
+# with changed tallies logged each second, including after traffic stops.
+# Effect: as `run-controller`, then the log. Pair it with
+# `dev-flash-comms-frames` on the module, which sends the frames.
+# Recovery: `just flash-controller` restores the ordinary image.
+#
+# FLASH and run the controller with the frames bench's counters.
+run-controller-frames:
+    cd firmwares/o89-controller && cargo run --release --features frames
+
+# FLASH and run the controller with the frames bench and NO FLOW CONTROL
+# (F-087): USART1 opened without RTS and CTS, which is the half of the rule
+# that has to fail. Effect: as `run-controller-frames`, with nothing holding
+# the module off; frames are refused and the link may drop. Recovery:
+# `just flash-controller` restores the ordinary image.
+#
+# Pair with `dev-flash-comms-frames-no-flow`: the sender must ignore CTS,
+# since this controller leaves that net undriven.
+# FLASH and run the controller with the frames bench and no flow control.
+run-controller-frames-no-flow:
+    cd firmwares/o89-controller && cargo run --release --features no-flow
+
+# FLASH the comms image built with the frames bench onto the module, into
+# its OTA slot (F-087): after a validated controller heartbeat the module
+# sends ten thousand worst-case frames at the link's rate, in batches
+# between turns of its loop so the controller's heartbeats are still
+# answered and the ladder never cuts the rail mid-run. Effect: the module replaces its slot image
+# and then puts about 10 MB on the link over roughly two minutes; it
+# answers the link normally throughout and does nothing else. Recovery:
+# `just dev-flash-comms` puts the ordinary image back; the factory image
+# is untouched either way. Run `run-controller-frames` first, so something
+# is counting.
+#
+# FLASH the module with the frames bench; it sends 10 000 frames once linked.
+dev-flash-comms-frames *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features frames
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
+
+# FLASH the no-flow bench sender into its OTA slot. CTS is disabled in the
+# sender so an undriven controller RTS cannot stall it. Recovery is the same
+# as `dev-flash-comms-frames`. Flash this while the controller still has
+# flow control, then start `run-controller-frames-no-flow`. The sender waits
+# for that controller's matching bench identity and a validated heartbeat.
+dev-flash-comms-frames-no-flow *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # LISTEN to the module through the bridge: the firmware resets it, by
 # `--entry reset` (the default), `knock` or `strap`, and prints what it

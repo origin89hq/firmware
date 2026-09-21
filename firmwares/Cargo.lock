@@ -1490,6 +1490,7 @@ dependencies = [
  "esp-storage",
  "km43",
  "o89-comms-core",
+ "o89-link",
  "static_cell",
 ]
 
@@ -1518,6 +1519,7 @@ dependencies = [
  "embedded-storage-async",
  "km43",
  "o89-core",
+ "o89-link",
  "panic-probe",
  "portable-atomic",
  "static_cell",

@@ -11,6 +11,10 @@ publish.workspace = true
 # Never `o89-core`: this crate is linked into the comms processor, and
 # `cargo xtask check` refuses a path from there to the crate that decides.
 # What the two sides share is `o89-link`'s, below both.
+[features]
+# Host-tested start gate for the hardware frames bench.
+frames = []
+
 [dependencies]
 km43.workspace = true
 o89-link = { path = "../o89-link" }

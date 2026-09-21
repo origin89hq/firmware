@@ -59,6 +59,8 @@ pub async fn run(
     };
     let mut link = Link::new(now());
     let mut chunk = [0u8; 64];
+    #[cfg(feature = "frames")]
+    let mut frames = frames::Blast::new();
     // Bounded per turn: a read waits `TICK` at most, and the tick follows.
     loop {
         rwdt.feed();
@@ -68,13 +70,22 @@ pub async fn run(
                     && let Ok(envelope) = LinkEnvelope::decode(frame)
                     && let Some(answer) = link.received(envelope, now())
                 {
+                    #[cfg(feature = "frames")]
+                    frames.start.observe(answer);
                     send(&link, &me, answer, &mut tx, &mut writer).await;
                 }
             }
         }
         if let Some(frame) = link.tick(now()) {
+            #[cfg(feature = "frames")]
+            frames.start.observe(frame);
             send(&link, &me, frame, &mut tx, &mut writer).await;
         }
+        // Between turns, not inside one: the link's own frames go first,
+        // so the controller's heartbeats are answered through the run and
+        // its ladder never cuts the rail (F-087).
+        #[cfg(feature = "frames")]
+        frames.batch(&link, &mut tx, &mut writer).await;
         // A read that is ready at once does not yield: a controller that
         // floods the UART would otherwise hold the executor every turn.
         yield_now().await;
@@ -100,7 +111,9 @@ async fn send(
     let Ok(len) = link.build(frame, me, now(), writer, &mut bytes) else {
         return;
     };
-    let _ = with_timeout(
+    // A frame that does not leave is one the controller retries or the
+    // ladder counts, so nothing here acts on the answer.
+    let _left = with_timeout(
         WRITE_DEADLINE,
         write_all(tx, bytes.get(..len).unwrap_or(&[])),
     )
@@ -108,13 +121,101 @@ async fn send(
 }
 
 /// The whole frame out of the pin, in as many writes as the FIFO takes.
-async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) {
+/// Whether all of it left: a caller that counts what it put on the wire
+/// must not count a frame the pin refused.
+async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) -> bool {
     // Bounded by the bytes: every turn writes at least one or stops.
     while !bytes.is_empty() {
         match tx.write_async(bytes).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return false,
             Ok(n) => bytes = bytes.get(n..).unwrap_or(&[]),
         }
     }
-    let _ = tx.flush_async().await;
+    tx.flush_async().await.is_ok()
+}
+
+/// The frames bench: worst-case frames at the link's rate, counted at the
+/// controller (F-087).
+#[cfg(feature = "frames")]
+mod frames {
+    use super::{UartTx, WRITE_DEADLINE, write_all};
+    use embassy_time::with_timeout;
+    use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
+    use o89_comms_core::{FrameBenchStart, Link};
+    use o89_link::{stamp, worst_case};
+
+    /// How many the run sends.
+    const TOTAL: u32 = 10_000;
+    /// At most 800 ms of blocked writes per batch, below both heartbeat
+    /// cadence and the eight-second watchdog, even under sustained CTS.
+    const PER_TURN: u32 = 4;
+    const _: () = assert!(PER_TURN as u64 * WRITE_DEADLINE.as_millis() < 1000);
+
+    /// The start gate and how many numbered frames have left.
+    pub struct Blast {
+        sent: u32,
+        failed: bool,
+        pub start: FrameBenchStart,
+    }
+
+    impl Blast {
+        pub const fn new() -> Self {
+            Self {
+                sent: 0,
+                failed: false,
+                start: FrameBenchStart::new(cfg!(feature = "no-flow")),
+            }
+        }
+
+        /// One batch, once the controller has sent a valid heartbeat and
+        /// until the run is done. Its heartbeat proves its own handshake
+        /// completed, and its firmware identity must match this bench mode.
+        ///
+        /// The payload is the worst case for the wire and is not an
+        /// envelope, so the controller reads each as a frame whose CRC
+        /// held and refuses it above: that is the point, since what is
+        /// being measured is the wire and not the protocol.
+        pub async fn batch(
+            &mut self,
+            link: &Link,
+            tx: &mut UartTx<'static, esp_hal::Async>,
+            writer: &mut FrameWriter,
+        ) {
+            self.start.controller(link.controller_bench_mode());
+            if !self.start.ready(link.is_linked()) || self.sent >= TOTAL || self.failed {
+                return;
+            }
+            let mut payload = [0u8; MAX_PAYLOAD];
+            let mut wire = [0u8; MAX_FRAME];
+            // Bounded: `PER_TURN` frames, or the rest of the run.
+            for _ in 0..PER_TURN.min(TOTAL.saturating_sub(self.sent)) {
+                let number = self.sent.wrapping_add(1);
+                worst_case(&mut payload, number);
+                // Its own number in it, so the controller reports which
+                // frames arrived rather than how many, and a run short of
+                // its total says whether the wire lost them or the pin
+                // never took them.
+                stamp(&mut payload, number);
+                let Ok(len) = writer.write(&payload, &mut wire) else {
+                    return;
+                };
+                // Counted only once it is on the wire. A frame the pin
+                // refused is one the controller never sees, and counting
+                // it would make the run look longer than it was and the
+                // wire look worse than it is.
+                let left = with_timeout(
+                    WRITE_DEADLINE,
+                    write_all(tx, wire.get(..len).unwrap_or(&[])),
+                )
+                .await;
+                if !matches!(left, Ok(true)) {
+                    // A timed-out flush may still leave bytes in the FIFO.
+                    // End this run rather than retrying a possibly sent number.
+                    self.failed = true;
+                    return;
+                }
+                self.sent = self.sent.saturating_add(1);
+            }
+        }
+    }
 }

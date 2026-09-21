@@ -17,6 +17,21 @@ publish.workspace = true
 # The build prints a warning when it is on, and an image built with it must
 # never be flashed onto a unit that will take an update.
 bench = []
+
+# The frames bench (F-087): counts what the link reads — frames whose CRC
+# held, frames refused between delimiters, part-frames abandoned and the
+# read-reported UART errors — and logs changed tallies each second. The
+# pinned driver does not expose hardware errors or ring overflow (#66).
+# The counterpart of `o89-comms`'s `frames`. Production layout; it changes
+# only the counting, so the ladder and everything else behave as they ship.
+frames = ["dep:o89-link"]
+
+# The frames bench with the flow control lifted (F-087): USART1 opened
+# without RTS and CTS, the lines left as inputs. The half of the rule that
+# has to fail — a run that loses nothing without flow control would mean
+# the flow control was never what was holding the peer off. Only with
+# `frames`, and never on a unit that ships.
+no-flow = ["frames"]
 # Halts on a panic with the message on the probe instead of writing the last
 # words and resetting. For chasing a panic at the bench, and nothing else: a
 # bench run that proves the panic path runs without it.
@@ -24,6 +39,9 @@ panic-probe = ["dep:panic-probe"]
 
 [dependencies]
 o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
+# The frames bench reads the number a worst-case frame carries; the same
+# module that stamps it on the other side.
+o89-link = { path = "../../crates/o89-link", optional = true }
 embedded-storage-async.workspace = true
 km43.workspace = true
 

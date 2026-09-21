@@ -105,6 +105,8 @@ struct Controller {
 /// The link's state on this side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
+    #[cfg(any(test, feature = "frames"))]
+    controller_bench_mode: Option<bool>,
     boot: Tick,
     /// The controller's last statement, from its `LinkUp` or its answer to
     /// ours.
@@ -129,6 +131,8 @@ impl Link {
     #[must_use]
     pub const fn new(now: Tick) -> Self {
         Self {
+            #[cfg(any(test, feature = "frames"))]
+            controller_bench_mode: None,
             boot: now,
             controller: None,
             linked: false,
@@ -145,6 +149,18 @@ impl Link {
     #[must_use]
     pub const fn is_linked(&self) -> bool {
         self.linked
+    }
+
+    /// Bench mode advertised by a validated controller handshake, if any.
+    #[cfg(any(test, feature = "frames"))]
+    #[must_use]
+    pub const fn controller_bench_mode(&self) -> Option<bool> {
+        self.controller_bench_mode
+    }
+
+    #[cfg(any(test, feature = "frames"))]
+    fn record_bench(&mut self, firmware: &str) {
+        self.controller_bench_mode = crate::frame_bench::controller_mode(firmware);
     }
 
     /// When the controller last answered a request of ours.
@@ -233,6 +249,8 @@ impl Link {
                     });
                 }
                 self.stated(theirs.boot_id, theirs.version, now);
+                #[cfg(any(test, feature = "frames"))]
+                self.record_bench(theirs.fw);
                 Some(Frame::LinkUpAck { req_id })
             }
             LinkMessageType::LinkUpAck => {
@@ -250,6 +268,8 @@ impl Link {
                 }
                 let _ = self.statement.answered(req_id, LinkMessageType::LinkUp);
                 self.linked(theirs.boot_id, theirs.version, now);
+                #[cfg(any(test, feature = "frames"))]
+                self.record_bench(theirs.fw);
                 None
             }
             LinkMessageType::Heartbeat => {
@@ -503,6 +523,39 @@ mod tests {
         }
         .write(link_header(kind, req_id), buf);
         decoded(buf, len)
+    }
+
+    #[test]
+    fn bench_mode_comes_only_from_an_accepted_controller_statement() {
+        for kind in [LinkMessageType::LinkUp, LinkMessageType::LinkUpAck] {
+            for (role, req_id, accepted) in [
+                (Side::Controller, ReqId(1), true),
+                (Side::Comms, ReqId(1), false),
+                (Side::Controller, ReqId(99), kind == LinkMessageType::LinkUp),
+            ] {
+                let mut link = Link::new(Tick::ZERO);
+                assert!(matches!(
+                    link.tick(Tick::ZERO),
+                    Some(Frame::LinkUp { req_id: ReqId(1) })
+                ));
+                let mut buf = [0u8; 256];
+                let len = LinkUp {
+                    version: OURS,
+                    role,
+                    fw: "0.0.0-bn+g0123abcd",
+                    boot_id: CONTROLLER_BOOT,
+                    hw: "controller-a rev A",
+                    net_version: None,
+                }
+                .write(link_header(kind, req_id), &mut buf);
+                let _ = link.received(decoded(&buf, len), at(1));
+                assert_eq!(link.controller_bench_mode(), accepted.then_some(true));
+                // A later ordinary controller must remove the bench identity.
+                let ordinary = from_controller(&mut buf, LinkMessageType::LinkUp, ReqId(2));
+                let _ = link.received(ordinary, at(2));
+                assert_eq!(link.controller_bench_mode(), None);
+            }
+        }
     }
 
     /// A link that stated itself at boot and heard the controller answer.
