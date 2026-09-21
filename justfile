@@ -287,11 +287,11 @@ run-controller-frames-no-flow:
     cd firmwares/o89-controller && cargo run --release --features no-flow
 
 # FLASH the comms image built with the frames bench onto the module, into
-# its OTA slot (F-087): after a validated controller heartbeat the module
+# its OTA slot (F-087): after a matching bench-controller identity and heartbeat it
 # sends ten thousand worst-case frames at the link's rate, in batches
 # between turns of its loop so the controller's heartbeats are still
 # answered and the ladder never cuts the rail mid-run. Effect: the module replaces its slot image
-# and then puts about 10 MB on the link over roughly two minutes; it
+# and then puts about 10 MB on the link; the batch/read cadence sets the duration. It
 # answers the link normally throughout and does nothing else. Recovery:
 # `just dev-flash-comms` puts the ordinary image back; the factory image
 # is untouched either way. Run `run-controller-frames` first, so something
