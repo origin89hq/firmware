@@ -2,6 +2,11 @@ target/
 *.bin
 *.elf
 *.map
+
+# Except committed fixtures: bytes a generator really produced, which the
+# readers of those formats are tested against. `*.bin` above is for build
+# output, and a fixture is the opposite of build output.
+!crates/o89-dev/fixtures/*.bin
 .DS_Store
 bench-logs/
 

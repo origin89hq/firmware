@@ -12,10 +12,13 @@ publish.workspace = true
 o89-core = { path = "../o89-core" }
 anyhow.workspace = true
 clap.workspace = true
+# The CRC the module's bootloader recomputes over an `otadata` entry.
+crc.workspace = true
 embassy-futures.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 km43.workspace = true
+md-5.workspace = true
 probe-rs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

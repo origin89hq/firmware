@@ -26,6 +26,7 @@ uncovered = [
     "F-032",
     "F-034",
     "F-035",
+    # Table structure and flash guards are tested; factory-window permanence is not.
     "F-036",
     "F-037",
     "F-038",

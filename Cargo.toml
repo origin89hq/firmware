@@ -29,6 +29,11 @@ km43 = "=0.2.0"
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }
+# The checksum the ESP-IDF bootloader verifies a partition table by, which
+# the bench tool recomputes before it acts on a table it read off a module.
+# Not a security property and not ours: the format's, and the same
+# generation as `sha2` so they share `digest`.
+md-5 = { version = "0.11", default-features = false }
 # The NOR flash trait the ring is written against; the same release
 # embassy's flash drivers implement.
 embedded-storage-async = "=0.4.1"

@@ -1098,8 +1098,13 @@ is rolled back by the ESP-IDF bootloader to the image that was running, which
 honours the window (L-173). If both OTA slots are bad it falls to the factory
 image, which honours the window. The only way to lose the window is to flash
 a bad image into the factory slot through the download mode itself, a bench
-act with a probe attached and a wire available. That is #1's acceptance
-test, run before any revision A unit leaves the bench. ESP-IDF's eFuse
+act with a probe attached and a wire available. So the bench tool does not
+do it by default: `dev-flash-comms` writes the application into `ota_0`,
+blanking the `otadata` before it erases the slot and naming the slot after
+the application lands, which leaves the factory image booting at every point
+in between (F-084). Replacing the factory image is its own recipe, and it
+says so. That is #1's acceptance test, run before any revision A unit leaves
+the bench. ESP-IDF's eFuse
 anti-rollback would refuse the factory image the first time its counter
 advanced, so the eFuse counter stays untouched and no-downgrade is enforced
 at the controller's authorisation (L-169). Kept open, not in V1: the

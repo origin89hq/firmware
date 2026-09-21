@@ -14,11 +14,12 @@
 //! workspace manifest.
 
 mod flash;
+mod layout;
 mod link;
 mod rail;
 mod store;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -128,8 +129,8 @@ enum Command {
     Reboot,
     /// FLASH the comms image onto the module through the controller: the
     /// module is reset into its ROM's download mode by the firmware, and
-    /// esptool writes the merged image, bootloader and partition table
-    /// included, at address 0.
+    /// esptool writes the application into an OTA slot, leaving the
+    /// factory image that carries the download window where it is.
     FlashComms {
         /// The comms ELF, as `cargo build --release -p o89-comms` leaves it.
         elf: PathBuf,
@@ -139,8 +140,21 @@ enum Command {
         /// The route into the ROM: the window the comms firmware opens, or
         /// the strap for a module that runs nothing that answers, which on
         /// revision A needs IO8 held high by a wire.
-        #[arg(long, value_enum, default_value_t = FlashEntry::Knock)]
-        entry: FlashEntry,
+        /// Left out, the layout chooses: the slot route knocks, and the
+        /// whole route straps, because the modules it is for answer
+        /// nothing.
+        #[arg(long, value_enum)]
+        entry: Option<FlashEntry>,
+        /// What is written: the application into an OTA slot, which leaves
+        /// the recovery image alone, or the whole flash, which replaces it.
+        #[arg(long, value_enum, default_value_t = Layout::Slot)]
+        layout: Layout,
+        /// Acknowledge that `--layout whole` replaces the factory image
+        /// that carries the download window. Required for that layout, and
+        /// meaningless for the slot one. `just dev-flash-comms-whole`
+        /// passes it, having asked first.
+        #[arg(long)]
+        yes: bool,
     },
     /// LISTEN to the module through the bridge: the module is reset by the
     /// firmware and whatever it says on its UART0 for `seconds` is printed,
@@ -180,6 +194,57 @@ enum StoreCommand {
         #[arg(long)]
         replace: bool,
     },
+}
+
+impl Layout {
+    /// Refuse the whole flash unless the operator said so in as many
+    /// words.
+    ///
+    /// The recipe asks before it runs, but the recipe is not the only way
+    /// in: this binary is run directly on the bench, and the one route
+    /// that takes the download window away should not be reachable by a
+    /// flag nobody had to think about.
+    fn permitted(self, yes: bool) -> Result<()> {
+        match self {
+            Self::Slot => Ok(()),
+            Self::Whole if yes => Ok(()),
+            Self::Whole => bail!(
+                "--layout whole replaces the bootloader, the partition table and the factory \
+                 image that carries the download window; from the first erase until it finishes \
+                 the module boots nothing, and on revision A recovering one that boots nothing \
+                 needs a wire holding IO8 high. Pass --yes, or use `just dev-flash-comms-whole`, \
+                 which asks."
+            ),
+        }
+    }
+
+    /// The route into the ROM this layout is for, when nobody named one.
+    ///
+    /// The whole route replaces the factory image, so the modules it
+    /// exists for — a new one, and one whose factory image is gone — boot
+    /// nothing and cannot answer a knock. It straps. The slot route runs
+    /// against a module that is running, so it knocks.
+    fn entry(self) -> FlashEntry {
+        match self {
+            Self::Slot => FlashEntry::Knock,
+            Self::Whole => FlashEntry::Strap,
+        }
+    }
+}
+
+/// What a flash writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Layout {
+    /// The application into an OTA slot. The bootloader, the partition
+    /// table and the factory image stay, so the download window survives a
+    /// transfer that dies (F-084).
+    Slot,
+    /// The whole flash from address zero, the factory image with it: how a
+    /// module is brought up the first time, and how one whose recovery
+    /// image is gone is restored. Until it finishes the module boots
+    /// nothing, and a module that boots nothing is reached by the strap
+    /// with a wire on revision A, or not at all (#1).
+    Whole,
 }
 
 /// The board revision on the command line.
@@ -266,21 +331,59 @@ fn main() -> Result<()> {
             elf,
             partitions,
             entry,
-        } => {
-            // One file per invocation: two benches on two probes must not
-            // hand esptool each other's image.
-            let merged =
-                std::env::temp_dir().join(format!("o89-comms-merged-{}.bin", std::process::id()));
-            flash::merge(&elf, &partitions, &merged)?;
-            println!("merged image at {}", merged.display());
-            flash::flash(&mut link, &merged, entry.into())
-        }
+            layout,
+            yes,
+        } => flash_comms(&mut link, &elf, &partitions, entry, layout, yes),
         Command::CommsListen {
             seconds,
             entry,
             leave_open,
         } => flash::listen(&mut link, seconds, entry.into(), leave_open),
     }
+}
+
+/// FLASH the comms image onto the module through the controller.
+fn flash_comms(
+    link: &mut Link,
+    elf: &Path,
+    partitions: &Path,
+    entry: Option<FlashEntry>,
+    layout: Layout,
+    yes: bool,
+) -> Result<()> {
+    // The generated files live for this flash and go with it.
+    let scratch = flash::Scratch::new()?;
+    layout.permitted(yes)?;
+    let entry = entry.unwrap_or_else(|| layout.entry());
+    let app;
+    let declared;
+    let merged;
+    let request = match layout {
+        Layout::Slot => {
+            app = scratch.file("o89-comms.bin");
+            flash::app_image(elf, &app)?;
+            // Only to be compared against the module's own, which
+            // is what the slot route plans from (F-085): a table
+            // the repository cannot read is not a reason to refuse
+            // a flash the module's table fully describes.
+            declared = layout::Table::read(partitions)
+                .inspect_err(|error| {
+                    println!("note: {}: {error:#}", partitions.display());
+                })
+                .ok();
+            flash::Request::Slot {
+                app: &app,
+                scratch: &scratch,
+                declared: declared.as_ref(),
+            }
+        }
+        Layout::Whole => {
+            merged = scratch.file("o89-comms-merged.bin");
+            flash::merge(elf, partitions, &merged)?;
+            flash::Request::Whole { merged: &merged }
+        }
+    };
+    flash::flash(link, &request, entry.into())
 }
 
 /// Sixteen bytes a line, the address in front.
@@ -311,10 +414,7 @@ mod tests {
         let knock = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
         assert!(matches!(
             knock.command,
-            Command::FlashComms {
-                entry: FlashEntry::Knock,
-                ..
-            }
+            Command::FlashComms { entry: None, .. }
         ));
         let strap =
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "strap"])
@@ -322,7 +422,7 @@ mod tests {
         assert!(matches!(
             strap.command,
             Command::FlashComms {
-                entry: FlashEntry::Strap,
+                entry: Some(FlashEntry::Strap),
                 ..
             }
         ));
@@ -330,6 +430,71 @@ mod tests {
             Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--entry", "reset"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_whole_flash_is_refused_until_the_operator_says_so_in_as_many_words() {
+        let error = format!("{:#}", Layout::Whole.permitted(false).expect_err("refused"));
+        assert!(error.contains("download window"), "{error}");
+        assert!(error.contains("--yes"), "{error}");
+        Layout::Whole
+            .permitted(true)
+            .expect("said in as many words");
+        // The slot route takes no acknowledgement either way: it keeps the
+        // image the acknowledgement is about.
+        Layout::Slot.permitted(false).expect("nothing to lose");
+        Layout::Slot.permitted(true).expect("nothing to lose");
+    }
+
+    #[test]
+    fn the_whole_route_straps_by_default_because_what_it_recovers_answers_no_knock() {
+        assert_eq!(Layout::Whole.entry(), FlashEntry::Strap);
+        assert_eq!(Layout::Slot.entry(), FlashEntry::Knock);
+        // And a route named on the command line is still the one taken:
+        // a healthy module's factory image is replaced through its window.
+        let named = Cli::try_parse_from([
+            "o89-dev",
+            "flash-comms",
+            "o89-comms",
+            "--layout",
+            "whole",
+            "--entry",
+            "knock",
+        ])
+        .expect("parses");
+        assert!(matches!(
+            named.command,
+            Command::FlashComms {
+                entry: Some(FlashEntry::Knock),
+                layout: Layout::Whole,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn f_084_a_flash_writes_a_slot_unless_the_whole_flash_is_asked_for_by_name() {
+        let plain = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
+        assert!(
+            matches!(
+                plain.command,
+                Command::FlashComms {
+                    layout: Layout::Slot,
+                    ..
+                }
+            ),
+            "the recovery image is kept unless something asks for it to go"
+        );
+        let whole =
+            Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms", "--layout", "whole"])
+                .expect("parses");
+        assert!(matches!(
+            whole.command,
+            Command::FlashComms {
+                layout: Layout::Whole,
+                ..
+            }
+        ));
     }
 
     #[test]

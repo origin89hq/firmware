@@ -341,6 +341,34 @@ M0.
 left alone; a pin lives in exactly two places that cannot disagree. Source:
 [#3][plan] §6. M1.
 
+**F-084** — The bench flashing path writes the application into an OTA slot
+and names that slot in `otadata` only once the application has landed; before
+it erases the slot it blanks the `otadata`, so from the first erase until the
+last write the module boots the factory image. The bootloader, the partition
+table and the factory image are replaced only by a route named for replacing
+them. The state written is `New`, which a bootloader with rollback holds
+against the image until it confirms itself, which `o89-comms` does after its
+window and not before. A transfer that dies leaves a module the controller can
+knock at with no wire on it, which is what the erase at address zero did not.
+Source: [#1][i1], F-036, bench 2026-09-19 §5 for the loss this prevents and
+§10 for the sequence run on the board. M3.
+
+**F-085** — The slot route plans from the partition table the module holds,
+read back from the sector the bootloader reads it from, and never from the
+table in the repository, which says only what the next whole flash would
+install. The two are compared and any disagreement about the partitions
+being written is reported, because a repository whose table has moved on is
+a whole flash somebody has not run. A table this tool cannot read whole is
+refused rather than partly believed: its checksum is recomputed the way the
+bootloader recomputes it and a table that fails it is refused, since offsets
+from a table the bootloader would reject are offsets to write nothing at,
+and every partition is bounded by the flash the module has. A table with no
+checksum entry is still read, because ESP-IDF makes it optional and the
+bootloader accepts one without. Without this the guard of F-084 checks
+the factory range the repository claims while the bytes land on the
+module's, so a table change alone could erase the recovery image and report
+that it stayed. Source: [#1][i1], F-084, review of [#58][p58]. M3.
+
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6
 [h13]: https://github.com/origin89hq/hardware/issues/13
@@ -365,3 +393,4 @@ left alone; a pin lives in exactly two places that cannot disagree. Source:
 [k34]: https://github.com/origin89hq/km43/issues/34
 [k35]: https://github.com/origin89hq/km43/issues/35
 [k36]: https://github.com/origin89hq/km43/issues/36
+[p58]: https://github.com/origin89hq/firmware/pull/58
