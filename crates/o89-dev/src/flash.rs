@@ -767,7 +767,7 @@ mod plans {
     use super::*;
     use crate::layout::Table;
 
-    /// The table the comms image is built against.
+    /// A reduced table for flash-plan tests.
     const BOARD_A: &str = "\
 otadata, data, ota,     0x9000,   0x2000,
 factory, app,  factory, 0x10000,  0x200000,
@@ -850,7 +850,7 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
     }
 
     #[test]
-    fn f_036_the_slot_route_writes_neither_the_factory_image_nor_the_bootloader() {
+    fn the_slot_route_writes_neither_the_factory_image_nor_the_bootloader() {
         let scratch = Scratch::new().expect("a scratch");
         let table = board_a();
         let plan = plan_slot(&table, &application(&scratch, 176_272), &scratch).expect("a plan");
@@ -914,7 +914,7 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
     }
 
     #[test]
-    fn f_036_a_plan_that_reaches_the_factory_image_is_refused() {
+    fn a_plan_that_reaches_the_factory_image_is_refused() {
         let plan = Plan {
             says: String::new(),
             passes: vec![vec![Write {
@@ -931,7 +931,7 @@ ota_1,   app,  ota_1,   0x410000, 0x200000,
     }
 
     #[test]
-    fn f_036_a_plan_that_reaches_the_partition_table_is_refused() {
+    fn a_plan_that_reaches_the_partition_table_is_refused() {
         // A table that placed a slot over the partition table would take
         // the factory image out of the bootloader's reach without ever
         // writing a byte of it.

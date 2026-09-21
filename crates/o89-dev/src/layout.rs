@@ -557,7 +557,7 @@ fn entry(seq: u32, state: ImageState) -> [u8; ENTRY_LEN] {
 mod tests {
     use super::*;
 
-    /// The table the comms image is built against, as it stands.
+    /// A synthetic table for parser tests.
     const BOARD_A: &str = "\
 # a comment, and a blank line follow
 
@@ -575,6 +575,44 @@ creds,     data, nvs,     0x610000, 0x6000,
         assert_eq!(slot.offset, 0x0021_0000);
         assert_eq!(slot.size, 0x0020_0000);
         assert_eq!(slot.end().expect("it ends"), 0x0041_0000);
+    }
+
+    #[test]
+    fn production_table_reserves_recovery_ota_credentials_and_assets() {
+        // This checks the shipped layout, not the factory image's contents or
+        // the download window's lifetime. F-036 remains uncovered.
+        let table = Table::parse(include_str!("../../../firmwares/o89-comms/partitions.csv"))
+            .expect("the production table parses");
+        let expected = [
+            ("otadata", Role::OTA_DATA, 0x9000, 0x2000),
+            ("factory", Role::FACTORY, 0x0001_0000, 0x0020_0000),
+            ("ota_0", Role::ota(0), 0x0021_0000, 0x0020_0000),
+            ("ota_1", Role::ota(1), 0x0041_0000, 0x0020_0000),
+            (
+                "creds",
+                Role {
+                    kind: 1,
+                    subtype: 0x02,
+                },
+                0x0061_0000,
+                0x6000,
+            ),
+            (
+                "assets",
+                Role {
+                    kind: 1,
+                    subtype: 0x82,
+                },
+                0x0061_6000,
+                0x001e_a000,
+            ),
+        ];
+        assert_eq!(table.partitions.len(), expected.len());
+        for (name, role, offset, size) in expected {
+            let partition = table.find(role).expect("the required partition exists");
+            assert_eq!(partition.name, name);
+            assert_eq!((partition.offset, partition.size), (offset, size), "{name}");
+        }
     }
 
     /// One 32-byte entry of a table as the module holds it.
@@ -837,7 +875,7 @@ creds,     data, nvs,     0x610000, 0x6000,
     }
 
     #[test]
-    fn f_036_a_row_merely_named_like_a_slot_is_not_the_slot_the_bootloader_boots() {
+    fn a_row_merely_named_like_a_slot_is_not_the_slot_the_bootloader_boots() {
         // The bootloader matches on type and subtype; the name is a label
         // it never reads. A tool that matched the name would write the
         // application into this row and report a success the module did

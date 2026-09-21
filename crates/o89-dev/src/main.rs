@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn f_036_the_whole_flash_is_refused_until_the_operator_says_so_in_as_many_words() {
+    fn the_whole_flash_is_refused_until_the_operator_says_so_in_as_many_words() {
         let error = format!("{:#}", Layout::Whole.permitted(false).expect_err("refused"));
         assert!(error.contains("download window"), "{error}");
         assert!(error.contains("--yes"), "{error}");
