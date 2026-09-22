@@ -18,6 +18,10 @@ use o89_core::{Class, Task};
 
 use crate::link::Link;
 
+/// An empty CBOR map: the body every class A record carried before KM43
+/// defined one, which a unit's ring keeps for as long as the ring does.
+const EMPTY_MAP: &[u8] = &[0xA0];
+
 /// One record as the page carried it, held past the page.
 struct Held {
     seq: u64,
@@ -116,7 +120,9 @@ fn describe(seq: u64, class: Class, payload: &[u8]) -> String {
     if event.seq.0 != seq {
         let _ = write!(line, "(the event says seq {}) ", event.seq.0);
     }
-    if event.kind == EventKind::BOOT {
+    if event.kind == EventKind::BOOT && event.body() == EMPTY_MAP {
+        line.push_str("boot, empty body: written before km43 0.3.0 gave the record its fields");
+    } else if event.kind == EventKind::BOOT {
         match Boot::decode(event.body()) {
             Ok(boot) => line.push_str(&boot_line(&boot)),
             Err(why) => {
@@ -281,10 +287,19 @@ mod tests {
             "{garbage}"
         );
         assert!(garbage.ends_with("ff00"), "{garbage}");
-        // The empty body the firmware wrote before the boot schema existed.
+        // The empty body the firmware wrote before the boot schema existed is
+        // named as old, not as damage.
         let old = describe(4, Class::A, &event(4, EventKind::BOOT, &[0xA0]));
-        assert!(old.contains("boot, body refused"), "{old}");
-        assert!(old.ends_with("a0"), "{old}");
+        assert!(
+            old.ends_with("boot, empty body: written before km43 0.3.0 gave the record its fields"),
+            "{old}"
+        );
+        // A boot body that is neither empty nor valid is refused, with its bytes.
+        let bad = describe(4, Class::A, &event(4, EventKind::BOOT, &[0xA1, 0x01, 0x03]));
+        assert!(
+            bad.contains("boot, body refused (boot reason 3 is not allocated): a10103"),
+            "{bad}"
+        );
         // Another kind: its number and its body.
         let lost = describe(5, Class::A, &event(5, EventKind::COMMS_LINK_LOST, &[0xA0]));
         assert!(lost.contains("0x0801  at -  body a0"), "{lost}");
