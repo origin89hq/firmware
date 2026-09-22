@@ -56,6 +56,105 @@ pub fn stamp(payload: &mut [u8], number: u32) {
     }
 }
 
+/// How many times the cut bench pulls the pair.
+pub const CUTS: u32 = 1_000;
+/// Frames in one pull: the frame that is cut, the frame its fragment runs
+/// into and is refused with, and the frame after that, which must arrive
+/// whole. Recovery inside one delimiter is the third frame arriving.
+pub const PER_CUT: u32 = 3;
+/// How many numbered frames the cut run sends.
+pub const CUT_RUN: u32 = CUTS * PER_CUT;
+// [`Arrivals::by_position`] has a slot a position.
+const _: () = assert!(PER_CUT == 3);
+
+/// Where the `number`th frame of the cut run is cut, as how many of its
+/// `wire_len` bytes are sent, or `None` for a frame sent whole.
+///
+/// The first frame of every pull is the one cut, and the thousand cuts
+/// sweep the frame from its first byte to the last byte before the
+/// delimiter, so a fragment of one byte and a fragment short of only its
+/// delimiter are both among them; never the delimiter itself, since a
+/// frame that ended is not a frame that was cut. A wire too short to cut
+/// is sent whole.
+#[must_use]
+pub fn cut_point(number: u32, wire_len: usize) -> Option<usize> {
+    if number == 0 || number > CUT_RUN || number % PER_CUT != 1 {
+        return None;
+    }
+    let trial = (number / PER_CUT).min(CUTS.saturating_sub(1));
+    // Cut positions run from one byte to one short of the whole frame.
+    let last = wire_len.checked_sub(1).filter(|last| *last >= 1)?;
+    let span = last.checked_sub(1)?;
+    let steps = usize::try_from(CUTS.saturating_sub(1)).ok()?.max(1);
+    let trial = usize::try_from(trial).ok()?;
+    let offset = trial.checked_mul(span)?.checked_div(steps)?;
+    Some(1usize.saturating_add(offset))
+}
+
+/// What the controller counts when every frame of the cut run reached it
+/// as sent: the numbered frames that arrived and the frames refused, both
+/// one a pull, and never a third frame lost.
+#[must_use]
+pub const fn cut_run_expected() -> (u32, u32) {
+    (CUTS, CUTS)
+}
+
+/// The numbered frames a run delivered, as the receiving side counts them
+/// (F-086, F-087): how many, the highest, and two things a count alone
+/// cannot say. Numbers arrive in the order they were sent, so an arrival
+/// not above the one before it is a duplicate or a frame out of order,
+/// which the sender never produces; and each number's position in a pull
+/// of [`PER_CUT`] says which frame of the pull it was, so a cut run whose
+/// arrivals all sit in the third position, strictly increasing and no
+/// higher than the run, delivered every third frame and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Arrivals {
+    /// How many numbered frames arrived.
+    pub count: u32,
+    /// The highest number that arrived.
+    pub highest: u32,
+    /// Arrivals whose number was not above the one before it.
+    pub not_increasing: u32,
+    /// Arrivals by position in a pull: the frame that would be cut, the
+    /// frame that would run into it, the frame that must arrive.
+    pub by_position: [u32; 3],
+    last: u32,
+}
+
+impl Arrivals {
+    /// No arrivals yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            count: 0,
+            highest: 0,
+            not_increasing: 0,
+            by_position: [0; 3],
+            last: 0,
+        }
+    }
+
+    /// A numbered frame arrived whole.
+    pub fn arrived(&mut self, number: u32) {
+        self.count = self.count.saturating_add(1);
+        self.highest = self.highest.max(number);
+        if number <= self.last {
+            self.not_increasing = self.not_increasing.saturating_add(1);
+        }
+        self.last = number;
+        let position = usize::try_from(number.saturating_sub(1) % PER_CUT).unwrap_or(0);
+        if let Some(slot) = self.by_position.get_mut(position) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// Numbers below the highest that did not arrive.
+    #[must_use]
+    pub const fn missing(&self) -> u32 {
+        self.highest.saturating_sub(self.count)
+    }
+}
+
 /// The number [`stamp`] wrote, or `None` if the payload is too short.
 #[must_use]
 pub fn stamped(payload: &[u8]) -> Option<u32> {
@@ -168,6 +267,160 @@ mod tests {
         let mut other = [0u8; MAX_PAYLOAD];
         worst_case(&mut other, 2);
         assert_ne!(payload, other);
+    }
+
+    const PULLS: usize = CUTS as usize;
+
+    /// The cut run, as the module puts it on the wire, read by the
+    /// controller's own reader: the numbers that arrived in order, how
+    /// many frames were refused and abandoned, and where each pull cut.
+    /// Arrays, not a heap: the domain tests allocate no more than the part.
+    struct Replay {
+        arrived: [u32; PULLS],
+        arrivals: usize,
+        dropped: u32,
+        abandoned: u32,
+        cuts: [usize; PULLS],
+        pulls: usize,
+    }
+
+    fn replay() -> Replay {
+        let mut writer = FrameWriter::new();
+        let mut reader = FrameReader::new();
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let mut wire = [0u8; MAX_FRAME];
+        let mut replay = Replay {
+            arrived: [0; PULLS],
+            arrivals: 0,
+            dropped: 0,
+            abandoned: 0,
+            cuts: [0; PULLS],
+            pulls: 0,
+        };
+        for number in 1..=CUT_RUN {
+            worst_case(&mut payload, number);
+            stamp(&mut payload, number);
+            let len = writer.write(&payload, &mut wire).expect("frames");
+            let sent = match cut_point(number, len) {
+                Some(cut) => {
+                    *replay.cuts.get_mut(replay.pulls).expect("a thousand pulls") = cut;
+                    replay.pulls = replay.pulls.saturating_add(1);
+                    cut
+                }
+                None => len,
+            };
+            for byte in wire.get(..sent).expect("fits") {
+                match reader.push(*byte) {
+                    Received::Frame(frame) => {
+                        let slot = replay.arrived.get_mut(replay.arrivals);
+                        *slot.expect("no more arrivals than pulls") =
+                            stamped(frame).expect("numbered");
+                        replay.arrivals = replay.arrivals.saturating_add(1);
+                    }
+                    Received::Dropped(_) => replay.dropped = replay.dropped.saturating_add(1),
+                    Received::Abandoned => replay.abandoned = replay.abandoned.saturating_add(1),
+                    Received::Nothing => {}
+                }
+            }
+        }
+        replay
+    }
+
+    #[test]
+    fn f_086_the_cut_run_costs_one_frame_a_pull_and_the_third_always_arrives() {
+        let replay = replay();
+        let (expected_arrived, expected_refused) = cut_run_expected();
+        assert_eq!(replay.pulls, PULLS);
+        assert_eq!(replay.arrivals, expected_arrived as usize);
+        assert_eq!(replay.dropped, expected_refused);
+        assert_eq!(replay.abandoned, 0);
+        // Exactly the third frame of every pull, and every one of them.
+        for (pull, number) in replay.arrived.iter().enumerate() {
+            let pull = u32::try_from(pull).expect("fits");
+            assert_eq!(
+                *number,
+                pull.saturating_add(1).saturating_mul(PER_CUT),
+                "pull {pull}"
+            );
+        }
+    }
+
+    #[test]
+    fn f_086_the_cuts_sweep_the_frame_from_its_first_byte_to_its_last_before_the_delimiter() {
+        let replay = replay();
+        let mut writer = FrameWriter::new();
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let mut wire = [0u8; MAX_FRAME];
+        worst_case(&mut payload, 1);
+        stamp(&mut payload, 1);
+        let len = writer.write(&payload, &mut wire).expect("frames");
+        assert_eq!(replay.cuts[0], 1);
+        assert_eq!(replay.cuts[PULLS.saturating_sub(1)], len.saturating_sub(1));
+        assert!(
+            replay.cuts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the sweep is monotonic"
+        );
+        assert!(
+            replay.cuts.iter().all(|cut| *cut < len),
+            "never the delimiter"
+        );
+    }
+
+    #[test]
+    fn f_086_only_the_first_frame_of_a_pull_is_cut_and_nothing_past_the_run() {
+        for number in [2, 3, 5, 6, CUT_RUN - 1, CUT_RUN] {
+            assert_eq!(cut_point(number, 1_000), None, "frame {number}");
+        }
+        assert_eq!(cut_point(0, 1_000), None);
+        assert_eq!(cut_point(CUT_RUN + 1, 1_000), None);
+        assert_eq!(cut_point(CUT_RUN + PER_CUT + 1, 1_000), None);
+    }
+
+    #[test]
+    fn f_086_a_wire_too_short_to_cut_is_sent_whole() {
+        assert_eq!(cut_point(1, 0), None);
+        assert_eq!(cut_point(1, 1), None);
+        // Two bytes: one byte and the delimiter, cut after the one.
+        assert_eq!(cut_point(1, 2), Some(1));
+        assert_eq!(cut_point(CUT_RUN - 2, 2), Some(1));
+    }
+
+    #[test]
+    fn f_086_arrivals_in_order_are_counted_by_position_with_none_out_of_order() {
+        let mut arrivals = Arrivals::new();
+        for number in [3u32, 6, 9, 12] {
+            arrivals.arrived(number);
+        }
+        assert_eq!(arrivals.count, 4);
+        assert_eq!(arrivals.highest, 12);
+        assert_eq!(arrivals.missing(), 8);
+        assert_eq!(arrivals.not_increasing, 0);
+        assert_eq!(arrivals.by_position, [0, 0, 4]);
+    }
+
+    #[test]
+    fn f_086_a_duplicate_or_a_frame_out_of_order_is_counted_as_not_increasing() {
+        let mut arrivals = Arrivals::new();
+        for number in [1u32, 2, 2, 5, 4] {
+            arrivals.arrived(number);
+        }
+        assert_eq!(arrivals.count, 5);
+        assert_eq!(arrivals.not_increasing, 2);
+        // Positions: 1 and 4 first, 2, 2 and 5 second, none third.
+        assert_eq!(arrivals.by_position, [2, 3, 0]);
+    }
+
+    #[test]
+    fn f_086_the_cut_run_read_by_the_arrivals_tracker_proves_every_third_frame() {
+        let replay = replay();
+        let mut arrivals = Arrivals::new();
+        for number in replay.arrived.iter().take(replay.arrivals) {
+            arrivals.arrived(*number);
+        }
+        assert_eq!(arrivals.count, CUTS);
+        assert_eq!(arrivals.highest, CUT_RUN);
+        assert_eq!(arrivals.not_increasing, 0);
+        assert_eq!(arrivals.by_position, [0, 0, CUTS]);
     }
 
     #[test]

@@ -954,7 +954,7 @@ mod frames {
     use embassy_stm32::usart::Error;
     use embassy_time::{Duration, Instant};
     use km43::{MAX_PAYLOAD, Received};
-    use o89_link::stamped;
+    use o89_link::{Arrivals, PER_CUT, stamped};
 
     /// The minimum interval between changed tallies.
     const EVERY: Duration = Duration::from_secs(1);
@@ -967,12 +967,13 @@ mod frames {
         others: u32,
         next: Instant,
         dirty: bool,
-        /// The highest number a bench frame carried, and how many of them
-        /// arrived. The two together say what a count alone cannot: a run
-        /// that stops short with no gap never left the module, and one
-        /// with a gap lost frames on the wire.
-        highest: u32,
-        stamped: u32,
+        /// The numbered frames that arrived: how many and the highest,
+        /// which together say what a count alone cannot (a run that stops
+        /// short with no gap never left the module, one with a gap lost
+        /// frames on the wire); and whether they came in order and in
+        /// which position of a pull, which is what proves a cut run
+        /// delivered every third frame and nothing else (F-086).
+        arrivals: Arrivals,
         /// How many times the link came up. More than one means it went
         /// down, and a run measured across that is a different run.
         ups: u32,
@@ -997,8 +998,7 @@ mod frames {
                 others: 0,
                 next: Instant::now(),
                 dirty: false,
-                highest: 0,
-                stamped: 0,
+                arrivals: Arrivals::new(),
                 ups: 0,
                 at_link: None,
             }
@@ -1045,8 +1045,7 @@ mod frames {
             let Some(number) = stamped(frame) else {
                 return;
             };
-            self.stamped = self.stamped.saturating_add(1);
-            self.highest = self.highest.max(number);
+            self.arrivals.arrived(number);
         }
 
         pub fn refused(&mut self, received: Received<'_>) {
@@ -1096,12 +1095,18 @@ mod frames {
                     self.overruns.saturating_sub(overruns),
                     self.others.saturating_sub(others)
                 );
-                if self.highest > 0 {
+                if self.arrivals.highest > 0 {
+                    let [first, second, third] = self.arrivals.by_position;
                     defmt::info!(
-                        "frames of the run: {} arrived, highest numbered {}, {} missing, link up {} time(s)",
-                        self.stamped,
-                        self.highest,
-                        self.highest.saturating_sub(self.stamped),
+                        "frames of the run: {} arrived, highest numbered {}, {} missing, {} not increasing, by position in a pull of {}: {} {} {}, link up {} time(s)",
+                        self.arrivals.count,
+                        self.arrivals.highest,
+                        self.arrivals.missing(),
+                        self.arrivals.not_increasing,
+                        PER_CUT,
+                        first,
+                        second,
+                        third,
                         self.ups
                     );
                 }

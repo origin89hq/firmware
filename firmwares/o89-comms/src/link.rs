@@ -141,8 +141,8 @@ mod frames {
     use super::{UartTx, WRITE_DEADLINE, write_all};
     use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
-    use o89_comms_core::{CUT_RUN, FrameBenchStart, Link, PER_CUT, cut_point};
-    use o89_link::{stamp, worst_case};
+    use o89_comms_core::{FrameBenchStart, Link};
+    use o89_link::{CUT_RUN, PER_CUT, cut_point, stamp, worst_case};
 
     /// How many the run sends: ten thousand worst-case frames (F-087), or
     /// the cut run's three a pull (F-086).
