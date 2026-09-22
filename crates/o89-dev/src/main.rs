@@ -17,6 +17,7 @@ mod flash;
 mod layout;
 mod link;
 mod rail;
+mod ring;
 mod store;
 
 use std::path::{Path, PathBuf};
@@ -115,6 +116,13 @@ enum Command {
         /// How many bytes.
         #[arg(long, default_value_t = 256)]
         len: u32,
+    },
+    /// The event ring's newest records, decoded, newest first: each event,
+    /// and for a boot why the part came up.
+    Ring {
+        /// How many of the newest sequence numbers.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
+        count: u64,
     },
     /// Erase NOR blocks of 4 KiB, one per request; the ring finds its head
     /// again after each block of its own.
@@ -311,6 +319,7 @@ fn main() -> Result<()> {
             dump(at, &bytes);
             Ok(())
         }
+        Command::Ring { count } => ring::newest(&mut link, count),
         Command::EraseNor { block, count } => {
             if count == 0 {
                 bail!("nothing to erase");

@@ -747,7 +747,13 @@ own would, and the bytes it writes are framed by this crate's own records
 on the host: the epoch and the secret a unit leaves the bench with are
 records the boot reads exactly as it reads its own. The firmware moves
 bytes and decides nothing about them; what they mean is the host's, in the
-same `o89-core`. The region is one the runtime never loads or zeroes and the
+same `o89-core`. One request reads records rather than bytes: the ring's
+newest events are walked by the ring's own reader and handed back a page at
+a time, because the ring is the one thing that knows where it starts and
+ends, and a host finding the head a mailbox request at a time would probe
+thousands of empty blocks at a tenth of a second each. The host decodes
+each event, a boot's reason and last words included, with KM43's codecs.
+The region is one the runtime never loads or zeroes and the
 stack never reaches, at the address both sides share from one constant.
 
 ### The event log ring

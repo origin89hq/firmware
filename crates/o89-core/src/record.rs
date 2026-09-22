@@ -81,14 +81,18 @@ impl Class {
     const A_BYTE: u8 = 0xA0;
     const B_BYTE: u8 = 0xB0;
 
-    const fn byte(self) -> u8 {
+    /// The byte on the part.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
         match self {
             Self::A => Self::A_BYTE,
             Self::B => Self::B_BYTE,
         }
     }
 
-    const fn of(byte: u8) -> Option<Self> {
+    /// The class a byte names, or nothing for one no build allocated.
+    #[must_use]
+    pub const fn of(byte: u8) -> Option<Self> {
         match byte {
             Self::A_BYTE => Some(Self::A),
             Self::B_BYTE => Some(Self::B),
