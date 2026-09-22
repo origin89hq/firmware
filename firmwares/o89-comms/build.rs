@@ -12,8 +12,17 @@ use std::error::Error;
 mod link_version;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let package_version = env::var("CARGO_PKG_VERSION")?;
+    // The acceptance image that omits its window says so on the link, so
+    // the controller's log names what it is talking to. Two letters leave
+    // room for `.dirty` within L-034's eight-byte cap.
+    let version = if env::var_os("CARGO_FEATURE_NO_WINDOW").is_some() {
+        format!("{package_version}-nw")
+    } else {
+        package_version
+    };
     link_version::emit(
-        &env::var("CARGO_PKG_VERSION")?,
+        &version,
         &[
             ".",
             "../link_version.rs",

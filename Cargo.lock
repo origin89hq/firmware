@@ -1031,6 +1031,7 @@ dependencies = [
  "md-5",
  "o89-core",
  "probe-rs",
+ "sha2",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1896,8 +1897,10 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
+ "hex",
  "km43",
  "serde",
+ "sha2",
  "syn 3.0.6",
  "toml",
 ]

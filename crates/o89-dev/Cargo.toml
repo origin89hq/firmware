@@ -19,6 +19,8 @@ getrandom.workspace = true
 hex.workspace = true
 km43.workspace = true
 md-5.workspace = true
+# The committed bootloader, held to the hash recorded beside it.
+sha2.workspace = true
 probe-rs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

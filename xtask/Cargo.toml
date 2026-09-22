@@ -12,6 +12,9 @@ publish.workspace = true
 anyhow.workspace = true
 cargo_metadata.workspace = true
 clap.workspace = true
+# The bootloader's hash, held to the one recorded beside it.
+hex.workspace = true
+sha2.workspace = true
 km43.workspace = true
 serde.workspace = true
 syn.workspace = true

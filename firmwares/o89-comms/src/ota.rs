@@ -5,8 +5,11 @@
 //! new one does not confirm itself before the next reset. The thing that
 //! proves this image safe to keep is not that it booted but that it
 //! honours the window, so the confirmation is the statement after the
-//! window and not the first in `main`. A bootloader without rollback treats
-//! the state as valid already, and this is then a write of what is there.
+//! window and not the first in `main`, and the confirmation takes the proof
+//! the window hands out and nothing else (F-089): an image whose window is
+//! omitted has nothing to confirm with. The bootloader is the one this
+//! repository builds with rollback enabled (F-088); under one without it
+//! the state is valid already, and this is then a write of what is there.
 
 use esp_bootloader_esp_idf::ota::{Ota, OtaImageState};
 use esp_bootloader_esp_idf::partitions::{
@@ -14,6 +17,7 @@ use esp_bootloader_esp_idf::partitions::{
 };
 use esp_hal::peripherals::FLASH;
 use esp_storage::FlashStorage;
+use o89_comms_core::WindowRan;
 
 /// The two OTA slots the partition table declares.
 const OTA_SLOTS: usize = 2;
@@ -35,7 +39,9 @@ struct Unconfirmed;
 /// run an image that has not been kept. A bootloader with rollback then puts
 /// the previous image back, which honours the window too (F-036), and one
 /// without it boots this image again, window first, to try again.
-pub fn confirm_if_pending(flash: FLASH<'static>) {
+///
+/// `ran` is the proof the window ran, which only the window makes (F-089).
+pub fn confirm_if_pending(flash: FLASH<'static>, _ran: WindowRan) {
     let mut storage = FlashStorage::new(flash);
     // Bounded: `ATTEMPTS` turns.
     for _ in 0..ATTEMPTS {

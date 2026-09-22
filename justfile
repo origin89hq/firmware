@@ -30,6 +30,8 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features crash-at-boot -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-window -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features no-flow -- -D warnings
 
@@ -56,6 +58,13 @@ sizes *args:
 # Refresh the shared skills once at the start of a task.
 skills-sync:
     python3 .origin89/sync-engineering.py
+
+# Build the module's second-stage bootloader from the pinned ESP-IDF in
+# Espressif's container, with app rollback enabled (F-088), into
+# `firmwares/o89-comms/bootloader/`. Needs Docker. Touches no board; the
+# whole route of `dev-flash-comms-whole` is what puts it on one.
+comms-bootloader:
+    firmwares/o89-comms/bootloader/build.sh
 
 # ---------------------------------------------------------------------------
 # Flashing, erasing and resetting: never run from `check`. Before any of these
@@ -309,6 +318,34 @@ dev-flash-comms-frames *args:
 # for that controller's matching bench identity and a validated heartbeat.
 dev-flash-comms-frames-no-flow *args:
     cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
+
+# FLASH the image #1's acceptance test delivers first: one that panics as
+# its first statement, before its window (F-088). Effect: the module boots
+# it from `ota_0`, the bootloader marks the slot pending, the panic resets
+# the part, and at that reset the bootloader marks the slot aborted and
+# boots the factory image, which honours the window; the controller's log
+# shows the module linking on the factory image's version. Recovery: none
+# needed, that is the test; `just dev-flash-comms` then puts the ordinary
+# image back through the window, with no wire. Needs the module to hold the
+# rollback bootloader (`dev-flash-comms-whole --entry knock`, once).
+#
+# FLASH the acceptance image that crashes before its window; the bootloader must roll it back.
+dev-flash-comms-crash *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features crash-at-boot
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
+
+# FLASH the image #1's acceptance test delivers second: one whose window is
+# omitted, and with it the proof its slot could be confirmed against
+# (F-089). Effect: the module runs it and links, stating `-nw`, and cannot
+# confirm the slot; the next reset of the module, which the next flash's
+# knock makes, has the bootloader boot the factory image instead, whose
+# window answers the knock. Recovery: `just dev-flash-comms`, which is the
+# second half of the test. Needs the rollback bootloader as above.
+#
+# FLASH the acceptance image whose window is omitted; the next reset must roll it back.
+dev-flash-comms-no-window *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-window
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # LISTEN to the module through the bridge: the firmware resets it, by

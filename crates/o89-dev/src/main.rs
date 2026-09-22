@@ -357,7 +357,15 @@ fn flash_comms(
     let entry = entry.unwrap_or_else(|| layout.entry());
     let app;
     let declared;
-    let merged;
+    // The bootloader is the committed one and no other, checked against
+    // the hash beside it and copied into the scratch as checked: a flag
+    // naming another file would be a way to put a bootloader without
+    // rollback on the module and have the slot route accept it (F-088).
+    // Both routes need the merged image: the whole one writes it, and the
+    // slot one compares the module's bootloader against its start.
+    let bootloader = flash::committed_bootloader(&scratch)?;
+    let merged = scratch.file("o89-comms-merged.bin");
+    flash::merge(elf, partitions, &bootloader, &merged)?;
     let request = match layout {
         Layout::Slot => {
             app = scratch.file("o89-comms.bin");
@@ -373,15 +381,12 @@ fn flash_comms(
                 .ok();
             flash::Request::Slot {
                 app: &app,
+                merged: &merged,
                 scratch: &scratch,
                 declared: declared.as_ref(),
             }
         }
-        Layout::Whole => {
-            merged = scratch.file("o89-comms-merged.bin");
-            flash::merge(elf, partitions, &merged)?;
-            flash::Request::Whole { merged: &merged }
-        }
+        Layout::Whole => flash::Request::Whole { merged: &merged },
     };
     flash::flash(link, &request, entry.into())
 }

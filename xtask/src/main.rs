@@ -23,6 +23,7 @@ mod link_version;
 #[cfg(test)]
 mod link_version_tests;
 
+mod bootloader;
 mod cross;
 mod deps;
 mod images;
@@ -40,8 +41,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Everything CI runs that `cargo test` does not: cross-compiles, the
-    /// dependency rules, the pin table, the rules' coverage, the three
-    /// images and their sizes.
+    /// dependency rules, the pin table, the module's bootloader against its
+    /// inputs, the rules' coverage, the three images and their sizes.
     Check,
     /// Build the three images and print their sizes against the budgets.
     Sizes {
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
             cross::check(&repo)?;
             deps::check(&repo)?;
             pins::check(&repo)?;
+            bootloader::check(&repo)?;
             traceability::check(&repo)?;
             let measured = images::build_and_measure(&repo)?;
             images::report(&measured);
