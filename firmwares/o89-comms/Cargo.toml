@@ -21,6 +21,14 @@ publish.workspace = true
 frames = ["dep:o89-link", "o89-comms-core/frames"]
 # Bench sender ignores CTS; pair with the controller's no-flow image.
 no-flow = ["frames"]
+# The two images #1's acceptance test delivers as updates (F-088, F-089),
+# never on a unit that ships. `crash-at-boot` panics as its first
+# statement, before the watchdog, the UART and the window: the image a bad
+# release would be. `no-window` omits the window, and with it the only
+# proof the slot could be confirmed against, so it runs and links until its
+# next reset puts the previous image back.
+crash-at-boot = []
+no-window = []
 # The image for an ESP32-C6 devkit on its own USB serial (`just
 # run-comms-devkit`): the same firmware, stating the devkit as its board in
 # every `LinkUp` rather than board A (L-034). Nothing else moves.

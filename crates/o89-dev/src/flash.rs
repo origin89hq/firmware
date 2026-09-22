@@ -15,7 +15,11 @@
 //! What is written, and in what order, is [`Plan`]. By default it is an
 //! application into an OTA slot with the factory image left alone (F-084),
 //! because that image carries the download window and is the way back into
-//! a module with no wire on it (F-036, #1).
+//! a module with no wire on it (F-036, #1). That route writes the slot's
+//! state as `New`, which means something only under a bootloader with
+//! rollback, so before it writes anything it reads the module's bootloader
+//! back and refuses one that is not the bootloader this repository builds
+//! (F-088).
 
 use o89_core::mailbox::DownloadEntry;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write as _};
@@ -32,6 +36,11 @@ use crate::layout::{
     ImageState, OTADATA_LEN, Partition, Role, TABLE_AT, TABLE_LEN, Table, otadata_no_slot,
     otadata_selecting,
 };
+
+/// The flash below the partition table, which is the bootloader and the
+/// erased space after it: what the whole route writes there, and what the
+/// slot route reads back to compare (F-088).
+const BELOW_TABLE: usize = TABLE_AT as usize;
 use crate::link::Link;
 
 /// `download_reason` as the registry numbers `bench`.
@@ -311,16 +320,63 @@ pub fn plan_whole(merged: &Path) -> Result<Plan> {
     })
 }
 
-/// The merged image `plan_whole` writes: the bootloader and the partition
-/// table with the application at its factory offset, without the padding
-/// to the flash's end.
-pub fn merge(elf: &Path, partitions: &Path, out: &Path) -> Result<()> {
+/// The merged image `plan_whole` writes: the bootloader this repository
+/// builds with rollback enabled (F-088) and the partition table, with the
+/// application at its factory offset, without the padding to the flash's
+/// end. `espflash` patches the bootloader's flash-size header byte and its
+/// trailing hash as it lays the image out, so this image and not the
+/// bootloader file is what the module's flash is compared against.
+pub fn merge(elf: &Path, partitions: &Path, bootloader: &Path, out: &Path) -> Result<()> {
+    let bootloader = bootloader.to_string_lossy();
     espflash(
-        &["--merge", "--skip-padding", "--partition-table"],
+        &[
+            "--merge",
+            "--skip-padding",
+            "--bootloader",
+            &bootloader,
+            "--partition-table",
+        ],
         Some(partitions),
         elf,
         out,
     )
+}
+
+/// The module holds the bootloader the whole route writes: the flash below
+/// the partition table, as `installed` reads it back, is byte for byte the
+/// start of `merged` (F-088).
+///
+/// The slot route's `New` is a promise only a bootloader with rollback
+/// keeps; under `espflash`'s prebuilt one, which has none, the state is
+/// ignored and a bad image keeps its slot for good. So a module holding
+/// any other bootloader is refused before anything is written, and the way
+/// forward is the whole route, once, by the knock.
+pub fn holds_bootloader(installed: &[u8], merged: &[u8]) -> Result<()> {
+    let expected = merged.get(..BELOW_TABLE).with_context(|| {
+        format!(
+            "the merged image is {} bytes, shorter than the {BELOW_TABLE:#x} below the partition table",
+            merged.len()
+        )
+    })?;
+    if installed.len() != expected.len() {
+        bail!(
+            "read {} bytes of the module's flash below the partition table, not {BELOW_TABLE:#x}",
+            installed.len()
+        );
+    }
+    if let Some(at) = installed
+        .iter()
+        .zip(expected)
+        .position(|(held, wanted)| held != wanted)
+    {
+        bail!(
+            "the module's bootloader differs at {at:#x} from the one this repository builds \
+             with rollback enabled; under it the slot's `New` state holds nothing and a bad \
+             image would keep its slot for good. Replace it once with `just \
+             dev-flash-comms-whole --entry knock` (F-088)"
+        );
+    }
+    Ok(())
 }
 
 /// The application image alone, as the bootloader loads it from a slot.
@@ -354,6 +410,9 @@ pub enum Request<'a> {
     Slot {
         /// The application image, as the bootloader loads it from a slot.
         app: &'a Path,
+        /// The merged image the whole route would write, whose start is
+        /// the bootloader the module must hold (F-088).
+        merged: &'a Path,
         /// Where the `otadata` this writes is built.
         scratch: &'a Scratch,
         /// The table the image was built against, compared against the
@@ -389,9 +448,14 @@ fn carry_out(link: &mut Link, request: &Request) -> Result<()> {
     let plan = match request {
         Request::Slot {
             app,
+            merged,
             scratch,
             declared,
         } => {
+            let below = installed_below_table(link, scratch)?;
+            let wanted =
+                std::fs::read(merged).with_context(|| format!("reading {}", merged.display()))?;
+            holds_bootloader(&below, &wanted)?;
             let installed = installed_table(link, scratch)?;
             if let Some(declared) = declared {
                 differences(&installed, declared);
@@ -424,6 +488,23 @@ fn carry_out(link: &mut Link, request: &Request) -> Result<()> {
         }
     }
     outcome
+}
+
+/// The module's flash below the partition table: its bootloader, read
+/// back whole (F-088).
+fn installed_below_table(link: &mut Link, scratch: &Scratch) -> Result<Vec<u8>> {
+    let out = scratch.file("installed-bootloader.bin");
+    run_esptool(
+        link,
+        &[
+            "read-flash".to_owned(),
+            "0x0".to_owned(),
+            format!("{BELOW_TABLE:#x}"),
+            out.to_string_lossy().into_owned(),
+        ],
+    )
+    .context("reading the module's bootloader")?;
+    std::fs::read(&out).with_context(|| format!("reading back {}", out.display()))
 }
 
 /// The partition table the module holds, read out of the sector the
@@ -759,6 +840,68 @@ mod tests {
         assert!(exists(pid), "a zombie until reaped");
         drop(Esptool(child));
         assert!(!exists(pid), "reaped as the guard dropped");
+    }
+}
+
+#[cfg(test)]
+mod bootloader {
+    use super::*;
+
+    /// A merged image as the whole route writes it: a bootloader's worth of
+    /// bytes, the erased space to the table, the table and an app after.
+    fn merged() -> Vec<u8> {
+        let mut image = vec![0xffu8; BELOW_TABLE.saturating_add(0x9000)];
+        for (at, byte) in image.iter_mut().enumerate().take(22_560) {
+            *byte = u8::try_from(at.wrapping_mul(7) % 251).expect("fits");
+        }
+        image
+    }
+
+    #[test]
+    fn f_088_a_module_holding_the_bootloader_the_whole_route_writes_is_accepted() {
+        let merged = merged();
+        let installed = merged.get(..BELOW_TABLE).expect("the region").to_vec();
+        holds_bootloader(&installed, &merged).expect("the same bytes are accepted");
+    }
+
+    #[test]
+    fn f_088_a_module_holding_another_bootloader_is_refused_before_anything_is_written() {
+        let merged = merged();
+        let mut installed = merged.get(..BELOW_TABLE).expect("the region").to_vec();
+        // One byte of the image body, as another build of the same
+        // bootloader would differ.
+        let byte = installed.get_mut(0x1234).expect("inside");
+        *byte = byte.wrapping_add(1);
+        let error = holds_bootloader(&installed, &merged)
+            .expect_err("a differing bootloader is refused")
+            .to_string();
+        assert!(error.contains("0x1234"), "{error}");
+        assert!(error.contains("dev-flash-comms-whole"), "{error}");
+    }
+
+    #[test]
+    fn f_088_a_difference_in_the_erased_space_after_the_bootloader_is_refused_too() {
+        let merged = merged();
+        let mut installed = merged.get(..BELOW_TABLE).expect("the region").to_vec();
+        *installed.get_mut(0x7fff).expect("the last byte") = 0x00;
+        assert!(holds_bootloader(&installed, &merged).is_err());
+    }
+
+    #[test]
+    fn f_088_a_bootloader_read_back_short_is_refused() {
+        let merged = merged();
+        let installed = merged.get(..BELOW_TABLE - 1).expect("the region").to_vec();
+        let error = holds_bootloader(&installed, &merged)
+            .expect_err("a short read is refused")
+            .to_string();
+        assert!(error.contains("0x8000"), "{error}");
+    }
+
+    #[test]
+    fn f_088_a_merged_image_with_no_room_for_a_bootloader_is_refused() {
+        let merged = vec![0xffu8; BELOW_TABLE - 1];
+        let installed = vec![0xffu8; BELOW_TABLE];
+        assert!(holds_bootloader(&installed, &merged).is_err());
     }
 }
 

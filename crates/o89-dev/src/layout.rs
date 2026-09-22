@@ -62,11 +62,13 @@ const OTA_SEQ_CRC: crc::Algorithm<u32> = crc::Algorithm {
 
 /// The state an entry gives the application it selects.
 ///
-/// `New` is what the bench writes: a bootloader with rollback enabled turns
-/// it into pending verification and puts the previous image back unless the
-/// application confirms itself, which `o89-comms` does after its download
-/// window has run and not before (F-036). A bootloader without rollback
-/// ignores the field, and the same bytes mean "run it".
+/// `New` is what the bench writes: the bootloader this repository builds
+/// with rollback enabled (F-088) turns it into pending verification and
+/// puts the previous image back unless the application confirms itself,
+/// which `o89-comms` does after its download window has run and not
+/// before (F-036, F-089). A bootloader without rollback ignores the field,
+/// and the same bytes mean "run it", which is why the slot route refuses a
+/// module that holds one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ImageState {

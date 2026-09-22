@@ -346,12 +346,12 @@ and names that slot in `otadata` only once the application has landed; before
 it erases the slot it blanks the `otadata`, so from the first erase until the
 last write the module boots the factory image. The bootloader, the partition
 table and the factory image are replaced only by a route named for replacing
-them. The state written is `New`, which a bootloader with rollback holds
-against the image until it confirms itself, which `o89-comms` does after its
-window and not before. A transfer that dies leaves a module the controller can
-knock at with no wire on it, which is what the erase at address zero did not.
-Source: [#1][i1], F-036, bench 2026-09-19 §5 for the loss this prevents and
-§10 for the sequence run on the board. M3.
+them. The state written is `New`, which the bootloader, having rollback
+(F-088), holds against the image until it confirms itself, which `o89-comms`
+does after its window and not before (F-089). A transfer that dies leaves a
+module the controller can knock at with no wire on it, which is what the
+erase at address zero did not. Source: [#1][i1], F-036, bench 2026-09-19 §5
+for the loss this prevents and §10 for the sequence run on the board. M3.
 
 **F-085** — The slot route plans from the partition table the module holds,
 read back from the sector the bootloader reads it from, and never from the
@@ -388,6 +388,29 @@ the rail mid-run. The controller counts frames whose CRC held, frames
 refused between delimiters, part-frames abandoned and the UART's own
 overruns, apart, because a counter that added them would hide whichever was
 rarer. Source: KM43 VERIFICATION §8, [#3][plan] §M3 exit. M3.
+
+**F-088** — The module's second-stage bootloader is ESP-IDF's, built by this
+repository from a pinned release with app rollback enabled, committed with
+the configuration that built it, and the only bootloader the whole route
+writes. The one `espflash` ships is built without rollback: its manifest sets
+only the flash size, and ESP-IDF's default for the option is off, so under it
+the `New` state of F-084 is ignored and a bad image keeps its slot for good,
+which is the loss #1 names. The slot route reads the module's flash below
+the partition table back and refuses, before it writes anything, a module
+that does not hold byte for byte what the whole route would write there; the
+way forward is the whole route once, by the knock. Source: [#1][i1], F-084,
+`espflash`'s bootloader manifest, ESP-IDF's `Kconfig.app_rollback`. M3.
+
+**F-089** — `o89-comms` confirms the slot it runs from against the proof
+that its download window ran, a value only the window makes and only once it
+has passed, and against nothing else. An image whose window is omitted has
+nothing to confirm with, so it runs unconfirmed until its next reset, at
+which the bootloader puts the previous image back (F-088); an image that
+crashes before its window never reaches the confirmation at all. Together
+these are #1's acceptance test: a crashing image and a windowless image,
+each delivered as an update, each rolled back to an image that honours the
+window, and the module reached again through the controller with no wire.
+Source: [#1][i1], F-036, F-088. M3.
 
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6

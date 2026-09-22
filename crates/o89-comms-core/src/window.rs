@@ -9,6 +9,11 @@
 //! that answered would be a window running code it did not need to. Nothing
 //! here can see a client transport, because none exists for another second;
 //! the request can only come from this UART.
+//!
+//! Once it has passed, the window hands out the one proof that it ran,
+//! [`WindowRan`], which is what the firmware confirms its OTA slot against
+//! (F-089): an image that omits the window has nothing to confirm with, and
+//! the bootloader puts the previous image back at its next reset.
 
 use km43::{
     DownloadRequest, DownloadVerdict, EnterDownload, FrameReader, FrameWriter, Intake,
@@ -43,6 +48,16 @@ impl Window {
             .is_some_and(|open| open.as_millis() < WINDOW.as_millis())
     }
 
+    /// The proof that the window ran, once `now` is [`WINDOW`] or more past
+    /// the opening, and `None` while it is still open. A `now` before the
+    /// opening is a tick from another boot and proves nothing either.
+    #[must_use]
+    pub fn closed(&self, now: Tick) -> Option<WindowRan> {
+        now.since(self.opened)
+            .filter(|open| open.as_millis() >= WINDOW.as_millis())
+            .map(|_| WindowRan(()))
+    }
+
     /// Take one byte read at `now` off the controller UART.
     ///
     /// `Some` when the byte completes an `EnterDownload` the window
@@ -68,6 +83,22 @@ impl Window {
         Some(Honour { req_id })
     }
 }
+
+/// The proof the download window ran (F-089). Only [`Window::closed`] makes
+/// one, and only once the window has passed; `o89-comms` confirms an OTA
+/// slot against it and against nothing else. So an image whose window is
+/// omitted cannot confirm the slot it was written into, and the bootloader
+/// rolls it back at its next reset to the image that was running (F-088),
+/// which is what #1's acceptance test delivers as an update.
+///
+/// It cannot be made anywhere else:
+///
+/// ```compile_fail
+/// let proof = o89_comms_core::WindowRan(());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the proof the window ran is what confirms the slot; dropped, the image is rolled back at its next reset"]
+pub struct WindowRan(());
 
 /// An `EnterDownload` the window honours (F-034). Only [`Window::take`]
 /// makes one; the firmware answers it, then sets the ROM's flag and resets.
@@ -392,5 +423,36 @@ mod tests {
             now = now.after(Millis::from_millis(1)).expect("fits");
         }
         assert!(!window.is_open(now));
+    }
+
+    #[test]
+    fn f_089_the_proof_the_window_ran_is_made_only_once_it_has_passed() {
+        let window = Window::open(OPENED);
+        let last_open = OPENED
+            .after(Millis::from_millis(WINDOW.as_millis().saturating_sub(1)))
+            .expect("fits");
+        assert_eq!(window.closed(last_open), None);
+        let passed = OPENED.after(WINDOW).expect("fits");
+        assert_eq!(window.closed(passed), Some(WindowRan(())));
+    }
+
+    #[test]
+    fn f_089_a_tick_before_the_opening_proves_nothing() {
+        let window = Window::open(OPENED);
+        let earlier = Tick::from_millis(OPENED.as_millis().saturating_sub(1));
+        assert_eq!(window.closed(earlier), None);
+    }
+
+    #[test]
+    fn f_089_a_window_still_hearing_bytes_gives_no_proof() {
+        let window = Window::open(OPENED);
+        let mut reader = FrameReader::new();
+        let mut now = OPENED;
+        // Bounded: one step a millisecond until the window has closed.
+        while window.closed(now).is_none() {
+            assert_eq!(window.take(&mut reader, 0x00, now), None);
+            now = now.after(Millis::from_millis(1)).expect("fits");
+        }
+        assert_eq!(now, OPENED.after(WINDOW).expect("fits"));
     }
 }

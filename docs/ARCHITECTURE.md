@@ -1067,7 +1067,9 @@ rolls back independently, and the two are never offline at once.
    `refused_outside_window` and never acted on. The window runs before any
    code that can crash for a reason of ours, and its having run is what
    confirms an OTA slot in pending verification (F-036): the proof an image
-   is safe to keep is that it honours the window.
+   is safe to keep is that it honours the window, and the confirmation takes
+   the value only the window's run produces (F-089), so an image without a
+   window cannot confirm itself.
 4. The scheduler (`esp-rtos`, with the embassy executor the link runs on,
    entered from the HAL's bare entry only now, so nothing of either runs
    before the window),
@@ -1095,8 +1097,11 @@ three 2 MB slots and the assets fit an 8 MB module. The factory slot is the froz
 a minimal image: a recovery path has to be proven and immutable, and a
 shipped release is both. An OTA image that boots and never confirms healthy
 is rolled back by the ESP-IDF bootloader to the image that was running, which
-honours the window (L-173). If both OTA slots are bad it falls to the factory
-image, which honours the window. The only way to lose the window is to flash
+honours the window (L-173). That bootloader is the one this repository builds
+with rollback enabled (`firmwares/o89-comms/bootloader/`, F-088), because the
+one `espflash` ships is built without it and would run the bad image for
+good; the slot route refuses a module that does not hold it. If both OTA
+slots are bad it falls to the factory image, which honours the window. The only way to lose the window is to flash
 a bad image into the factory slot through the download mode itself, a bench
 act with a probe attached and a wire available. So the bench tool does not
 do it by default: `dev-flash-comms` writes the application into `ota_0`,

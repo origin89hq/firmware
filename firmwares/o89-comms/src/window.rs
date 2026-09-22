@@ -15,21 +15,25 @@ use esp_hal::rtc_cntl::Rwdt;
 use esp_hal::time::Instant;
 use esp_hal::uart::Uart;
 use km43::{FrameReader, FrameWriter, MAX_FRAME};
-use o89_comms_core::{Honour, Tick, Window};
+use o89_comms_core::{Honour, Tick, Window, WindowRan};
 
-/// Run the window on `uart`. Returns once it has closed; never returns when
-/// a request was honoured.
+/// Run the window on `uart`. Returns the proof it ran once it has closed,
+/// which is the only thing the OTA slot is confirmed against (F-089);
+/// never returns when a request was honoured.
 pub fn run(
     uart: &mut Uart<'_, Blocking>,
     reader: &mut FrameReader,
     writer: &mut FrameWriter,
     rwdt: &mut Rwdt,
-) {
+) -> WindowRan {
     let window = Window::open(now());
     let mut chunk = [0u8; 64];
     // Bounded by the window: every turn either reads what the FIFO holds
     // or passes, and the watchdog is fed on each.
-    while window.is_open(now()) {
+    loop {
+        if let Some(ran) = window.closed(now()) {
+            return ran;
+        }
         rwdt.feed();
         if !uart.read_ready() {
             continue;

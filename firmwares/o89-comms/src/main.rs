@@ -30,8 +30,10 @@
 #![no_main]
 
 mod link;
+#[cfg(not(feature = "no-window"))]
 mod ota;
 mod panic;
+#[cfg(not(feature = "no-window"))]
 mod window;
 
 use esp_hal::rng::{Rng, TrngSource};
@@ -59,9 +61,28 @@ const WATCHDOG: Duration = Duration::from_secs(8);
 /// The executor the link runs on, entered at the end of the boot.
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
+/// The image #1's acceptance test delivers as an update: one that crashes
+/// before its window. The panic is the reset `panic.rs` makes of it, so the
+/// module boots this again and again until the bootloader, seeing a slot
+/// still unconfirmed at a reset, puts the previous image back (F-088). Not
+/// declared diverging, so the boot it cuts short reads as the boot it is.
+#[cfg(feature = "crash-at-boot")]
+#[expect(
+    clippy::panic,
+    reason = "the bench image whose whole purpose is to crash before its window, never on a unit that ships"
+)]
+fn crash_at_boot() {
+    panic!("crash-at-boot: the acceptance image that never reaches its window")
+}
+
 #[esp_hal::main]
 fn main() -> ! {
     let p = esp_hal::init(esp_hal::Config::default());
+    // 0. Only the acceptance image that crashes before anything (#1): a
+    // panic here is a reset, boot after boot, and the slot it was written
+    // into is never confirmed.
+    #[cfg(feature = "crash-at-boot")]
+    crash_at_boot();
     // 1. The watchdog, first: `esp_hal::init` disabled every one (F-032).
     let mut rtc = Rtc::new(p.RTC_TIMER);
     rtc.rwdt.set_timeout(RwdtStage::Stage0, WATCHDOG);
@@ -95,20 +116,41 @@ fn main() -> ! {
             esp_hal::delay::Delay::new().delay_millis(1_000);
         }
     };
+    // The window is what writes and reads these before the link does, and
+    // the acceptance image that omits it (#1) leaves them untouched until
+    // then.
+    #[cfg_attr(
+        feature = "no-window",
+        expect(unused_mut, reason = "the window is omitted")
+    )]
     let mut uart = uart
         .with_rx(p.GPIO17)
         .with_tx(p.GPIO16)
         .with_cts(p.GPIO4)
         .with_rts(p.GPIO5);
+    #[cfg_attr(
+        feature = "no-window",
+        expect(unused_mut, reason = "the window is omitted")
+    )]
     let mut reader = FrameReader::new();
+    #[cfg_attr(
+        feature = "no-window",
+        expect(unused_mut, reason = "the window is omitted")
+    )]
     let mut writer = FrameWriter::new();
 
     // 3. The download window (F-033, F-034). Does not return when honoured.
-    window::run(&mut uart, &mut reader, &mut writer, &mut rtc.rwdt);
+    // The acceptance image that omits it (#1) omits the proof with it, and
+    // so cannot confirm its slot: the next reset puts the previous image
+    // back (F-089).
+    #[cfg(not(feature = "no-window"))]
+    let ran = window::run(&mut uart, &mut reader, &mut writer, &mut rtc.rwdt);
 
     // 4. The window has run: this image honours it, which is what makes it
-    // safe to keep (F-036). A slot in pending verification is confirmed.
-    ota::confirm_if_pending(p.FLASH);
+    // safe to keep (F-036). A slot in pending verification is confirmed,
+    // against the window's own proof and nothing else (F-089).
+    #[cfg(not(feature = "no-window"))]
+    ota::confirm_if_pending(p.FLASH, ran);
 
     // 5. The scheduler, then the true random source for the `boot_id`
     // (F-035): the bare RNG is pseudo-random until the ADC feeds it.

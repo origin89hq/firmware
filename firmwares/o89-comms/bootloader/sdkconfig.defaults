@@ -1,0 +1,12 @@
+# The module's second-stage bootloader (F-088): ESP-IDF's own, built with
+# app rollback enabled. The one espflash ships is built without it (its
+# manifest sets only the flash size, and ESP-IDF's default for
+# BOOTLOADER_APP_ROLLBACK_ENABLE is n), so under it the `New` state the
+# bench writes holds nothing and a bad image keeps its slot for good.
+CONFIG_IDF_TARGET="esp32c6"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# The flash the module has (F-036).
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+# No build date in the image, so the same source gives the same bytes.
+# CONFIG_BOOTLOADER_COMPILE_TIME_DATE is not set

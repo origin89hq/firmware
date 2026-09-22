@@ -7,6 +7,10 @@ target/
 # readers of those formats are tested against. `*.bin` above is for build
 # output, and a fixture is the opposite of build output.
 !crates/o89-dev/fixtures/*.bin
+# And the module's bootloader, built from ESP-IDF by `just comms-bootloader`
+# with its configuration beside it (F-088): what the bench flashes, and what
+# the slot route requires a module to hold.
+!firmwares/o89-comms/bootloader/*.bin
 .DS_Store
 bench-logs/
 
