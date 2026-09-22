@@ -137,11 +137,6 @@ enum Command {
         /// The partition table.
         #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../firmwares/o89-comms/partitions.csv"))]
         partitions: PathBuf,
-        /// The bootloader, built by this repository with rollback enabled
-        /// (F-088): what the whole route writes, and what the slot route
-        /// requires the module to hold already.
-        #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../firmwares/o89-comms/bootloader/esp32c6-bootloader.bin"))]
-        bootloader: PathBuf,
         /// The route into the ROM: the window the comms firmware opens, or
         /// the strap for a module that runs nothing that answers, which on
         /// revision A needs IO8 held high by a wire.
@@ -335,19 +330,10 @@ fn main() -> Result<()> {
         Command::FlashComms {
             elf,
             partitions,
-            bootloader,
             entry,
             layout,
             yes,
-        } => flash_comms(
-            &mut link,
-            &elf,
-            &partitions,
-            &bootloader,
-            entry,
-            layout,
-            yes,
-        ),
+        } => flash_comms(&mut link, &elf, &partitions, entry, layout, yes),
         Command::CommsListen {
             seconds,
             entry,
@@ -361,7 +347,6 @@ fn flash_comms(
     link: &mut Link,
     elf: &Path,
     partitions: &Path,
-    bootloader: &Path,
     entry: Option<FlashEntry>,
     layout: Layout,
     yes: bool,
@@ -372,10 +357,15 @@ fn flash_comms(
     let entry = entry.unwrap_or_else(|| layout.entry());
     let app;
     let declared;
-    // Both routes need the merged image: the whole one writes it, and the
-    // slot one compares the module's bootloader against its start (F-088).
+    // The bootloader is the committed one and no other, checked against
+    // the hash beside it: a flag naming another file would be a way to put
+    // a bootloader without rollback on the module and have the slot route
+    // accept it (F-088). Both routes need the merged image: the whole one
+    // writes it, and the slot one compares the module's bootloader
+    // against its start.
+    let bootloader = flash::committed_bootloader()?;
     let merged = scratch.file("o89-comms-merged.bin");
-    flash::merge(elf, partitions, bootloader, &merged)?;
+    flash::merge(elf, partitions, &bootloader, &merged)?;
     let request = match layout {
         Layout::Slot => {
             app = scratch.file("o89-comms.bin");

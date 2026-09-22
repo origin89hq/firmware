@@ -20,4 +20,7 @@ docker run --rm -v "$work:/project" -w /project "$idf" \
 # lost the option is refused rather than committed.
 grep -x 'CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y' "$work/sdkconfig"
 cp "$work/build/bootloader/bootloader.bin" "$here/esp32c6-bootloader.bin"
-shasum -a 256 "$here/esp32c6-bootloader.bin"
+# The hash beside the binary: what `cargo xtask check` holds the binary to,
+# and what the bench tool checks before it flashes or compares, since a
+# `.bin` is invisible in a review and this line is not.
+(cd "$here" && shasum -a 256 esp32c6-bootloader.bin | tee esp32c6-bootloader.sha256)

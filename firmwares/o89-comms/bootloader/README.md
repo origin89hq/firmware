@@ -10,10 +10,14 @@ for good; under this one, a slot that does not confirm itself before its
 next reset is put back to the image that was running, which honours the
 download window (#1).
 
-`just comms-bootloader` rebuilds it; the same source gives the same bytes,
-and a pull request that changes them says which option moved. The whole
-route of `dev-flash-comms` writes it; the slot route refuses a module that
-does not hold it.
+`just comms-bootloader` rebuilds it and writes its SHA-256 beside it; the
+same source gives the same bytes, and a pull request that changes them
+shows the hash moving and says which option moved. `cargo xtask check`
+holds the binary to that hash, the configuration to the rollback option
+and the binary to the ESP-IDF release `build.sh` names; the bench tool
+checks the hash again before it flashes. The whole route of
+`dev-flash-comms` writes it; the slot route refuses a module that does not
+hold it.
 
 ESP-IDF is Copyright Espressif Systems, licensed under Apache-2.0; the
 binary is redistributed under that licence.

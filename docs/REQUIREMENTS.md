@@ -391,8 +391,13 @@ rarer. Source: KM43 VERIFICATION §8, [#3][plan] §M3 exit. M3.
 
 **F-088** — The module's second-stage bootloader is ESP-IDF's, built by this
 repository from a pinned release with app rollback enabled, committed with
-the configuration that built it, and the only bootloader the whole route
-writes. The one `espflash` ships is built without rollback: its manifest sets
+the configuration that built it and its hash, and the only bootloader the
+whole route writes: the bench tool takes no other file, and refuses the
+committed one when its bytes and its hash disagree. The gate holds the
+binary to that hash, the configuration to the rollback option and the
+binary to the release the build script names, because a binary is invisible
+in a review and those three lines are not. The one `espflash` ships is
+built without rollback: its manifest sets
 only the flash size, and ESP-IDF's default for the option is off, so under it
 the `New` state of F-084 is ignored and a bad image keeps its slot for good,
 which is the loss #1 names. The slot route reads the module's flash below

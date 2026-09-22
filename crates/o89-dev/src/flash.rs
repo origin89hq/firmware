@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 
 use crate::layout::{
     ImageState, OTADATA_LEN, Partition, Role, TABLE_AT, TABLE_LEN, Table, otadata_no_slot,
@@ -41,6 +42,47 @@ use crate::layout::{
 /// erased space after it: what the whole route writes there, and what the
 /// slot route reads back to compare (F-088).
 const BELOW_TABLE: usize = TABLE_AT as usize;
+
+/// Where the committed bootloader lives, with its hash beside it.
+const BOOTLOADER_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../firmwares/o89-comms/bootloader"
+);
+/// The bootloader this repository builds with rollback enabled (F-088).
+const BOOTLOADER: &str = "esp32c6-bootloader.bin";
+/// Its SHA-256, as `build.sh` writes it with `shasum`.
+const BOOTLOADER_HASH: &str = "esp32c6-bootloader.sha256";
+
+/// The committed bootloader, once its bytes match the hash recorded beside
+/// it (F-088). There is no other: the file is the one the whole route
+/// writes and the one the slot route requires, and a checkout whose binary
+/// has moved without its hash is refused rather than flashed.
+pub fn committed_bootloader() -> Result<PathBuf> {
+    let dir = Path::new(BOOTLOADER_DIR);
+    let binary = dir.join(BOOTLOADER);
+    let bytes = std::fs::read(&binary).with_context(|| format!("reading {}", binary.display()))?;
+    let recorded = std::fs::read_to_string(dir.join(BOOTLOADER_HASH))
+        .with_context(|| format!("reading {BOOTLOADER_HASH} beside the bootloader"))?;
+    bootloader_matches_hash(&bytes, &recorded)?;
+    Ok(binary)
+}
+
+/// `bytes` hash to what `recorded` says, in `shasum`'s format.
+fn bootloader_matches_hash(bytes: &[u8], recorded: &str) -> Result<()> {
+    let recorded = recorded
+        .split_whitespace()
+        .next()
+        .with_context(|| format!("{BOOTLOADER_HASH} is empty"))?;
+    let actual = hex::encode(Sha256::digest(bytes));
+    if actual != recorded {
+        bail!(
+            "{BOOTLOADER} hashes to {actual}, and {BOOTLOADER_HASH} records {recorded}: the \
+             binary or the hash moved without the other, and neither is flashed until `just \
+             comms-bootloader` rebuilds both (F-088)"
+        );
+    }
+    Ok(())
+}
 use crate::link::Link;
 
 /// `download_reason` as the registry numbers `bench`.
@@ -855,6 +897,26 @@ mod bootloader {
             *byte = u8::try_from(at.wrapping_mul(7) % 251).expect("fits");
         }
         image
+    }
+
+    #[test]
+    fn f_088_the_committed_bootloader_matches_the_hash_beside_it() {
+        committed_bootloader().expect("the checkout's bootloader and hash agree");
+    }
+
+    #[test]
+    fn f_088_a_bootloader_whose_bytes_moved_without_its_hash_is_refused() {
+        let recorded = format!("{}  {BOOTLOADER}\n", hex::encode(Sha256::digest(b"built")));
+        bootloader_matches_hash(b"built", &recorded).expect("the same bytes pass");
+        let error = bootloader_matches_hash(b"built and then edited", &recorded)
+            .expect_err("moved bytes are refused")
+            .to_string();
+        assert!(error.contains("moved without the other"), "{error}");
+    }
+
+    #[test]
+    fn f_088_an_empty_hash_file_is_refused() {
+        assert!(bootloader_matches_hash(b"built", "\n").is_err());
     }
 
     #[test]
