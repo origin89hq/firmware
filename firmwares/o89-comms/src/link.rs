@@ -141,7 +141,7 @@ mod frames {
     use super::{UartTx, WRITE_DEADLINE, write_all};
     use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
-    use o89_comms_core::{CUT_RUN, FrameBenchStart, Link, cut_point};
+    use o89_comms_core::{CUT_RUN, FrameBenchStart, Link, PER_CUT, cut_point};
     use o89_link::{stamp, worst_case};
 
     /// How many the run sends: ten thousand worst-case frames (F-087), or
@@ -153,7 +153,12 @@ mod frames {
     };
     /// At most 800 ms of blocked writes per batch, below both heartbeat
     /// cadence and the eight-second watchdog, even under sustained CTS.
-    const PER_TURN: u32 = 4;
+    /// The cut run sends a pull a batch: a fragment that waits a turn for
+    /// the frame it runs into is abandoned by the reader across the gap,
+    /// or merged into a heartbeat that goes out first, and either is the
+    /// other shape of the fault, not the one this run measures (F-086).
+    const PER_TURN: u32 = if cfg!(feature = "cuts") { PER_CUT } else { 4 };
+    const _: () = assert!(CUT_RUN.is_multiple_of(PER_CUT));
     const _: () = assert!(PER_TURN as u64 * WRITE_DEADLINE.as_millis() < 1000);
 
     /// The start gate and how many numbered frames have left.
