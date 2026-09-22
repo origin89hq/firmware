@@ -142,13 +142,23 @@ mod frames {
     use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
     use o89_comms_core::{FrameBenchStart, Link};
-    use o89_link::{stamp, worst_case};
+    use o89_link::{CUT_RUN, PER_CUT, cut_point, stamp, worst_case};
 
-    /// How many the run sends.
-    const TOTAL: u32 = 10_000;
+    /// How many the run sends: ten thousand worst-case frames (F-087), or
+    /// the cut run's three a pull (F-086).
+    const TOTAL: u32 = if cfg!(feature = "cuts") {
+        CUT_RUN
+    } else {
+        10_000
+    };
     /// At most 800 ms of blocked writes per batch, below both heartbeat
     /// cadence and the eight-second watchdog, even under sustained CTS.
-    const PER_TURN: u32 = 4;
+    /// The cut run sends a pull a batch: a fragment that waits a turn for
+    /// the frame it runs into is abandoned by the reader across the gap,
+    /// or merged into a heartbeat that goes out first, and either is the
+    /// other shape of the fault, not the one this run measures (F-086).
+    const PER_TURN: u32 = if cfg!(feature = "cuts") { PER_CUT } else { 4 };
+    const _: () = assert!(CUT_RUN.is_multiple_of(PER_CUT));
     const _: () = assert!(PER_TURN as u64 * WRITE_DEADLINE.as_millis() < 1000);
 
     /// The start gate and how many numbered frames have left.
@@ -198,6 +208,15 @@ mod frames {
                 stamp(&mut payload, number);
                 let Ok(len) = writer.write(&payload, &mut wire) else {
                     return;
+                };
+                // The cut bench pulls the pair here: the first frame of a
+                // pull leaves the pin short of its delimiter, and the
+                // controller's reader has to find its footing at the next
+                // one (F-086).
+                let len = if cfg!(feature = "cuts") {
+                    cut_point(number, len).unwrap_or(len)
+                } else {
+                    len
                 };
                 // Counted only once it is on the wire. A frame the pin
                 // refused is one the controller never sees, and counting

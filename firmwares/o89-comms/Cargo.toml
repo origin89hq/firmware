@@ -21,6 +21,12 @@ publish.workspace = true
 frames = ["dep:o89-link", "o89-comms-core/frames"]
 # Bench sender ignores CTS; pair with the controller's no-flow image.
 no-flow = ["frames"]
+# The cut bench (F-086): the frames bench with the pair pulled on the wire
+# a thousand times, by the sender itself. The first frame of every three is
+# cut short of its delimiter, the second runs into the fragment and is
+# refused with it, the third must arrive whole. Pair with
+# `run-controller-frames`, whose counters read the outcome.
+cuts = ["frames"]
 # The two images #1's acceptance test delivers as updates (F-088, F-089),
 # never on a unit that ships. `crash-at-boot` panics as its first
 # statement, before the watchdog, the UART and the window: the image a bad

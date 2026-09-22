@@ -1,4 +1,6 @@
-//! Keep the stress sender out of the controller's link-up handshake.
+//! Keep the stress sender out of the controller's link-up handshake. The
+//! cut bench's plan, the pair pulled mid-frame a thousand times on the wire
+//! by the sender itself, is `o89-link`'s, where both sides read it (F-086).
 
 use crate::Frame;
 
