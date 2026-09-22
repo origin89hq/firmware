@@ -28,12 +28,12 @@ pub fn generator_and_bus_lines() {
         w.set_br(KICK, true);
     });
     GPIOD.otyper().modify(|w| {
-        w.set_ot(RUN, Ot::PUSH_PULL);
-        w.set_ot(KICK, Ot::PUSH_PULL);
+        w.set_ot(RUN, Ot::PushPull);
+        w.set_ot(KICK, Ot::PushPull);
     });
     GPIOD.moder().modify(|w| {
-        w.set_moder(RUN, Moder::OUTPUT);
-        w.set_moder(KICK, Moder::OUTPUT);
+        w.set_moder(RUN, Moder::Output);
+        w.set_moder(KICK, Moder::Output);
     });
 
     GPIOA.bsrr().write(|w| {
@@ -41,19 +41,19 @@ pub fn generator_and_bus_lines() {
         w.set_bs(RS485_3_TX, true);
     });
     GPIOA.otyper().modify(|w| {
-        w.set_ot(RS485_1_TX, Ot::PUSH_PULL);
-        w.set_ot(RS485_3_TX, Ot::PUSH_PULL);
+        w.set_ot(RS485_1_TX, Ot::PushPull);
+        w.set_ot(RS485_3_TX, Ot::PushPull);
     });
     GPIOA.moder().modify(|w| {
-        w.set_moder(RS485_1_TX, Moder::OUTPUT);
-        w.set_moder(RS485_3_TX, Moder::OUTPUT);
+        w.set_moder(RS485_1_TX, Moder::Output);
+        w.set_moder(RS485_3_TX, Moder::Output);
     });
 
     GPIOB.bsrr().write(|w| w.set_bs(RS485_2_TX, true));
     GPIOB
         .otyper()
-        .modify(|w| w.set_ot(RS485_2_TX, Ot::PUSH_PULL));
+        .modify(|w| w.set_ot(RS485_2_TX, Ot::PushPull));
     GPIOB
         .moder()
-        .modify(|w| w.set_moder(RS485_2_TX, Moder::OUTPUT));
+        .modify(|w| w.set_moder(RS485_2_TX, Moder::Output));
 }

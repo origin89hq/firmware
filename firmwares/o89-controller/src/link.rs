@@ -607,8 +607,8 @@ async fn knock(
     config.baudrate = BAUD;
     let Ok(uart) = BufferedUart::new_with_rtscts(
         pins.usart.reborrow(),
-        pins.rx.reborrow(),
         pins.tx.reborrow(),
+        pins.rx.reborrow(),
         pins.rts.reborrow(),
         pins.cts.reborrow(),
         Irqs,
@@ -694,11 +694,11 @@ async fn bridge(pins: &mut Pins, rings: &mut Rings, seq: u32) -> Closed {
     config.baudrate = ROM_BAUD;
     let Ok(uart) = BufferedUart::new(
         pins.usart.reborrow(),
-        pins.rx.reborrow(),
         pins.tx.reborrow(),
+        pins.rx.reborrow(),
+        Irqs,
         &mut rings.tx[..],
         &mut rings.rx[..],
-        Irqs,
         config,
     ) else {
         defmt::error!("link: USART1 refused the ROM's configuration");
@@ -907,8 +907,8 @@ fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>
     #[cfg(not(feature = "no-flow"))]
     let opened = BufferedUart::new_with_rtscts(
         pins.usart.reborrow(),
-        pins.rx.reborrow(),
         pins.tx.reborrow(),
+        pins.rx.reborrow(),
         pins.rts.reborrow(),
         pins.cts.reborrow(),
         Irqs,
@@ -925,11 +925,11 @@ fn open<'a>(pins: &'a mut Pins, rings: &'a mut Rings) -> Result<BufferedUart<'a>
         );
         BufferedUart::new(
             pins.usart.reborrow(),
-            pins.rx.reborrow(),
             pins.tx.reborrow(),
+            pins.rx.reborrow(),
+            Irqs,
             &mut rings.tx[..],
             &mut rings.rx[..],
-            Irqs,
             config,
         )
     };

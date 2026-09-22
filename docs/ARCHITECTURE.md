@@ -252,7 +252,11 @@ Embassy, confined to `o89-controller`. The drivers are already async state
 machines: a Modbus exchange is send, await a reply, time out, which in a
 superloop is a hand-rolled state machine per bus, and that is where the bugs
 live. `embassy-stm32` gives a buffered UART fed from its interrupt, which is
-what the framing wants; its DMA ring overran on this part (#39). And the
+what the framing wants; its DMA ring overran on this part (#39). It is
+pinned to a revision of Embassy's `main` rather than to 0.6.0, because that
+release's handler empties the data register even when its ring is full: the
+byte is dropped and `RTS` never asserts, so flow control cannot hold the
+module off for a task that is late (F-090, #66). And the
 one real concurrency constraint is *do not
 block each other*: a slow Modbus timeout on one bus must not stall the frost
 tick or the link. Nothing here is fast; a device is polled every two seconds

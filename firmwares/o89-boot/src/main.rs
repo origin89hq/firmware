@@ -96,12 +96,12 @@ fn generator_lines_low() {
         w.set_br(KICK, true);
     });
     GPIOD.otyper().modify(|w| {
-        w.set_ot(RUN, Ot::PUSH_PULL);
-        w.set_ot(KICK, Ot::PUSH_PULL);
+        w.set_ot(RUN, Ot::PushPull);
+        w.set_ot(KICK, Ot::PushPull);
     });
     GPIOD.moder().modify(|w| {
-        w.set_moder(RUN, Moder::OUTPUT);
-        w.set_moder(KICK, Moder::OUTPUT);
+        w.set_moder(RUN, Moder::Output);
+        w.set_moder(KICK, Moder::Output);
     });
 }
 

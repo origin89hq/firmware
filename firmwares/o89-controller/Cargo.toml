@@ -61,14 +61,16 @@ embedded-io-async.workspace = true
 
 # The part. `memory-x` is off on purpose: it would emit the part's 512 KB,
 # and the budget is one slot less the bootloader. See memory.x.
+# Taken at the revision the workspace's patch table names, for the buffered
+# UART's backpressure (F-090); the version is what that revision states.
 embassy-stm32 = { version = "=0.6.0", features = [
     "stm32g0b1re",
     "time-driver-any",
     "defmt",
 ] }
 # The registers the first statements and the reset cause need before the HAL
-# owns anything: the same release the HAL builds on, so the lockfile holds
-# one copy.
+# owns anything: patched to the same revision the HAL builds on, so the
+# lockfile holds one copy.
 stm32-metapac = { version = "=21.0.0", features = ["stm32g0b1re", "pac"] }
 cortex-m.workspace = true
 # `set-vtor`: the runtime points `VTOR` at this image's own vector table
