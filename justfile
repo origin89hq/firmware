@@ -30,6 +30,7 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features devkit -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow -- -D warnings
+    cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features cuts -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features crash-at-boot -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-window -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
@@ -318,6 +319,20 @@ dev-flash-comms-frames *args:
 # for that controller's matching bench identity and a validated heartbeat.
 dev-flash-comms-frames-no-flow *args:
     cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
+    cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
+
+# FLASH the cut bench into the module's OTA slot (F-086): the frames bench
+# with the pair pulled on the wire a thousand times by the sender itself,
+# each pull three frames: one cut short of its delimiter, one that runs
+# into the fragment and is refused with it, one that must arrive whole.
+# Effect: as `dev-flash-comms-frames`, with 3 000 frames; the controller's
+# tally must read 1 000 arrived, highest 3 000, 1 000 refused, none
+# abandoned, the link up once. Recovery: `just dev-flash-comms`. Run with
+# `run-controller-frames`, whose counters read the outcome.
+#
+# FLASH the module with the cut bench; it pulls the pair a thousand times once linked.
+dev-flash-comms-cuts *args:
+    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features cuts
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH the image #1's acceptance test delivers first: one that panics as

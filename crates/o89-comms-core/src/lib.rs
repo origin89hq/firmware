@@ -23,7 +23,7 @@ mod link;
 mod window;
 
 #[cfg(any(test, feature = "frames"))]
-pub use frame_bench::FrameBenchStart;
+pub use frame_bench::{CUT_RUN, CUTS, FrameBenchStart, PER_CUT, cut_point, cut_run_expected};
 pub use link::*;
 pub use o89_link::{EncodeError, Millis, Tick};
 pub use window::*;

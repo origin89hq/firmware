@@ -141,11 +141,16 @@ mod frames {
     use super::{UartTx, WRITE_DEADLINE, write_all};
     use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
-    use o89_comms_core::{FrameBenchStart, Link};
+    use o89_comms_core::{CUT_RUN, FrameBenchStart, Link, cut_point};
     use o89_link::{stamp, worst_case};
 
-    /// How many the run sends.
-    const TOTAL: u32 = 10_000;
+    /// How many the run sends: ten thousand worst-case frames (F-087), or
+    /// the cut run's three a pull (F-086).
+    const TOTAL: u32 = if cfg!(feature = "cuts") {
+        CUT_RUN
+    } else {
+        10_000
+    };
     /// At most 800 ms of blocked writes per batch, below both heartbeat
     /// cadence and the eight-second watchdog, even under sustained CTS.
     const PER_TURN: u32 = 4;
@@ -198,6 +203,15 @@ mod frames {
                 stamp(&mut payload, number);
                 let Ok(len) = writer.write(&payload, &mut wire) else {
                     return;
+                };
+                // The cut bench pulls the pair here: the first frame of a
+                // pull leaves the pin short of its delimiter, and the
+                // controller's reader has to find its footing at the next
+                // one (F-086).
+                let len = if cfg!(feature = "cuts") {
+                    cut_point(number, len).unwrap_or(len)
+                } else {
+                    len
                 };
                 // Counted only once it is on the wire. A frame the pin
                 // refused is one the controller never sees, and counting
