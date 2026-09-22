@@ -78,9 +78,11 @@ fn verify(binary: &[u8], hash: &str, config: &str, script: &str) -> Result<()> {
         .trim();
     ensure!(!tag.is_empty(), "{SCRIPT} names an empty release");
     // The bootloader states its release in its own text, `ESP-IDF v5.5.1`
-    // as a version string the log line formats in; the tag is that string.
+    // as a version string the log line formats in; the tag is that string,
+    // whole: a C string ends at its NUL, so `v5.5.1` does not pass for
+    // `v5.5.10`.
     ensure!(
-        contains(binary, tag.as_bytes()),
+        contains(binary, format!("{tag}\0").as_bytes()),
         "{BINARY} does not carry the release text `{tag}` that {SCRIPT} names: the script moved \
          without a rebuild"
     );
@@ -157,6 +159,16 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(error.contains("v5.6.0"), "{error}");
+    }
+
+    #[test]
+    fn f_088_a_release_the_binary_carries_only_as_a_prefix_is_refused() {
+        let mut binary = vec![MAGIC, 0x03, 0x02, 0x30];
+        binary.extend_from_slice(b"ESP-IDF %s 2nd stage bootloader\0v5.5.10\0");
+        let error = verify(&binary, &hash_of(&binary), CONFIG, SCRIPT)
+            .expect_err("v5.5.1 is not v5.5.10")
+            .to_string();
+        assert!(error.contains("v5.5.1"), "{error}");
     }
 
     #[test]

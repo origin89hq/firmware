@@ -54,17 +54,22 @@ const BOOTLOADER: &str = "esp32c6-bootloader.bin";
 const BOOTLOADER_HASH: &str = "esp32c6-bootloader.sha256";
 
 /// The committed bootloader, once its bytes match the hash recorded beside
-/// it (F-088). There is no other: the file is the one the whole route
-/// writes and the one the slot route requires, and a checkout whose binary
-/// has moved without its hash is refused rather than flashed.
-pub fn committed_bootloader() -> Result<PathBuf> {
+/// it (F-088), as a copy of those very bytes in `scratch`. There is no
+/// other: the file is the one the whole route writes and the one the slot
+/// route requires, and a checkout whose binary has moved without its hash
+/// is refused rather than flashed. The copy is what `espflash` later
+/// reads, so a rebuild landing in the repository between the check and
+/// the merge cannot put unchecked bytes on the module.
+pub fn committed_bootloader(scratch: &Scratch) -> Result<PathBuf> {
     let dir = Path::new(BOOTLOADER_DIR);
     let binary = dir.join(BOOTLOADER);
     let bytes = std::fs::read(&binary).with_context(|| format!("reading {}", binary.display()))?;
     let recorded = std::fs::read_to_string(dir.join(BOOTLOADER_HASH))
         .with_context(|| format!("reading {BOOTLOADER_HASH} beside the bootloader"))?;
     bootloader_matches_hash(&bytes, &recorded)?;
-    Ok(binary)
+    let snapshot = scratch.file(BOOTLOADER);
+    std::fs::write(&snapshot, &bytes).with_context(|| format!("writing {}", snapshot.display()))?;
+    Ok(snapshot)
 }
 
 /// `bytes` hash to what `recorded` says, in `shasum`'s format.
@@ -900,8 +905,18 @@ mod bootloader {
     }
 
     #[test]
-    fn f_088_the_committed_bootloader_matches_the_hash_beside_it() {
-        committed_bootloader().expect("the checkout's bootloader and hash agree");
+    fn f_088_the_committed_bootloader_matches_the_hash_beside_it_and_is_snapshotted() {
+        let scratch = Scratch::new().expect("a scratch");
+        let snapshot =
+            committed_bootloader(&scratch).expect("the checkout's bootloader and hash agree");
+        assert!(
+            snapshot.starts_with(scratch.file("")),
+            "{}",
+            snapshot.display()
+        );
+        let copied = std::fs::read(&snapshot).expect("the snapshot reads");
+        let original = std::fs::read(Path::new(BOOTLOADER_DIR).join(BOOTLOADER)).expect("reads");
+        assert_eq!(copied, original);
     }
 
     #[test]
