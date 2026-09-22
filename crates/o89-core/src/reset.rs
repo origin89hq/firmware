@@ -12,7 +12,9 @@
 //!
 //! cites: F-009, F-010
 
-use crate::{Blame, RailThroughReset, Revision};
+use km43::{Boot, BootCause, Starved};
+
+use crate::{LastWords, RailThroughReset, Revision};
 
 /// The reset flags as `RCC.CSR` reports them. Several can be set at once,
 /// so this is a set, built from the register one flag at a time:
@@ -181,17 +183,15 @@ pub enum BackupDomain {
     Invalid,
 }
 
-/// What a boot writes down about itself, before anything else happens.
-///
-/// The fields land in the class A boot record (`0x0601`) once KM43 fixes its
-/// body; until then this is the record the firmware holds and logs.
+/// What a boot writes down about itself, before anything else happens: the
+/// class A boot record (`0x0601`) on the ring, and the line on the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BootRecord {
     /// Why the part reset.
     pub cause: ResetCause,
     /// What the previous run wrote before it stopped, if it did.
-    pub blame: Option<Blame>,
+    pub words: Option<LastWords>,
     /// What clocks the RTC.
     pub rtc: RtcClock,
     /// Whether the backup domain survived.
@@ -208,7 +208,7 @@ impl BootRecord {
     #[must_use]
     pub const fn new(
         cause: ResetCause,
-        blame: Option<Blame>,
+        words: Option<LastWords>,
         rtc: RtcClock,
         backup: BackupDomain,
         revision: Revision,
@@ -216,11 +216,52 @@ impl BootRecord {
         let module_rail_cycled = matches!(revision.rail_through_reset(), RailThroughReset::Off);
         Self {
             cause,
-            blame,
+            words,
             rtc,
             backup,
             revision,
             module_rail_cycled,
+        }
+    }
+
+    /// The record as KM43's boot body carries it.
+    ///
+    /// Last words ride only with the reset they explain (P-214): a starved
+    /// task with the watchdog that starving it fired, a panic site with the
+    /// software reset the panic handler asks for. Words beside any other
+    /// cause are from a run that did not end the way they say, and are left
+    /// to the probe's log rather than put in a record that contradicts
+    /// itself. A software reset with a panic site is a panic.
+    #[must_use]
+    pub fn body(&self) -> Boot {
+        let cause = match (self.cause, self.words) {
+            (ResetCause::Watchdog, Some(LastWords::Starved(blame))) => {
+                BootCause::Watchdog(Some(Starved {
+                    task: blame.task.byte(),
+                    overdue_ms: u32::try_from(blame.overdue.as_millis()).unwrap_or(u32::MAX),
+                }))
+            }
+            (ResetCause::Watchdog, None | Some(LastWords::Panicked(_))) => {
+                BootCause::Watchdog(None)
+            }
+            (ResetCause::Software, Some(LastWords::Panicked(site))) => {
+                BootCause::Panic(km43::PanicSite {
+                    file: site.file,
+                    line: site.line,
+                })
+            }
+            (ResetCause::Software, None | Some(LastWords::Starved(_))) => BootCause::SoftwareReset,
+            (ResetCause::Power, _) => BootCause::Power,
+            (ResetCause::Pin, _) => BootCause::PinReset,
+            (ResetCause::WindowWatchdog, _) => BootCause::WindowWatchdog,
+            (ResetCause::LowPower, _) => BootCause::LowPowerEntry,
+            (ResetCause::OptionByte, _) => BootCause::OptionByteReload,
+        };
+        Boot {
+            cause,
+            backup_valid: matches!(self.backup, BackupDomain::Valid),
+            rtc_crystal: matches!(self.rtc, RtcClock::Lse),
+            rail_cycled: self.module_rail_cycled,
         }
     }
 }
@@ -228,7 +269,7 @@ impl BootRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Millis, Task};
+    use crate::{Blame, Millis, PanicSite, Task};
 
     #[test]
     fn f_009_the_most_specific_reset_flag_names_the_cause() {
@@ -304,21 +345,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn f_014_the_boot_record_says_the_rail_cycled_on_revision_a_only() {
-        let blame = Some(Blame {
+    fn starved() -> LastWords {
+        LastWords::Starved(Blame {
             task: Task::OneWire,
             overdue: Millis::from_millis(31_000),
-        });
+        })
+    }
+
+    fn panicked() -> LastWords {
+        LastWords::Panicked(PanicSite {
+            file: 0x9E37_79B9,
+            line: 212,
+        })
+    }
+
+    fn record(cause: ResetCause, words: Option<LastWords>) -> BootRecord {
+        BootRecord::new(
+            cause,
+            words,
+            RtcClock::Lse,
+            BackupDomain::Valid,
+            Revision::B,
+        )
+    }
+
+    #[test]
+    fn f_014_the_boot_record_says_the_rail_cycled_on_revision_a_only() {
         let on_a = BootRecord::new(
             ResetCause::Watchdog,
-            blame,
+            Some(starved()),
             RtcClock::Lse,
             BackupDomain::Valid,
             Revision::A,
         );
         assert!(on_a.module_rail_cycled);
-        assert_eq!(on_a.blame, blame);
+        assert!(on_a.body().rail_cycled, "the ring says what the probe said");
+        assert_eq!(on_a.words, Some(starved()));
         let on_b = BootRecord::new(
             ResetCause::Watchdog,
             None,
@@ -327,6 +389,117 @@ mod tests {
             Revision::B,
         );
         assert!(!on_b.module_rail_cycled);
+        assert!(!on_b.body().rail_cycled);
         assert_eq!(on_b.backup, BackupDomain::Invalid);
+    }
+
+    #[test]
+    fn f_008_the_ring_names_the_task_that_starved_the_watchdog() {
+        let body = record(ResetCause::Watchdog, Some(starved())).body();
+        assert_eq!(
+            body.cause,
+            BootCause::Watchdog(Some(Starved {
+                task: Task::OneWire.byte(),
+                overdue_ms: 31_000,
+            }))
+        );
+        assert_eq!(
+            Task::from_index(u32::from(Task::OneWire.byte())),
+            Some(Task::OneWire)
+        );
+        // A watchdog the previous run never got to explain is still a
+        // watchdog, with nobody named.
+        assert_eq!(
+            record(ResetCause::Watchdog, None).body().cause,
+            BootCause::Watchdog(None)
+        );
+        // An overdue past a u32 of milliseconds saturates, as the words do.
+        let long = LastWords::Starved(Blame {
+            task: Task::Rail,
+            overdue: Millis::from_millis(u64::MAX),
+        });
+        assert_eq!(
+            record(ResetCause::Watchdog, Some(long)).body().cause,
+            BootCause::Watchdog(Some(Starved {
+                task: Task::Rail.byte(),
+                overdue_ms: u32::MAX,
+            }))
+        );
+    }
+
+    #[test]
+    fn f_008_a_software_reset_with_a_panic_site_is_a_panic_and_without_one_is_not() {
+        assert_eq!(
+            record(ResetCause::Software, Some(panicked())).body().cause,
+            BootCause::Panic(km43::PanicSite {
+                file: 0x9E37_79B9,
+                line: 212,
+            })
+        );
+        assert_eq!(
+            record(ResetCause::Software, None).body().cause,
+            BootCause::SoftwareReset
+        );
+    }
+
+    #[test]
+    fn p_214_last_words_beside_a_cause_they_do_not_explain_stay_off_the_ring() {
+        // A panic site beside a watchdog, a starved task beside a software
+        // reset, and either beside a cause with no words of its own: each
+        // body carries the cause alone, which is one KM43 decodes.
+        let cases = [
+            (ResetCause::Watchdog, panicked(), BootCause::Watchdog(None)),
+            (ResetCause::Software, starved(), BootCause::SoftwareReset),
+            (ResetCause::Power, panicked(), BootCause::Power),
+            (ResetCause::Pin, starved(), BootCause::PinReset),
+            (
+                ResetCause::WindowWatchdog,
+                starved(),
+                BootCause::WindowWatchdog,
+            ),
+            (ResetCause::LowPower, panicked(), BootCause::LowPowerEntry),
+            (
+                ResetCause::OptionByte,
+                starved(),
+                BootCause::OptionByteReload,
+            ),
+        ];
+        for (cause, words, expected) in cases {
+            let body = record(cause, Some(words)).body();
+            assert_eq!(body.cause, expected, "{cause:?} with {words:?}");
+            let mut out = [0u8; km43::BOOT_MAX_BYTES];
+            let len = body.encode(&mut out).expect("encodes");
+            assert_eq!(
+                Boot::decode(out.get(..len).expect("written")),
+                Ok(body),
+                "{cause:?}: a body KM43 refuses"
+            );
+        }
+    }
+
+    #[test]
+    fn f_009_the_ring_carries_the_backup_domain_and_the_clock_as_they_were() {
+        let dead = BootRecord::new(
+            ResetCause::Power,
+            None,
+            RtcClock::Fault {
+                lse_ready: true,
+                source: RtcSource::Lsi,
+            },
+            BackupDomain::Invalid,
+            Revision::A,
+        )
+        .body();
+        assert_eq!(dead.cause, BootCause::Power);
+        assert!(!dead.backup_valid, "a dead backup cell reads as a live one");
+        assert!(!dead.rtc_crystal, "the LSI fallback reads as the crystal");
+        let healthy = record(ResetCause::Pin, None).body();
+        assert_eq!(healthy.cause, BootCause::PinReset);
+        assert!(healthy.backup_valid && healthy.rtc_crystal);
+        assert_eq!(
+            record(ResetCause::OptionByte, None).body().cause,
+            BootCause::OptionByteReload,
+            "a bank swap read as a power cut"
+        );
     }
 }

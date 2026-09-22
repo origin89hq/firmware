@@ -17,9 +17,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker};
-use km43::{Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
+use km43::{BOOT_MAX_BYTES, Boot, Event, EventKind, LogSeq, MAX_EVENT_QUEUE};
 use o89_core::{
-    Class, CutsRecord, Keep, KeepAnswer, LinkEvent, NotKept, RecentCuts, Ring, SCRATCH, Store, Task,
+    Class, CutsRecord, Keep, KeepAnswer, LinkEvent, MAX_PAYLOAD, NotKept, RecentCuts, Ring,
+    SCRATCH, Store, Task,
 };
 
 use crate::fram::Fram;
@@ -141,7 +142,7 @@ pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
 /// The recorder task: the only owner of the FRAM and the NOR, and so the
 /// one that serves the bench tool's mailbox.
 #[embassy_executor::task]
-pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
+pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor, boot: Boot) {
     let mut scratch = [0u8; SCRATCH];
     defmt::info!("recorder: identifying the NOR");
     let jedec = nor.jedec().await;
@@ -184,7 +185,7 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     let mut ring = ring;
     if let Some(ring) = ring.as_mut() {
         defmt::info!("recorder: writing the boot record");
-        boot_record(ring, &mut scratch).await;
+        boot_record(ring, &mut scratch, boot).await;
     }
     let boot = store
         .as_ref()
@@ -241,21 +242,41 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor) {
     }
 }
 
-/// The class A boot record.
-async fn boot_record(ring: &mut Ring<Nor>, scratch: &mut [u8]) {
-    append(ring, scratch, EventKind::BOOT).await;
+/// The class A boot record (`0x0601`): why the part reset, what the RTC
+/// kept, and the previous run's last words, in KM43's body (F-009, L-143).
+/// Written first, because a boot nobody had a probe on is one only the
+/// ring remembers.
+async fn boot_record(ring: &mut Ring<Nor>, scratch: &mut [u8], boot: Boot) {
+    let mut body = [0u8; BOOT_MAX_BYTES];
+    match boot.encode(&mut body) {
+        Ok(len) => {
+            append_body(
+                ring,
+                scratch,
+                EventKind::BOOT,
+                body.get(..len).unwrap_or(&[]),
+            )
+            .await;
+        }
+        Err(error) => defmt::error!("record 0x0601: the boot body did not encode: {}", error),
+    }
 }
 
-/// One class A record of `kind`, with the body the schema will give it
-/// once origin89hq/km43#32 settles what each carries: an empty map until
-/// then, which is a record that says the thing happened at this sequence
-/// and nothing it should not. The count a power cycle carries (L-111) is
-/// on the probe's log until then; a body written under a layout of this
-/// firmware's own would persist on a unit past the schema that replaces
-/// it, which is the one place nothing shipped does not apply.
+/// One class A record of `kind` whose body origin89hq/km43#32 has not
+/// settled yet: an empty map, which is a record that says the thing
+/// happened at this sequence and nothing it should not. The count a power
+/// cycle carries (L-111) is on the probe's log until then; a body written
+/// under a layout of this firmware's own would persist on a unit past the
+/// schema that replaces it, which is the one place nothing shipped does
+/// not apply.
 async fn append(ring: &mut Ring<Nor>, scratch: &mut [u8], kind: EventKind) {
-    let mut payload = [0u8; 32];
-    let Ok(event) = Event::new(LogSeq(ring.next_seq()), None, kind, &[0xA0]) else {
+    append_body(ring, scratch, kind, &[0xA0]).await;
+}
+
+/// One class A record of `kind` carrying `body`, a CBOR map KM43 defines.
+async fn append_body(ring: &mut Ring<Nor>, scratch: &mut [u8], kind: EventKind, body: &[u8]) {
+    let mut payload = [0u8; MAX_PAYLOAD];
+    let Ok(event) = Event::new(LogSeq(ring.next_seq()), None, kind, body) else {
         defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
         return;
     };

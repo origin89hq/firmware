@@ -61,6 +61,10 @@ pub enum Task {
 
 /// How many tasks the roll holds.
 pub const TASKS: usize = 16;
+const _: () = assert!(
+    TASKS <= 256,
+    "a task's place must fit the boot record's byte"
+);
 
 impl Task {
     /// Every task, in roll order, which is the order a late one is named in.
@@ -87,6 +91,13 @@ impl Task {
     #[must_use]
     pub const fn index(self) -> u32 {
         self as u32
+    }
+
+    /// The task's place on the roll as one byte, which is how the boot
+    /// record carries it.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self as u8
     }
 
     const fn slot(self) -> usize {
