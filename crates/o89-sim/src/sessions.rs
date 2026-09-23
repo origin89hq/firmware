@@ -14,10 +14,10 @@ use km43::{
     HelloInner, Incoming, LinkTransport, MessageType, PairAckClaim, PairRequest, PairResponse,
     PrintedSecret, ReqId, Session, SessionId, SessionKey, Signed, Tagged, Version, Wrapper,
 };
-use o89_core::{Facts, Millis, Sessions};
+use o89_core::{DropReason, Facts, Millis, Sessions};
 
 use crate::link::{Bench, DEVICE, LOG, MODEL, PRINTED, unit};
-use crate::{Answers, Capabilities, Heard, SimFram, crash_at_every_step};
+use crate::{Answers, Capabilities, Heard, Releases, SimFram, crash_at_every_step};
 
 fn device() -> DeviceSecret {
     DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
@@ -422,19 +422,92 @@ fn l_041_a_comms_reboot_takes_every_row_and_session_with_it() {
 
 #[test]
 fn l_062_a_transport_whose_release_was_dropped_is_reclaimed_by_the_reboot_that_follows() {
-    // Capabilities: drop, reboot.
+    // Capabilities: lose a release, reboot.
     let mut bench = linked();
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
     // The transport goes and the release never reaches the controller: the
     // row stays, and the heartbeat says so (L-101).
+    bench.comms.capabilities().releases = Releases::Lost;
+    release(&mut bench, 1);
     bench.run_for(Millis::from_millis(2_100));
     assert_eq!(conns(&bench), Some(1));
+    // The reboot comes before three beats have disagreed, so it is what
+    // reclaims the row here; L-102's resync is the path without one.
     let bytes = bench.comms.boot(bench.now).expect("the peer reboots");
     bench.feed(&bytes);
     bench.run_for(Millis::from_millis(3_000));
     assert_eq!(conns(&bench), Some(0), "no row leaked past the reboot");
+    assert!(
+        closes(&bench).is_empty(),
+        "reclaimed by the reboot, not a resync"
+    );
+}
+
+/// Proven against the simulated peer only. The comms firmware keeps no
+/// connection table yet and counts none in its heartbeats, so the real
+/// ESP32 cannot drive this resync until #90 gives it the table, the count
+/// and the re-announce.
+#[test]
+fn l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_without_a_reboot() {
+    // Capabilities: lose a release.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    announce(&mut bench, 2);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let boot_id = bench.comms.boot_id();
+    bench.comms.capabilities().releases = Releases::Lost;
+    release(&mut bench, 1);
+    assert_eq!(
+        bench.endpoint.sessions.allocated(),
+        2,
+        "the controller was never told"
+    );
+    let lost_at = bench.comms.heard.len();
+    bench.run_for(Millis::from_millis(7_000));
+    // The close of every connection went out on the third beat the two
+    // counts disagreed on, and not before.
+    let since = &bench.comms.heard[lost_at..];
+    let close = since
+        .iter()
+        .position(|heard| matches!(heard, Heard::Close { .. }))
+        .expect("a resync");
+    let beats = since[..close]
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Heartbeat { .. }))
+        .count();
+    assert_eq!(beats, 3);
+    assert_eq!(closes(&bench), vec![(0, CloseReason::Resync)]);
+    // Its answer freed every row, with the session on it, and no reboot.
+    assert_eq!(bench.endpoint.sessions.allocated(), 0);
+    assert!(
+        !bench
+            .endpoint
+            .sessions
+            .is_bound(Conn::new(1).expect("a handle"))
+    );
+    assert!(
+        bench
+            .drops()
+            .iter()
+            .any(|(_, why)| *why == DropReason::Resync)
+    );
+    assert_eq!(bench.comms.boot_id(), boot_id, "no reboot");
+    assert!(bench.endpoint.link.is_up());
+    bench.run_for(Millis::from_millis(2_100));
+    assert_eq!(conns(&bench), Some(0));
+    // The client that was still connected reconnects and is announced
+    // again, and the counts agree from there on.
+    bench.comms.capabilities().releases = Releases::Sent;
+    announce(&mut bench, 2);
+    assert_eq!(outcomes(&bench, 0xE2), vec![1, 1, 1]);
+    let mut again = Client::on(2);
+    let _ = again.open(&mut bench);
+    bench.run_for(Millis::from_millis(10_000));
+    assert_eq!(conns(&bench), Some(1));
+    assert_eq!(closes(&bench), vec![(0, CloseReason::Resync)], "once");
 }
 
 #[test]

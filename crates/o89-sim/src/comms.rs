@@ -11,18 +11,24 @@
 //! still talking, withhold its statement or its heartbeats, beat without a
 //! link, deliver late, speak the ROM's text before its own `LinkUp`, cut a
 //! frame in half before every frame, speak another version, claim to be a
-//! controller, reboot with a new `boot_id`, and put on the wire the frames a
-//! real peer would not. It builds those with `km43`'s own writers, so what
+//! controller, reboot with a new `boot_id`, lose a release on the wire, and
+//! put on the wire the frames a real peer would not.
+//!
+//! The connections it announces are its own, outside that link, because the
+//! comms firmware has no connection table yet (#90): it keeps the handles it
+//! announced and has not released, counts them in its heartbeats (L-101),
+//! and closes them when asked, reporting how many (L-090). A connection the
+//! controller refused for a full table is not kept. It builds those with `km43`'s own writers, so what
 //! the controller reads is what a real peer would have sent, and a frame it
 //! cannot build is an error a test reads, never a panic in this crate.
 
 use std::collections::VecDeque;
 
 use km43::{
-    ClientDown, ClientUp, ClockOffer, CloseConnections, CloseReason, DisconnectReason, Envelope,
-    ErrorBody, FrameReader, FrameWriter, Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader,
-    LinkMessageType, LinkTransport, LinkUp, MAX_FRAME, MessageType, PairingWindowNotice, Received,
-    ReqId, SessionId, Side, Version,
+    ClientConnected, ClientDown, ClientUp, ClockOffer, CloseConnection, CloseConnections,
+    CloseReason, CloseReport, DisconnectReason, Envelope, ErrorBody, FrameReader, FrameWriter,
+    Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader, LinkMessageType, LinkTransport, LinkUp,
+    MAX_FRAME, MessageType, PairingWindowNotice, Received, ReqId, SessionId, Side, Version,
 };
 use o89_comms_core::{Frame, Identity, Link as CommsLink};
 use o89_core::{HEARTBEAT_PERIOD, Millis, OURS, Tick};
@@ -81,6 +87,16 @@ pub enum Claims {
     Controller,
 }
 
+/// Whether the peer's releases reach the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Releases {
+    /// A transport that goes is released over the link.
+    Sent,
+    /// The transport goes and its `ClientDisconnected` is lost on the wire:
+    /// the peer stops counting it, and the controller is never told.
+    Lost,
+}
+
 /// What the peer may do. The default is a peer that behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
@@ -101,6 +117,8 @@ pub struct Capabilities {
     pub version: Version,
     /// What it claims to be.
     pub claims: Claims,
+    /// Whether its releases arrive.
+    pub releases: Releases,
 }
 
 impl Default for Capabilities {
@@ -114,6 +132,7 @@ impl Default for Capabilities {
             frames: Frames::Whole,
             version: Version::V1_0,
             claims: Claims::Comms,
+            releases: Releases::Sent,
         }
     }
 }
@@ -236,6 +255,12 @@ pub struct HostileComms {
     pub heard: Vec<Heard>,
     /// Every frame kind it put on the wire, in order.
     pub sent: Vec<LinkMessageType>,
+    /// The handles it announced and has not released or closed.
+    live: Vec<u16>,
+    /// Announcements not yet answered, by request id.
+    announcing: Vec<(ReqId, u16)>,
+    /// What the close it is answering did, for its report.
+    close_report: Option<(CloseConnection, u8)>,
 }
 
 impl HostileComms {
@@ -255,6 +280,9 @@ impl HostileComms {
             outbox: VecDeque::new(),
             heard: Vec::new(),
             sent: Vec::new(),
+            live: Vec::new(),
+            announcing: Vec::new(),
+            close_report: None,
         }
     }
 
@@ -280,6 +308,7 @@ impl HostileComms {
     /// whatever it had not yet put on the wire.
     pub fn power_off(&mut self) {
         self.link = None;
+        self.forget_connections();
         self.outbox.clear();
         self.reader = FrameReader::new();
     }
@@ -293,6 +322,7 @@ impl HostileComms {
         self.boot_id = 0x5EED_0000u32.wrapping_add(self.boots.wrapping_mul(0x9E37));
         self.booted_at = now;
         self.link = Some(CommsLink::new(now));
+        self.forget_connections();
         self.next_unlinked_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
         self.reader = FrameReader::new();
         self.outbox.clear();
@@ -351,6 +381,7 @@ impl HostileComms {
             if self.caps.answers == Answers::TalksOnly {
                 continue;
             }
+            self.connections(&frame);
             let answer = match (self.link.as_mut(), LinkEnvelope::decode(&frame)) {
                 (Some(link), Ok(envelope)) => link.received(envelope, now),
                 (None, _) | (_, Err(_)) => None,
@@ -464,12 +495,21 @@ impl HostileComms {
         }
         .write(header(LinkMessageType::ClientConnected, req_id), &mut dst)
         .map_err(|_| Broken::Body)?;
+        if !self.live.contains(&conn) {
+            self.live.push(conn);
+        }
+        self.announcing.push((req_id, conn));
         let frame = self.frame(&dst, len, Some(LinkMessageType::ClientConnected))?;
         Ok(self.queue(frame, now))
     }
 
-    /// A connection released, with this handle.
+    /// A connection released, with this handle; with [`Releases::Lost`],
+    /// released here and lost on the wire.
     pub fn release_connection(&mut self, conn: u16, now: Tick) -> Result<Vec<u8>, Broken> {
+        self.live.retain(|live| *live != conn);
+        if self.caps.releases == Releases::Lost {
+            return Ok(Vec::new());
+        }
         let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let len = ClientDown {
@@ -653,6 +693,9 @@ impl HostileComms {
     /// would, unless the peer claims another version or the other side, in
     /// which case its statements say so.
     fn build(&mut self, frame: Frame, now: Tick) -> Result<Vec<u8>, Broken> {
+        if let Some(own) = self.own_frame(frame, now) {
+            return own;
+        }
         let honest = self.caps.version == OURS && self.caps.claims == Claims::Comms;
         if !honest {
             if let Frame::LinkUp { req_id } = frame {
@@ -678,6 +721,106 @@ impl HostileComms {
         };
         let len = built.map_err(|_| Broken::Frame)?;
         Ok(dst.get(..len).ok_or(Broken::Frame)?.to_vec())
+    }
+
+    /// The frames that carry its connections, which its link cannot write
+    /// because it holds none: a beat with the count, and a close's report
+    /// with what the close did.
+    fn own_frame(&mut self, frame: Frame, now: Tick) -> Option<Result<Vec<u8>, Broken>> {
+        let mut envelope = [0u8; MAX_FRAME];
+        let beat = |kind, req_id, envelope: &mut [u8]| {
+            let uptime_s = now
+                .since(self.booted_at)
+                .and_then(|up| up.as_millis().checked_div(1_000))
+                .map_or(0, |secs| u32::try_from(secs).unwrap_or(u32::MAX));
+            Heartbeat {
+                uptime_s,
+                conns: u8::try_from(self.live.len()).unwrap_or(u8::MAX),
+            }
+            .write(header(kind, req_id), envelope)
+        };
+        let written = match frame {
+            Frame::Heartbeat { req_id } => beat(LinkMessageType::Heartbeat, req_id, &mut envelope),
+            Frame::HeartbeatAck { req_id } => {
+                beat(LinkMessageType::HeartbeatAck, req_id, &mut envelope)
+            }
+            Frame::CloseReport { req_id, .. } => {
+                let (outcome, closed) = self.close_report.take()?;
+                CloseReport { outcome, closed }.write(
+                    header(LinkMessageType::CloseConnectionAck, req_id),
+                    &mut envelope,
+                )
+            }
+            Frame::LinkUp { .. }
+            | Frame::LinkUpAck { .. }
+            | Frame::DownloadRefused { .. }
+            | Frame::TimeOffer { .. }
+            | Frame::NetReport { .. }
+            | Frame::PairingWindowAck { .. }
+            | Frame::Refuse { .. } => return None,
+        };
+        let Ok(len) = written else {
+            return Some(Err(Broken::Body));
+        };
+        let mut dst = [0u8; MAX_FRAME];
+        Some(
+            envelope
+                .get(..len)
+                .ok_or(Broken::Body)
+                .and_then(|payload| {
+                    self.writer
+                        .write(payload, &mut dst)
+                        .map_err(|_| Broken::Frame)
+                })
+                .and_then(|len| Ok(dst.get(..len).ok_or(Broken::Frame)?.to_vec())),
+        )
+    }
+
+    /// What a frame from the controller does to its connections: an
+    /// announcement refused for a full table is not kept, and a close
+    /// closes what it names, every one for handle 0 (L-090).
+    fn connections(&mut self, frame: &[u8]) {
+        let Ok(envelope) = LinkEnvelope::decode(frame) else {
+            return;
+        };
+        let req_id = envelope.req_id();
+        match LinkMessageType::try_from(envelope.opcode()) {
+            Ok(LinkMessageType::ClientConnectedAck) => {
+                let Some(at) = self.announcing.iter().position(|(id, _)| *id == req_id) else {
+                    return;
+                };
+                let (_, conn) = self.announcing.remove(at);
+                if first_value(envelope) == Some(ClientConnected::RefusedTableFull as u8) {
+                    self.live.retain(|live| *live != conn);
+                }
+            }
+            Ok(LinkMessageType::CloseConnection) => {
+                let Ok(close) = CloseConnections::decode(envelope) else {
+                    return;
+                };
+                let before = self.live.len();
+                if close.is_every_connection() {
+                    self.live.clear();
+                } else {
+                    self.live.retain(|live| *live != close.conn);
+                }
+                let closed = before.saturating_sub(self.live.len());
+                let outcome = if close.is_every_connection() || closed > 0 {
+                    CloseConnection::Closed
+                } else {
+                    CloseConnection::UnknownHandle
+                };
+                self.close_report = Some((outcome, u8::try_from(closed).unwrap_or(u8::MAX)));
+            }
+            Ok(_) | Err(()) => {}
+        }
+    }
+
+    /// Its connections go with its boot or its power.
+    fn forget_connections(&mut self) {
+        self.live.clear();
+        self.announcing.clear();
+        self.close_report = None;
     }
 
     /// A statement with the version and the side the peer claims.

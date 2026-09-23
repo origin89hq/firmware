@@ -22,6 +22,14 @@
 //! `CloseConnection` request, tracked and retried like any other, and its
 //! row is freed when the answer says the transport is gone (L-090).
 //!
+//! Each answer to a heartbeat of ours carries the comms processor's count
+//! of connections, which is compared with ours (L-101). Three answers in a
+//! row that disagree and the comms processor's count is taken as the
+//! truth: every connection is closed with one `CloseConnection` naming
+//! handle 0, and when its answer arrives every row goes with it, so a
+//! release lost on the wire leaks a row for six seconds rather than until
+//! the next reboot (L-102). The clients reconnect and are announced again.
+//!
 //! Time offers are decoded here and handed to the recorder, which owns the
 //! floor and RTC. Its verdict returns through `time_verdict`; a pending
 //! offer never stalls heartbeat processing.
@@ -79,6 +87,27 @@ pub trait Rows {
 
 /// Closes that can be outstanding: one per row.
 const CLOSING: usize = MAX_SESSIONS;
+
+/// Heartbeat answers in a row whose `conns` disagrees with ours before the
+/// table is resynchronised (L-102). One is a `ClientConnected` crossing a
+/// beat in flight; three is a leak.
+pub const RESYNC_AFTER: u8 = 3;
+
+/// The resynchronisation of every connection (L-102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+    /// The counts agree, or disagree on fewer than [`RESYNC_AFTER`]
+    /// answers in a row.
+    Watching { disagreed: u8 },
+    /// Due, and not sent: four requests are in flight (L-014).
+    Owed,
+    /// Sent under this request, and not answered.
+    Sent(ReqId),
+}
+
+impl Resync {
+    const AGREED: Self = Self::Watching { disagreed: 0 };
+}
 
 /// A close asked for and not yet answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +215,10 @@ pub enum DropReason {
     LinkLost,
     /// The comms processor came back with another `boot_id` (L-041).
     CommsRebooted,
+    /// The two connection counts disagreed on three heartbeats in a row,
+    /// and the comms processor answered the close of every connection
+    /// (L-102).
+    Resync,
     /// The bench took the module into its ROM (F-038).
     ModuleTaken,
     /// Every pairing-report revision of this boot was used: the link falls
@@ -306,7 +339,7 @@ pub enum Outgoing {
         /// What became of it.
         outcome: TimeOffer,
     },
-    /// Close a transport, or every one.
+    /// Close a transport.
     CloseConnection {
         /// From our counter.
         req_id: ReqId,
@@ -314,6 +347,12 @@ pub enum Outgoing {
         conn: Conn,
         /// Why.
         reason: CloseReason,
+    },
+    /// Close every transport: `CloseConnection` naming handle 0, with the
+    /// reason `resync` (L-102).
+    Resync {
+        /// From our counter; a retry keeps it.
+        req_id: ReqId,
     },
     /// The pairing window's state, reported (L-195).
     PairingWindow {
@@ -483,6 +522,9 @@ pub struct Link {
     conns: u8,
     /// Closes asked for and not yet answered.
     closing: [Option<Closing>; CLOSING],
+    /// Whether the counts disagree, and the close of every connection that
+    /// heals it (L-102).
+    resync: Resync,
     /// What the comms processor has been told of the pairing window, and
     /// whether the link fell for want of a revision (L-195).
     pairing: PairingReports,
@@ -511,6 +553,7 @@ impl Link {
             attempt: false,
             conns: 0,
             closing: [None; CLOSING],
+            resync: Resync::AGREED,
             pairing: PairingReports::new(),
         }
     }
@@ -723,9 +766,10 @@ impl Link {
                 // Heard only as the first answer to a beat of ours, which it
                 // uses up: an answer to nothing, or one replayed, proves
                 // nothing about whether the peer hears.
-                Ok(_) => {
+                Ok(beat) => {
                     if self.beats.answered(req_id) {
                         self.heard(now);
+                        self.compare(beat.conns, rows, now, &mut actions);
                     } else {
                         actions.push(Action::Note(Note::UnexpectedAck(kind)));
                     }
@@ -940,6 +984,10 @@ impl Link {
         actions: &mut Actions,
     ) {
         let req_id = envelope.req_id();
+        if self.resync == Resync::Sent(req_id) {
+            self.resynced(envelope, rows, actions);
+            return;
+        }
         if !self
             .requests
             .awaits(req_id, LinkMessageType::CloseConnection)
@@ -962,6 +1010,79 @@ impl Link {
             let _ = rows.release(closing.conn);
         }
         self.conns = rows.allocated();
+    }
+
+    /// The comms processor's `conns`, from an answer to a beat of ours,
+    /// against the rows (L-101). Three disagreements in a row and every
+    /// connection is closed (L-102); an agreement starts the count again.
+    /// Nothing is counted while that close is owed or in flight.
+    fn compare(&mut self, theirs: u8, rows: &impl Rows, now: Tick, actions: &mut Actions) {
+        self.conns = rows.allocated();
+        let Resync::Watching { disagreed } = self.resync else {
+            return;
+        };
+        if theirs == self.conns {
+            self.resync = Resync::AGREED;
+            return;
+        }
+        let disagreed = disagreed.saturating_add(1);
+        self.resync = if disagreed >= RESYNC_AFTER {
+            Resync::Owed
+        } else {
+            Resync::Watching { disagreed }
+        };
+        self.issue_resync(now, actions);
+    }
+
+    /// Send the close of every connection that is owed, while the link is
+    /// up and a request slot is free (L-014).
+    fn issue_resync(&mut self, now: Tick, actions: &mut Actions) {
+        if self.resync != Resync::Owed || !self.is_up() {
+            return;
+        }
+        if let Some(req_id) = self.request(LinkMessageType::CloseConnection, now) {
+            self.resync = Resync::Sent(req_id);
+            actions.push(Action::Send(Outgoing::Resync { req_id }));
+        }
+    }
+
+    /// The answer to the close of every connection: the comms processor's
+    /// count was the true one and it has closed them all, so every row
+    /// goes, with every session on it and every close still owed (L-102).
+    /// One that does not read leaves the request to its retries (L-015).
+    fn resynced(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
+        if CloseReport::decode(envelope).is_err() {
+            actions.push(Action::Note(Note::Malformed(
+                LinkMessageType::CloseConnectionAck,
+            )));
+            return;
+        }
+        rows.drop_all();
+        self.conns = rows.allocated();
+        self.forget_resync();
+        for closing in self.closing.iter_mut().filter_map(Option::take) {
+            if let Some(req_id) = closing.req_id {
+                let _ = self
+                    .requests
+                    .answered(req_id, LinkMessageType::CloseConnection);
+            }
+        }
+        actions.push(Action::DropConnections(DropReason::Resync));
+    }
+
+    /// Back to watching, with the close in flight retired.
+    fn forget_resync(&mut self) {
+        if let Resync::Sent(req_id) = self.resync {
+            let _ = self
+                .requests
+                .answered(req_id, LinkMessageType::CloseConnection);
+        }
+        self.resync = Resync::AGREED;
     }
 
     /// The answer to a pairing report: it consumes the report only when it
@@ -1081,6 +1202,7 @@ impl Link {
         }
         self.retry(now, &mut actions);
         self.issue_closes(now, &mut actions);
+        self.issue_resync(now, &mut actions);
         match self.phase {
             Phase::Up { next_beat, .. } => {
                 let silent = self
@@ -1170,6 +1292,14 @@ impl Link {
             } => CloseConnections {
                 conn: conn.get(),
                 reason,
+            }
+            .write(
+                link_header(LinkMessageType::CloseConnection, req_id),
+                &mut envelope,
+            ),
+            Outgoing::Resync { req_id } => CloseConnections {
+                conn: 0,
+                reason: CloseReason::Resync,
             }
             .write(
                 link_header(LinkMessageType::CloseConnection, req_id),
@@ -1365,6 +1495,7 @@ impl Link {
     fn drop_rows(&mut self, why: DropReason, rows: &mut impl Rows, actions: &mut Actions) {
         rows.drop_all();
         self.conns = rows.allocated();
+        self.forget_resync();
         for closing in self.closing.iter_mut().filter_map(Option::take) {
             if let Some(req_id) = closing.req_id {
                 let _ = self
@@ -1457,6 +1588,11 @@ impl Link {
                     // release, or to the link falling.
                     if kind == LinkMessageType::CloseConnection {
                         let _ = self.take_closing(req_id);
+                        if self.resync == Resync::Sent(req_id) {
+                            // Back to watching: the counts still disagree,
+                            // and three more answers send it again.
+                            self.resync = Resync::AGREED;
+                        }
                     }
                     if kind == LinkMessageType::PairingWindow {
                         self.pairing.given_up(req_id);
@@ -1474,6 +1610,9 @@ impl Link {
                             .flatten()
                             .find(|closing| closing.req_id == Some(req_id))
                         {
+                            None if self.resync == Resync::Sent(req_id) => {
+                                actions.push(Action::Send(Outgoing::Resync { req_id }));
+                            }
                             Some(closing) => {
                                 actions.push(Action::Send(Outgoing::CloseConnection {
                                     req_id,
@@ -2098,5 +2237,167 @@ mod tests {
                 .any(|a| matches!(a, Action::Send(Outgoing::LinkUp { .. }))),
             "the statement goes out the moment the module is powered"
         );
+    }
+    /// Rows that hold a count of connections.
+    struct Held(u8);
+
+    impl Rows for Held {
+        fn admit(&mut self, _: Conn) -> ClientConnected {
+            self.0 = self.0.saturating_add(1);
+            ClientConnected::Accepted
+        }
+
+        fn release(&mut self, _: Conn) -> ClientDisconnected {
+            self.0 = self.0.saturating_sub(1);
+            ClientDisconnected::Released
+        }
+
+        fn drop_all(&mut self) {
+            self.0 = 0;
+        }
+
+        fn allocated(&self) -> u8 {
+            self.0
+        }
+    }
+
+    /// The `n`th beat after linking at one second, answered with `conns`:
+    /// what the answer asked for.
+    fn answer_beat(link: &mut Link, rows: &mut Held, n: u64, conns: u8) -> Actions {
+        let now = at(2_000u64.saturating_mul(n).saturating_add(1_010));
+        let ticked = link.tick(now, false, rows);
+        let req_id = ticked
+            .iter()
+            .find_map(|action| {
+                if let Action::Send(Outgoing::Heartbeat { req_id }) = action {
+                    Some(*req_id)
+                } else {
+                    None
+                }
+            })
+            .expect("a beat");
+        let mut buf = [0u8; 64];
+        let len = Heartbeat { uptime_s: 1, conns }
+            .write(link_header(LinkMessageType::HeartbeatAck, req_id), &mut buf)
+            .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        link.received(envelope, now, rows)
+    }
+
+    /// The close of every connection among `actions`, if one.
+    fn resync(actions: &Actions) -> Option<ReqId> {
+        actions.iter().find_map(|action| {
+            if let Action::Send(Outgoing::Resync { req_id }) = action {
+                Some(*req_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The comms processor's report of a close, under `req_id`.
+    fn close_report(link: &mut Link, rows: &mut Held, req_id: ReqId, now: Tick) -> Actions {
+        let mut buf = [0u8; 64];
+        let len = CloseReport {
+            outcome: km43::CloseConnection::Closed,
+            closed: 1,
+        }
+        .write(
+            link_header(LinkMessageType::CloseConnectionAck, req_id),
+            &mut buf,
+        )
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        link.received(envelope, now, rows)
+    }
+
+    #[test]
+    fn l_102_three_disagreeing_answers_in_a_row_close_every_connection_once() {
+        let mut link = up(at(1_000));
+        let mut rows = Held(2);
+        assert_eq!(resync(&answer_beat(&mut link, &mut rows, 1, 1)), None);
+        assert_eq!(resync(&answer_beat(&mut link, &mut rows, 2, 1)), None);
+        let req_id = resync(&answer_beat(&mut link, &mut rows, 3, 1)).expect("the third");
+        // Asked once: the counts still disagree while it is in flight.
+        assert_eq!(resync(&answer_beat(&mut link, &mut rows, 4, 1)), None);
+        assert_eq!(rows.0, 2, "no row goes before the answer");
+        // On the wire it is a close of handle 0, for a resync.
+        let (frame, len) = envelope_of(&link, Outgoing::Resync { req_id }, at(7_100));
+        let envelope = LinkEnvelope::decode(&frame[..len]).expect("an envelope");
+        assert_eq!(envelope.opcode(), LinkMessageType::CloseConnection as u8);
+        let close = CloseConnections::decode(envelope).expect("a close");
+        assert!(close.is_every_connection());
+        assert_eq!(close.reason, CloseReason::Resync);
+    }
+
+    #[test]
+    fn l_102_an_agreeing_answer_starts_the_count_again() {
+        let mut link = up(at(1_000));
+        let mut rows = Held(1);
+        for (n, theirs) in [(1, 0), (2, 0), (3, 1), (4, 0), (5, 0)] {
+            let actions = answer_beat(&mut link, &mut rows, n, theirs);
+            assert_eq!(resync(&actions), None, "beat {n}");
+        }
+        assert!(resync(&answer_beat(&mut link, &mut rows, 6, 0)).is_some());
+    }
+
+    #[test]
+    fn l_102_the_answer_to_the_resync_frees_every_row_and_the_counts_agree_after() {
+        let mut link = up(at(1_000));
+        let mut rows = Held(3);
+        for n in 1..=2 {
+            let _ = answer_beat(&mut link, &mut rows, n, 1);
+        }
+        let req_id = resync(&answer_beat(&mut link, &mut rows, 3, 1)).expect("sent");
+        let answered = close_report(&mut link, &mut rows, req_id, at(7_050));
+        assert!(
+            answered
+                .iter()
+                .any(|a| *a == Action::DropConnections(DropReason::Resync)),
+            "{answered:?}"
+        );
+        assert_eq!(rows.0, 0);
+        // The same answer again is one nothing waits for.
+        let again = close_report(&mut link, &mut rows, req_id, at(7_060));
+        assert_eq!(
+            only(&again),
+            Some(Action::Note(Note::UnexpectedAck(
+                LinkMessageType::CloseConnectionAck
+            )))
+        );
+        // Both sides count none now, and nothing is sent again.
+        for n in 4..=10 {
+            let actions = answer_beat(&mut link, &mut rows, n, 0);
+            assert_eq!(resync(&actions), None, "beat {n}");
+        }
+    }
+
+    #[test]
+    fn l_102_an_answer_to_the_resync_that_does_not_read_frees_nothing_and_it_goes_again() {
+        let mut link = up(at(1_000));
+        let mut rows = Held(1);
+        for n in 1..=2 {
+            let _ = answer_beat(&mut link, &mut rows, n, 0);
+        }
+        let req_id = resync(&answer_beat(&mut link, &mut rows, 3, 0)).expect("sent");
+        let mut buf = [0u8; 16];
+        let cbor = link_header(LinkMessageType::CloseConnectionAck, req_id)
+            .write(0, &mut buf)
+            .expect("fits");
+        let len = cbor.finish().expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        let malformed = link.received(envelope, at(7_050), &mut rows);
+        assert_eq!(
+            only(&malformed),
+            Some(Action::Note(Note::Malformed(
+                LinkMessageType::CloseConnectionAck
+            )))
+        );
+        assert_eq!(rows.0, 1);
+        // Retried under the same request, as any request is (L-015).
+        let retried = link.tick(at(7_600), false, &mut rows);
+        assert_eq!(resync(&retried), Some(req_id));
+        let _ = close_report(&mut link, &mut rows, req_id, at(7_650));
+        assert_eq!(rows.0, 0);
     }
 }

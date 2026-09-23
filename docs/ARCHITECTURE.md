@@ -695,7 +695,12 @@ on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
-(above). Time offers go through a bounded
+(above). Each answer to a heartbeat of the controller's carries the comms
+processor's count of connections; three in a row that disagree with the
+rows close every connection with one `CloseConnection` naming handle 0, and
+its answer frees every row (L-102), so a release lost on the wire leaks a
+row for six seconds rather than until the next reboot. The comms firmware
+counts no connections until it has a table (#90). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
