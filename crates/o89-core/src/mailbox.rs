@@ -16,8 +16,16 @@
 //! as its response last. Nothing is read by either side while the other is
 //! writing it, because each waits for the other's sequence to move.
 //!
+//! One operation reads records rather than bytes: [`Op::ReadRing`] walks the
+//! event ring with the ring's own reader, because the ring is the one thing
+//! that knows where it starts and ends, and a host walking 3712 blocks a
+//! request at a time would take minutes to find a head the firmware already
+//! holds. What the records say is still the host's business.
+//!
 //! This is the layout both sides share; the address is where the
 //! controller's linker puts it, stated here so the two cannot disagree.
+
+use crate::record::{Class, MAX_PAYLOAD};
 
 /// Where the mailbox sits in the controller's RAM: the last 8 KiB, which
 /// `memory.x` keeps out of the stack and the runtime never zeroes.
@@ -118,6 +126,9 @@ pub enum Op {
     Download,
     /// End the bridge: reset the module normally and give the link back.
     Normal,
+    /// The ring's records from the sequence `ARG1 << 32 | ARG0`, oldest
+    /// first, as many as the data holds, laid out as a [`RingPage`].
+    ReadRing,
 }
 
 impl Op {
@@ -133,6 +144,7 @@ impl Op {
             Self::Reboot => 6,
             Self::Download => 7,
             Self::Normal => 8,
+            Self::ReadRing => 9,
         }
     }
 
@@ -148,6 +160,7 @@ impl Op {
             6 => Some(Self::Reboot),
             7 => Some(Self::Download),
             8 => Some(Self::Normal),
+            9 => Some(Self::ReadRing),
             _ => None,
         }
     }
@@ -318,9 +331,326 @@ impl Ring {
     }
 }
 
+/// The answer to [`Op::ReadRing`]: a header, then the records.
+///
+/// ```text
+/// [ ring_next: u64 | oldest: u64, 0 for none | next: u64 ]
+/// [ seq: u64 | class: u8 | len: u16 | payload ] ...
+/// ```
+///
+/// `ring_next` is the sequence the ring hands out next, so a host asking
+/// for the newest records knows where they end; `oldest` is the first it
+/// still holds; `next` is what to ask for to continue. Zero is never a
+/// sequence, so it can say *none* for `oldest`. Every integer is
+/// little-endian. The firmware writes an entry only while one more at its
+/// largest still fits, so a page never cuts a record short and the ring's
+/// `next` never skips one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingPage {
+    /// The sequence the ring hands out next.
+    pub ring_next: u64,
+    /// The first sequence the ring still holds, if any.
+    pub oldest: Option<u64>,
+    /// The sequence to ask for next.
+    pub next: u64,
+}
+
+/// One record in a [`RingPage`], as the ring verified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingEntry<'a> {
+    /// The record's sequence.
+    pub seq: u64,
+    /// Its class.
+    pub class: Class,
+    /// Its payload: an encoded KM43 event.
+    pub payload: &'a [u8],
+}
+
+/// Why a [`RingPage`] could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageError {
+    /// Fewer bytes than the header.
+    Short,
+    /// An entry cut short, at this offset.
+    Truncated(usize),
+    /// A class byte no build allocated, at this offset.
+    Class(usize),
+    /// A payload longer than the ring allows, at this offset.
+    TooLong(usize),
+}
+
+impl RingPage {
+    /// A sequence as the two argument words carry it: `ARG0` the low half,
+    /// `ARG1` the high.
+    #[must_use]
+    pub fn args(from: u64) -> (u32, u32) {
+        let lo = u32::try_from(from & 0xFFFF_FFFF).unwrap_or(0);
+        let hi = u32::try_from(from.checked_shr(32).unwrap_or(0)).unwrap_or(0);
+        (lo, hi)
+    }
+
+    /// The sequence two argument words carry.
+    #[must_use]
+    pub fn from_args(lo: u32, hi: u32) -> u64 {
+        u64::from(hi).checked_shl(32).unwrap_or(0) | u64::from(lo)
+    }
+
+    /// The header's bytes.
+    pub const HEADER: usize = 24;
+    /// The bytes in front of each payload.
+    pub const ENTRY_HEAD: usize = 11;
+
+    /// The header as it sits at the start of the data.
+    #[must_use]
+    pub fn header(self) -> [u8; Self::HEADER] {
+        let mut out = [0u8; Self::HEADER];
+        let words = [self.ring_next, self.oldest.unwrap_or(0), self.next];
+        for (slot, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+            *slot = word.to_le_bytes();
+        }
+        out
+    }
+
+    /// The bytes in front of one entry's payload, or nothing for a payload
+    /// longer than a record may carry.
+    #[must_use]
+    pub fn entry_head(seq: u64, class: Class, len: usize) -> Option<[u8; Self::ENTRY_HEAD]> {
+        if len > MAX_PAYLOAD {
+            return None;
+        }
+        let len = u16::try_from(len).ok()?;
+        let mut out = [0u8; Self::ENTRY_HEAD];
+        let (seq_room, rest) = out.split_at_mut(8);
+        seq_room.copy_from_slice(&seq.to_le_bytes());
+        let (class_room, len_room) = rest.split_at_mut(1);
+        class_room.copy_from_slice(&[class.byte()]);
+        len_room.copy_from_slice(&len.to_le_bytes());
+        Some(out)
+    }
+
+    /// Whether another entry, at its largest, fits after `used` bytes.
+    #[must_use]
+    pub const fn room_after(used: usize) -> bool {
+        used.saturating_add(Self::ENTRY_HEAD)
+            .saturating_add(MAX_PAYLOAD)
+            <= DATA_BYTES
+    }
+
+    /// Read a page: the header, and the entries after it, each checked as
+    /// it is read.
+    pub fn read(
+        data: &[u8],
+    ) -> Result<(Self, impl Iterator<Item = Result<RingEntry<'_>, PageError>>), PageError> {
+        let word = |at: usize| -> Result<u64, PageError> {
+            let bytes: [u8; 8] = data
+                .get(at..at.saturating_add(8))
+                .and_then(|b| b.try_into().ok())
+                .ok_or(PageError::Short)?;
+            Ok(u64::from_le_bytes(bytes))
+        };
+        let page = Self {
+            ring_next: word(0)?,
+            oldest: Some(word(8)?).filter(|oldest| *oldest != 0),
+            next: word(16)?,
+        };
+        let mut at = Self::HEADER;
+        let mut failed = false;
+        let entries = core::iter::from_fn(move || {
+            if failed || at >= data.len() {
+                return None;
+            }
+            let entry = Self::entry(data, at);
+            match entry {
+                Ok((found, end)) => {
+                    at = end;
+                    Some(Ok(found))
+                }
+                Err(why) => {
+                    failed = true;
+                    Some(Err(why))
+                }
+            }
+        });
+        Ok((page, entries))
+    }
+
+    fn entry(data: &[u8], at: usize) -> Result<(RingEntry<'_>, usize), PageError> {
+        let head = data
+            .get(at..at.saturating_add(Self::ENTRY_HEAD))
+            .ok_or(PageError::Truncated(at))?;
+        let (seq, rest) = head.split_at(8);
+        let (class, len) = rest.split_at(1);
+        let seq = u64::from_le_bytes(seq.try_into().map_err(|_| PageError::Truncated(at))?);
+        let class = class
+            .first()
+            .and_then(|byte| Class::of(*byte))
+            .ok_or(PageError::Class(at))?;
+        let len = usize::from(u16::from_le_bytes(
+            len.try_into().map_err(|_| PageError::Truncated(at))?,
+        ));
+        if len > MAX_PAYLOAD {
+            return Err(PageError::TooLong(at));
+        }
+        let from = at.saturating_add(Self::ENTRY_HEAD);
+        let end = from.saturating_add(len);
+        let payload = data.get(from..end).ok_or(PageError::Truncated(at))?;
+        Ok((
+            RingEntry {
+                seq,
+                class,
+                payload,
+            },
+            end,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page as the firmware lays it out, from `(seq, class, payload)`.
+    fn page(header: RingPage, entries: &[(u64, Class, &[u8])], out: &mut [u8]) -> usize {
+        let mut at = 0usize;
+        let mut put = |bytes: &[u8]| {
+            let end = at.saturating_add(bytes.len());
+            out[at..end].copy_from_slice(bytes);
+            at = end;
+        };
+        put(&header.header());
+        for (seq, class, payload) in entries {
+            put(&RingPage::entry_head(*seq, *class, payload.len()).expect("a record's length"));
+            put(payload);
+        }
+        at
+    }
+
+    #[test]
+    fn a_ring_page_reads_back_its_header_and_every_entry_in_order() {
+        let header = RingPage {
+            ring_next: 1219,
+            oldest: Some(1),
+            next: 1219,
+        };
+        let big = [0x5A; MAX_PAYLOAD];
+        let mut data = [0u8; DATA_BYTES];
+        let len = page(
+            header,
+            &[(1216, Class::A, b"boot"), (1218, Class::B, &big)],
+            &mut data,
+        );
+        let (read, entries) = RingPage::read(&data[..len]).expect("a header");
+        assert_eq!(read, header);
+        let entries: [Result<RingEntry<'_>, PageError>; 2] = {
+            let mut it = entries;
+            [it.next().expect("one"), it.next().expect("two")]
+        };
+        assert_eq!(
+            entries[0],
+            Ok(RingEntry {
+                seq: 1216,
+                class: Class::A,
+                payload: b"boot"
+            })
+        );
+        let second = entries[1].expect("the largest record");
+        assert_eq!((second.seq, second.class), (1218, Class::B));
+        assert_eq!(
+            second.payload.len(),
+            MAX_PAYLOAD,
+            "a hole in seq is not a hole in the page"
+        );
+    }
+
+    #[test]
+    fn an_empty_ring_is_a_header_with_no_oldest_and_no_entries() {
+        let header = RingPage {
+            ring_next: 1,
+            oldest: None,
+            next: 1,
+        };
+        let bytes = header.header();
+        assert_eq!(
+            &bytes[8..16],
+            &[0; 8],
+            "none is zero, which is never a sequence"
+        );
+        let (read, mut entries) = RingPage::read(&bytes).expect("a header");
+        assert_eq!(read, header);
+        assert!(entries.next().is_none());
+        assert_eq!(
+            RingPage::read(&bytes[..23]).map(|(p, _)| p),
+            Err(PageError::Short)
+        );
+    }
+
+    #[test]
+    fn a_page_cut_short_or_carrying_a_class_nobody_allocated_stops_at_the_entry() {
+        let header = RingPage {
+            ring_next: 3,
+            oldest: Some(1),
+            next: 3,
+        };
+        let mut data = [0u8; 128];
+        let len = page(
+            header,
+            &[(1, Class::A, b"one"), (2, Class::A, b"two")],
+            &mut data,
+        );
+        // Every cut inside the second entry is refused, and the first survives.
+        let second = RingPage::HEADER + RingPage::ENTRY_HEAD + 3;
+        for cut in second + 1..len {
+            let (_, mut entries) = RingPage::read(&data[..cut]).expect("a header");
+            assert!(entries.next().expect("the first").is_ok());
+            assert_eq!(
+                entries.next(),
+                Some(Err(PageError::Truncated(second))),
+                "cut at {cut}"
+            );
+            assert!(entries.next().is_none(), "reading past a refusal");
+        }
+        let mut damaged = data;
+        damaged[second + 8] = 0x01;
+        let (_, mut entries) = RingPage::read(&damaged[..len]).expect("a header");
+        assert!(entries.next().expect("the first").is_ok());
+        assert_eq!(entries.next(), Some(Err(PageError::Class(second))));
+        let mut long = data;
+        long[second + 9..second + 11].copy_from_slice(&300u16.to_le_bytes());
+        let (_, mut entries) = RingPage::read(&long[..len]).expect("a header");
+        assert!(entries.next().expect("the first").is_ok());
+        assert_eq!(entries.next(), Some(Err(PageError::TooLong(second))));
+    }
+
+    #[test]
+    fn a_sequence_crosses_the_two_argument_words_whole() {
+        for seq in [
+            0,
+            1,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x0123_4567_89AB_CDEF,
+            u64::MAX,
+        ] {
+            let (lo, hi) = RingPage::args(seq);
+            assert_eq!(RingPage::from_args(lo, hi), seq);
+        }
+        assert_eq!(
+            RingPage::args(0x0000_0002_0000_0001),
+            (1, 2),
+            "low half first"
+        );
+    }
+
+    #[test]
+    fn a_page_holds_another_record_only_while_the_largest_still_fits() {
+        assert!(RingPage::room_after(RingPage::HEADER));
+        let last = DATA_BYTES - RingPage::ENTRY_HEAD - MAX_PAYLOAD;
+        assert!(RingPage::room_after(last));
+        assert!(!RingPage::room_after(last + 1));
+        assert!(!RingPage::room_after(usize::MAX));
+        assert_eq!(RingPage::entry_head(1, Class::A, MAX_PAYLOAD + 1), None);
+        assert!(RingPage::entry_head(1, Class::A, MAX_PAYLOAD).is_some());
+    }
 
     #[test]
     fn a_ring_counts_its_bytes_and_its_room_on_both_sides_of_the_wrap() {
@@ -363,6 +693,7 @@ mod tests {
             Op::Reboot,
             Op::Download,
             Op::Normal,
+            Op::ReadRing,
         ] {
             assert_eq!(Op::of(op.code()), Some(op));
         }
@@ -382,7 +713,7 @@ mod tests {
             assert_eq!(Status::of(status.code()), Some(status));
         }
         assert_eq!(Op::of(0), None);
-        assert_eq!(Op::of(9), None);
+        assert_eq!(Op::of(10), None);
         assert_eq!(Status::of(11), None);
         for entry in [
             DownloadEntry::Reset,

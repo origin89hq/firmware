@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use o89_core::mailbox::{
-    DATA_BYTES, DownloadEntry, MAGIC, MAILBOX_ADDRESS, Op, RING_BYTES, Ring, Status, VERSION,
-    offset,
+    DATA_BYTES, DownloadEntry, MAGIC, MAILBOX_ADDRESS, Op, RING_BYTES, Ring, RingPage, Status,
+    VERSION, offset,
 };
 use o89_core::{Address, FRAM_BYTES, Fram, Refused};
 use probe_rs::probe::list::Lister;
@@ -279,6 +279,14 @@ impl Link {
             from = from.saturating_add(len);
         }
         Ok(())
+    }
+
+    /// One page of the ring's records from `from`, walked by the firmware's
+    /// own reader and laid out as `o89_core::mailbox::RingPage`.
+    pub fn read_ring(&mut self, from: u64) -> Result<Vec<u8>> {
+        let (lo, hi) = RingPage::args(from);
+        self.request(Op::ReadRing, lo, hi, &[])?
+            .ok("reading the ring")
     }
 
     /// Erase one 4 KiB block of the NOR, counted from the part's start.

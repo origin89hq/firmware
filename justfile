@@ -196,6 +196,11 @@ dev-rail revision *args:
 dev-fram at="0" len="256" *args:
     cargo run -q -p o89-dev -- {{args}} fram --at {{at}} --len {{len}}
 
+# The event ring's newest `count` records, decoded, newest first: a boot's
+# reason, backup domain and last words spelled out.
+dev-ring count="20" *args:
+    cargo run -q -p o89-dev -- {{args}} ring --count {{count}}
+
 # Bytes of the NOR in hex, from `at` for `len`.
 dev-nor at="0" len="256" *args:
     cargo run -q -p o89-dev -- {{args}} nor --at {{at}} --len {{len}}

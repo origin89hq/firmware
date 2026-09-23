@@ -22,8 +22,10 @@ use core::sync::atomic::Ordering;
 use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, with_timeout};
 use km43::DownloadReason;
-use o89_core::mailbox::{DATA_BYTES, DownloadEntry, MAGIC, Op, RING_BYTES, Ring, Status, VERSION};
-use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing};
+use o89_core::mailbox::{
+    DATA_BYTES, DownloadEntry, MAGIC, Op, RING_BYTES, Ring, RingPage, Status, VERSION,
+};
+use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, Wants};
 use portable_atomic::{AtomicU8, AtomicU32};
 
 use crate::fram::Fram;
@@ -134,6 +136,10 @@ pub async fn serve(parts: Parts<'_>) {
             Some(ring) => read_nor(ring, arg0, arg1).await,
             None => (Status::NoNor, 0),
         },
+        Some(Op::ReadRing) => match parts.ring {
+            Some(ring) => read_ring(ring, arg0, arg1, parts.scratch).await,
+            None => (Status::NoNor, 0),
+        },
         Some(Op::EraseNorBlock) => match parts.ring {
             Some(ring) => erase_nor(ring, arg0, parts.scratch).await,
             None => (Status::NoNor, 0),
@@ -190,6 +196,13 @@ fn answer(seq: u32, status: Status, length: u32) {
 /// Copy `bytes` into the data, as many as fit.
 fn put(bytes: &[u8]) {
     for (slot, byte) in MAILBOX.data.iter().zip(bytes) {
+        slot.store(*byte, Ordering::Relaxed);
+    }
+}
+
+/// Copy `bytes` into the data from `at`, as many as fit.
+fn put_at(at: usize, bytes: &[u8]) {
+    for (slot, byte) in MAILBOX.data.iter().skip(at).zip(bytes) {
         slot.store(*byte, Ordering::Relaxed);
     }
 }
@@ -291,6 +304,51 @@ async fn write_fram(fram: &mut Fram, at: u32, len: u32) -> (Status, u32) {
         Ok(()) => (Status::Ok, 0),
         Err(Refused::SupplyFalling) => (Status::SupplyFalling, 0),
         Err(Refused::AtTheCeiling | Refused::Bus(_)) => (Status::Bus, 0),
+    }
+}
+
+/// The ring's records from the sequence `hi:lo`, walked by the ring's own
+/// reader and laid out as a `RingPage`. A record goes in only while one
+/// more at its largest still fits, so the ring's answer of what to ask
+/// next never passes a record the page left out.
+async fn read_ring(ring: &mut NorRing<Nor>, lo: u32, hi: u32, scratch: &mut [u8]) -> (Status, u32) {
+    let from = RingPage::from_args(lo, hi);
+    let oldest = ring.head().oldest;
+    let mut at = RingPage::HEADER;
+    let walked = ring
+        .read_from(from, scratch, |found| {
+            // The ring holds nothing longer than a record carries, so the
+            // head always builds; a page cut here says so by its length.
+            let Some(head) = RingPage::entry_head(found.seq, found.class, found.payload.len())
+            else {
+                return Wants::Enough;
+            };
+            put_at(at, &head);
+            put_at(at.saturating_add(RingPage::ENTRY_HEAD), found.payload);
+            at = at
+                .saturating_add(RingPage::ENTRY_HEAD)
+                .saturating_add(found.payload.len());
+            if RingPage::room_after(at) {
+                Wants::More
+            } else {
+                Wants::Enough
+            }
+        })
+        .await;
+    match walked {
+        Ok(next) => {
+            let page = RingPage {
+                ring_next: ring.next_seq(),
+                oldest,
+                next,
+            };
+            put_at(0, &page.header());
+            (Status::Ok, u32::try_from(at).unwrap_or(0))
+        }
+        Err(error) => {
+            defmt::error!("mailbox: the ring could not be read: {}", error);
+            (Status::Bus, 0)
+        }
     }
 }
 

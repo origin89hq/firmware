@@ -147,19 +147,14 @@ async fn main(spawner: Spawner) {
     let rtc = reset::rtc_clock();
     let backup = reset::backup_domain();
 
-    let blame = match words {
-        Some(LastWords::Starved(blame)) => Some(blame),
-        Some(LastWords::Panicked(site)) => {
-            defmt::error!(
-                "the previous run panicked at file {=u32:#x} line {=u32}",
-                site.file,
-                site.line
-            );
-            None
-        }
-        None => None,
-    };
-    let record = BootRecord::new(cause, blame, rtc, backup, REVISION);
+    if let Some(LastWords::Panicked(site)) = words {
+        defmt::error!(
+            "the previous run panicked at file {=u32:#x} line {=u32}",
+            site.file,
+            site.line
+        );
+    }
+    let record = BootRecord::new(cause, words, rtc, backup, REVISION);
     defmt::info!("boot: {}", record);
     if let RtcClock::Fault { lse_ready, source } = record.rtc {
         defmt::error!(
@@ -365,7 +360,7 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(store, fram, nor) {
+    if let Ok(token) = recorder::run(store, fram, nor, record.body()) {
         spawner.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");
