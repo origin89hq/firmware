@@ -1153,14 +1153,37 @@ controller has 16 MB of NOR and the authorised comms image is under 2 MB, so
 a controller that keeps the last authorised image can reflash a dead module
 through the ROM with no client and no drive.
 
-**Transports in V1**: local Wi-Fi with one WebSocket connection per client
-(P-034), and the comms processor's own access point for provisioning, raised
-only while no network is cached or the pairing window is open, so a phone's
-browser can pair and write the network section before the house Wi-Fi
-exists. It carries nothing a client could act on without a session. Cloud
-and BLE are specified in KM43 as unimplemented and stay that way in V1. The
-connection table has eight rows, handles from a counter never 0 and never
-reused before the controller acknowledges the disconnect (L-060, L-080);
+**Transports in V1**: BLE GATT is required for initial pairing from the
+native phone app, before site Wi-Fi is configured and without internet.
+The person scans the controller's QR code, opens the 120-second window at
+the panel, and the app performs `Discover`, `Pair`, then `Hello` over BLE.
+An authenticated session can then write the network configuration. BLE
+availability does not depend on a successful Wi-Fi association, including
+when cached credentials name an unavailable network. The ESP32 carries
+bytes; the STM32 verifies proofs, owns enrolment and holds every key.
+Bluetooth connection or bonding alone grants no KM43 permission.
+
+Local Wi-Fi uses one WebSocket connection per client (P-034). The comms
+processor's own access point remains the browser provisioning fallback,
+raised only while no network is cached or the pairing window is open. The
+window-dependent AP path requires the controller-owned link signal tracked
+in [origin89hq/km43#74](https://github.com/origin89hq/km43/issues/74).
+Advertising is transport availability, not permission to pair; the
+controller checks its window when it processes `Pair`. Cloud stays out of V1.
+
+The BLE implementation is tracked in [#96](https://github.com/origin89hq/firmware/issues/96).
+KM43's BLE section is still specified but unverified; service discovery,
+fragmentation vectors and conformance evidence are tracked in
+[origin89hq/km43#81](https://github.com/origin89hq/km43/issues/81). V1
+acceptance requires those protocol checks, a compatible pinned stack within
+the target's allocation and memory constraints, and native-app pairing on
+the supported phone platforms against board A. A transport plan is not a
+claim that BLE is implemented or qualified. The early recovery download
+window still runs before the radio stack, and advertising starts only after
+a valid `LinkUp`.
+
+BLE and WebSocket share the bounded connection table, with eight rows and
+handles from a counter never 0 and never reused before the controller acknowledges the disconnect (L-060, L-080);
 every inbound client frame has its handle stamped into `session_id` (P-021);
 a link-local type on a client transport is dropped and answered (L-002). A
 controller that goes quiet closes every client, stops advertising and retries

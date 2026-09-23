@@ -258,6 +258,16 @@ a recorded proof verifies against twice. Source:
 network is cached or the pairing window is open, and goes away when either
 ends. Source: [#3][plan] §9 item 3. M4.
 
+**F-043** — V1 initial pairing is available over BLE GATT from the native
+phone app without cached Wi-Fi credentials, a working site network, or
+internet. The STM32 alone gates `Pair` on the physical 120-second window
+and verifies the proof; Bluetooth connection or bonding grants no KM43
+permission. BLE shares the bounded client table with WebSocket, starts
+only after the recovery download window and valid `LinkUp`, and closes
+clients and stops advertising on controller loss. Source: [#3][plan] §9
+item 3, [#96](https://github.com/origin89hq/firmware/issues/96), P-066,
+L-060, L-080, L-120. M4.
+
 ## The site
 
 **F-050** — A Modbus driver on this board discards the frame it just sent
