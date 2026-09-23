@@ -9,10 +9,10 @@ use std::cell::RefCell;
 
 use embassy_futures::block_on;
 use km43::{
-    Attempt, ClientId, ClientKind, CloseReason, Conn, DeviceId, DeviceSecret, Discovery, EmptyBody,
-    Envelope, Epoch, ErrorBody, Handshake, Header, HelloInner, Incoming, LinkTransport,
-    MessageType, PairAckClaim, PairRequest, PairResponse, PrintedSecret, ReqId, Session, SessionId,
-    SessionKey, Tagged, Version, Wrapper,
+    Attempt, ClientId, ClientKind, CloseReason, CommandKind, CommandOperation, Conn, Counter,
+    DeviceId, DeviceSecret, Discovery, EmptyBody, Envelope, Epoch, ErrorBody, Handshake, Header,
+    HelloInner, Incoming, LinkTransport, MessageType, PairAckClaim, PairRequest, PairResponse,
+    PrintedSecret, ReqId, Session, SessionId, SessionKey, Signed, Tagged, Version, Wrapper,
 };
 use o89_core::{Facts, Millis, Sessions};
 
@@ -155,6 +155,31 @@ impl Client {
         assert_eq!(session.report().log_newest_seq, LOG.newest);
         self.key = Some(enrolment.session_key(&handshake, SessionId::from(self.handle)));
         frame
+    }
+
+    /// A signed `Command` under `counter`, as the client signs it.
+    fn command(&mut self, counter: u64, cmd_id: u32, key: &SessionKey) -> Vec<u8> {
+        let header = self.header(MessageType::Command);
+        let mut op = [0u8; 16];
+        let len = CommandOperation {
+            cmd_id,
+            kind: CommandKind::StartGenerator,
+            args: &[0xa0],
+        }
+        .encode(&mut op)
+        .expect("fits");
+        let mut dst = [0u8; 128];
+        let len = Signed::over(
+            header,
+            ClientId::new(1).expect("a slot"),
+            Counter(counter),
+            &op[..len],
+            key,
+        )
+        .expect("signs")
+        .write(&mut dst)
+        .expect("fits");
+        dst[..len].to_vec()
     }
 
     fn wrapped(&mut self, kind: MessageType, key: &SessionKey) -> Vec<u8> {
@@ -410,6 +435,51 @@ fn l_062_a_transport_whose_release_was_dropped_is_reclaimed_by_the_reboot_that_f
     bench.feed(&bytes);
     bench.run_for(Millis::from_millis(3_000));
     assert_eq!(conns(&bench), Some(0), "no row leaked past the reboot");
+}
+
+#[test]
+fn p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once() {
+    // Capabilities: replay.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let key = client.key.take().expect("a session");
+    let frame = client.command(1, 7, &key);
+    let answers = client.send(&mut bench, &frame);
+    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
+    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
+    let accepted = |bench: &Bench| {
+        bench
+            .endpoint
+            .sessions
+            .keys()
+            .clients
+            .present()
+            .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
+    };
+    assert_eq!(accepted(&bench), Some(Counter(1)));
+    // The same bytes, relayed again and again as the comms processor
+    // chooses: nothing reaches the client that it could take for an answer,
+    // the counter is not read again, and the connection is not shed.
+    for n in 1..=9 {
+        let answers = client.send(&mut bench, &frame);
+        assert!(answers.is_empty(), "replay {n} answered");
+    }
+    assert_eq!(accepted(&bench), Some(Counter(1)));
+    assert!(closes(&bench).is_empty());
+    assert!(
+        bench
+            .endpoint
+            .sessions
+            .is_bound(Conn::new(1).expect("a handle"))
+    );
+    // The client's next request is served as if nothing had happened.
+    let next = client.command(2, 8, &key);
+    let answers = client.send(&mut bench, &next);
+    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
+    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
+    assert_eq!(accepted(&bench), Some(Counter(2)));
 }
 
 #[test]

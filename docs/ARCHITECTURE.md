@@ -658,7 +658,11 @@ the epoch moves, and keys derive afterwards under whatever the record then
 holds, nothing at all if the advance failed. Enrolment is gated by the gesture. Challenges are derived as above, with the
 counter written before the challenge leaves. A signed request is verified in
 P-080's order; the counter and the dedup entry are written in one FRAM
-transaction, and a write that fails fails closed (P-079). Commands are
+transaction, and a write that fails fails closed (P-079). Between the MAC
+and the counter, each session holds the highest `req_id` it accepted and
+the four below it, and drops a request whose `req_id` it accepted already or
+that is below that window, unanswered, since KM43 allocates no error for it
+yet (P-022). Commands are
 reserved until an output has been granted authority.
 
 ### The link
