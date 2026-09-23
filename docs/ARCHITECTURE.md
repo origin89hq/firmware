@@ -794,6 +794,17 @@ half: no
 transaction starts on a falling supply. Every FRAM write path runs crashing
 at every step on the host, and the invariant after recovery is asserted.
 
+Identity and behaviour configuration use schema-sized prefixes of the existing
+`SITE_CONFIG`, `GENR`, `FRST`, `SCHD` and `SHED` reservations. The second slot
+keeps its reserved address; the CRC follows the encoded prefix. Identity needs
+41 bytes (4 version + 1 length + 36 CBOR), each behaviour 8 (4 + 1 + 3).
+No existing record moves. The network body uses 138 of its reserved 160 bytes:
+4 version + 1 metadata marker + 2 country + 33 hostname + 1 join marker +
+33 SSID + 64 passphrase. A clear retains country and hostname and advances the
+version. Configuration is canonicalized after validation; unknown CBOR keys
+are not persisted. Never-written records answer version zero with no body;
+damaged records refuse rather than pretending to be unwritten.
+
 **One record is one transaction, and that decides what shares a record.**
 The per-client counters and the dedup table are fields of the client table's
 record, not records of their own, because P-080 lands the new counter and

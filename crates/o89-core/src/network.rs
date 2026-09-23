@@ -34,13 +34,25 @@ pub const HOSTNAME_BYTES: usize = 32;
 
 const NONE: u8 = 0;
 const SET: u8 = 1;
-const LAYOUT: usize = 4 + 1 + (1 + SSID_BYTES) + (1 + PSK_MAX) + 2 + (1 + HOSTNAME_BYTES);
+const LAYOUT: usize = 4 + 1 + 2 + (1 + HOSTNAME_BYTES) + 1 + (1 + SSID_BYTES) + (1 + PSK_MAX);
 const _: () = assert!(LAYOUT <= NETWORK_BYTES);
 
 /// A passphrase of 8 to 63 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Psk(Text<PSK_MAX>);
+
+impl core::fmt::Debug for Psk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Psk({} bytes)", self.0.len())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Psk {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "Psk({=usize} bytes)", self.0.len());
+    }
+}
 
 /// A passphrase outside its bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +102,8 @@ pub struct Credentials {
 pub struct Network {
     version: u32,
     credentials: Option<Credentials>,
+    country: Option<[u8; 2]>,
+    hostname: Text<HOSTNAME_BYTES>,
 }
 
 /// The version is at the top of its `u32`; refused rather than wrapped,
@@ -103,6 +117,8 @@ impl Network {
     pub const NONE: Self = Self {
         version: 0,
         credentials: None,
+        country: None,
+        hostname: Text::EMPTY,
     };
 
     /// The version the comms processor's cache is compared against.
@@ -120,6 +136,8 @@ impl Network {
     /// Set the network, moving the version.
     pub fn set(&mut self, credentials: Credentials) -> Result<(), VersionCeiling> {
         self.version = self.version.checked_add(1).ok_or(VersionCeiling)?;
+        self.country = Some(credentials.country.as_bytes());
+        self.hostname = credentials.hostname;
         self.credentials = Some(credentials);
         Ok(())
     }
@@ -130,6 +148,97 @@ impl Network {
         self.version = self.version.checked_add(1).ok_or(VersionCeiling)?;
         self.credentials = None;
         Ok(())
+    }
+
+    /// Validate a whole write, resolving a retained passphrase only for its SSID.
+    pub fn changed(&self, write: km43::NetworkWrite<'_>) -> Result<Self, km43::ConfigError> {
+        use km43::{ConfigError, PassphraseChange};
+        let held = self.credentials.as_ref();
+        let held_ssid = held
+            .map(|join| km43::Ssid::new(join.ssid.as_str()))
+            .transpose()?;
+        let passphrase = write.passphrase(held_ssid)?;
+        let country_bytes = write
+            .country
+            .as_str()
+            .as_bytes()
+            .try_into()
+            .map_err(|_| ConfigError::CountryNotCapitals)?;
+        let country = Country::new(country_bytes).map_err(|_| ConfigError::CountryNotCapitals)?;
+        let hostname = Text::new(write.hostname.as_str()).map_err(|_| ConfigError::NotAHostname)?;
+        let credentials = match write.join {
+            None => None,
+            Some(join) => {
+                let psk = match passphrase {
+                    PassphraseChange::Set(value) => {
+                        Psk::new(value.as_str()).map_err(|_| ConfigError::NoPassphraseHeld)?
+                    }
+                    PassphraseChange::Keep => held.ok_or(ConfigError::NoPassphraseHeld)?.psk,
+                    PassphraseChange::Clear => return Err(ConfigError::NoPassphraseHeld),
+                };
+                Some(Credentials {
+                    ssid: Text::new(join.ssid.as_str())
+                        .map_err(|_| ConfigError::NoPassphraseHeld)?,
+                    psk,
+                    country,
+                    hostname,
+                })
+            }
+        };
+        Ok(Self {
+            version: self
+                .version
+                .checked_add(1)
+                .ok_or(ConfigError::NoPassphraseHeld)?,
+            credentials,
+            country: Some(country.as_bytes()),
+            hostname,
+        })
+    }
+
+    /// The public shape has no field capable of holding the passphrase.
+    pub fn read_body(&self) -> Result<km43::NetworkRead<'_>, km43::ConfigError> {
+        let country = self
+            .country
+            .as_ref()
+            .ok_or(km43::ConfigError::CountryNotCapitals)?;
+        let country =
+            core::str::from_utf8(country).map_err(|_| km43::ConfigError::CountryNotCapitals)?;
+        Ok(km43::NetworkRead {
+            join: self
+                .credentials
+                .as_ref()
+                .map(|join| {
+                    km43::Ssid::new(join.ssid.as_str()).map(|ssid| km43::JoinRead {
+                        ssid,
+                        psk_set: true,
+                    })
+                })
+                .transpose()?,
+            country: km43::Country::new(country)?,
+            hostname: km43::Hostname::new(self.hostname.as_str())?,
+        })
+    }
+
+    /// The radio's copy, including credentials only on the private link.
+    #[must_use]
+    pub fn change(&self) -> Option<km43::NetChange<'_>> {
+        let country = core::str::from_utf8(self.country.as_ref()?).ok()?;
+        let hostname = self.hostname.as_str();
+        Some(match self.credentials.as_ref() {
+            Some(join) => km43::NetChange::Set {
+                version: self.version,
+                ssid: join.ssid.as_str(),
+                psk: join.psk.as_text().as_str(),
+                country,
+                hostname,
+            },
+            None => km43::NetChange::Clear {
+                version: self.version,
+                country,
+                hostname,
+            },
+        })
     }
 
     /// Whether a comms processor reporting `cached` after link-up gets a
@@ -145,14 +254,15 @@ impl Body<NETWORK_BYTES> for Network {
         let mut out = [0u8; NETWORK_BYTES];
         let mut writer = Writer::over(&mut out);
         writer.u32(self.version);
+        writer.u8(if self.country.is_some() { SET } else { NONE });
+        writer.put(&self.country.unwrap_or([0; 2]));
+        self.hostname.put(&mut writer);
         match &self.credentials {
             None => writer.u8(NONE),
             Some(credentials) => {
                 writer.u8(SET);
                 credentials.ssid.put(&mut writer);
                 credentials.psk.0.put(&mut writer);
-                writer.put(&credentials.country.as_bytes());
-                credentials.hostname.put(&mut writer);
             }
         }
         out
@@ -161,6 +271,18 @@ impl Body<NETWORK_BYTES> for Network {
     fn decode(bytes: &[u8; NETWORK_BYTES]) -> Result<Self, Malformed> {
         let mut reader = Reader::over(bytes);
         let version = reader.u32()?;
+        let present = reader.u8()?;
+        let country_bytes = reader.take::<2>()?;
+        let country = match present {
+            NONE => None,
+            SET => Some(
+                Country::new(country_bytes)
+                    .map_err(|_| reader.malformed(2))?
+                    .as_bytes(),
+            ),
+            _ => return Err(reader.malformed(1)),
+        };
+        let hostname = Text::take(&mut reader)?;
         let credentials = match reader.u8()? {
             NONE => None,
             SET => {
@@ -169,28 +291,88 @@ impl Body<NETWORK_BYTES> for Network {
                 if psk.len() < PSK_MIN {
                     return Err(reader.malformed(PSK_MAX.saturating_add(1)));
                 }
-                let country =
-                    Country::new(reader.take::<2>()?).map_err(|BadCountry| reader.malformed(2))?;
-                let hostname = Text::take(&mut reader)?;
                 Some(Credentials {
                     ssid,
                     psk: Psk(psk),
-                    country,
+                    country: Country::new(country.ok_or(reader.malformed(2))?)
+                        .map_err(|_| reader.malformed(2))?,
                     hostname,
                 })
             }
             _ => return Err(reader.malformed(1)),
         };
-        Ok(Self {
+        let value = Self {
             version,
             credentials,
-        })
+            country,
+            hostname,
+        };
+        if version != 0 {
+            value.read_body().map_err(|_| Malformed { at: 0 })?;
+        }
+        Ok(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn l_135_clear_retains_radio_metadata_and_advances_version() {
+        let mut network = Network::NONE;
+        network.set(cabin()).expect("set");
+        network.clear().expect("clear");
+        assert_eq!(
+            network.change(),
+            Some(km43::NetChange::Clear {
+                version: 2,
+                country: "CA",
+                hostname: "origin89"
+            })
+        );
+        assert_eq!(Network::decode(&network.encode()), Ok(network));
+    }
+
+    #[test]
+    fn p_107_keep_requires_the_byte_identical_ssid() {
+        let mut network = Network::NONE;
+        network.set(cabin()).expect("set");
+        let mut write = km43::NetworkWrite {
+            join: Some(km43::JoinWrite {
+                ssid: km43::Ssid::new("cabin").expect("ssid"),
+                psk: None,
+            }),
+            country: km43::Country::new("CA").expect("country"),
+            hostname: km43::Hostname::new("new-host").expect("host"),
+        };
+        let kept = network.changed(write).expect("kept");
+        assert_eq!(kept.credentials().expect("join").psk, cabin().psk);
+        write.join.as_mut().expect("join").ssid = km43::Ssid::new("Cabin").expect("ssid");
+        assert_eq!(
+            network.changed(write),
+            Err(km43::ConfigError::PassphraseForAnotherNetwork)
+        );
+        assert_eq!(
+            Network::NONE.changed(write),
+            Err(km43::ConfigError::NoPassphraseHeld)
+        );
+    }
+
+    #[test]
+    fn p_106_read_has_presence_but_no_passphrase() {
+        let mut network = Network::NONE;
+        network.set(cabin()).expect("set");
+        let mut bytes = [0; km43::MAX_NETWORK_READ_BYTES];
+        let len = network
+            .read_body()
+            .expect("body")
+            .encode(&mut bytes)
+            .expect("encoded");
+        let read = km43::NetworkRead::decode(&bytes[..len]).expect("read");
+        assert!(read.join.expect("join").psk_set);
+        assert!(!bytes.windows(13).any(|window| window == b"correct horse"));
+    }
 
     fn cabin() -> Credentials {
         Credentials {
@@ -229,6 +411,8 @@ mod tests {
         let mut top = Network {
             version: u32::MAX,
             credentials: None,
+            country: None,
+            hostname: Text::EMPTY,
         };
         assert_eq!(top.set(cabin()), Err(VersionCeiling));
         assert_eq!(top.clear(), Err(VersionCeiling));
@@ -263,23 +447,18 @@ mod tests {
         assert_eq!(Network::decode(&Network::NONE.encode()), Ok(Network::NONE));
         // A short passphrase on the part: refused as the wire refuses it.
         let mut short = network.encode();
-        short[4 + 1 + 1 + SSID_BYTES] = 3;
+        short[4 + 1 + 2 + 1 + HOSTNAME_BYTES + 1 + 1 + SSID_BYTES] = 3;
         assert_eq!(
             Network::decode(&short),
             Err(Malformed {
-                at: 4 + 1 + 1 + SSID_BYTES
+                at: 4 + 1 + 2 + 1 + HOSTNAME_BYTES + 1 + 1 + SSID_BYTES
             })
         );
         let mut country = network.encode();
-        country[4 + 1 + 1 + SSID_BYTES + 1 + PSK_MAX] = b'c';
-        assert_eq!(
-            Network::decode(&country),
-            Err(Malformed {
-                at: 4 + 1 + 1 + SSID_BYTES + 1 + PSK_MAX
-            })
-        );
+        country[5] = b'c';
+        assert_eq!(Network::decode(&country), Err(Malformed { at: 5 }));
         let mut state = network.encode();
         state[4] = 2;
-        assert_eq!(Network::decode(&state), Err(Malformed { at: 4 }));
+        assert_eq!(Network::decode(&state), Err(Malformed { at: 6 }));
     }
 }

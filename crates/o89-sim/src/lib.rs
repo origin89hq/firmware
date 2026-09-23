@@ -42,3 +42,6 @@ mod tables;
 pub use comms::*;
 pub use fram::*;
 pub use nor::*;
+
+#[cfg(test)]
+mod configuration;
