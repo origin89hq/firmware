@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
-use km43::{Boot, BootCause, Event, EventKind};
+use km43::{Boot, BootCause, ControllerRecord, ControllerRecordError, Event, EventKind};
 use o89_core::mailbox::{RingEntry, RingPage};
 use o89_core::{Class, Task};
 
@@ -134,9 +134,47 @@ fn describe(seq: u64, class: Class, payload: &[u8]) -> String {
             }
         }
     } else {
-        let _ = write!(line, "body {}", hex::encode(event.body()));
+        match ControllerRecord::decode(event.kind, event.body()) {
+            Ok(record) => line.push_str(&record_line(record)),
+            Err(ControllerRecordError::UnknownKind(_)) => {
+                let _ = write!(line, "body {}", hex::encode(event.body()));
+            }
+            Err(_) if event.body() == EMPTY_MAP => {
+                line.push_str("empty body: written before km43 0.4.1 gave the record its fields");
+            }
+            Err(why) => {
+                let _ = write!(line, "body refused ({why}): {}", hex::encode(event.body()));
+            }
+        }
     }
     line
+}
+
+/// A controller record in words (P-215).
+fn record_line(record: ControllerRecord) -> String {
+    match record {
+        ControllerRecord::TimeSet { old, new, source } => format!(
+            "time set: {} to {new} ms, by {source:?}",
+            old.map_or_else(|| "unknown".to_owned(), |old| format!("{old} ms"))
+        ),
+        ControllerRecord::RecordFailedCrc { count } => {
+            format!("record failed CRC: {count} skipped in the boot's scan")
+        }
+        ControllerRecord::CommsLinkLost => "comms link lost".to_owned(),
+        ControllerRecord::CommsPowerCycled { count } => {
+            format!("comms power cycled: {count} in the last hour")
+        }
+        ControllerRecord::CommsUnrecoverable { rail_on } => format!(
+            "comms unrecoverable: the rail left {}",
+            if rail_on { "on" } else { "off" }
+        ),
+        ControllerRecord::SessionsShed { count } => {
+            format!("sessions shed: {count} in the last hour")
+        }
+        ControllerRecord::CommsBootNoise { count } => {
+            format!("comms boot noise: {count} bytes that were not frames")
+        }
+    }
 }
 
 /// A boot body in words.
@@ -279,6 +317,77 @@ mod tests {
         assert_eq!(task_name(200), "task 200");
     }
 
+    fn record_event(seq: u64, record: ControllerRecord) -> Vec<u8> {
+        let mut body = [0u8; km43::CONTROLLER_RECORD_MAX_BYTES];
+        let len = record.encode(&mut body).expect("encodes");
+        event(seq, record.kind(), &body[..len])
+    }
+
+    #[test]
+    fn the_ladders_records_and_the_boot_noise_read_as_what_they_say() {
+        let cycled = describe(
+            10,
+            Class::A,
+            &record_event(
+                10,
+                ControllerRecord::CommsPowerCycled {
+                    count: core::num::NonZeroU32::new(3).expect("three"),
+                },
+            ),
+        );
+        assert!(
+            cycled.ends_with("comms power cycled: 3 in the last hour"),
+            "{cycled}"
+        );
+        let off = describe(
+            11,
+            Class::A,
+            &record_event(11, ControllerRecord::CommsUnrecoverable { rail_on: false }),
+        );
+        assert!(
+            off.ends_with("comms unrecoverable: the rail left off"),
+            "{off}"
+        );
+        let noise = describe(
+            12,
+            Class::A,
+            &record_event(12, ControllerRecord::CommsBootNoise { count: 0 }),
+        );
+        assert!(
+            noise.ends_with("comms boot noise: 0 bytes that were not frames"),
+            "{noise}"
+        );
+        let lost = describe(
+            13,
+            Class::A,
+            &record_event(13, ControllerRecord::CommsLinkLost),
+        );
+        assert!(lost.ends_with("comms link lost"), "{lost}");
+    }
+
+    #[test]
+    fn a_ladder_record_from_before_its_body_existed_is_named_as_old() {
+        // The empty map the firmware wrote for a power cycle before km43
+        // 0.4.1: a count is required now, and the record is old, not bad.
+        let old = describe(
+            14,
+            Class::A,
+            &event(14, EventKind::COMMS_POWER_CYCLED, &[0xA0]),
+        );
+        assert!(
+            old.ends_with("empty body: written before km43 0.4.1 gave the record its fields"),
+            "{old}"
+        );
+        // A body that is neither empty nor valid is refused with its bytes.
+        let bad = describe(
+            15,
+            Class::A,
+            &event(15, EventKind::COMMS_POWER_CYCLED, &[0xA1, 0x01, 0x00]),
+        );
+        assert!(bad.contains("body refused"), "{bad}");
+        assert!(bad.ends_with("a10100"), "{bad}");
+    }
+
     #[test]
     fn a_record_the_tool_cannot_read_is_shown_as_its_bytes_not_skipped() {
         let garbage = describe(3, Class::B, &[0xFF, 0x00]);
@@ -300,11 +409,19 @@ mod tests {
             bad.contains("boot, body refused (boot reason 3 is not allocated): a10103"),
             "{bad}"
         );
-        // Another kind: its number and its body.
-        let lost = describe(5, Class::A, &event(5, EventKind::COMMS_LINK_LOST, &[0xA0]));
-        assert!(lost.contains("0x0801  at -  body a0"), "{lost}");
+        // A kind KM43 has no body for: its number and its bytes.
+        let other = describe(
+            5,
+            Class::A,
+            &event(5, EventKind::GENERATOR_STATE_CHANGED, &[0xA0]),
+        );
+        assert!(other.contains("0x0201  at -  body a0"), "{other}");
         // A payload whose event names another sequence says so.
-        let moved = describe(6, Class::A, &event(9, EventKind::COMMS_LINK_LOST, &[0xA0]));
+        let moved = describe(
+            6,
+            Class::A,
+            &event(9, EventKind::GENERATOR_STATE_CHANGED, &[0xA0]),
+        );
         assert!(moved.contains("(the event says seq 9)"), "{moved}");
     }
 }

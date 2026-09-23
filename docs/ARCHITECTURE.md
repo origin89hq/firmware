@@ -664,9 +664,8 @@ boot without a written boot count, which is a FRAM that did not answer
 or a new count that did not land on it, has no `boot_id` to state
 (F-039): the link task keeps its place on the roll and the link never
 comes up, the module powered as on every boot because a rail switched on
-at a later boot is what F-005 forbids, and the probe's log says why; the boot
-record carries the reason once origin89hq/km43#32 gives its body a
-shape. Records the
+at a later boot is what F-005 forbids, and the probe's log says why; KM43's
+boot body has no field for it, so nothing on the ring does. Records the
 link raises go to the recorder through a queue as deep as the protocol's
 event queue, which refuses when full.
 
@@ -909,9 +908,9 @@ switch is slew-limited, defaults on with the controller's pin high-impedance,
 and the pin drives low to cut it (A-23). The controller takes ownership once
 it has booted and applies its policy from there:
 
-- The recovery ladder's cuts (L-111, L-112), each logged; the count L-111
-  names goes into the record once origin89hq/km43#32 gives the body its
-  shape, and is on the probe's log until then. The cuts of the last hour
+- The recovery ladder's cuts (L-111, L-112), each recorded with the count
+  L-111 names, and the third rung with the branch it took: `comms
+  unrecoverable` says whether the rail was left on or off (KM43 P-215). The cuts of the last hour
   are on the FRAM before the rail goes off, and a cut whose count does not
   land is not made and the ladder asks again. The rail task never waits on
   the part for it: a module reset asked while the count goes out, or in the

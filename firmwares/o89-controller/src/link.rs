@@ -363,6 +363,9 @@ async fn episode(
     }
     let mut chunk = [0u8; 64];
     let mut last_byte = Instant::now();
+    // Bytes pushed since the reader last handed up a frame, a refusal or an
+    // abandoned run: what a refused run cost, for the boot noise (F-031).
+    let mut run: u32 = 0;
     // Bounded by the cut the state machine asks for, and every turn by the
     // tick: the read waits `TICK` at most.
     loop {
@@ -372,8 +375,12 @@ async fn episode(
             Ok(Ok(count)) => {
                 last_byte = Instant::now();
                 for byte in chunk.get(..count).unwrap_or(&[]) {
+                    run = run.saturating_add(1);
                     let ended = match reader.push(*byte) {
                         Received::Frame(frame) => {
+                            // A frame's bytes, malformed or not, are not
+                            // noise (F-031).
+                            run = 0;
                             #[cfg(feature = "frames")]
                             counts.frame(frame);
                             if let Ok(envelope) = LinkEnvelope::decode(frame) {
@@ -391,7 +398,6 @@ async fn episode(
                                 }
                                 perform(link, &mut tx, writer, &actions).await
                             } else {
-                                link.noise();
                                 None
                             }
                         }
@@ -400,7 +406,8 @@ async fn episode(
                             counts.refused(refused);
                             #[cfg(not(feature = "frames"))]
                             let _ = refused;
-                            link.noise();
+                            link.noise(run);
+                            run = 0;
                             None
                         }
                         Received::Nothing => None,
@@ -412,10 +419,11 @@ async fn episode(
             }
             Ok(Err(error)) => {
                 // An overrun or a line error: the bytes it lost are noise.
+                // The bytes it lost were never read, so they are not counted
+                // as non-frames; the error is on the probe's log.
                 #[cfg(feature = "frames")]
                 counts.error(error);
                 note_rx_error(error);
-                link.noise();
             }
             Err(_) => {
                 // The incomplete-frame timeout is the reader's, fed with
@@ -424,7 +432,8 @@ async fn episode(
                 if let Received::Abandoned = reader.tick(None, quiet) {
                     #[cfg(feature = "frames")]
                     counts.abandoned();
-                    link.noise();
+                    link.noise(run);
+                    run = 0;
                 }
             }
         }
@@ -873,7 +882,7 @@ fn log(event: o89_core::LinkEvent) {
 
 fn note_line(note: Note) {
     match note {
-        Note::RomText { .. } | Note::UnexpectedAck(_) => defmt::info!("link: {}", note),
+        Note::UnexpectedAck(_) => defmt::info!("link: {}", note),
         Note::Refused(_)
         | Note::RequestFailed(_)
         | Note::Malformed(_)

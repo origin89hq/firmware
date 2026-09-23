@@ -19,7 +19,7 @@ use km43::{
 use o89_core::{
     Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Keep,
     Link, LinkEvent, LinkText, Millis, NotKept, Note, Outgoing, Rail, RailEvent, RailLine,
-    RailRequest, RailSequencer, Recovery, Revision, Tick,
+    RailRequest, RailSequencer, RailThroughReset, Recovery, Revision, Tick,
 };
 
 use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
@@ -55,8 +55,13 @@ struct Bench {
     /// What each tick asked for by itself, apart from the answers to frames
     /// that arrived in its step; empty batches are not kept.
     ticked: Vec<(Tick, Actions)>,
-    /// Refusals and abandoned runs the controller's reader reported.
+    /// Bytes the controller's reader refused or abandoned, all attempts.
     noise: u32,
+    /// Bytes pushed since the reader last handed up a frame, a refusal or
+    /// an abandoned run.
+    run: u32,
+    /// Runs the reader refused or abandoned, all attempts.
+    refusals: u32,
     /// What the comms processor's module has been told to be.
     module_booted: bool,
     /// Whether the ladder's cuts land on the FRAM when the adapter keeps
@@ -68,11 +73,16 @@ impl Bench {
     /// Boot at one second on the tick: the rail powered, the module coming
     /// up when it settles.
     fn new(caps: Capabilities) -> Self {
+        Self::on(Revision::A, caps)
+    }
+
+    /// As [`Bench::new`], on the board revision given.
+    fn on(revision: Revision, caps: Capabilities) -> Self {
         let now = Tick::from_millis(1_000);
-        let mut sequencer = RailSequencer::new(Revision::A);
+        let mut sequencer = RailSequencer::new(revision);
         let _ = sequencer.power_on(now);
         let rail = Rail::new(sequencer, None);
-        Self {
+        let mut bench = Self {
             now,
             link: Link::new(identity(), now),
             comms: HostileComms::new(caps),
@@ -83,9 +93,28 @@ impl Bench {
             asked: Vec::new(),
             ticked: Vec::new(),
             noise: 0,
+            run: 0,
+            refusals: 0,
             module_booted: false,
             keeps_land: true,
+        };
+        // A board whose rail stays on through a reset has a module already
+        // powered at boot, which the adapter says at once.
+        if let RailThroughReset::On = revision.rail_through_reset() {
+            bench.settled();
         }
+        bench
+    }
+
+    /// The module is powered and booting: the link is told, and the peer
+    /// boots.
+    fn settled(&mut self) {
+        let now = self.now;
+        let actions = self.link.module_settled(now);
+        self.perform(actions);
+        let bytes = self.comms.boot(now).expect("the peer boots");
+        self.module_booted = true;
+        self.feed(&bytes);
     }
 
     fn run_for(&mut self, span: Millis) {
@@ -101,13 +130,7 @@ impl Bench {
         let turn = self.rail.turn(now, None, None);
         if let Some(event) = turn.event {
             match event {
-                RailEvent::Settled => {
-                    let actions = self.link.module_settled(now);
-                    self.perform(actions);
-                    let bytes = self.comms.boot(now).expect("the peer boots");
-                    self.module_booted = true;
-                    self.feed(&bytes);
-                }
+                RailEvent::Settled => self.settled(),
                 RailEvent::PowerCycled { .. } | RailEvent::Unrecoverable => {}
             }
         }
@@ -202,16 +225,21 @@ impl Bench {
     fn receive(&mut self, bytes: &[u8]) -> Vec<Actions> {
         let mut out = Vec::new();
         for byte in bytes {
+            self.run = self.run.saturating_add(1);
             match self.reader.push(*byte) {
                 Received::Frame(frame) => {
+                    // A frame's bytes, malformed or not, are not noise.
+                    self.run = 0;
                     let Ok(envelope) = LinkEnvelope::decode(frame) else {
                         continue;
                     };
                     out.push(self.link.received(envelope, self.now));
                 }
                 Received::Dropped(_) | Received::Abandoned => {
-                    self.noise = self.noise.saturating_add(1);
-                    self.link.noise();
+                    self.refusals = self.refusals.saturating_add(1);
+                    self.noise = self.noise.saturating_add(self.run);
+                    self.link.noise(self.run);
+                    self.run = 0;
                 }
                 Received::Nothing => {}
             }
@@ -1003,9 +1031,10 @@ fn l_110_six_seconds_of_silence_is_link_down_with_the_record_and_no_cut() {
         (DEAD_AFTER.as_millis()..=DEAD_AFTER.as_millis() + 20).contains(&silence),
         "dropped after {silence} ms"
     );
+    // The clean boot's attempt, recorded at the link, then the loss.
     assert_eq!(
         bench.events().iter().map(|(_, e)| *e).collect::<Vec<_>>(),
-        vec![LinkEvent::LinkLost]
+        vec![LinkEvent::BootNoise { count: 0 }, LinkEvent::LinkLost]
     );
     assert!(bench.cuts().is_empty(), "no cut inside the first minute");
 }
@@ -1048,14 +1077,16 @@ fn l_112_the_third_cycle_in_an_hour_leaves_the_rail_on_and_raises_unrecoverable_
         .iter()
         .filter_map(|(_, e)| match e {
             LinkEvent::PowerCycled { count } => Some(*count),
-            LinkEvent::LinkLost | LinkEvent::Unrecoverable => None,
+            LinkEvent::LinkLost | LinkEvent::Unrecoverable { .. } | LinkEvent::BootNoise { .. } => {
+                None
+            }
         })
         .collect();
     assert_eq!(cycles, vec![1, 2, 3], "three cycles, each counted");
     let raised = bench
         .events()
         .iter()
-        .filter(|(_, e)| *e == LinkEvent::Unrecoverable)
+        .filter(|(_, e)| *e == LinkEvent::Unrecoverable { rail_on: true })
         .count();
     assert_eq!(raised, 1, "the third rung raised once, not every minute");
     assert_eq!(
@@ -1064,6 +1095,38 @@ fn l_112_the_third_cycle_in_an_hour_leaves_the_rail_on_and_raises_unrecoverable_
         "revision A leaves the rail on"
     );
     assert!(!bench.link.is_up());
+}
+
+#[test]
+fn l_112_the_third_rung_on_revision_b_leaves_the_rail_off_and_raises_unrecoverable_saying_so() {
+    // Capabilities: answers nothing, from boot: a module that never speaks,
+    // on the board that executes the third rung.
+    let mut bench = Bench::on(
+        Revision::B,
+        Capabilities {
+            answers: Answers::Nothing,
+            ..Capabilities::default()
+        },
+    );
+    // Three cycles a minute apart, then the rung: the rail off for its
+    // pause. Stopped inside the pause, before the rail comes back.
+    bench.run_for(Millis::from_millis(5 * 60 * 1_000));
+    let raised: Vec<LinkEvent> = bench
+        .events()
+        .iter()
+        .map(|(_, e)| *e)
+        .filter(|e| matches!(e, LinkEvent::Unrecoverable { .. }))
+        .collect();
+    assert_eq!(
+        raised,
+        vec![LinkEvent::Unrecoverable { rail_on: false }],
+        "the rung executed, raised once, and the record says the rail is off"
+    );
+    assert_eq!(
+        bench.rail.lines().rail,
+        RailLine::Off,
+        "revision B leaves the rail off for the pause"
+    );
 }
 
 #[test]
@@ -1097,13 +1160,14 @@ fn l_113_an_install_in_flight_suspends_the_first_rung_too() {
     assert!(bench.link.is_up());
     bench.comms.capabilities().answers = Answers::Nothing;
     bench.install_in_flight = true;
+    let recorded_before = bench.events().len();
     bench.run_for(Millis::from_millis(30_000));
     assert!(
         bench.link.is_up(),
         "no link loss while a release is written"
     );
     assert!(bench.drops().is_empty());
-    assert!(bench.events().is_empty(), "nothing recorded");
+    assert_eq!(bench.events().len(), recorded_before, "nothing recorded");
     bench.install_in_flight = false;
     bench.run_for(Millis::from_millis(200));
     assert_eq!(
@@ -1196,8 +1260,22 @@ fn l_013_request_ids_come_from_our_own_counter_and_climb() {
             .any(|h| matches!(h, Heard::HeartbeatAck { .. }))
     );
 }
+/// The boot-noise records, in order.
+fn boot_noise(bench: &Bench) -> Vec<u32> {
+    bench
+        .events()
+        .iter()
+        .filter_map(|(_, event)| match event {
+            LinkEvent::BootNoise { count } => Some(*count),
+            LinkEvent::LinkLost
+            | LinkEvent::PowerCycled { .. }
+            | LinkEvent::Unrecoverable { .. } => None,
+        })
+        .collect()
+}
+
 #[test]
-fn f_031_bytes_that_are_not_frames_are_counted_per_module_boot_and_noted_at_link_up() {
+fn f_031_the_bytes_a_boot_attempt_reads_as_non_frames_are_recorded_once_at_link_up() {
     // Capabilities: rom_text.
     let mut bench = Bench::new(Capabilities {
         rom_text: 200,
@@ -1205,29 +1283,47 @@ fn f_031_bytes_that_are_not_frames_are_counted_per_module_boot_and_noted_at_link
     });
     bench.run_for(Millis::from_millis(1_000));
     assert!(bench.link.is_up());
-    assert!(bench.noise > 0, "the ROM's text refused as frames");
-    let noted: Vec<u32> = bench
-        .notes()
-        .iter()
-        .filter_map(|note| match note {
-            Note::RomText { count } => Some(*count),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(noted, vec![bench.noise], "counted once, at the statement");
-    // A quiet link adds nothing to the next boot's count.
-    bench.comms.capabilities().rom_text = 0;
+    assert!(
+        bench.noise > 200,
+        "every byte of the ROM's text counted, and its delimiters: {}",
+        bench.noise
+    );
+    assert_eq!(
+        boot_noise(&bench),
+        vec![bench.noise],
+        "recorded once, at the link"
+    );
+    // The peer rebooting on its own is no attempt of the controller's, and
+    // stray bytes after the link is up belong to no attempt.
+    bench.comms.capabilities().rom_text = 50;
     let bytes = bench.comms.boot(bench.now).expect("the peer builds it");
     bench.feed(&bytes);
-    let noted_again: Vec<u32> = bench
-        .notes()
+    assert_eq!(boot_noise(&bench).len(), 1, "one attempt, one record");
+}
+
+#[test]
+fn f_031_an_attempt_the_controller_abandons_is_recorded_zero_included() {
+    // Capabilities: answers nothing, from boot, with no ROM text: a module
+    // that never speaks, cut by the ladder, each boot an attempt abandoned
+    // at the next.
+    let mut bench = Bench::new(Capabilities {
+        answers: Answers::Nothing,
+        ..Capabilities::default()
+    });
+    bench.run_for(Millis::from_millis(3 * 60 * 1_000));
+    let recorded = boot_noise(&bench);
+    let cycles = bench
+        .events()
         .iter()
-        .filter_map(|note| match note {
-            Note::RomText { count } => Some(*count),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(noted_again.len(), 1, "nothing to note on a clean boot");
+        .filter(|(_, e)| matches!(e, LinkEvent::PowerCycled { .. }))
+        .count();
+    assert!(cycles >= 2, "{cycles} cycles");
+    assert_eq!(
+        recorded.len(),
+        cycles,
+        "each cycle closes the attempt before it"
+    );
+    assert!(recorded.iter().all(|count| *count == 0), "{recorded:?}");
 }
 
 #[test]
@@ -1407,7 +1503,7 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
     });
     bench.run_for(Millis::from_millis(1_000));
     assert!(bench.link.is_up(), "up through a cut statement");
-    let before = bench.noise;
+    let before = bench.refusals;
     let sent_before = bench.comms.sent.len();
     for _ in 0..1_000 {
         let bytes = bench
@@ -1423,7 +1519,7 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
     let sent = bench.comms.sent.len() - sent_before;
     assert!(sent >= 1_000);
     assert_eq!(
-        bench.noise - before,
+        bench.refusals - before,
         u32::try_from(sent).expect("fits"),
         "every cut frame refused, once"
     );
