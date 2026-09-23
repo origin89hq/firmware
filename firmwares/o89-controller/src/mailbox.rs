@@ -23,9 +23,9 @@ use cortex_m::peripheral::SCB;
 use embassy_time::{Duration, with_timeout};
 use km43::DownloadReason;
 use o89_core::mailbox::{
-    DATA_BYTES, DownloadEntry, MAGIC, Op, RING_BYTES, Ring, RingPage, Status, VERSION,
+    DATA_BYTES, DownloadEntry, DropAnswer, MAGIC, Op, RING_BYTES, Ring, RingPage, Status, VERSION,
 };
-use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, Wants};
+use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, RingError, Wants};
 use portable_atomic::{AtomicU8, AtomicU32};
 
 use crate::fram::Fram;
@@ -141,7 +141,11 @@ pub async fn serve(parts: Parts<'_>) {
             None => (Status::NoNor, 0),
         },
         Some(Op::EraseNorBlock) => match parts.ring {
-            Some(ring) => erase_nor(ring, arg0, parts.scratch).await,
+            Some(ring) => erase_nor(ring, arg0).await,
+            None => (Status::NoNor, 0),
+        },
+        Some(Op::DropOldest) => match parts.ring {
+            Some(ring) => drop_oldest(ring, parts.scratch).await,
             None => (Status::NoNor, 0),
         },
         Some(Op::Reboot) => {
@@ -369,10 +373,38 @@ async fn read_nor(ring: &mut NorRing<Nor>, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-async fn erase_nor(ring: &mut NorRing<Nor>, block: u32, scratch: &mut [u8]) -> (Status, u32) {
-    match ring.erase_block(block, scratch).await {
+/// A block outside the ring, erased; one of the ring's is refused (#78).
+async fn erase_nor(ring: &mut NorRing<Nor>, block: u32) -> (Status, u32) {
+    match ring.erase_block(block).await {
         Ok(()) => (Status::Ok, 0),
-        Err(o89_core::RingError::OutOfRange) => (Status::OutOfRange, 0),
-        Err(_) => (Status::Bus, 0),
+        Err(RingError::OutOfRange) => (Status::OutOfRange, 0),
+        Err(RingError::InsideTheRing(_)) => (Status::InsideTheRing, 0),
+        Err(error) => {
+            defmt::error!("mailbox: the erase failed: {}", error);
+            (Status::Bus, 0)
+        }
+    }
+}
+
+/// The ring's oldest block, erased, and what it left.
+async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u32) {
+    match ring.drop_oldest(scratch).await {
+        Ok(dropped) => {
+            defmt::warn!(
+                "mailbox: the host dropped the ring's oldest block: {}",
+                dropped
+            );
+            match DropAnswer::encode(dropped) {
+                Some(bytes) => {
+                    put(&bytes);
+                    (Status::Ok, u32::try_from(bytes.len()).unwrap_or(0))
+                }
+                None => (Status::Ok, 0),
+            }
+        }
+        Err(error) => {
+            defmt::error!("mailbox: the drop failed: {}", error);
+            (Status::Bus, 0)
+        }
     }
 }

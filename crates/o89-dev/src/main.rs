@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use o89_core::Revision;
 use o89_core::mailbox::DownloadEntry;
+use o89_core::{Dropped, Revision};
 
 /// The route into the module's ROM, on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -124,8 +124,16 @@ enum Command {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
         count: u64,
     },
-    /// Erase NOR blocks of 4 KiB, one per request; the ring finds its head
-    /// again after each block of its own.
+    /// Drop the event ring's oldest blocks, one per request, the oldest
+    /// first: the only way the ring's own blocks are erased, so a sequence
+    /// never comes back (#78). Stops early when the ring is empty.
+    DropRing {
+        /// How many blocks.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        count: u32,
+    },
+    /// Erase NOR blocks of 4 KiB outside the event ring, one per request;
+    /// a block of the ring's own is refused (#78).
     EraseNor {
         /// The first block, counted from the part's start.
         block: u32,
@@ -320,6 +328,27 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Ring { count } => ring::newest(&mut link, count),
+        Command::DropRing { count } => {
+            for _ in 0..count {
+                match link.drop_oldest()? {
+                    Dropped::Block {
+                        block,
+                        oldest: Some(oldest),
+                    } => println!("dropped ring block {block}; the oldest record is now {oldest}"),
+                    Dropped::Block {
+                        block,
+                        oldest: None,
+                    } => println!(
+                        "dropped ring block {block}; the ring is empty and starts again at one"
+                    ),
+                    Dropped::Nothing => {
+                        println!("the ring holds no records");
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
         Command::EraseNor { block, count } => {
             if count == 0 {
                 bail!("nothing to erase");
@@ -509,6 +538,15 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn dropping_the_ring_takes_one_block_unless_told_how_many_and_never_none() {
+        let one = Cli::try_parse_from(["o89-dev", "drop-ring"]).expect("parses");
+        assert!(matches!(one.command, Command::DropRing { count: 1 }));
+        let three = Cli::try_parse_from(["o89-dev", "drop-ring", "--count", "3"]).expect("parses");
+        assert!(matches!(three.command, Command::DropRing { count: 3 }));
+        assert!(Cli::try_parse_from(["o89-dev", "drop-ring", "--count", "0"]).is_err());
     }
 
     #[test]

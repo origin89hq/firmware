@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use o89_core::mailbox::{
-    DATA_BYTES, DownloadEntry, MAGIC, MAILBOX_ADDRESS, Op, RING_BYTES, Ring, RingPage, Status,
-    VERSION, offset,
+    DATA_BYTES, DownloadEntry, DropAnswer, MAGIC, MAILBOX_ADDRESS, Op, RING_BYTES, Ring, RingPage,
+    Status, VERSION, offset,
 };
-use o89_core::{Address, FRAM_BYTES, Fram, Refused};
+use o89_core::{Address, Dropped, FRAM_BYTES, Fram, Refused};
 use probe_rs::probe::list::Lister;
 use probe_rs::{MemoryInterface, Permissions, Session};
 
@@ -74,6 +74,9 @@ impl Answer {
             ),
             Status::ModuleRefused => bail!(
                 "{what}: the module answered refused_outside_window: it runs an image whose window had closed when the knock arrived"
+            ),
+            Status::InsideTheRing => bail!(
+                "{what}: the block is the ring's; only the oldest goes, with `drop-ring` (#78)"
             ),
         }
     }
@@ -253,7 +256,8 @@ impl Link {
             | Status::LinkBusy
             | Status::NoStore
             | Status::BridgeRefused
-            | Status::ModuleRefused => Err(Refused::Bus(anyhow!(
+            | Status::ModuleRefused
+            | Status::InsideTheRing => Err(Refused::Bus(anyhow!(
                 "writing the FRAM: {:?}",
                 answer.status
             ))),
@@ -289,7 +293,17 @@ impl Link {
             .ok("reading the ring")
     }
 
-    /// Erase one 4 KiB block of the NOR, counted from the part's start.
+    /// Erase the ring's oldest block, and say what that left.
+    pub fn drop_oldest(&mut self) -> Result<Dropped> {
+        let data = self
+            .request(Op::DropOldest, 0, 0, &[])?
+            .ok("dropping the oldest block")?;
+        DropAnswer::decode(&data)
+            .with_context(|| format!("a drop answered in {} bytes", data.len()))
+    }
+
+    /// Erase one 4 KiB block of the NOR outside the ring, counted from the
+    /// part's start.
     pub fn erase_nor_block(&mut self, block: u32) -> Result<()> {
         self.request(Op::EraseNorBlock, block, 0, &[])?
             .ok("erasing a block")?;

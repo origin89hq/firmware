@@ -583,4 +583,57 @@ mod tests {
         assert_eq!(seqs(&mut again), found);
         assert_eq!(again.damage().failed_crc, 0);
     }
+
+    /// The bench's drop of the ring's oldest block, the power cut at every
+    /// byte of it (#78): the next boot opens with no damage, reads records
+    /// that stay contiguous up to the last one, never hands out a sequence
+    /// it already used, and the drop can be asked again.
+    #[test]
+    fn f_023_a_drop_of_the_oldest_block_cut_at_any_byte_never_reuses_a_sequence() {
+        let full = full();
+        let crashes = crash_nor_at_every_step(
+            &full.part,
+            |part| {
+                let mut scratch = [0u8; SCRATCH];
+                let mut ring = open(part);
+                let outcome = block_on(ring.drop_oldest(&mut scratch))
+                    .map(|_| ())
+                    .map_err(|_| ());
+                close(part, ring);
+                outcome
+            },
+            |part, step| {
+                let mut ring = open(part);
+                let found = seqs(&mut ring);
+                assert!(
+                    found.windows(2).all(|w| w[1] == w[0].saturating_add(1)),
+                    "cut at {step}"
+                );
+                assert_eq!(found.last(), Some(&full.total), "cut at {step}");
+                assert!(
+                    (full.block_one..=full.block_two).contains(&found[0]),
+                    "cut at {step}: {}",
+                    found[0]
+                );
+                assert_eq!(ring.damage().failed_crc, 0, "cut at {step}");
+                let next = append(&mut ring).expect("appends after any cut");
+                assert_eq!(next, full.total.saturating_add(1), "cut at {step}");
+                let mut scratch = [0u8; SCRATCH];
+                let again = block_on(ring.drop_oldest(&mut scratch)).expect("drops again");
+                assert!(
+                    matches!(
+                        again,
+                        o89_core::Dropped::Block {
+                            oldest: Some(_),
+                            ..
+                        }
+                    ),
+                    "cut at {step}: {again:?}"
+                );
+                close(part, ring);
+            },
+        )
+        .expect("the path runs uncut");
+        assert_eq!(crashes.steps, ERASE, "one block, a byte at a time");
+    }
 }

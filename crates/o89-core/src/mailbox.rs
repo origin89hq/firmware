@@ -26,6 +26,7 @@
 //! controller's linker puts it, stated here so the two cannot disagree.
 
 use crate::record::{Class, MAX_PAYLOAD};
+use crate::ring::Dropped;
 
 /// Where the mailbox sits in the controller's RAM: the last 8 KiB, which
 /// `memory.x` keeps out of the stack and the runtime never zeroes.
@@ -38,8 +39,12 @@ pub const MAILBOX_BYTES: usize = 8192;
 /// The word at offset zero when a mailbox is there: `O89M`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"O89M");
 
-/// The protocol's version, at offset four.
-pub const VERSION: u32 = 2;
+/// The protocol's version, at offset four. A host that reads another
+/// refuses the part, because an operation's meaning can change under the
+/// same number: 3 is where `EraseNorBlock` stopped erasing the ring's own
+/// blocks (#78), and a newer host that took a version 2 part's erase for
+/// a refusing one would recreate the hole it exists to prevent.
+pub const VERSION: u32 = 3;
 
 /// Bytes of data a request or an answer carries: enough for the client
 /// table's record in one write.
@@ -115,7 +120,8 @@ pub enum Op {
     WriteFram,
     /// `ARG1` bytes of the NOR from `ARG0`.
     ReadNor,
-    /// Erase the NOR block `ARG0`.
+    /// Erase the NOR block `ARG0`, which has to lie outside the ring:
+    /// the ring's own are refused with [`Status::InsideTheRing`] (#78).
     EraseNorBlock,
     /// Answer, then reset the part.
     Reboot,
@@ -129,6 +135,8 @@ pub enum Op {
     /// The ring's records from the sequence `ARG1 << 32 | ARG0`, oldest
     /// first, as many as the data holds, laid out as a [`RingPage`].
     ReadRing,
+    /// Erase the ring's oldest block, answered as a [`DropAnswer`].
+    DropOldest,
 }
 
 impl Op {
@@ -145,6 +153,7 @@ impl Op {
             Self::Download => 7,
             Self::Normal => 8,
             Self::ReadRing => 9,
+            Self::DropOldest => 10,
         }
     }
 
@@ -161,6 +170,7 @@ impl Op {
             7 => Some(Self::Download),
             8 => Some(Self::Normal),
             9 => Some(Self::ReadRing),
+            10 => Some(Self::DropOldest),
             _ => None,
         }
     }
@@ -234,6 +244,8 @@ pub enum Status {
     /// The module answered `refused_outside_window` (L-191): it is running
     /// an image whose window had closed when the knock arrived.
     ModuleRefused,
+    /// A block of the ring's own, which only [`Op::DropOldest`] erases.
+    InsideTheRing,
 }
 
 impl Status {
@@ -252,6 +264,7 @@ impl Status {
             Self::NoStore => 8,
             Self::BridgeRefused => 9,
             Self::ModuleRefused => 10,
+            Self::InsideTheRing => 11,
         }
     }
 
@@ -270,6 +283,7 @@ impl Status {
             8 => Some(Self::NoStore),
             9 => Some(Self::BridgeRefused),
             10 => Some(Self::ModuleRefused),
+            11 => Some(Self::InsideTheRing),
             _ => None,
         }
     }
@@ -505,9 +519,83 @@ impl RingPage {
     }
 }
 
+/// The answer to [`Op::DropOldest`]: nothing when the ring held no
+/// records, else the block erased, counted within the ring, and the oldest
+/// sequence left, zero for none, both little-endian.
+///
+/// ```text
+/// [ block: u32 | oldest: u64 ]
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropAnswer;
+
+impl DropAnswer {
+    /// The bytes of an answer that dropped a block.
+    pub const BYTES: usize = 12;
+
+    /// What the firmware lands in the data: nothing for
+    /// [`Dropped::Nothing`], twelve bytes for a block.
+    #[must_use]
+    pub fn encode(dropped: Dropped) -> Option<[u8; Self::BYTES]> {
+        match dropped {
+            Dropped::Nothing => None,
+            Dropped::Block { block, oldest } => {
+                let mut out = [0u8; Self::BYTES];
+                let (block_room, oldest_room) = out.split_at_mut(4);
+                block_room.copy_from_slice(&block.to_le_bytes());
+                oldest_room.copy_from_slice(&oldest.unwrap_or(0).to_le_bytes());
+                Some(out)
+            }
+        }
+    }
+
+    /// What the host reads back, or nothing for an answer of any length
+    /// but zero or twelve.
+    #[must_use]
+    pub fn decode(data: &[u8]) -> Option<Dropped> {
+        if data.is_empty() {
+            return Some(Dropped::Nothing);
+        }
+        let bytes: &[u8; Self::BYTES] = data.try_into().ok()?;
+        let (block, oldest) = bytes.split_at(4);
+        let block = u32::from_le_bytes(block.try_into().ok()?);
+        let oldest = u64::from_le_bytes(oldest.try_into().ok()?);
+        Some(Dropped::Block {
+            block,
+            oldest: Some(oldest).filter(|oldest| *oldest != 0),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drop_answer_reads_back_whatever_the_drop_did_and_refuses_any_other_length() {
+        let cases = [
+            Dropped::Nothing,
+            Dropped::Block {
+                block: 3,
+                oldest: Some(1_216),
+            },
+            Dropped::Block {
+                block: 0,
+                oldest: None,
+            },
+            Dropped::Block {
+                block: u32::MAX,
+                oldest: Some(u64::MAX),
+            },
+        ];
+        for dropped in cases {
+            let bytes = DropAnswer::encode(dropped);
+            let data: &[u8] = bytes.as_ref().map_or(&[], |b| b.as_slice());
+            assert_eq!(DropAnswer::decode(data), Some(dropped), "{dropped:?}");
+        }
+        assert_eq!(DropAnswer::decode(&[0; 11]), None);
+        assert_eq!(DropAnswer::decode(&[0; 13]), None);
+    }
 
     /// A page as the firmware lays it out, from `(seq, class, payload)`.
     fn page(header: RingPage, entries: &[(u64, Class, &[u8])], out: &mut [u8]) -> usize {
@@ -694,6 +782,7 @@ mod tests {
             Op::Download,
             Op::Normal,
             Op::ReadRing,
+            Op::DropOldest,
         ] {
             assert_eq!(Op::of(op.code()), Some(op));
         }
@@ -709,12 +798,13 @@ mod tests {
             Status::NoStore,
             Status::BridgeRefused,
             Status::ModuleRefused,
+            Status::InsideTheRing,
         ] {
             assert_eq!(Status::of(status.code()), Some(status));
         }
         assert_eq!(Op::of(0), None);
-        assert_eq!(Op::of(10), None);
-        assert_eq!(Status::of(11), None);
+        assert_eq!(Op::of(11), None);
+        assert_eq!(Status::of(12), None);
         for entry in [
             DownloadEntry::Reset,
             DownloadEntry::Knock,

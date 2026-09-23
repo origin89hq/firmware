@@ -123,6 +123,9 @@ pub enum RingError<E> {
     /// The payload is not an event, or names another sequence than the
     /// one the ring hands out next.
     NotTheNextEvent,
+    /// A block of the ring's own, which only
+    /// [`Ring::drop_oldest`] erases (#78).
+    InsideTheRing(u32),
     /// The part refused.
     Flash(E),
 }
@@ -131,6 +134,23 @@ impl<E> From<Unframed> for RingError<E> {
     fn from(unframed: Unframed) -> Self {
         Self::Unframed(unframed)
     }
+}
+
+/// What [`Ring::drop_oldest`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a drop nobody reports is a log that shrank without a word"]
+pub enum Dropped {
+    /// The ring held no records.
+    Nothing,
+    /// The block erased, counted within the ring, and the oldest sequence
+    /// the ring holds after it, if any.
+    Block {
+        /// The block, counted from the ring's first.
+        block: u32,
+        /// The oldest sequence left.
+        oldest: Option<u64>,
+    },
 }
 
 /// Whether a reader wants more.
@@ -271,21 +291,20 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         self.flash.read(at, into).await.map_err(RingError::Flash)
     }
 
-    /// Erase one erase block of the part, counted from the part's start,
-    /// and find the head again when the block was one of the ring's: the
-    /// bench tool's way to clear a part, one block per request so that
-    /// whoever feeds the watchdog gets a turn between two. Everything the
-    /// ring knew is found again from the bytes, as a boot would find it,
-    /// which is why the scratch is checked before the erase: a search
-    /// that cannot run after the bytes are gone would leave a head
-    /// describing bytes that are no longer there.
-    pub async fn erase_block(
-        &mut self,
-        block: u32,
-        scratch: &mut [u8],
-    ) -> Result<(), RingError<N::Error>> {
-        if scratch.len() < SCRATCH {
-            return Err(RingError::ScratchTooSmall(scratch.len()));
+    /// Erase one erase block of the part outside the ring, counted from the
+    /// part's start: the bench tool's way to clear what the ring does not
+    /// own, one block per request so that whoever feeds the watchdog gets a
+    /// turn between two. A block of the ring's own is refused (#78): an
+    /// erase anywhere but the oldest leaves a hole the head search reads
+    /// as the end of the log, and the next record reuses a sequence. The
+    /// ring's blocks go through [`drop_oldest`](Self::drop_oldest).
+    pub async fn erase_block(&mut self, block: u32) -> Result<(), RingError<N::Error>> {
+        let first = self.from.checked_div(Self::block_len()).unwrap_or(0);
+        let ours = block
+            .checked_sub(first)
+            .is_some_and(|index| index < self.blocks);
+        if ours {
+            return Err(RingError::InsideTheRing(block));
         }
         let from = block
             .checked_mul(Self::block_len())
@@ -296,17 +315,38 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if usize::try_from(to).map_or(true, |to| to > self.flash.capacity()) {
             return Err(RingError::OutOfRange);
         }
-        self.flash.erase(from, to).await.map_err(RingError::Flash)?;
-        let first = self.from.checked_div(Self::block_len()).unwrap_or(0);
-        let ours = block
-            .checked_sub(first)
-            .is_some_and(|index| index < self.blocks);
-        if ours {
-            self.damage = Damage::default();
-            self.floor = Floor::Unknown;
-            self.find_the_head(scratch).await?;
+        self.flash.erase(from, to).await.map_err(RingError::Flash)
+    }
+
+    /// Erase the block holding the oldest records, which is the block the
+    /// ring would erase next anyway, and find the head again from the bytes
+    /// as a boot would: the bench tool's way to shed the log, one block per
+    /// request. The order of the ring is kept, so a sequence never comes
+    /// back. When the oldest block is the head's, the ring held one block
+    /// of records and is empty after it, and the next record is one again.
+    ///
+    /// The scratch is checked before the erase: a search that cannot run
+    /// after the bytes are gone would leave a head describing bytes that
+    /// are no longer there.
+    pub async fn drop_oldest(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> Result<Dropped, RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
         }
-        Ok(())
+        if self.head.oldest.is_none() {
+            return Ok(Dropped::Nothing);
+        }
+        let (block, _) = self.run(scratch).await?;
+        self.erase(block).await?;
+        self.damage = Damage::default();
+        self.floor = Floor::Unknown;
+        self.find_the_head(scratch).await?;
+        Ok(Dropped::Block {
+            block,
+            oldest: self.head.oldest,
+        })
     }
 
     /// Append one event and answer the sequence it got.
@@ -601,20 +641,37 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         Ok(())
     }
 
-    /// The first sequence held: the first record after the erased block
-    /// ahead of the head, or, before the first wrap, the anchor's.
+    /// The first sequence held.
+    ///
+    /// Before the ring has wrapped, the records sit in one run in block
+    /// order and the oldest is the anchor's, the first block of the part
+    /// that holds any. Once it has wrapped, the oldest are the first found
+    /// walking forward from two past the head, over erased and closed
+    /// blocks alike: a dropped oldest block (#78) leaves two or more erased
+    /// blocks ahead of the head with older records after them, and stopping
+    /// at the first would answer with a newer block's sequence and hide
+    /// every record behind it.
+    ///
+    /// The last block tells the two apart in one probe: a ring that has
+    /// wrapped has written it, and one that has not has never reached it
+    /// unless the head is there. That keeps the walk to the gap ahead of
+    /// the head rather than every block of a young ring, which is a second
+    /// of reads on the part at every boot and every page turn.
     async fn find_the_oldest(
         &mut self,
         anchor: u64,
         scratch: &mut [u8],
     ) -> Result<Option<u64>, RingError<N::Error>> {
+        let last = self.blocks.saturating_sub(1);
+        if self.head.block != last && self.probe(last, scratch).await? == Probe::Erased {
+            return Ok(Some(anchor));
+        }
         let mut block = self.next_block(self.next_block(self.head.block));
         for _ in 0..self.blocks {
             yield_now().await;
             match self.probe(block, scratch).await? {
                 Probe::Records { first } => return Ok(Some(first)),
-                Probe::Erased => return Ok(Some(anchor)),
-                Probe::Closed => block = self.next_block(block),
+                Probe::Erased | Probe::Closed => block = self.next_block(block),
             }
         }
         Ok(Some(anchor))
@@ -1069,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn erasing_the_heads_block_finds_the_head_again_as_a_boot_would() {
+    fn dropping_the_only_block_of_records_leaves_a_fresh_ring() {
         let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         for _ in 0..3 {
@@ -1077,7 +1134,13 @@ mod tests {
         }
         assert_eq!(ring.next_seq(), 4);
         let mut scratch = [0u8; SCRATCH];
-        block_on(ring.erase_block(0, &mut scratch)).expect("erases");
+        assert_eq!(
+            block_on(ring.drop_oldest(&mut scratch)),
+            Ok(Dropped::Block {
+                block: 0,
+                oldest: None
+            })
+        );
         assert_eq!(
             ring.head(),
             Head {
@@ -1088,13 +1151,168 @@ mod tests {
             },
             "a ring with nothing on it is a fresh ring"
         );
+        assert_eq!(
+            block_on(ring.drop_oldest(&mut scratch)),
+            Ok(Dropped::Nothing),
+            "and there is nothing more to drop"
+        );
         assert_eq!(append(&mut ring, None), 1);
         let (_, count, next) = read(&mut ring, 1);
         assert_eq!((count, next), (1, 2));
     }
 
+    /// Past a wrap, every drop takes the oldest block and nothing else: the
+    /// oldest sequence climbs, the next one stays where it was, what is left
+    /// reads back contiguous, and a boot finds the same ring (#78).
     #[test]
-    fn an_undersized_scratch_is_refused_before_anything_is_erased() {
+    fn f_023_dropping_the_oldest_block_sheds_the_old_end_and_never_reuses_a_sequence() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open_with(&mut part, 4);
+        for _ in 0..60 {
+            append(&mut ring, None);
+        }
+        let next = ring.next_seq();
+        let mut oldest = ring.head().oldest.expect("records");
+        assert!(oldest > 1, "the ring has wrapped");
+        let mut scratch = [0u8; SCRATCH];
+        let mut dropped = 0;
+        // Bounded: a drop that leaves records moves the oldest past a
+        // block's worth, and four blocks hold at most three of them.
+        for _ in 0..5 {
+            match block_on(ring.drop_oldest(&mut scratch)).expect("drops") {
+                Dropped::Block {
+                    oldest: Some(left), ..
+                } => {
+                    dropped += 1;
+                    assert!(left > oldest, "{left} after {oldest}");
+                    assert_eq!(ring.next_seq(), next, "the next sequence never moves back");
+                    let (seqs, count, answered) = read(&mut ring, 1);
+                    assert_eq!(
+                        count as u64,
+                        next - left,
+                        "every record from the oldest left"
+                    );
+                    assert!(seqs[..count].iter().copied().eq(left..next), "contiguous");
+                    assert_eq!(answered, next);
+                    let head = ring.head();
+                    close(&mut part, ring);
+                    ring = open_with(&mut part, 4);
+                    assert_eq!(ring.head(), head, "a boot finds the same ring");
+                    oldest = left;
+                }
+                Dropped::Block { oldest: None, .. } => {
+                    dropped += 1;
+                    assert_eq!(
+                        ring.next_seq(),
+                        1,
+                        "the last block went: the log starts over"
+                    );
+                    break;
+                }
+                Dropped::Nothing => panic!("records were left"),
+            }
+        }
+        assert!(dropped >= 2, "{dropped} drops");
+        assert_eq!(
+            block_on(ring.drop_oldest(&mut scratch)),
+            Ok(Dropped::Nothing)
+        );
+    }
+
+    /// A drop takes one block's records and no more, wherever the head is:
+    /// with the head low and the ring wrapped, the two erased blocks ahead
+    /// of it are followed by older records, which have to stay readable.
+    /// The records a block holds, counted from its bytes.
+    fn records_in<const E: usize>(ring: &mut Ring<Part<E>>, block: u32) -> u64 {
+        let mut bytes = [0u8; ERASE];
+        let at = block
+            .checked_mul(u32::try_from(ERASE).expect("fits"))
+            .expect("inside the part");
+        block_on(ring.read_raw(at, &mut bytes)).expect("reads");
+        let mut count = 0u64;
+        let mut offset = 0usize;
+        while let Some(found) = bytes.get(offset..).and_then(record::verify) {
+            count = count.saturating_add(1);
+            offset = offset.saturating_add(record::framed_len(found.payload.len()));
+        }
+        count
+    }
+
+    #[test]
+    fn f_023_a_drop_loses_the_oldest_blocks_records_and_no_others_wherever_the_head_is() {
+        // About nineteen records a block: every fill from one that has
+        // wrapped to two turns of the ring later, so the head sits in every
+        // block with the drop taken there.
+        let wrapped = 7 * 19 + 1;
+        for fill in wrapped..wrapped + 16 * 19 {
+            let mut part: Part<ERASE> = fresh();
+            let mut ring = open_with(&mut part, 8);
+            for _ in 0..fill {
+                append(&mut ring, None);
+            }
+            let next = ring.next_seq();
+            let (_, before, _) = read(&mut ring, 1);
+            let before = before as u64;
+            let mut scratch = [0u8; SCRATCH];
+            let (oldest_block, _) = block_on(ring.run(&mut scratch)).expect("walks");
+            let in_it = records_in(&mut ring, oldest_block);
+            let Dropped::Block {
+                block,
+                oldest: Some(left),
+            } = block_on(ring.drop_oldest(&mut scratch)).expect("drops")
+            else {
+                panic!("fill {fill}: a wrapped ring holds more than one block");
+            };
+            assert_eq!(block, oldest_block, "fill {fill}: the oldest block went");
+            let (seqs, after, answered) = read(&mut ring, 1);
+            let after = after as u64;
+            assert_eq!(
+                before - after,
+                in_it,
+                "fill {fill}: that block's records and no others"
+            );
+            assert_eq!(seqs[0], left, "fill {fill}");
+            assert_eq!(left, next - after, "fill {fill}: the rest reads to the end");
+            assert_eq!(answered, next, "fill {fill}");
+            let head = ring.head();
+            close(&mut part, ring);
+            let again = open_with(&mut part, 8);
+            assert_eq!(again.head(), head, "fill {fill}: a boot agrees");
+        }
+    }
+
+    /// Bytes a boot reads to open a ring of `blocks` blocks holding twenty
+    /// records in its first.
+    fn open_reads(blocks: u32) -> usize {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open_with(&mut part, blocks);
+        for _ in 0..20 {
+            append(&mut ring, None);
+        }
+        close(&mut part, ring);
+        let before = part.read;
+        let ring = open_with(&mut part, blocks);
+        close(&mut part, ring);
+        part.read.saturating_sub(before)
+    }
+
+    /// A young ring's boot does not walk the blocks it has never reached to
+    /// find its oldest record: on the part that is 3712 of them and a
+    /// second of reads, at every boot and every page turn. Doubling the
+    /// ring adds a step of the head search and nothing like a probe per
+    /// block.
+    #[test]
+    fn f_023_a_young_rings_boot_reads_about_the_same_however_many_blocks_it_has() {
+        let small = open_reads(16);
+        let large = open_reads(32);
+        assert!(
+            large < small.saturating_add(16 * HEADER),
+            "{small} bytes for 16 blocks and {large} for 32: a probe per block"
+        );
+    }
+
+    #[test]
+    fn an_undersized_scratch_is_refused_before_anything_is_dropped() {
         let mut part: Part<ERASE> = fresh();
         let mut ring = open(&mut part);
         for _ in 0..3 {
@@ -1103,7 +1321,7 @@ mod tests {
         let before = ring.head();
         let mut small = [0u8; SCRATCH - 1];
         assert_eq!(
-            block_on(ring.erase_block(0, &mut small)),
+            block_on(ring.drop_oldest(&mut small)),
             Err(RingError::ScratchTooSmall(SCRATCH - 1))
         );
         assert_eq!(ring.head(), before, "the head still describes the bytes");
@@ -1113,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn erasing_a_block_outside_the_ring_leaves_the_head_alone() {
+    fn a_block_outside_the_ring_is_erased_and_one_inside_it_is_refused() {
         let mut part: Part<ERASE> = fresh();
         // Four of the part's thirty-two blocks are the ring's.
         let mut ring = open_with(&mut part, 4);
@@ -1121,12 +1339,19 @@ mod tests {
             append(&mut ring, None);
         }
         let before = ring.head();
-        let mut scratch = [0u8; SCRATCH];
-        block_on(ring.erase_block(6, &mut scratch)).expect("erases");
+        block_on(ring.erase_block(6)).expect("erases");
+        assert_eq!(ring.head(), before);
+        for block in 0..4 {
+            assert_eq!(
+                block_on(ring.erase_block(block)),
+                Err(RingError::InsideTheRing(block)),
+                "only the oldest goes, through drop_oldest (#78)"
+            );
+        }
         assert_eq!(ring.head(), before);
         let blocks = u32::try_from(PART / ERASE).expect("fits");
         assert_eq!(
-            block_on(ring.erase_block(blocks, &mut scratch)),
+            block_on(ring.erase_block(blocks)),
             Err(RingError::OutOfRange),
             "the block after the last is past the part"
         );
