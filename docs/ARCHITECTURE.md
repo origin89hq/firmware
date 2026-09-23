@@ -1248,8 +1248,12 @@ Bluetooth connection or bonding alone grants no KM43 permission.
 Local Wi-Fi uses one WebSocket connection per client (P-034). The comms
 processor's own access point remains the browser provisioning fallback,
 raised only while no network is cached or the pairing window is open. The
-window-dependent AP path requires the controller-owned link signal tracked
-in [origin89hq/km43#74](https://github.com/origin89hq/km43/issues/74).
+controller reports its window over the link with KM43's `PairingWindow`
+after every link-up, on the opening and on every closure, an enrolment's
+`Pair` answer ahead of the closed report (L-195); the comms processor acts
+on it only from the controller UART once its own link is up (L-194) and
+keeps the lifetime on its own clock from receipt. Raising the access point
+on that lifetime is [#90](https://github.com/origin89hq/firmware/issues/90).
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
 

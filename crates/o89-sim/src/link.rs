@@ -19,9 +19,9 @@ use km43::{
 };
 use o89_core::{
     Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Endpoint,
-    Identity, Keep, Keys, Label, Link, LinkEvent, LinkText, Local, LogSpan, Millis, NotKept, Note,
-    Outgoing, Rail, RailEvent, RailLine, RailRequest, RailSequencer, RailThroughReset, Recovery,
-    Revision, Secret, Sessions, Store, Tick,
+    Gesture, Identity, Keep, Keys, Label, Link, LinkEvent, LinkText, Local, LogSpan, Millis,
+    NotKept, Note, Outgoing, PairingWindow, Rail, RailEvent, RailLine, RailRequest, RailSequencer,
+    RailThroughReset, Recovery, Revision, Secret, SessionNote, Sessions, Store, Tick,
 };
 
 use crate::{
@@ -117,6 +117,10 @@ pub(crate) struct Bench {
     /// Whether the ladder's cuts land on the FRAM when the adapter keeps
     /// them before a cut (F-017).
     keeps_land: bool,
+    /// The panel's pairing window, as the selector would hold it: read by
+    /// a `Pair` as its frame is handled, closed by the enrolment it
+    /// answers, and its deadline handed to the link every tick.
+    pub(crate) window: PairingWindow,
 }
 
 impl Bench {
@@ -156,6 +160,7 @@ impl Bench {
             refusals: 0,
             module_booted: false,
             keeps_land: true,
+            window: PairingWindow::new(),
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -180,6 +185,17 @@ impl Bench {
         let bytes = self.comms.boot(now).expect("the peer boots");
         self.module_booted = true;
         self.feed(&bytes);
+    }
+
+    /// The pairing gesture completed at the panel now.
+    pub(crate) fn open_pairing(&mut self) {
+        self.window.gesture(Gesture::Pairing, self.now);
+    }
+
+    /// The factory-reset gesture completed at the panel now: the window
+    /// closes.
+    pub(crate) fn reset_at_the_panel(&mut self) {
+        self.window.gesture(Gesture::FactoryReset, self.now);
     }
 
     pub(crate) fn run_for(&mut self, span: Millis) {
@@ -207,7 +223,9 @@ impl Bench {
         }
         let late = self.comms.drain(now);
         self.feed(&late);
-        let actions = self.endpoint.tick(now, self.install_in_flight);
+        let actions = self
+            .endpoint
+            .tick(now, self.install_in_flight, self.window.deadline(now));
         if actions.iter().next().is_some() {
             self.ticked.push((now, actions));
         }
@@ -326,7 +344,7 @@ impl Bench {
                         model: MODEL,
                         log: LOG,
                         time_known: false,
-                        pairing_open: false,
+                        pairing_open: self.window.is_open(self.now),
                     };
                     let step = block_on(self.endpoint.frame(
                         frame,
@@ -338,6 +356,14 @@ impl Bench {
                     let Some(step) = step else {
                         continue;
                     };
+                    if let Some(o89_core::Reply {
+                        note: Some(SessionNote::Paired(_)),
+                        ..
+                    }) = step.reply
+                    {
+                        // As the adapter does: one press, one enrolment.
+                        self.window.close();
+                    }
                     if let Some(len) = step.reply.and_then(|reply| reply.answer) {
                         let mut framed = [0u8; MAX_FRAME];
                         let len = self
@@ -374,7 +400,7 @@ impl Bench {
             .collect()
     }
 
-    fn drops(&self) -> Vec<(Tick, DropReason)> {
+    pub(crate) fn drops(&self) -> Vec<(Tick, DropReason)> {
         self.asked
             .iter()
             .filter_map(|(at, action)| match action {
@@ -395,7 +421,7 @@ impl Bench {
             .collect()
     }
 
-    fn notes(&self) -> Vec<Note> {
+    pub(crate) fn notes(&self) -> Vec<Note> {
         self.asked
             .iter()
             .filter_map(|(_, action)| match action {
@@ -622,7 +648,7 @@ fn l_113_a_module_taken_for_a_flash_suspends_the_ladder_and_records_no_loss() {
     let mut now = bench.now;
     for _ in 0..9_000 {
         now = now.after(STEP).expect("fits");
-        let ticked = bench.endpoint.tick(now, false);
+        let ticked = bench.endpoint.tick(now, false, None);
         assert_eq!((&ticked).into_iter().count(), 0, "silent at {now:?}");
     }
     // Given back, the module is stated to as after any power-up.

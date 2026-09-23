@@ -39,6 +39,7 @@ impl FrameBenchStart {
             | Frame::DownloadRefused { .. }
             | Frame::CloseReport { .. }
             | Frame::NetReport { .. }
+            | Frame::PairingWindowAck { .. }
             | Frame::TimeOffer { .. }
             | Frame::Refuse { .. } => {}
         }

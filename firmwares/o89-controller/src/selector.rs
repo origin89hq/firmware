@@ -59,6 +59,12 @@ pub fn floor_used() {
     });
 }
 
+/// The open window's deadline, which the link reports to the comms
+/// processor on every change (L-195); `None` while enrolment is closed.
+pub fn pairing_deadline() -> Option<o89_core::Tick> {
+    PANEL.lock(|cell| cell.get().pairing_deadline(Uptime.now()))
+}
+
 /// A `Pair` enrolled or reclaimed a client: its window closes (L-195).
 pub fn enrolled() {
     PANEL.lock(|cell| {

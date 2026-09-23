@@ -19,14 +19,26 @@
 //! major mismatch keeps `LinkUp`, `Heartbeat` and `CommsRelease` only
 //! (L-050).
 //!
+//! The controller's pairing-window report is acted on only here, which
+//! reads the controller UART and nothing a client sent, and only once this
+//! side is linked; before that it is discarded with no answer (L-194). The
+//! greatest revision accepted and one local deadline, measured from its
+//! receipt, are all that is kept of it; an older or repeated revision is
+//! acknowledged and changes nothing, link loss ends the lifetime, and a
+//! controller that rebooted clears the history. What the access point
+//! does with the lifetime is #90's.
+//!
 //! The mechanics are `o89-link`'s, shared with the controller's link: the
 //! requests in flight and their retries, the beats whose answers count, and
 //! the rules every link-local frame meets.
 
+use core::num::NonZeroU64;
+
 use km43::{
     CloseConnection, CloseConnections, CloseReport, DownloadRequest, DownloadVerdict,
     EnterDownload, FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkErrorCode, LinkMessageType,
-    LinkUp, MAX_FRAME, NetChange, NetConfig, NetVerdict, ReqId, Side, Version, arriving,
+    LinkUp, MAX_FRAME, NetChange, NetConfig, NetVerdict, PairingWindowAck, PairingWindowNotice,
+    ReqId, Side, Version, arriving,
 };
 use o89_link::{
     Beats, DEAD_AFTER, EncodeError, HEARTBEAT_PERIOD, LINK_ENVELOPE, LINKUP_PERIOD, Millis, OURS,
@@ -90,6 +102,14 @@ pub enum Frame {
         /// Version held in RAM, including after a failed write.
         version: u32,
     },
+    /// The controller's pairing report processed: its revision echoed,
+    /// whether it changed anything or not (L-193).
+    PairingWindowAck {
+        /// The controller's request.
+        req_id: ReqId,
+        /// The report's revision.
+        revision: NonZeroU64,
+    },
     /// A retry of the same NTP offer (L-015), never a fresh sample.
     TimeOffer {
         /// Unchanged correlation id.
@@ -115,6 +135,15 @@ pub enum OfferDelivery {
     Answered(km43::TimeOffer),
     /// Link loss or the final response deadline ended delivery.
     Failed,
+}
+
+/// What this side kept of the controller's pairing reports: the greatest
+/// revision it accepted, and while the window it reported is open, when
+/// that ends on this side's own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reach {
+    revision: NonZeroU64,
+    until: Option<Tick>,
 }
 
 /// What the controller last said about itself.
@@ -153,6 +182,9 @@ pub struct Link {
     /// Our last heartbeats: only the first answer to one of these is the
     /// controller heard (L-100).
     beats: Beats,
+    /// The controller's pairing window as its reports left it; `None`
+    /// before any report from its current boot.
+    pairing: Option<Reach>,
 }
 
 impl Link {
@@ -176,7 +208,21 @@ impl Link {
             next_req: 1,
             statement: Requests::NONE,
             beats: Beats::NONE,
+            pairing: None,
         }
+    }
+
+    /// How long the controller's pairing window stays open as this side
+    /// measures it: from the receipt of the report that opened it, until a
+    /// newer closed report, the link falling, or the controller rebooting.
+    /// `None` is closed or never reported, which grants the access point no
+    /// pairing-based lifetime (L-193).
+    #[must_use]
+    pub fn pairing_window(&self, now: Tick) -> Option<Millis> {
+        self.pairing
+            .and_then(|reach| reach.until)
+            .and_then(|until| until.since(now))
+            .filter(|left| left.as_millis() > 0)
     }
 
     /// Restore durable credentials before the first handshake.
@@ -440,11 +486,17 @@ impl Link {
                 }
                 None
             }
-            LinkMessageType::ClientConnectedAck
-            | LinkMessageType::ClientDisconnectedAck
-            | LinkMessageType::PairingWindow => {
-                // Answers to requests not made yet, and a pairing report with
-                // no access point to keep up (#90): unanswered, as L-194.
+            LinkMessageType::PairingWindow => {
+                if !self.linked {
+                    // Before this side's own statement is answered: discarded
+                    // with no answer and nothing learned (L-194).
+                    return None;
+                }
+                let notice = PairingWindowNotice::decode(envelope).ok()?;
+                self.pairing_report(notice, req_id, now)
+            }
+            LinkMessageType::ClientConnectedAck | LinkMessageType::ClientDisconnectedAck => {
+                // Answers to requests not made yet.
                 None
             }
             LinkMessageType::ClientConnected
@@ -462,6 +514,28 @@ impl Link {
                 })
             }
         }
+    }
+
+    /// A valid report on a linked link. A newer revision replaces what was
+    /// kept: open, a deadline from now; closed, none. An older or repeated
+    /// one is acknowledged and changes nothing, so a retry never restarts
+    /// the deadline and never reopens a closed window. A deadline past the
+    /// end of the tick is refused: unanswered, and nothing kept.
+    fn pairing_report(
+        &mut self,
+        notice: PairingWindowNotice,
+        req_id: ReqId,
+        now: Tick,
+    ) -> Option<Frame> {
+        let revision = notice.revision();
+        if self.pairing.is_none_or(|kept| revision > kept.revision) {
+            let until = match notice.remaining_ms() {
+                0 => None,
+                remaining => Some(now.after(Millis::from_millis(u64::from(remaining)))?),
+            };
+            self.pairing = Some(Reach { revision, until });
+        }
+        Some(Frame::PairingWindowAck { req_id, revision })
     }
 
     fn configure_network(
@@ -556,6 +630,10 @@ impl Link {
                 link_header(LinkMessageType::NetConfigAck, req_id),
                 &mut envelope,
             ),
+            Frame::PairingWindowAck { req_id, revision } => PairingWindowAck { revision }.write(
+                link_header(LinkMessageType::PairingWindowAck, req_id),
+                &mut envelope,
+            ),
             Frame::TimeOffer { req_id, offer } => offer.write(
                 link_header(LinkMessageType::TimeOffer, req_id),
                 &mut envelope,
@@ -580,6 +658,8 @@ impl Link {
             self.linked = false;
             self.beats.forget();
             self.forget_offer();
+            // Another boot's revisions start again from 1.
+            self.pairing = None;
         }
         let agreed = OURS.agreed(version).is_ok();
         if !agreed {
@@ -613,6 +693,11 @@ impl Link {
         self.linked = false;
         self.beats.forget();
         self.forget_offer();
+        // The lifetime ends with the link; the revision stays, and the
+        // controller's resynchronisation brings a newer one.
+        if let Some(reach) = &mut self.pairing {
+            reach.until = None;
+        }
         self.next_statement = now;
     }
 
@@ -1561,6 +1646,236 @@ mod tests {
         assert_eq!(link.last_heard(), heard);
         assert!(!link.offer_rate.take(at(900_009)));
     }
+    /// A pairing report from the controller, on `session`.
+    fn report(
+        buf: &mut [u8; 256],
+        req_id: ReqId,
+        revision: u64,
+        remaining_ms: u32,
+        session: u16,
+    ) -> LinkEnvelope<'_> {
+        let notice =
+            PairingWindowNotice::new(NonZeroU64::new(revision).expect("non-zero"), remaining_ms)
+                .expect("bounded");
+        let len = notice.write(
+            km43::LinkHeader {
+                kind: LinkMessageType::PairingWindow,
+                session: SessionId::from(session),
+                req_id,
+            },
+            buf,
+        );
+        decoded(buf, len)
+    }
+
+    fn ack(req_id: u32, revision: u64) -> Frame {
+        Frame::PairingWindowAck {
+            req_id: ReqId(req_id),
+            revision: NonZeroU64::new(revision).expect("non-zero"),
+        }
+    }
+
+    #[test]
+    fn l_194_a_report_before_this_side_is_linked_is_discarded_without_an_answer() {
+        let mut link = Link::new(Tick::ZERO);
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 1, 120_000, 0), at(10)),
+            None
+        );
+        assert_eq!(link.pairing_window(at(10)), None, "nothing learned");
+        // The controller's own statement is not this side's link either.
+        let theirs = from_controller(&mut buf, LinkMessageType::LinkUp, ReqId(2));
+        let _ = link.received(theirs, at(20));
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(3), 1, 120_000, 0), at(30)),
+            None
+        );
+        assert_eq!(link.pairing_window(at(30)), None);
+        // Linked, the same report is acted on.
+        let mut link = linked_at_boot();
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(4), 1, 120_000, 0), at(40)),
+            Some(ack(4, 1))
+        );
+        assert_eq!(
+            link.pairing_window(at(40)),
+            Some(Millis::from_millis(120_000))
+        );
+    }
+
+    #[test]
+    fn l_194_a_report_on_a_client_session_is_refused_and_changes_nothing() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        for session in [1, 3, u16::MAX] {
+            assert_eq!(
+                link.received(report(&mut buf, ReqId(5), 9, 120_000, session), at(10)),
+                Some(Frame::Refuse {
+                    code: LinkErrorCode::NonZeroSession
+                }),
+                "session {session}"
+            );
+            assert_eq!(link.pairing_window(at(10)), None);
+        }
+        // Nor did it take the revision: revision 1 is still newer.
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(6), 1, 60_000, 0), at(20)),
+            Some(ack(6, 1))
+        );
+        assert_eq!(
+            link.pairing_window(at(20)),
+            Some(Millis::from_millis(60_000))
+        );
+    }
+
+    #[test]
+    fn l_194_under_a_major_mismatch_a_report_is_refused_with_261() {
+        let mut link = linked_at_boot();
+        link.record(CONTROLLER_BOOT, Version { major: 2, minor: 0 });
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 1, 120_000, 0), at(10)),
+            Some(Frame::Refuse {
+                code: LinkErrorCode::LinkMajorMismatch
+            })
+        );
+        assert_eq!(link.pairing_window(at(10)), None);
+    }
+
+    #[test]
+    fn l_193_a_report_is_acknowledged_with_its_revision_and_opens_the_window_from_receipt() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        let answer = link.received(report(&mut buf, ReqId(8), 2, 90_000, 0), at(1_000));
+        assert_eq!(answer, Some(ack(8, 2)));
+        assert_eq!(
+            link.pairing_window(at(1_000)),
+            Some(Millis::from_millis(90_000))
+        );
+        assert_eq!(
+            link.pairing_window(at(90_999)),
+            Some(Millis::from_millis(1))
+        );
+        assert_eq!(link.pairing_window(at(91_000)), None, "expired locally");
+        // The acknowledgement reads back as the controller reads it.
+        let mut wire = [0u8; MAX_FRAME];
+        let len = link
+            .build(
+                answer.expect("an answer"),
+                &ME,
+                at(1_000),
+                &mut FrameWriter::new(),
+                &mut wire,
+            )
+            .expect("builds");
+        let mut out = [0u8; 256];
+        let len = read_back(wire.get(..len).expect("fits"), &mut out);
+        let envelope = envelope_in(&out, len);
+        assert_eq!(envelope.opcode(), LinkMessageType::PairingWindowAck as u8);
+        assert_eq!(envelope.req_id(), ReqId(8));
+        assert_eq!(envelope.session(), SessionId::None);
+        assert_eq!(
+            PairingWindowAck::decode(envelope)
+                .expect("an ack")
+                .revision
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn l_193_a_malformed_report_is_unanswered_and_learns_nothing() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        // A duration longer than the physical window, written by hand.
+        let mut body = link_header(LinkMessageType::PairingWindow, ReqId(3))
+            .write(2, &mut buf)
+            .expect("fits");
+        body.key(1).expect("fits");
+        body.u64(1).expect("fits");
+        body.key(2).expect("fits");
+        body.u64(120_001).expect("fits");
+        let len = body.finish().map_err(LinkError::from);
+        assert_eq!(link.received(decoded(&buf, len), at(10)), None);
+        assert_eq!(link.pairing_window(at(10)), None);
+    }
+
+    #[test]
+    fn a_retried_or_older_report_is_acknowledged_and_never_restarts_or_reopens_the_window() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(0)),
+            Some(ack(1, 5))
+        );
+        // The retry, a second later: acknowledged, deadline unchanged.
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(1_000)),
+            Some(ack(1, 5))
+        );
+        assert_eq!(
+            link.pairing_window(at(1_000)),
+            Some(Millis::from_millis(119_000))
+        );
+        // Closed by a newer revision; an older open one reopens nothing.
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(2), 6, 0, 0), at(2_000)),
+            Some(ack(2, 6))
+        );
+        assert_eq!(link.pairing_window(at(2_000)), None);
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(2_500)),
+            Some(ack(1, 5))
+        );
+        assert_eq!(link.pairing_window(at(2_500)), None);
+    }
+
+    #[test]
+    fn link_loss_ends_the_window_and_only_a_rebooted_controller_starts_its_revisions_again() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        let _ = link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(0));
+        // Six seconds unanswered: the link and the window go, and this side
+        // states itself in the same tick.
+        let Some(Frame::LinkUp { req_id }) = link.tick(at(6_000)) else {
+            panic!("a statement at once");
+        };
+        assert!(!link.is_linked());
+        assert_eq!(link.pairing_window(at(6_000)), None);
+        // The same boot links again: its old revision still reopens nothing.
+        let answer = from_controller(&mut buf, LinkMessageType::LinkUpAck, req_id);
+        let _ = link.received(answer, at(6_100));
+        assert!(link.is_linked());
+        let _ = link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(6_200));
+        assert_eq!(link.pairing_window(at(6_200)), None);
+        // A controller that rebooted starts again from 1.
+        link.record(CONTROLLER_BOOT.wrapping_add(1), OURS);
+        link.linked(CONTROLLER_BOOT.wrapping_add(1), OURS, at(7_000));
+        let _ = link.received(report(&mut buf, ReqId(1), 1, 30_000, 0), at(7_000));
+        assert_eq!(
+            link.pairing_window(at(7_000)),
+            Some(Millis::from_millis(30_000))
+        );
+    }
+
+    #[test]
+    fn a_deadline_past_the_end_of_the_tick_is_refused_unanswered() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        let late = at(u64::MAX - 10);
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(1), 1, 120_000, 0), late),
+            None
+        );
+        assert_eq!(link.pairing_window(late), None);
+        // A closed report needs no deadline and is taken there.
+        assert_eq!(
+            link.received(report(&mut buf, ReqId(2), 2, 0, 0), late),
+            Some(ack(2, 2))
+        );
+    }
+
     #[test]
     fn changed_major_or_controller_boot_discards_pending_time_offer() {
         for (boot_id, version) in [

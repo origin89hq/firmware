@@ -96,8 +96,10 @@ impl Endpoint {
 
     /// Time passed: the link's own tick, then every session that has gone
     /// quiet for fifteen minutes closed (P-077). `install_in_flight` is
-    /// L-113's.
-    pub fn tick(&mut self, now: Tick, install_in_flight: bool) -> Actions {
+    /// L-113's; `pairing` is the panel's window deadline while it is open,
+    /// read now, which the link reports when it changed (L-195).
+    pub fn tick(&mut self, now: Tick, install_in_flight: bool, pairing: Option<Tick>) -> Actions {
+        self.link.pairing_window(pairing, now);
         let mut actions = self.link.tick(now, install_in_flight, &mut self.sessions);
         for close in self.sessions.tick(now).iter() {
             self.link

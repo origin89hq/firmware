@@ -9,9 +9,10 @@ use std::cell::RefCell;
 
 use embassy_futures::block_on;
 use km43::{
-    ClientId, CloseReason, Conn, DeviceId, DeviceSecret, Discovery, EmptyBody, Envelope, Epoch,
-    ErrorBody, Handshake, Header, HelloInner, Incoming, LinkTransport, MessageType, PrintedSecret,
-    ReqId, Session, SessionId, SessionKey, Tagged, Version, Wrapper,
+    Attempt, ClientId, ClientKind, CloseReason, Conn, DeviceId, DeviceSecret, Discovery, EmptyBody,
+    Envelope, Epoch, ErrorBody, Handshake, Header, HelloInner, Incoming, LinkTransport,
+    MessageType, PairAckClaim, PairRequest, PairResponse, PrintedSecret, ReqId, Session, SessionId,
+    SessionKey, Tagged, Version, Wrapper,
 };
 use o89_core::{Facts, Millis, Sessions};
 
@@ -28,14 +29,14 @@ fn epoch() -> Epoch {
 
 /// A client on one connection, speaking through the bench's comms
 /// processor, which stamps the handle into every frame (P-021).
-struct Client {
+pub(crate) struct Client {
     handle: u16,
     req: u32,
     key: Option<SessionKey>,
 }
 
 impl Client {
-    const fn on(handle: u16) -> Self {
+    pub(crate) const fn on(handle: u16) -> Self {
         Self {
             handle,
             req: 0,
@@ -54,7 +55,7 @@ impl Client {
 
     /// Put `frame` on the wire and let the bench settle; what the
     /// controller sent this client since.
-    fn send(&self, bench: &mut Bench, frame: &[u8]) -> Vec<Vec<u8>> {
+    pub(crate) fn send(&self, bench: &mut Bench, frame: &[u8]) -> Vec<Vec<u8>> {
         let before = bench.comms.to_client(self.handle).len();
         let bytes = bench.comms.relay(frame, bench.now).expect("relays");
         bench.feed(&bytes);
@@ -83,6 +84,34 @@ impl Client {
         assert_eq!(discovery.model, MODEL);
         assert!(discovery.provisioned);
         discovery.challenge
+    }
+
+    /// `Discover`, then a `Pair` from `label` proved under the printed
+    /// secret's pair key, and its `Pair 0x8B` verified as a client verifies
+    /// it.
+    pub(crate) fn pair(&mut self, bench: &mut Bench, label: &str) -> PairResponse {
+        let challenge = self.discover(bench);
+        let attempt = Attempt {
+            device_id: DEVICE,
+            challenge,
+            client_nonce: [self.handle.to_le_bytes()[0] ^ 0x5a; 16],
+        };
+        let mut dst = [0u8; 256];
+        let header = self.header(MessageType::Pair);
+        let len = PairRequest {
+            client_kind: ClientKind::Cli,
+            label,
+        }
+        .write(&device().pair_key(), &attempt, header, &mut dst)
+        .expect("fits");
+        let answers = self.send(bench, &dst[..len]);
+        let answer = answers.last().expect("Pair is answered");
+        let envelope = Envelope::decode(answer).expect("an envelope");
+        assert_eq!(envelope.header().kind, MessageType::PairResponse);
+        PairAckClaim::decode(envelope)
+            .expect("a pair ack")
+            .verify(&device().pair_key(), &attempt, epoch())
+            .expect("MAC'd under the pair key")
     }
 
     fn hello_frame(&mut self, challenge: [u8; 16], nonce: [u8; 16]) -> Vec<u8> {
@@ -170,7 +199,8 @@ fn outcomes(bench: &Bench, opcode: u8) -> Vec<u8> {
             | Heard::LinkUpAck { .. }
             | Heard::Heartbeat { .. }
             | Heard::HeartbeatAck { .. }
-            | Heard::Refusal { .. } => None,
+            | Heard::Refusal { .. }
+            | Heard::PairingWindow { .. } => None,
         })
         .collect()
 }
@@ -188,7 +218,8 @@ fn closes(bench: &Bench) -> Vec<(u16, CloseReason)> {
             | Heard::LinkUpAck { .. }
             | Heard::Heartbeat { .. }
             | Heard::HeartbeatAck { .. }
-            | Heard::Refusal { .. } => None,
+            | Heard::Refusal { .. }
+            | Heard::PairingWindow { .. } => None,
         })
         .collect()
 }
@@ -208,7 +239,8 @@ fn conns(bench: &Bench) -> Option<u8> {
             | Heard::LinkUp { .. }
             | Heard::LinkUpAck { .. }
             | Heard::HeartbeatAck { .. }
-            | Heard::Refusal { .. } => None,
+            | Heard::Refusal { .. }
+            | Heard::PairingWindow { .. } => None,
         })
 }
 
@@ -220,7 +252,7 @@ fn linked() -> Bench {
     bench
 }
 
-fn announce(bench: &mut Bench, handle: u16) {
+pub(crate) fn announce(bench: &mut Bench, handle: u16) {
     let bytes = bench
         .comms
         .announce_connection(handle, bench.now)

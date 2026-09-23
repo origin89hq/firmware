@@ -33,6 +33,8 @@ mod fram;
 mod link;
 mod nor;
 #[cfg(test)]
+mod pairing;
+#[cfg(test)]
 mod sessions;
 #[cfg(test)]
 mod tables;

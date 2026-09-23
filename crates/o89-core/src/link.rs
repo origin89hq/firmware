@@ -26,6 +26,16 @@
 //! floor and RTC. Its verdict returns through `time_verdict`; a pending
 //! offer never stalls heartbeat processing.
 //!
+//! The pairing window is the panel's; the link reports its state to the
+//! comms processor as a `PairingWindow` request after every link-up, on the
+//! opening and on every closure (L-195), each report a fresh revision of
+//! this boot and each retry the same one, a newer report superseding the
+//! one in flight. The adapter hands the panel's deadline in every tick, and
+//! a report owed goes out on the tick; an enrolment's `Pair` answer, sent
+//! as its frame is handled, is on the wire before the tick that sees the
+//! window closed. When the revisions of a boot run out the link falls and
+//! stays down until the controller reboots.
+//!
 //! cites: F-031, F-039
 
 use core::num::NonZeroU32;
@@ -33,13 +43,14 @@ use km43::{
     ClientConnected, ClientDisconnected, ClientDown, ClientDownAck, ClientUp, ClientUpAck,
     ClockOffer, CloseConnections, CloseReason, CloseReport, Conn, ControllerRecord, EventKind,
     FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkError, LinkErrorCode, LinkMessageType,
-    LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, MAX_SESSIONS, ReqId, Side, TimeOffer, TimeVerdict,
-    Version, arriving,
+    LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, MAX_SESSIONS, PairingWindowAck, PairingWindowNotice,
+    ReqId, Side, TimeOffer, TimeVerdict, Version, arriving,
 };
 
 use sha2::{Digest, Sha256};
 
 use crate::BootCount;
+use crate::pairing_report::{PairingReports, Unbuilt};
 use crate::rail::{CUT, Recovery};
 use crate::text::Text;
 use crate::tick::{Millis, Tick};
@@ -177,6 +188,9 @@ pub enum DropReason {
     CommsRebooted,
     /// The bench took the module into its ROM (F-038).
     ModuleTaken,
+    /// Every pairing-report revision of this boot was used: the link falls
+    /// and stays down until the controller reboots (L-195).
+    RevisionsSpent,
 }
 
 /// A record the ring gets, each with the body KM43 gives it (P-215).
@@ -301,6 +315,13 @@ pub enum Outgoing {
         /// Why.
         reason: CloseReason,
     },
+    /// The pairing window's state, reported (L-195).
+    PairingWindow {
+        /// From our counter; a retry keeps it.
+        req_id: ReqId,
+        /// Its revision and remaining time, fixed when first sent.
+        notice: PairingWindowNotice,
+    },
     /// A refusal, with session and request both zero (L-181).
     Refuse {
         /// Why.
@@ -336,9 +357,9 @@ pub enum Action {
 /// How many actions one call can hand out. A tick is the most: a request
 /// slot given up and its note, resent or newly issued, four in all because
 /// four is every slot (L-014), each given-up slot then reissued as a close
-/// (four more), and the link falling with its drop and its record. Sixteen
-/// is room for every combination and a dropped action is a bug, counted
-/// rather than hidden.
+/// (four more), the link falling with its drop and its record, or a beat,
+/// and a pairing report. Sixteen is room for every combination and a
+/// dropped action is a bug, counted rather than hidden.
 pub const ACTIONS: usize = 16;
 
 /// The actions of one call, in order.
@@ -462,6 +483,9 @@ pub struct Link {
     conns: u8,
     /// Closes asked for and not yet answered.
     closing: [Option<Closing>; CLOSING],
+    /// What the comms processor has been told of the pairing window, and
+    /// whether the link fell for want of a revision (L-195).
+    pairing: PairingReports,
 }
 
 impl Link {
@@ -487,6 +511,7 @@ impl Link {
             attempt: false,
             conns: 0,
             closing: [None; CLOSING],
+            pairing: PairingReports::new(),
         }
     }
 
@@ -545,6 +570,20 @@ impl Link {
         actions
     }
 
+    /// The panel's pairing window at `now`: its deadline while open, `None`
+    /// while closed. A change from what was last reported, and the first
+    /// state after a link-up, is reported on the next tick (L-195).
+    pub fn pairing_window(&mut self, deadline: Option<Tick>, now: Tick) {
+        self.pairing.observe(deadline, now);
+    }
+
+    /// Whether every pairing-report revision of this boot is used, which
+    /// keeps the link down until the controller reboots (L-195).
+    #[must_use]
+    pub const fn revisions_spent(&self) -> bool {
+        self.pairing.retired()
+    }
+
     /// The last valid frame from the peer, from which silence is measured.
     #[must_use]
     pub const fn last_heard(&self) -> Option<Tick> {
@@ -569,6 +608,7 @@ impl Link {
         // answer to a beat before it counts.
         self.requests.forget();
         self.beats.forget();
+        let _ = self.pairing.forget();
         self.cut_pending = false;
         actions
     }
@@ -698,8 +738,8 @@ impl Link {
             LinkMessageType::CloseConnectionAck => {
                 self.close_answered(envelope, rows, &mut actions);
             }
+            LinkMessageType::PairingWindowAck => self.pairing_answered(envelope, &mut actions),
             LinkMessageType::NetConfigAck
-            | LinkMessageType::PairingWindowAck
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownloadAck => {
                 // Requests this firmware does not send yet, so nothing
@@ -924,6 +964,75 @@ impl Link {
         self.conns = rows.allocated();
     }
 
+    /// The answer to a pairing report: it consumes the report only when it
+    /// reads and echoes the revision in flight under that request (L-193).
+    /// Anything else is an acknowledgement nobody waits for, or a malformed
+    /// one, and leaves the report to its retries (L-015).
+    fn pairing_answered(&mut self, envelope: LinkEnvelope<'_>, actions: &mut Actions) {
+        let kind = LinkMessageType::PairingWindowAck;
+        let req_id = envelope.req_id();
+        if !self.requests.awaits(req_id, LinkMessageType::PairingWindow) {
+            actions.push(Action::Note(Note::UnexpectedAck(kind)));
+            return;
+        }
+        let Ok(ack) = PairingWindowAck::decode(envelope) else {
+            actions.push(Action::Note(Note::Malformed(kind)));
+            return;
+        };
+        if self.pairing.acknowledged(req_id, ack.revision) {
+            let _ = self
+                .requests
+                .answered(req_id, LinkMessageType::PairingWindow);
+        } else {
+            actions.push(Action::Note(Note::UnexpectedAck(kind)));
+        }
+    }
+
+    /// The pairing report owed, if the link is up under an agreed version
+    /// and a request slot is free (L-014): the one in flight superseded,
+    /// the new one built now. With every revision used, the link falls
+    /// instead and stays down (L-195).
+    fn report(&mut self, now: Tick, rows: &mut impl Rows, actions: &mut Actions) {
+        if !self.pairing.owed() {
+            return;
+        }
+        let Phase::Up {
+            compat: Compat::Agreed(_),
+            ..
+        } = self.phase
+        else {
+            // Down, the next link-up owes the state again; under a major
+            // mismatch the peer would refuse it (L-050).
+            return;
+        };
+        if let Some(superseded) = self.pairing.supersede() {
+            let _ = self
+                .requests
+                .answered(superseded, LinkMessageType::PairingWindow);
+        }
+        let notice = match self.pairing.prepare(now) {
+            Ok(notice) => notice,
+            Err(Unbuilt::Spent) => {
+                self.pairing.retire();
+                self.down(DropReason::RevisionsSpent, now, rows, actions);
+                return;
+            }
+            Err(Unbuilt::Refused) => {
+                debug_assert!(false, "a clamped pairing report was refused");
+                actions.push(Action::Note(Note::RequestFailed(
+                    LinkMessageType::PairingWindow,
+                )));
+                return;
+            }
+        };
+        let Some(req_id) = self.request(LinkMessageType::PairingWindow, now) else {
+            // Four in flight: still owed, and built afresh when a slot frees.
+            return;
+        };
+        self.pairing.sent(req_id, notice);
+        actions.push(Action::Send(Outgoing::PairingWindow { req_id, notice }));
+    }
+
     /// Forget the close owed for `conn`, and retire the request carrying
     /// it, so neither a retry nor a late answer reaches the handle's next
     /// owner.
@@ -994,6 +1103,7 @@ impl Link {
                 }
             }
         }
+        self.report(now, rows, &mut actions);
         actions
     }
 
@@ -1002,6 +1112,11 @@ impl Link {
     /// last came up, past the earliest cut, and no install in flight
     /// (L-113).
     fn cut_due(&self, now: Tick, install_in_flight: bool) -> bool {
+        if self.pairing.retired() {
+            // Down on purpose for the rest of the boot: its silence is
+            // nothing a cycle of the module would cure.
+            return false;
+        }
         let Phase::Down {
             next_linkup: Some(_),
         } = self.phase
@@ -1058,6 +1173,10 @@ impl Link {
             }
             .write(
                 link_header(LinkMessageType::CloseConnection, req_id),
+                &mut envelope,
+            ),
+            Outgoing::PairingWindow { req_id, notice } => notice.write(
+                link_header(LinkMessageType::PairingWindow, req_id),
                 &mut envelope,
             ),
             Outgoing::Refuse { code } => {
@@ -1194,6 +1313,9 @@ impl Link {
         self.close_attempt(actions);
         self.last_peer = Some(peer);
         self.heard(now);
+        // Every link-up owes the window's state under a fresh revision,
+        // unchanged or not (L-195).
+        self.pairing.linked();
         self.raised = false;
         self.cut_pending = false;
         let next_beat = match self.phase {
@@ -1250,6 +1372,14 @@ impl Link {
                     .answered(req_id, LinkMessageType::CloseConnection);
             }
         }
+        // The report in flight goes too: the peer that would acknowledge it
+        // drops what it learned with the link, and the next link-up owes a
+        // fresh revision (L-195).
+        if let Some(req_id) = self.pairing.forget() {
+            let _ = self
+                .requests
+                .answered(req_id, LinkMessageType::PairingWindow);
+        }
         actions.push(Action::DropConnections(why));
     }
 
@@ -1266,6 +1396,10 @@ impl Link {
     }
 
     fn announce(&mut self, now: Tick, actions: &mut Actions) {
+        if self.pairing.retired() {
+            // Only a controller reboot links again (L-195).
+            return;
+        }
         if let Phase::Down { next_linkup } = &mut self.phase {
             *next_linkup = Some(now.after(LINKUP_PERIOD).unwrap_or(now));
         }
@@ -1324,6 +1458,9 @@ impl Link {
                     if kind == LinkMessageType::CloseConnection {
                         let _ = self.take_closing(req_id);
                     }
+                    if kind == LinkMessageType::PairingWindow {
+                        self.pairing.given_up(req_id);
+                    }
                     actions.push(Action::Note(Note::RequestFailed(kind)));
                 }
                 Some(Overdue::Resend { kind, req_id }) => match kind {
@@ -1349,6 +1486,16 @@ impl Link {
                             }
                         }
                     }
+                    // The same revision and body, under the same id: a
+                    // report superseded meanwhile is not sent again.
+                    LinkMessageType::PairingWindow => match self.pairing.resend(req_id) {
+                        Some(notice) => {
+                            actions.push(Action::Send(Outgoing::PairingWindow { req_id, notice }));
+                        }
+                        None => {
+                            let _ = self.requests.answered(req_id, kind);
+                        }
+                    },
                     LinkMessageType::LinkUpAck
                     | LinkMessageType::Heartbeat
                     | LinkMessageType::HeartbeatAck
@@ -1359,7 +1506,6 @@ impl Link {
                     | LinkMessageType::CloseConnectionAck
                     | LinkMessageType::NetConfig
                     | LinkMessageType::NetConfigAck
-                    | LinkMessageType::PairingWindow
                     | LinkMessageType::PairingWindowAck
                     | LinkMessageType::TimeOffer
                     | LinkMessageType::TimeOfferAck
@@ -1663,6 +1809,281 @@ mod tests {
         assert_eq!(link.uptime_s(Tick::from_millis(2_000)), 1);
         assert_eq!(link.uptime_s(Tick::from_millis(u64::MAX)), u32::MAX);
         assert_eq!(link.uptime_s(Tick::ZERO), 0, "before boot is not negative");
+    }
+
+    /// A link the comms processor brought up at `now` by answering its
+    /// statement, speaking `version`.
+    fn up_with(now: Tick, version: Version) -> Link {
+        let mut link = Link::new(identity(), Tick::ZERO);
+        let settled = link.module_settled(now);
+        let req_id = settled
+            .iter()
+            .find_map(|action| {
+                if let Action::Send(Outgoing::LinkUp { req_id }) = action {
+                    Some(*req_id)
+                } else {
+                    None
+                }
+            })
+            .expect("a statement");
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: 0x5EED,
+            hw: "comms",
+            net_version: Some(0),
+        }
+        .write(link_header(LinkMessageType::LinkUpAck, req_id), &mut buf)
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        let _ = link.received(envelope, now, &mut NoRows);
+        assert!(link.is_up());
+        link
+    }
+
+    fn up(now: Tick) -> Link {
+        up_with(now, OURS)
+    }
+
+    /// The one pairing report among `actions`, if one; two is a failure.
+    fn report(actions: &Actions) -> Option<(ReqId, PairingWindowNotice)> {
+        let mut found = None;
+        for action in actions {
+            if let Action::Send(Outgoing::PairingWindow { req_id, notice }) = action {
+                assert_eq!(found, None, "two reports in one call: {actions:?}");
+                found = Some((*req_id, *notice));
+            }
+        }
+        found
+    }
+
+    /// The one action in `actions`, if exactly one.
+    fn only(actions: &Actions) -> Option<Action> {
+        (actions.len() == 1)
+            .then(|| actions.iter().next().copied())
+            .flatten()
+    }
+
+    /// The comms processor's acknowledgement of `revision` under `req_id`.
+    fn acknowledge(link: &mut Link, req_id: ReqId, revision: u64, now: Tick) -> Actions {
+        let mut buf = [0u8; 64];
+        let len = PairingWindowAck {
+            revision: core::num::NonZeroU64::new(revision).expect("non-zero"),
+        }
+        .write(
+            link_header(LinkMessageType::PairingWindowAck, req_id),
+            &mut buf,
+        )
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        link.received(envelope, now, &mut NoRows)
+    }
+
+    fn at(millis: u64) -> Tick {
+        Tick::from_millis(millis)
+    }
+
+    #[test]
+    fn l_195_the_first_tick_after_linking_reports_the_window_and_the_report_reads_back() {
+        let mut link = up(at(1_000));
+        link.pairing_window(Some(at(61_000)), at(1_000));
+        let (req_id, notice) = report(&link.tick(at(1_010), false, &mut NoRows)).expect("a report");
+        assert_eq!(notice.revision().get(), 1);
+        assert_eq!(notice.remaining_ms(), 59_990);
+        let (bytes, len) =
+            envelope_of(&link, Outgoing::PairingWindow { req_id, notice }, at(1_010));
+        let envelope = LinkEnvelope::decode(&bytes[..len]).expect("decodes");
+        assert_eq!(envelope.opcode(), LinkMessageType::PairingWindow as u8);
+        assert_eq!(envelope.session(), SessionId::None, "L-194");
+        assert_eq!(envelope.req_id(), req_id);
+        assert_eq!(PairingWindowNotice::decode(envelope), Ok(notice));
+        // Nothing more while nothing changes.
+        assert_eq!(report(&link.tick(at(1_020), false, &mut NoRows)), None);
+    }
+
+    #[test]
+    fn l_195_only_an_ack_echoing_the_revision_in_flight_consumes_the_report() {
+        let mut link = up(at(0));
+        let (req_id, notice) = report(&link.tick(at(10), false, &mut NoRows)).expect("a report");
+        let unexpected = Action::Note(Note::UnexpectedAck(LinkMessageType::PairingWindowAck));
+        // Another request's id, then this one's with another revision.
+        let stray = acknowledge(&mut link, ReqId(req_id.0.wrapping_add(50)), 1, at(20));
+        assert_eq!(only(&stray), Some(unexpected));
+        let wrong = acknowledge(&mut link, req_id, 2, at(30));
+        assert_eq!(only(&wrong), Some(unexpected));
+        // A body that does not read.
+        let mut buf = [0u8; 64];
+        let cbor = link_header(LinkMessageType::PairingWindowAck, req_id)
+            .write(0, &mut buf)
+            .expect("fits");
+        let len = cbor.finish().expect("fits");
+        let malformed = link.received(
+            LinkEnvelope::decode(&buf[..len]).expect("an envelope"),
+            at(40),
+            &mut NoRows,
+        );
+        assert_eq!(
+            only(&malformed),
+            Some(Action::Note(Note::Malformed(
+                LinkMessageType::PairingWindowAck
+            )))
+        );
+        // None of those consumed it: it goes again, the same.
+        let again = report(&link.tick(at(510), false, &mut NoRows));
+        assert_eq!(again, Some((req_id, notice)));
+        // The right one does, and nothing more goes.
+        let right = acknowledge(&mut link, req_id, 1, at(520));
+        assert!(right.is_empty(), "{right:?}");
+        assert_eq!(report(&link.tick(at(1_100), false, &mut NoRows)), None);
+        let late = acknowledge(&mut link, req_id, 1, at(1_200));
+        assert_eq!(only(&late), Some(unexpected));
+    }
+
+    #[test]
+    fn l_195_no_report_goes_under_a_major_mismatch() {
+        let mut link = up_with(at(0), Version { major: 2, minor: 0 });
+        assert!(matches!(link.compat(), Some(Compat::MajorMismatch { .. })));
+        link.pairing_window(Some(at(120_000)), at(0));
+        for now in [10, 500, 1_000, 5_000] {
+            assert_eq!(report(&link.tick(at(now), false, &mut NoRows)), None);
+        }
+    }
+
+    #[test]
+    fn l_195_a_report_held_back_by_four_requests_says_what_is_left_when_it_leaves() {
+        let mut link = up(at(0));
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("a report");
+        assert!(acknowledge(&mut link, req_id, 1, at(20)).is_empty());
+        // Four closes fill every request slot (L-014) and are never answered.
+        for handle in 1..=4 {
+            let conn = Conn::new(handle).expect("a handle");
+            let _ = link.close(conn, CloseReason::Shedding, at(100));
+        }
+        link.pairing_window(Some(at(120_100)), at(100));
+        for now in [110, 600, 1_100] {
+            assert_eq!(
+                report(&link.tick(at(now), false, &mut NoRows)),
+                None,
+                "no slot at {now}"
+            );
+        }
+        // The closes are given up at 1 600 ms and the report leaves then,
+        // built from the deadline, not the duration observed.
+        let (_, sent) = report(&link.tick(at(1_600), false, &mut NoRows)).expect("a report");
+        assert_eq!(sent.revision().get(), 2);
+        assert_eq!(sent.remaining_ms(), 118_500);
+    }
+
+    #[test]
+    fn l_195_a_closure_takes_the_slot_of_the_open_report_it_supersedes_at_once() {
+        let mut link = up(at(0));
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("a report");
+        assert!(acknowledge(&mut link, req_id, 1, at(20)).is_empty());
+        // Three closes unanswered and the opening make four in flight.
+        for handle in 1..=3 {
+            let conn = Conn::new(handle).expect("a handle");
+            let _ = link.close(conn, CloseReason::Shedding, at(100));
+        }
+        link.pairing_window(Some(at(120_100)), at(100));
+        let (open_id, open) = report(&link.tick(at(110), false, &mut NoRows)).expect("the opening");
+        assert_eq!(open.revision().get(), 2);
+        // Closed before anything was answered: the closure goes in the same
+        // tick, in the open report's slot, and the opening is never retried.
+        link.pairing_window(None, at(200));
+        let (closed_id, closed) =
+            report(&link.tick(at(210), false, &mut NoRows)).expect("the closure at once");
+        assert_eq!(closed.revision().get(), 3);
+        assert_eq!(closed.remaining_ms(), 0);
+        for now in [610, 710, 1_110, 1_210] {
+            let resent = report(&link.tick(at(now), false, &mut NoRows));
+            assert!(
+                resent.is_none_or(|(id, notice)| id == closed_id && notice == closed),
+                "{resent:?} at {now}"
+            );
+        }
+        let late = acknowledge(&mut link, open_id, 2, at(1_300));
+        assert_eq!(
+            only(&late),
+            Some(Action::Note(Note::UnexpectedAck(
+                LinkMessageType::PairingWindowAck
+            )))
+        );
+    }
+
+    #[test]
+    fn l_195_a_report_in_flight_goes_with_the_link_and_is_never_retried_after_it() {
+        let mut link = up(at(0));
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("a report");
+        assert!(acknowledge(&mut link, req_id, 1, at(20)).is_empty());
+        link.pairing_window(Some(at(120_100)), at(100));
+        let (_, open) = report(&link.tick(at(110), false, &mut NoRows)).expect("the opening");
+        // The comms processor states itself under another boot: the link
+        // falls with the report unanswered.
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: 0xB007,
+            hw: "comms",
+            net_version: Some(0),
+        }
+        .write(link_header(LinkMessageType::LinkUp, ReqId(90)), &mut buf)
+        .expect("fits");
+        let rebooted = link.received(
+            LinkEnvelope::decode(&buf[..len]).expect("an envelope"),
+            at(200),
+            &mut NoRows,
+        );
+        assert!(
+            rebooted
+                .iter()
+                .any(|a| *a == Action::DropConnections(DropReason::CommsRebooted))
+        );
+        assert!(!link.is_up());
+        // Its retry time comes and goes with nothing sent to the new boot.
+        for now in (210..2_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert_eq!(report(&ticked), None, "{open:?} retried at {now}");
+        }
+    }
+
+    #[test]
+    fn l_195_when_the_revisions_run_out_the_link_falls_and_stays_down_until_a_reboot() {
+        let mut link = up(at(0));
+        link.pairing.skip_to(core::num::NonZeroU64::MAX);
+        let (req_id, last) = report(&link.tick(at(10), false, &mut NoRows)).expect("a report");
+        assert_eq!(
+            last.revision(),
+            core::num::NonZeroU64::MAX,
+            "the last is used"
+        );
+        assert!(acknowledge(&mut link, req_id, u64::MAX, at(20)).is_empty());
+        assert!(link.is_up() && !link.revisions_spent());
+        // The next report owed has no revision: the link falls, nothing wraps.
+        link.pairing_window(Some(at(120_100)), at(100));
+        let fell = link.tick(at(110), false, &mut NoRows);
+        assert_eq!(report(&fell), None);
+        assert!(
+            fell.iter()
+                .any(|a| *a == Action::DropConnections(DropReason::RevisionsSpent))
+        );
+        assert!(!link.is_up());
+        assert!(link.revisions_spent());
+        // Nothing states this side again, and the silence is never cut.
+        let settled = link.module_settled(at(200));
+        assert!(settled.iter().all(|a| !matches!(a, Action::Send(_))));
+        for now in (300..200_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(
+                ticked
+                    .iter()
+                    .all(|a| !matches!(a, Action::Send(_) | Action::CutRail)),
+                "{ticked:?} at {now}"
+            );
+        }
     }
 
     #[test]
