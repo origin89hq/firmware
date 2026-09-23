@@ -43,6 +43,17 @@ struct Image {
 
 const KIB: u64 = 1024;
 
+/// What every image is compiled with beyond the environment's flags.
+///
+/// SHA-256's compact software backend: the same algorithm as the unrolled
+/// default, rolled into a loop. On the controller, which has no hash
+/// peripheral and hashes at most a frame's worth at a time, the unrolled
+/// `compress256` was 9.4 KB of the slot and the loop is 488 bytes. A `cfg`
+/// sha2 reads, and only a flag can set it; this is where the images' flags
+/// live, so a recipe that builds with `cargo run` instead gets the unrolled
+/// one, larger and otherwise identical.
+const IMAGE_FLAGS: &[&str] = &["--cfg=sha2_backend_soft=\"compact\""];
+
 /// The three images, their targets and their budgets.
 ///
 /// The comms budget is the OTA slot the partition table will give it; the
@@ -235,10 +246,11 @@ fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
     let mut command = repo.cargo();
     let cargo_home = cargo_home()?;
     no_config_rustflags(repo.root(), &cargo_home)?;
-    let inherited = inherited(
+    let mut inherited = inherited(
         std::env::var_os("CARGO_ENCODED_RUSTFLAGS").as_deref(),
         std::env::var_os("RUSTFLAGS").as_deref(),
     )?;
+    inherited.extend(IMAGE_FLAGS.iter().map(|flag| (*flag).to_owned()));
     command.env(
         "CARGO_ENCODED_RUSTFLAGS",
         remapped(&inherited, repo.root(), &cargo_home, &sysroot()?)?,

@@ -111,6 +111,9 @@ flash-controller: sizes
 # Flash and run the production controller image with the log on the probe.
 # The runner is `probe-rs run`, which flashes the ELF's own regions only, so
 # the bootloader stays. Effect: as `flash-controller`, then the defmt log.
+# `cargo run` builds without the images' flags (`xtask/src/images.rs`): the
+# paths stay unremapped and SHA-256 unrolled, so the bytes are not the
+# measured image's, and the behaviour is.
 #
 # Flash and run the production controller image with the log on the probe.
 run-controller:
