@@ -142,14 +142,23 @@ impl Slot {
     }
 }
 
-/// What one slot's bytes decode to.
+/// What one slot's bytes decode to. The body stays in the buffer it was
+/// read into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decoded<const N: usize> {
+enum Decoded {
     /// The magic, the CRC and the sequence all hold.
-    Valid { seq: u32, body: [u8; N] },
+    Valid { seq: u32 },
     /// Every byte erased or zero: never written, or a fresh part.
     Blank,
     /// Written and wrong: a torn write, or damage.
+    Corrupt,
+}
+
+/// Which slot holds the record, if either does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Newest {
+    Valid { seq: u32, slot: Slot },
+    Empty,
     Corrupt,
 }
 
@@ -255,87 +264,35 @@ impl<const N: usize> Record<N> {
         self.a.plus(slot_bytes(N).saturating_mul(2))
     }
 
-    const fn address(self, slot: Slot) -> Address {
-        match slot {
-            Slot::A => self.a,
-            Slot::B => self.a.plus(slot_bytes(N)),
+    const fn slots(self) -> Slots {
+        Slots {
+            magic: self.magic,
+            a: self.a,
+            body: N,
         }
     }
 
     /// The bytes a slot holds for `seq` and `body`, CRC included.
+    #[cfg(test)]
     fn encode(self, seq: u32, body: &[u8; N]) -> ([u8; HEAD], u32) {
-        let mut head = [0u8; HEAD];
-        head[..4].copy_from_slice(&self.magic.to_le_bytes());
-        head[4..].copy_from_slice(&seq.to_le_bytes());
-        let mut digest = CRC32.digest();
-        digest.update(&head);
-        digest.update(body);
-        (head, digest.finalize())
-    }
-
-    fn decode(self, head: [u8; HEAD], body: &[u8; N], tail: [u8; TAIL]) -> Decoded<N> {
-        let blank = |byte: &u8| *byte == 0x00 || *byte == 0xFF;
-        if head.iter().all(blank) && body.iter().all(blank) && tail.iter().all(blank) {
-            return Decoded::Blank;
-        }
-        let magic = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-        let seq = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
-        let crc = u32::from_le_bytes(tail);
-        let mut digest = CRC32.digest();
-        digest.update(&head);
-        digest.update(body);
-        if magic == self.magic && digest.finalize() == crc && seq != 0 {
-            Decoded::Valid { seq, body: *body }
-        } else {
-            Decoded::Corrupt
-        }
-    }
-
-    async fn read_slot<F: Fram>(self, fram: &mut F, slot: Slot) -> Result<Decoded<N>, F::Error> {
-        let at = self.address(slot);
-        let mut head = [0u8; HEAD];
-        let mut body = [0u8; N];
-        let mut tail = [0u8; TAIL];
-        fram.read(at, &mut head).await?;
-        fram.read(at.plus(HEAD), &mut body).await?;
-        fram.read(at.plus(HEAD.saturating_add(N)), &mut tail)
-            .await?;
-        Ok(self.decode(head, &body, tail))
+        self.slots().encode(seq, body)
     }
 
     /// What the record holds: the newer valid slot, or that there is none.
     pub async fn read<F: Fram>(self, fram: &mut F) -> Result<Current<N>, F::Error> {
-        let a = self.read_slot(fram, Slot::A).await?;
-        let b = self.read_slot(fram, Slot::B).await?;
-        Ok(match (a, b) {
-            (Decoded::Valid { seq: sa, body: ba }, Decoded::Valid { seq: sb, body: bb }) => {
-                if sa >= sb {
-                    Current::Valid {
-                        seq: sa,
-                        body: ba,
-                        slot: Slot::A,
-                    }
-                } else {
-                    Current::Valid {
-                        seq: sb,
-                        body: bb,
-                        slot: Slot::B,
-                    }
-                }
-            }
-            (Decoded::Valid { seq, body }, Decoded::Blank | Decoded::Corrupt) => Current::Valid {
+        let mut a = [0u8; N];
+        let mut b = [0u8; N];
+        Ok(match self.slots().read(fram, &mut a, &mut b).await? {
+            Newest::Valid { seq, slot } => Current::Valid {
                 seq,
-                body,
-                slot: Slot::A,
+                body: match slot {
+                    Slot::A => a,
+                    Slot::B => b,
+                },
+                slot,
             },
-            (Decoded::Blank | Decoded::Corrupt, Decoded::Valid { seq, body }) => Current::Valid {
-                seq,
-                body,
-                slot: Slot::B,
-            },
-            (Decoded::Blank, Decoded::Blank | Decoded::Corrupt)
-            | (Decoded::Corrupt, Decoded::Blank) => Current::Empty,
-            (Decoded::Corrupt, Decoded::Corrupt) => Current::Corrupt,
+            Newest::Empty => Current::Empty,
+            Newest::Corrupt => Current::Corrupt,
         })
     }
 
@@ -352,6 +309,123 @@ impl<const N: usize> Record<N> {
         at: Position,
         body: &[u8; N],
     ) -> Result<Written, Refused<F::Error>> {
+        self.slots().write(fram, at, body).await
+    }
+}
+
+/// A record with its body's length known at run time rather than in the
+/// type: the code every record shares. Typed, each of a dozen body sizes
+/// carried its own copy of the reads, the check and the five-step write,
+/// about 450 bytes apiece of a 248 KB slot; here there is one, and
+/// [`Record`] only lends it buffers of the right length.
+#[derive(Debug, Clone, Copy)]
+struct Slots {
+    magic: u32,
+    a: Address,
+    /// The body's length in bytes: `N` of the record this came from.
+    body: usize,
+}
+
+impl Slots {
+    const fn address(self, slot: Slot) -> Address {
+        match slot {
+            Slot::A => self.a,
+            Slot::B => self.a.plus(slot_bytes(self.body)),
+        }
+    }
+
+    /// The bytes a slot holds for `seq` and `body`, CRC included.
+    fn encode(self, seq: u32, body: &[u8]) -> ([u8; HEAD], u32) {
+        debug_assert_eq!(body.len(), self.body);
+        let mut head = [0u8; HEAD];
+        head[..4].copy_from_slice(&self.magic.to_le_bytes());
+        head[4..].copy_from_slice(&seq.to_le_bytes());
+        let mut digest = CRC32.digest();
+        digest.update(&head);
+        digest.update(body);
+        (head, digest.finalize())
+    }
+
+    fn decode(self, head: [u8; HEAD], body: &[u8], tail: [u8; TAIL]) -> Decoded {
+        let blank = |byte: &u8| *byte == 0x00 || *byte == 0xFF;
+        if head.iter().all(blank) && body.iter().all(blank) && tail.iter().all(blank) {
+            return Decoded::Blank;
+        }
+        let magic = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+        let seq = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let crc = u32::from_le_bytes(tail);
+        let mut digest = CRC32.digest();
+        digest.update(&head);
+        digest.update(body);
+        if magic == self.magic && digest.finalize() == crc && seq != 0 {
+            Decoded::Valid { seq }
+        } else {
+            Decoded::Corrupt
+        }
+    }
+
+    /// Read `slot` into `body`, which is exactly the body's length.
+    async fn read_slot<F: Fram>(
+        self,
+        fram: &mut F,
+        slot: Slot,
+        body: &mut [u8],
+    ) -> Result<Decoded, F::Error> {
+        debug_assert_eq!(body.len(), self.body);
+        let at = self.address(slot);
+        let mut head = [0u8; HEAD];
+        let mut tail = [0u8; TAIL];
+        fram.read(at, &mut head).await?;
+        fram.read(at.plus(HEAD), body).await?;
+        fram.read(at.plus(HEAD.saturating_add(self.body)), &mut tail)
+            .await?;
+        Ok(self.decode(head, body, tail))
+    }
+
+    /// Read both slots, `A` into `a` and `B` into `b`, and say which holds
+    /// the record.
+    async fn read<F: Fram>(
+        self,
+        fram: &mut F,
+        a: &mut [u8],
+        b: &mut [u8],
+    ) -> Result<Newest, F::Error> {
+        let in_a = self.read_slot(fram, Slot::A, a).await?;
+        let in_b = self.read_slot(fram, Slot::B, b).await?;
+        Ok(match (in_a, in_b) {
+            (Decoded::Valid { seq: sa }, Decoded::Valid { seq: sb }) => {
+                if sa >= sb {
+                    Newest::Valid {
+                        seq: sa,
+                        slot: Slot::A,
+                    }
+                } else {
+                    Newest::Valid {
+                        seq: sb,
+                        slot: Slot::B,
+                    }
+                }
+            }
+            (Decoded::Valid { seq }, Decoded::Blank | Decoded::Corrupt) => {
+                Newest::Valid { seq, slot: Slot::A }
+            }
+            (Decoded::Blank | Decoded::Corrupt, Decoded::Valid { seq }) => {
+                Newest::Valid { seq, slot: Slot::B }
+            }
+            (Decoded::Blank, Decoded::Blank | Decoded::Corrupt)
+            | (Decoded::Corrupt, Decoded::Blank) => Newest::Empty,
+            (Decoded::Corrupt, Decoded::Corrupt) => Newest::Corrupt,
+        })
+    }
+
+    /// [`Record::write`], for a body of this length.
+    async fn write<F: Fram>(
+        self,
+        fram: &mut F,
+        at: Position,
+        body: &[u8],
+    ) -> Result<Written, Refused<F::Error>> {
+        debug_assert_eq!(body.len(), self.body);
         let (seq, slot) = match at {
             Position::At { seq, slot } => match seq.checked_add(1) {
                 Some(next) => (next, slot.other()),
@@ -366,7 +440,7 @@ impl<const N: usize> Record<N> {
         // 2. Everything after the magic. None of it is a record without one.
         fram.write(at.plus(MAGIC_BYTES), &seq.to_le_bytes()).await?;
         fram.write(at.plus(HEAD), body).await?;
-        fram.write(at.plus(HEAD.saturating_add(N)), &crc.to_le_bytes())
+        fram.write(at.plus(HEAD.saturating_add(self.body)), &crc.to_le_bytes())
             .await?;
         // 3. The magic, last: the switch.
         fram.write(at, &self.magic.to_le_bytes()).await?;
@@ -689,6 +763,6 @@ mod tests {
     fn slots_and_records_lay_out_end_to_end() {
         assert_eq!(slot_bytes(4), 16);
         assert_eq!(COUNTER.end(), Address(16 + 32));
-        assert_eq!(COUNTER.address(Slot::B), Address(32));
+        assert_eq!(COUNTER.slots().address(Slot::B), Address(32));
     }
 }
