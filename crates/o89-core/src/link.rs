@@ -764,13 +764,17 @@ impl Link {
                 };
                 Outgoing::ClientUpAck { req_id, outcome }
             }),
-            LinkMessageType::ClientDisconnected => {
-                ClientDown::decode(envelope).map(|down| Outgoing::ClientDownAck {
-                    req_id,
-                    outcome: Conn::new(down.conn)
-                        .map_or(ClientDisconnected::UnknownHandle, |conn| rows.release(conn)),
-                })
-            }
+            LinkMessageType::ClientDisconnected => ClientDown::decode(envelope).map(|down| {
+                let outcome =
+                    Conn::new(down.conn).map_or(ClientDisconnected::UnknownHandle, |conn| {
+                        // The transport is gone, and the answer lets its handle
+                        // go to the next one (L-080): a close still owed for it
+                        // would close, or its late answer free, the next owner.
+                        self.forget_close(conn);
+                        rows.release(conn)
+                    });
+                Outgoing::ClientDownAck { req_id, outcome }
+            }),
             LinkMessageType::TimeOffer => {
                 match ClockOffer::decode(envelope) {
                     Ok(offer) => actions.push(Action::OfferTime {
@@ -914,6 +918,26 @@ impl Link {
             let _ = rows.release(closing.conn);
         }
         self.conns = rows.allocated();
+    }
+
+    /// Forget the close owed for `conn`, and retire the request carrying
+    /// it, so neither a retry nor a late answer reaches the handle's next
+    /// owner.
+    fn forget_close(&mut self, conn: Conn) {
+        let owed = self
+            .closing
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|closing| closing.conn == conn))
+            .and_then(Option::take);
+        if let Some(Closing {
+            req_id: Some(req_id),
+            ..
+        }) = owed
+        {
+            let _ = self
+                .requests
+                .answered(req_id, LinkMessageType::CloseConnection);
+        }
     }
 
     fn take_closing(&mut self, req_id: ReqId) -> Option<Closing> {

@@ -16,7 +16,7 @@ use km43::{
 use o89_core::{Facts, Millis, Sessions};
 
 use crate::link::{Bench, DEVICE, LOG, MODEL, PRINTED, unit};
-use crate::{Capabilities, Heard, SimFram, crash_at_every_step};
+use crate::{Answers, Capabilities, Heard, SimFram, crash_at_every_step};
 
 fn device() -> DeviceSecret {
     DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
@@ -423,6 +423,50 @@ fn p_051_eight_bad_macs_inside_a_minute_close_the_connection_over_the_wire() {
         vec![(1, CloseReason::AuthenticationFailures)]
     );
     assert_eq!(bench.endpoint.sessions.allocated(), 0);
+}
+
+#[test]
+fn l_080_a_close_owed_for_a_released_handle_is_forgotten_before_the_handle_is_reused() {
+    // Capabilities: withhold (the close's answer), reuse a handle.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let forged = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]))
+        .enrolment(epoch(), ClientId::new(1).expect("a slot"))
+        .session_key(
+            &Handshake {
+                challenge: [0; 16],
+                client_nonce: [0; 16],
+            },
+            SessionId::from(1),
+        );
+    for _ in 1..=7 {
+        let frame = client.wrapped(MessageType::Readings, &forged);
+        let _ = client.send(&mut bench, &frame);
+    }
+    // The comms processor stops hearing the controller: the close the
+    // eighth failure asks for is never answered.
+    bench.comms.capabilities().answers = Answers::TalksOnly;
+    let frame = client.wrapped(MessageType::Readings, &forged);
+    let _ = client.send(&mut bench, &frame);
+    assert_eq!(
+        closes(&bench),
+        vec![(1, CloseReason::AuthenticationFailures)]
+    );
+    // It closed the transport anyway and says so; the release is answered,
+    // which frees the handle for the next transport (L-080).
+    release(&mut bench, 1);
+    announce(&mut bench, 1);
+    assert_eq!(outcomes(&bench, 0xE2), vec![1, 1]);
+    // Past every retry the close would have had: nothing closes the new
+    // transport, and its row stands.
+    bench.run_for(Millis::from_millis(2_000));
+    assert_eq!(
+        closes(&bench),
+        vec![(1, CloseReason::AuthenticationFailures)]
+    );
+    assert_eq!(bench.endpoint.sessions.allocated(), 1);
 }
 
 #[test]
