@@ -320,14 +320,33 @@ impl<const N: usize> Record<N> {
     /// Zero both complete reservations, including any previous credentials.
     /// A refused write stops immediately; retrying may repeat the partial erase.
     pub(crate) async fn erase<F: Fram>(self, fram: &mut F) -> Result<(), Refused<F::Error>> {
+        self.erase_slot(fram, Slot::A).await?;
+        self.erase_slot(fram, Slot::B).await
+    }
+
+    /// Scrub the non-current reservation without touching the committed record.
+    /// With no current record, scrub both reservations.
+    pub(crate) async fn erase_previous<F: Fram>(
+        self,
+        fram: &mut F,
+        position: Position,
+    ) -> Result<(), Refused<F::Error>> {
+        match position {
+            Position::At { slot, .. } => self.erase_slot(fram, slot.other()).await,
+            Position::Start => self.erase(fram).await,
+        }
+    }
+
+    async fn erase_slot<F: Fram>(self, fram: &mut F, slot: Slot) -> Result<(), Refused<F::Error>> {
         // A fixed scratch buffer bounds stack use independently of reservation size.
         const ERASE_CHUNK: usize = 32;
         let zeros = [0; ERASE_CHUNK];
-        let bytes = slot_bytes(self.reserved).saturating_mul(2);
+        let bytes = slot_bytes(self.reserved);
+        let start = self.slots().address(slot);
         for offset in (0..bytes).step_by(ERASE_CHUNK) {
             let len = bytes.saturating_sub(offset).min(ERASE_CHUNK);
             if let Some(chunk) = zeros.get(..len) {
-                fram.write(self.a.plus(offset), chunk).await?;
+                fram.write(start.plus(offset), chunk).await?;
             }
         }
         Ok(())

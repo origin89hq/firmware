@@ -506,7 +506,7 @@ impl Sessions {
     }
 
     /// The physical factory reset (P-085): the epoch advanced and verified,
-    /// then the table cleared under it. The network clear lands before the
+    /// then the table cleared under it. The network clear and old-slot scrub land before the
     /// epoch can advance. Every session ends first, whatever
     /// comes of the writes, because each was keyed under the epoch this
     /// retires; the rows stay with their transports, and a client that
@@ -531,6 +531,11 @@ impl Sessions {
                 self.keys
                     .network
                     .write(fram, cleared)
+                    .await
+                    .map_err(ResetFailed::Network)?;
+                self.keys
+                    .network
+                    .erase_previous(fram)
                     .await
                     .map_err(ResetFailed::Network)?;
             }

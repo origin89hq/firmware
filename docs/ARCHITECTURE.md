@@ -688,8 +688,10 @@ the next link-up compares again.
 
 Factory reset ends sessions and writes the network clear before advancing the
 epoch. The clear increments the network version and retains country and
-hostname, so it remains encodable after reboot (L-134, L-135). A failed clear
-stops the reset. A damaged network record is erased across both slots before
+hostname, so it remains encodable after reboot (L-134, L-135). After the clear
+commits, reset scrubs the entire old slot before advancing the epoch, leaving
+the current cleared record untouched. A failed clear or scrub stops the reset;
+a retry finishes removing the old credentials. A damaged network record is erased across both slots before
 the epoch advances; a failed erase also stops the reset. An absent record is
 erased too, so a retry finishes removing residue after a partial erase. No
 country or hostname is invented, and the section reads absent afterwards. A

@@ -1889,6 +1889,71 @@ fn l_135_factory_reset_pushes_clear_and_keeps_its_version_after_reboot() {
     assert_eq!(kept.present(), Some(network));
 }
 
+fn assert_network_reservation_scrubbed(part: &mut SimFram) {
+    use o89_core::{Current, Slot, map};
+    let current = block_on(map::NETWORK.read(part)).expect("network slots");
+    let Current::Valid { slot, .. } = current else {
+        panic!("cleared record must remain valid");
+    };
+    let start = usize::from(map::COMMS_RELEASE.end().0);
+    let end = usize::from(map::NETWORK.end().0);
+    let reservation = &part.bytes()[start..end];
+    for secret in [b"cabin".as_slice(), b"correct horse".as_slice()] {
+        assert!(
+            !reservation
+                .windows(secret.len())
+                .any(|bytes| bytes == secret)
+        );
+    }
+    let slot_bytes = reservation.len() / 2;
+    let old = match slot {
+        Slot::A => &reservation[slot_bytes..],
+        Slot::B => &reservation[..slot_bytes],
+    };
+    assert!(old.iter().all(|byte| *byte == 0), "old slot retains bytes");
+}
+
+#[test]
+fn p_085_healthy_network_reset_scrubs_both_slots_after_reboot() {
+    for previous_slot in [false, true] {
+        // Capabilities: none.
+        let mut bench = network_bench();
+        if previous_slot {
+            let network = *bench
+                .endpoint
+                .sessions
+                .keys()
+                .network
+                .present()
+                .expect("network");
+            let mut kept = block_on(o89_core::Kept::read(
+                o89_core::map::NETWORK,
+                &mut bench.fram,
+            ))
+            .expect("read");
+            block_on(kept.write(&mut bench.fram, network)).expect("second slot");
+            let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
+            bench.endpoint.sessions = Sessions::new(Keys {
+                configuration: store.configuration,
+                network: store.network,
+                secret: store.secret.present().copied(),
+                epoch: report.epoch.epoch(),
+                epoch_record: store.epoch,
+                clients: store.clients,
+                challenges: store.challenges,
+            });
+        }
+        block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
+        bench.fram.reboot();
+        let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("reboot");
+        assert_eq!(report.epoch.epoch(), km43::Epoch::new(2));
+        let network = store.network.present().expect("cleared network");
+        assert_eq!(network.version(), 2);
+        assert_eq!(network.credentials(), None);
+        assert_network_reservation_scrubbed(&mut bench.fram);
+    }
+}
+
 #[test]
 fn l_133_unwritten_master_with_a_foreign_cache_reports_the_protocol_gap() {
     // Capabilities: claim a cached version from another controller.
@@ -1918,7 +1983,7 @@ fn l_133_unwritten_master_with_a_foreign_cache_reports_the_protocol_gap() {
 }
 
 #[test]
-fn l_135_factory_reset_cut_at_every_byte_never_advances_epoch_with_old_credentials() {
+fn l_135_healthy_reset_cut_at_every_byte_scrubs_credentials_before_epoch_and_on_retry() {
     // Capabilities: none; the deterministic cut is behind the storage seam.
     let mut whole = network_bench();
     let seed = whole.fram.clone();
@@ -1940,7 +2005,12 @@ fn l_135_factory_reset_cut_at_every_byte_never_advances_epoch_with_old_credentia
         });
         part.reboot();
         part.cut_after(cut);
-        let _ = block_on(sessions.factory_reset(&mut part));
+        let result = block_on(sessions.factory_reset(&mut part));
+        // The clear writes 176 bytes, then the old 172-byte slot is scrubbed.
+        if (176..348).contains(&cut) {
+            assert!(result.is_err(), "scrub failure must stop reset at {cut}");
+            assert_eq!(sessions.keys().epoch, Some(km43::Epoch::FIRST));
+        }
         part.reboot();
         let (store, report) = block_on(o89_core::Store::boot(&mut part, None)).expect("recover");
         let network = store.network.present().expect("old or clear");
@@ -1948,10 +2018,33 @@ fn l_135_factory_reset_cut_at_every_byte_never_advances_epoch_with_old_credentia
             network.version() == 1 || network.version() == 2,
             "cut {cut}"
         );
+        if cut >= 176 {
+            assert_eq!(network.version(), 2, "clear survives scrub cut {cut}");
+            assert_eq!(network.credentials(), None);
+        }
         if report.epoch.epoch() != Some(km43::Epoch::FIRST) {
             assert_eq!(network.version(), 2, "cut {cut}");
             assert_eq!(network.credentials(), None, "cut {cut}");
+            assert_network_reservation_scrubbed(&mut part);
         }
+        let mut sessions = Sessions::new(Keys {
+            configuration: store.configuration,
+            network: store.network,
+            secret: store.secret.present().copied(),
+            epoch: report.epoch.epoch(),
+            epoch_record: store.epoch,
+            clients: store.clients,
+            challenges: store.challenges,
+        });
+        block_on(sessions.factory_reset(&mut part)).expect("retry reset");
+        part.reboot();
+        let (store, report) = block_on(Store::boot(&mut part, None)).expect("reboot retry");
+        assert_ne!(report.epoch.epoch(), Some(km43::Epoch::FIRST));
+        assert_eq!(
+            store.network.present().expect("clear boots").credentials(),
+            None
+        );
+        assert_network_reservation_scrubbed(&mut part);
     }
 }
 

@@ -142,6 +142,14 @@ impl<T: Body<N>, const N: usize> Kept<T, N> {
         Ok(())
     }
 
+    /// Remove the previous slot's bytes while retaining the current record.
+    pub(crate) async fn erase_previous<F: Fram>(
+        &self,
+        fram: &mut F,
+    ) -> Result<(), Refused<F::Error>> {
+        self.record.erase_previous(fram, self.position).await
+    }
+
     /// Erase both slots before publishing absence. A failure retains the held state.
     pub(crate) async fn erase<F: Fram>(&mut self, fram: &mut F) -> Result<(), Refused<F::Error>> {
         self.record.erase(fram).await?;
