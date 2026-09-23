@@ -506,7 +506,8 @@ impl Sessions {
     }
 
     /// The physical factory reset (P-085): the epoch advanced and verified,
-    /// then the table cleared under it. Every session ends first, whatever
+    /// then the table cleared under it. The network clear lands before the
+    /// epoch can advance. Every session ends first, whatever
     /// comes of the writes, because each was keyed under the epoch this
     /// retires; the rows stay with their transports, and a client that
     /// pairs again under the new epoch `Hello`s on the same one. Keys derive
@@ -519,6 +520,23 @@ impl Sessions {
         for row in self.rows.iter_mut().flatten() {
             if let Bound::Session(_) = row.bound {
                 row.bound = Bound::Ended;
+            }
+        }
+        match self.keys.network.held() {
+            crate::Held::Present(held) => {
+                let mut cleared = *held;
+                cleared
+                    .clear()
+                    .map_err(|_| ResetFailed::Network(crate::Refused::AtTheCeiling))?;
+                self.keys
+                    .network
+                    .write(fram, cleared)
+                    .await
+                    .map_err(ResetFailed::Network)?;
+            }
+            crate::Held::Absent => {}
+            crate::Held::Corrupt | crate::Held::Malformed(_) => {
+                return Err(ResetFailed::NetworkUnavailable);
             }
         }
         let reset = reset_clients(&mut self.keys.epoch_record, &mut self.keys.clients, fram).await;
@@ -633,10 +651,8 @@ impl Sessions {
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
             MessageType::Time => self.time(to, envelope, now, fram, dst).await,
-            // Signed, and not served until their handlers call `admit`:
-            // refused without a counter spent, after the session they need
-            // is checked (P-143).
             MessageType::SetConfig => self.set_config(to, envelope, now, fram, dst).await,
+            // Firmware remains unserved and spends no counter (P-143).
             MessageType::Firmware => match self.bound_on(to, dst) {
                 Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
                 Err(refused) => refused,
@@ -1185,11 +1201,7 @@ impl Sessions {
         }
     }
 
-    /// `Time 0x0A` on a session, through [`admit`]: the counter spent before
-    /// anything else (P-080), then the operation handed to the recorder,
-    /// which owns the calendar and the floor, with a ticket. The answer
-    /// comes back through [`Sessions::time_answered`]. Refusals before the
-    /// recorder are answered as a `Command`'s are.
+    /// Admit the signed write before its version or section body is examined.
     async fn set_config<F: Fram>(
         &mut self,
         to: Addressed,
@@ -1237,7 +1249,7 @@ impl Sessions {
                 return reply;
             }
             // Only a `Command` is reserved, answered from the table or left
-            // in flight; a `Time` never is.
+            // in flight; a `SetConfig` never is.
             Admission::Execute(Permit::Command(_))
             | Admission::Answered(_)
             | Admission::InFlight(_) => {
@@ -1273,6 +1285,11 @@ impl Sessions {
         answered(written)
     }
 
+    /// `Time 0x0A` on a session, through [`admit`]: the counter spent before
+    /// anything else (P-080), then the operation handed to the recorder,
+    /// which owns the calendar and the floor, with a ticket. The answer
+    /// comes back through [`Sessions::time_answered`]. Refusals before the
+    /// recorder are answered as a `Command`'s are.
     async fn time<F: Fram>(
         &mut self,
         to: Addressed,

@@ -678,7 +678,25 @@ writer. The core
 holds the link-local state: link-up and `boot_id` invalidation, the heartbeat
 and the recovery ladder with the board's revision policy (below), connection
 rows and challenges, network configuration push, time offers with the floor,
-cap and rate limit, and the comms release flow. The adapter owns the bytes
+cap and rate limit, and the comms release flow. After every accepted `LinkUp`, the controller
+compares the module's `net_version` with its persisted network section and
+pushes `NetConfig` whenever they differ in either direction (L-133). A local
+network write also owes a push. One immutable snapshot is tracked in the
+bounded request table; retries retain its request id and bytes. A newer write
+supersedes that request. A refused or exhausted request raises a probe note;
+the next link-up compares again.
+
+Factory reset ends sessions and writes the network clear before advancing the
+epoch. The clear increments the network version and retains country and
+hostname, so it remains encodable after reboot (L-134, L-135). A failed clear
+stops the reset. A never-written section remains unwritten. If that unit meets
+a module reporting a nonzero network version, KM43 0.5.1 has no clear shape
+without country and hostname: the controller sends nothing and raises
+`NetworkWithoutMaster`. That protocol gap remains open; no regulatory country
+is guessed. The phone-to-Wi-Fi bench exit also remains open and depends on
+#90's comms side.
+
+The adapter owns the bytes
 and the rail pin. The ROM's boot text arrives on the link at 115200 after
 every module reset while the link runs at 921600; the framer resynchronises
 through it and counts it, and a count far from the bench's baseline of about

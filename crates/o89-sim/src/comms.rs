@@ -100,6 +100,8 @@ pub enum Releases {
 /// What the peer may do. The default is a peer that behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Network version claimed at `LinkUp`; supports a module moved between units.
+    pub net_version: u32,
     /// Whether it answers at all.
     pub answers: Answers,
     /// Whether it states itself.
@@ -124,6 +126,7 @@ pub struct Capabilities {
 impl Default for Capabilities {
     fn default() -> Self {
         Self {
+            net_version: 0,
             answers: Answers::Everything,
             statement: Statement::Given,
             beats: Beats::Given,
@@ -149,6 +152,13 @@ pub enum Broken {
 /// What the peer decoded from the controller, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heard {
+    /// A decoded network update; its passphrase is redacted by the owned type.
+    NetConfig {
+        /// Version offered by the controller.
+        version: u32,
+        /// Redacted decoded body (its synthetic version is one).
+        network: o89_core::Network,
+    },
     /// The controller stated itself.
     LinkUp {
         /// Its request id.
@@ -545,6 +555,7 @@ impl HostileComms {
             .filter_map(|heard| match heard {
                 Heard::ToClient { session: to, frame } if *to == session => Some(frame.clone()),
                 Heard::ToClient { .. }
+                | Heard::NetConfig { .. }
                 | Heard::Close { .. }
                 | Heard::LinkUp { .. }
                 | Heard::LinkUpAck { .. }
@@ -577,6 +588,7 @@ impl HostileComms {
                     remaining_ms,
                 } => Some((*req_id, *revision, *remaining_ms)),
                 Heard::ToClient { .. }
+                | Heard::NetConfig { .. }
                 | Heard::Close { .. }
                 | Heard::LinkUp { .. }
                 | Heard::LinkUpAck { .. }
@@ -696,7 +708,9 @@ impl HostileComms {
         if let Some(own) = self.own_frame(frame, now) {
             return own;
         }
-        let honest = self.caps.version == OURS && self.caps.claims == Claims::Comms;
+        let honest = self.caps.version == OURS
+            && self.caps.claims == Claims::Comms
+            && self.caps.net_version == 0;
         if !honest {
             if let Frame::LinkUp { req_id } = frame {
                 return self.claimed_statement(LinkMessageType::LinkUp, req_id);
@@ -835,7 +849,7 @@ impl HostileComms {
             Claims::Controller => Side::Controller,
         };
         let net_version = match self.caps.claims {
-            Claims::Comms => Some(0),
+            Claims::Comms => Some(self.caps.net_version),
             Claims::Controller => None,
         };
         let len = LinkUp {
@@ -924,6 +938,7 @@ impl HostileComms {
                             conns: beat.conns,
                         })
                 }
+                Ok(LinkMessageType::NetConfig) => heard_network(envelope),
                 Ok(LinkMessageType::HeartbeatAck) => Some(Heard::HeartbeatAck { req_id }),
                 Ok(LinkMessageType::PairingWindow) => PairingWindowNotice::decode(envelope)
                     .ok()
@@ -1027,6 +1042,41 @@ fn first_value(envelope: LinkEnvelope<'_>) -> Option<u8> {
         return None;
     }
     body.u8().ok()
+}
+
+fn heard_network(envelope: LinkEnvelope<'_>) -> Option<Heard> {
+    km43::NetChange::decode(envelope).ok().and_then(|change| {
+        let (version, join, country, hostname) = match change {
+            km43::NetChange::Set {
+                version,
+                ssid,
+                psk,
+                country,
+                hostname,
+            } => (
+                version,
+                Some(km43::JoinWrite {
+                    ssid: km43::Ssid::new(ssid).ok()?,
+                    psk: Some(km43::Passphrase::new(psk).ok()?),
+                }),
+                country,
+                hostname,
+            ),
+            km43::NetChange::Clear {
+                version,
+                country,
+                hostname,
+            } => (version, None, country, hostname),
+        };
+        let network = o89_core::Network::NONE
+            .changed(km43::NetworkWrite {
+                join,
+                country: km43::Country::new(country).ok()?,
+                hostname: km43::Hostname::new(hostname).ok()?,
+            })
+            .ok()?;
+        Some(Heard::NetConfig { version, network })
+    })
 }
 
 #[cfg(test)]

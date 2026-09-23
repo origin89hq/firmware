@@ -126,7 +126,11 @@ impl Kept<Epoch, EPOCH_BYTES> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResetFailed<E> {
-    /// Epoch advance or verification failed; nothing else was cleared.
+    /// Credentials could not be cleared; the epoch and clients remain unchanged.
+    Network(Refused<E>),
+    /// The network record is damaged; its credentials cannot be cleared reliably.
+    NetworkUnavailable,
+    /// Epoch advance or verification failed; the client table was not cleared.
     Epoch(EpochFailed<E>),
     /// The epoch advanced, but the table did not clear. Boot finishes it.
     Clients(Refused<E>),

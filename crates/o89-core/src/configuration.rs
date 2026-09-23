@@ -148,10 +148,16 @@ impl Configuration {
                     return Ok(ack(operation, version, SetConfig::ExceedsCap));
                 }
                 let next = match km43::NetworkWrite::decode(operation.body)
+                    .map_err(crate::NetworkChangeError::Invalid)
                     .and_then(|write| current.changed(write))
                 {
                     Ok(next) => next,
-                    Err(why) => return invalid(operation, version, why),
+                    Err(crate::NetworkChangeError::Invalid(why)) => {
+                        return invalid(operation, version, why);
+                    }
+                    Err(crate::NetworkChangeError::VersionCeiling) => {
+                        return Ok(ack(operation, version, SetConfig::ExceedsCap));
+                    }
                 };
                 network
                     .write(fram, next)
@@ -165,26 +171,13 @@ impl Configuration {
         }
     }
 }
-fn shown<T, const N: usize>(record: &Kept<T, N>) -> Result<(u32, Option<&[u8]>), ErrorCode>
-where
-    T: SectionBody + Body<N>,
-{
+fn shown<const N: usize, const M: usize>(
+    record: &Kept<Section<N>, M>,
+) -> Result<(u32, Option<&[u8]>), ErrorCode> {
     match record.held() {
         Held::Absent => Ok((0, None)),
-        Held::Present(value) => Ok((value.version(), Some(value.bytes()))),
+        Held::Present(value) => Ok((value.version, Some(value.body()))),
         Held::Corrupt | Held::Malformed(_) => Err(ErrorCode::BusyRetry),
-    }
-}
-trait SectionBody {
-    fn version(&self) -> u32;
-    fn bytes(&self) -> &[u8];
-}
-impl<const N: usize> SectionBody for Section<N> {
-    fn version(&self) -> u32 {
-        self.version
-    }
-    fn bytes(&self) -> &[u8] {
-        self.body()
     }
 }
 fn ack(operation: SetConfigOperation<'_>, version: u32, outcome: SetConfig) -> SetConfigAck {

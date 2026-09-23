@@ -680,9 +680,12 @@ mod tests {
     #[test]
     fn a_boot_whose_last_read_fails_writes_nothing_and_the_next_one_counts_once() {
         let mut part = Part::fresh();
-        // The network record is the last one read: fail it, so every other
-        // read had succeeded before the boot gave up.
-        part.refuse_reads_at = Some(map::NETWORK.end().0.saturating_sub(1));
+        // The last section's B-prefix CRC is the last read. Every earlier
+        // record has been read when this transaction fails.
+        let last_read = usize::from(map::LOAD_SHED_CONFIG.end().0) - crate::fram::slot_bytes(1024)
+            + crate::fram::slot_bytes(crate::BEHAVIOUR_RECORD_BYTES)
+            - 1;
+        part.refuse_reads_at = Some(u16::try_from(last_read).expect("inside FRAM"));
         let outcome = block_on(Store::boot(
             &mut part,
             Some(LastWords::Panicked(PanicSite { file: 1, line: 2 })),

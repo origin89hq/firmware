@@ -112,6 +112,21 @@ pub struct Network {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct VersionCeiling;
 
+/// Why a validated network write cannot replace the master copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum NetworkChangeError {
+    /// The section or retained passphrase is invalid.
+    Invalid(km43::ConfigError),
+    /// No further version is representable.
+    VersionCeiling,
+}
+impl From<km43::ConfigError> for NetworkChangeError {
+    fn from(why: km43::ConfigError) -> Self {
+        Self::Invalid(why)
+    }
+}
+
 impl Network {
     /// A unit out of its box: version zero, no network.
     pub const NONE: Self = Self {
@@ -151,7 +166,7 @@ impl Network {
     }
 
     /// Validate a whole write, resolving a retained passphrase only for its SSID.
-    pub fn changed(&self, write: km43::NetworkWrite<'_>) -> Result<Self, km43::ConfigError> {
+    pub fn changed(&self, write: km43::NetworkWrite<'_>) -> Result<Self, NetworkChangeError> {
         use km43::{ConfigError, PassphraseChange};
         let held = self.credentials.as_ref();
         let held_ssid = held
@@ -174,7 +189,7 @@ impl Network {
                         Psk::new(value.as_str()).map_err(|_| ConfigError::NoPassphraseHeld)?
                     }
                     PassphraseChange::Keep => held.ok_or(ConfigError::NoPassphraseHeld)?.psk,
-                    PassphraseChange::Clear => return Err(ConfigError::NoPassphraseHeld),
+                    PassphraseChange::Clear => return Err(ConfigError::NoPassphraseHeld.into()),
                 };
                 Some(Credentials {
                     ssid: Text::new(join.ssid.as_str())
@@ -189,7 +204,7 @@ impl Network {
             version: self
                 .version
                 .checked_add(1)
-                .ok_or(ConfigError::NoPassphraseHeld)?,
+                .ok_or(NetworkChangeError::VersionCeiling)?,
             credentials,
             country: Some(country.as_bytes()),
             hostname,
@@ -351,11 +366,15 @@ mod tests {
         write.join.as_mut().expect("join").ssid = km43::Ssid::new("Cabin").expect("ssid");
         assert_eq!(
             network.changed(write),
-            Err(km43::ConfigError::PassphraseForAnotherNetwork)
+            Err(NetworkChangeError::Invalid(
+                km43::ConfigError::PassphraseForAnotherNetwork
+            ))
         );
         assert_eq!(
             Network::NONE.changed(write),
-            Err(km43::ConfigError::NoPassphraseHeld)
+            Err(NetworkChangeError::Invalid(
+                km43::ConfigError::NoPassphraseHeld
+            ))
         );
     }
 
@@ -416,6 +435,14 @@ mod tests {
         };
         assert_eq!(top.set(cabin()), Err(VersionCeiling));
         assert_eq!(top.clear(), Err(VersionCeiling));
+        assert_eq!(
+            top.changed(km43::NetworkWrite {
+                join: None,
+                country: km43::Country::new("CA").expect("country"),
+                hostname: km43::Hostname::new("origin89").expect("hostname"),
+            }),
+            Err(NetworkChangeError::VersionCeiling)
+        );
     }
 
     #[test]

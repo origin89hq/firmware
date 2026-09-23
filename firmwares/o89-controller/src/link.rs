@@ -1063,7 +1063,9 @@ fn note_line(note: Note) {
         | Note::RequestFailed(_)
         | Note::Malformed(_)
         | Note::PeerRefused(_)
-        | Note::WrongRole => {
+        | Note::WrongRole
+        | Note::NetworkWithoutMaster
+        | Note::NetworkRefused(_) => {
             defmt::warn!("link: {}", note);
         }
     }

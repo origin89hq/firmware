@@ -1750,3 +1750,207 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
     );
     assert!(bench.endpoint.link.is_up());
 }
+
+#[test]
+fn l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions() {
+    // Capabilities: claim another cached version, as a replaced module can.
+    for cached in [0, 1, 7] {
+        let mut bench = Bench::new(Capabilities {
+            net_version: cached,
+            ..Capabilities::default()
+        });
+        let mut record = block_on(o89_core::Kept::read(
+            o89_core::map::NETWORK,
+            &mut bench.fram,
+        ))
+        .expect("read");
+        let mut network = o89_core::Network::NONE;
+        network
+            .set(o89_core::Credentials {
+                ssid: o89_core::Text::new("cabin").expect("ssid"),
+                psk: o89_core::Psk::new("correct horse").expect("psk"),
+                country: o89_core::Country::new(*b"CA").expect("country"),
+                hostname: o89_core::Text::new("origin89").expect("host"),
+            })
+            .expect("network");
+        block_on(record.write(&mut bench.fram, network)).expect("persist");
+        let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
+        bench.endpoint.sessions = o89_core::Sessions::new(Keys {
+            configuration: store.configuration,
+            network: store.network,
+            secret: store.secret.present().copied(),
+            epoch: report.epoch.epoch(),
+            epoch_record: store.epoch,
+            clients: store.clients,
+            challenges: store.challenges,
+        });
+        bench.run_for(Millis::from_millis(2000));
+        assert_eq!(
+            bench
+                .comms
+                .heard
+                .iter()
+                .any(|heard| matches!(heard, Heard::NetConfig { version: 1, .. })),
+            cached != 1,
+            "cached {cached}"
+        );
+    }
+}
+
+fn network_bench() -> Bench {
+    let mut bench = Bench::new(Capabilities::default());
+    let mut record = block_on(o89_core::Kept::read(
+        o89_core::map::NETWORK,
+        &mut bench.fram,
+    ))
+    .expect("read");
+    let network = o89_core::Network::NONE
+        .changed(km43::NetworkWrite {
+            join: Some(km43::JoinWrite {
+                ssid: km43::Ssid::new("cabin").expect("ssid"),
+                psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+            }),
+            country: km43::Country::new("CA").expect("country"),
+            hostname: km43::Hostname::new("origin89").expect("host"),
+        })
+        .expect("network");
+    block_on(record.write(&mut bench.fram, network)).expect("persist");
+    let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
+    bench.endpoint.sessions = o89_core::Sessions::new(Keys {
+        configuration: store.configuration,
+        network: store.network,
+        secret: store.secret.present().copied(),
+        epoch: report.epoch.epoch(),
+        epoch_record: store.epoch,
+        clients: store.clients,
+        challenges: store.challenges,
+    });
+    bench.run_for(Millis::from_millis(2000));
+    bench
+}
+
+#[test]
+fn l_134_hostile_comms_observes_the_validated_country_in_net_config() {
+    // Capabilities: none.
+    let bench = network_bench();
+    let network = bench
+        .comms
+        .heard
+        .iter()
+        .find_map(|heard| {
+            if let Heard::NetConfig { network, .. } = heard {
+                Some(network)
+            } else {
+                None
+            }
+        })
+        .expect("push");
+    assert_eq!(
+        network.change(),
+        Some(km43::NetChange::Set {
+            version: 1,
+            ssid: "cabin",
+            psk: "correct horse",
+            country: "CA",
+            hostname: "origin89"
+        })
+    );
+}
+
+#[test]
+fn l_135_factory_reset_pushes_clear_and_keeps_its_version_after_reboot() {
+    // Capabilities: none.
+    let mut bench = network_bench();
+    block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
+    bench.run_for(Millis::from_millis(100));
+    assert!(bench.comms.heard.iter().any(|heard| matches!(heard, Heard::NetConfig { version: 2, network } if network.credentials().is_none())));
+    let network = bench
+        .endpoint
+        .sessions
+        .keys()
+        .network
+        .present()
+        .expect("clear held");
+    assert_eq!(network.version(), 2);
+    assert_eq!(network.read_body().expect("read").join, None);
+    assert_eq!(
+        network.change(),
+        Some(km43::NetChange::Clear {
+            version: 2,
+            country: "CA",
+            hostname: "origin89"
+        })
+    );
+    let kept = block_on(o89_core::Kept::<o89_core::Network, 160>::read(
+        o89_core::map::NETWORK,
+        &mut bench.fram,
+    ))
+    .expect("reboot");
+    assert_eq!(kept.present(), Some(network));
+}
+
+#[test]
+fn l_133_unwritten_master_with_a_foreign_cache_reports_the_protocol_gap() {
+    // Capabilities: claim a cached version from another controller.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 7,
+        ..Capabilities::default()
+    });
+    bench.run_for(Millis::from_millis(2000));
+    assert!(
+        !bench
+            .comms
+            .heard
+            .iter()
+            .any(|heard| matches!(heard, Heard::NetConfig { .. }))
+    );
+    assert!(
+        bench.asked.iter().any(|(_, action)| matches!(
+            action,
+            Action::Note(o89_core::Note::NetworkWithoutMaster)
+        ))
+    );
+    block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
+    assert!(matches!(
+        bench.endpoint.sessions.keys().network.held(),
+        o89_core::Held::Absent
+    ));
+}
+
+#[test]
+fn l_135_factory_reset_cut_at_every_byte_never_advances_epoch_with_old_credentials() {
+    // Capabilities: none; the deterministic cut is behind the storage seam.
+    let mut whole = network_bench();
+    let seed = whole.fram.clone();
+    whole.fram.reboot();
+    block_on(whole.endpoint.sessions.factory_reset(&mut whole.fram)).expect("reset");
+    let steps = whole.fram.bytes_written();
+    assert!(steps > 160);
+    for cut in 0..=steps {
+        let mut part = seed.clone();
+        let (store, report) = block_on(o89_core::Store::boot(&mut part, None)).expect("boot");
+        let mut sessions = o89_core::Sessions::new(Keys {
+            configuration: store.configuration,
+            network: store.network,
+            secret: store.secret.present().copied(),
+            epoch: report.epoch.epoch(),
+            epoch_record: store.epoch,
+            clients: store.clients,
+            challenges: store.challenges,
+        });
+        part.reboot();
+        part.cut_after(cut);
+        let _ = block_on(sessions.factory_reset(&mut part));
+        part.reboot();
+        let (store, report) = block_on(o89_core::Store::boot(&mut part, None)).expect("recover");
+        let network = store.network.present().expect("old or clear");
+        assert!(
+            network.version() == 1 || network.version() == 2,
+            "cut {cut}"
+        );
+        if report.epoch.epoch() != Some(km43::Epoch::FIRST) {
+            assert_eq!(network.version(), 2, "cut {cut}");
+            assert_eq!(network.credentials(), None, "cut {cut}");
+        }
+    }
+}

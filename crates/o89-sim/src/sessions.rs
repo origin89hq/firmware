@@ -225,7 +225,8 @@ fn outcomes(bench: &Bench, opcode: u8) -> Vec<u8> {
             | Heard::Heartbeat { .. }
             | Heard::HeartbeatAck { .. }
             | Heard::Refusal { .. }
-            | Heard::PairingWindow { .. } => None,
+            | Heard::PairingWindow { .. }
+            | Heard::NetConfig { .. } => None,
         })
         .collect()
 }
@@ -244,7 +245,8 @@ fn closes(bench: &Bench) -> Vec<(u16, CloseReason)> {
             | Heard::Heartbeat { .. }
             | Heard::HeartbeatAck { .. }
             | Heard::Refusal { .. }
-            | Heard::PairingWindow { .. } => None,
+            | Heard::PairingWindow { .. }
+            | Heard::NetConfig { .. } => None,
         })
         .collect()
 }
@@ -265,7 +267,8 @@ fn conns(bench: &Bench) -> Option<u8> {
             | Heard::LinkUpAck { .. }
             | Heard::HeartbeatAck { .. }
             | Heard::Refusal { .. }
-            | Heard::PairingWindow { .. } => None,
+            | Heard::PairingWindow { .. }
+            | Heard::NetConfig { .. } => None,
         })
 }
 
@@ -857,4 +860,81 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
         }
     }
     assert!(steps.is_some_and(|steps| steps > 0 && steps < 2999));
+}
+
+#[test]
+fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privately() {
+    // Capabilities: none; the honest transport relays a signed write and wrapped read.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let key = client.key.take().expect("key");
+    let write = km43::NetworkWrite {
+        join: Some(km43::JoinWrite {
+            ssid: km43::Ssid::new("cabin").expect("ssid"),
+            psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+        }),
+        country: km43::Country::new("CA").expect("country"),
+        hostname: km43::Hostname::new("origin89").expect("host"),
+    };
+    let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+    let len = write.encode(&mut body).expect("body");
+    let mut operation = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_WRITE_BYTES];
+    let len = km43::SetConfigOperation {
+        section: km43::ConfigSection::Network,
+        expected_version: 0,
+        body: &body[..len],
+    }
+    .encode(&mut operation)
+    .expect("operation");
+    let mut frame = [0; 256];
+    let len = Signed::over(
+        client.header(MessageType::SetConfig),
+        ClientId::new(1).expect("client"),
+        Counter(1),
+        &operation[..len],
+        &key,
+    )
+    .expect("signed")
+    .write(&mut frame)
+    .expect("frame");
+    let answers = client.send(&mut bench, &frame[..len]);
+    let verified =
+        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
+            .expect("wrapper")
+            .verify(&key)
+            .expect("MAC");
+    assert_eq!(
+        km43::SetConfigAck::decode(verified.payload())
+            .expect("ack")
+            .outcome,
+        km43::SetConfig::Accepted
+    );
+    let len = km43::GetConfigRequest {
+        section: km43::ConfigSection::Network,
+    }
+    .encode(&mut body)
+    .expect("get");
+    let len = Tagged::over(client.header(MessageType::GetConfig), &body[..len], &key)
+        .expect("wrapped")
+        .write(&mut frame)
+        .expect("frame");
+    let answers = client.send(&mut bench, &frame[..len]);
+    let verified =
+        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
+            .expect("wrapper")
+            .verify(&key)
+            .expect("MAC");
+    let answer = km43::ConfigAnswer::decode(verified.payload()).expect("config");
+    let read = km43::NetworkRead::decode(answer.body().expect("body")).expect("read");
+    assert_eq!(answer.version(), 1);
+    assert!(read.join.expect("join").psk_set);
+    assert!(
+        !verified
+            .payload()
+            .windows(13)
+            .any(|window| window == b"correct horse")
+    );
+    assert!(bench.comms.heard.iter().any(|heard| matches!(heard, Heard::NetConfig { version: 1, network } if network.credentials().is_some())));
 }
