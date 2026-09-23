@@ -419,17 +419,7 @@ impl Link {
                 DownloadRequest::decode(envelope).ok()?;
                 Some(Frame::DownloadRefused { req_id })
             }
-            LinkMessageType::CloseConnection => {
-                // No connection rows before M4: nothing to close, which is a
-                // real report and not silence.
-                let close = CloseConnections::decode(envelope).ok()?;
-                let outcome = if close.is_every_connection() {
-                    CloseConnection::Closed
-                } else {
-                    CloseConnection::UnknownHandle
-                };
-                Some(Frame::CloseReport { req_id, outcome })
-            }
+            LinkMessageType::CloseConnection => Self::close_report(envelope, req_id),
             LinkMessageType::NetConfig => Some(self.configure_network(envelope, store)),
             LinkMessageType::CommsRelease => {
                 // No installer before M7: refused with the one code that
@@ -450,15 +440,18 @@ impl Link {
                 }
                 None
             }
-            LinkMessageType::ClientConnectedAck | LinkMessageType::ClientDisconnectedAck => {
-                // Answers to requests this side does not make yet: nothing
-                // waits, and an answer to nothing is not heard.
+            LinkMessageType::ClientConnectedAck
+            | LinkMessageType::ClientDisconnectedAck
+            | LinkMessageType::PairingWindow => {
+                // Answers to requests not made yet, and a pairing report with
+                // no access point to keep up (#90): unanswered, as L-194.
                 None
             }
             LinkMessageType::ClientConnected
             | LinkMessageType::ClientDisconnected
             | LinkMessageType::CloseConnectionAck
             | LinkMessageType::NetConfigAck
+            | LinkMessageType::PairingWindowAck
             | LinkMessageType::TimeOffer
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownloadAck => {
@@ -492,6 +485,18 @@ impl Link {
             outcome: verdict.outcome,
             version: verdict.version,
         }
+    }
+
+    /// The answer to a `CloseConnection`. No connection rows before M4:
+    /// nothing to close, which is a real report and not silence.
+    fn close_report(envelope: LinkEnvelope<'_>, req_id: ReqId) -> Option<Frame> {
+        let close = CloseConnections::decode(envelope).ok()?;
+        let outcome = if close.is_every_connection() {
+            CloseConnection::Closed
+        } else {
+            CloseConnection::UnknownHandle
+        };
+        Some(Frame::CloseReport { req_id, outcome })
     }
 
     /// Build `frame` as this side sends it at `now`, framed into `dst`, and

@@ -87,3 +87,8 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
+
+# km43's Command and Ack codecs (origin89hq/km43#85), merged and not yet
+# released. This pin goes back to a release when km43 0.4.2 is published.
+[patch.crates-io]
+km43 = { git = "https://github.com/origin89hq/km43", rev = "b6f8598b36b43dd524d9419ccbdbccfd41c824df" }

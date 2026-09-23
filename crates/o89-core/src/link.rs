@@ -699,6 +699,7 @@ impl Link {
                 self.close_answered(envelope, rows, &mut actions);
             }
             LinkMessageType::NetConfigAck
+            | LinkMessageType::PairingWindowAck
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownloadAck => {
                 // Requests this firmware does not send yet, so nothing
@@ -711,6 +712,7 @@ impl Link {
             | LinkMessageType::ClientDisconnectedAck
             | LinkMessageType::CloseConnection
             | LinkMessageType::NetConfig
+            | LinkMessageType::PairingWindow
             | LinkMessageType::TimeOfferAck
             | LinkMessageType::CommsRelease
             | LinkMessageType::EnterDownload => {
@@ -795,6 +797,8 @@ impl Link {
             | LinkMessageType::CloseConnectionAck
             | LinkMessageType::NetConfig
             | LinkMessageType::NetConfigAck
+            | LinkMessageType::PairingWindow
+            | LinkMessageType::PairingWindowAck
             | LinkMessageType::TimeOfferAck
             | LinkMessageType::CommsRelease
             | LinkMessageType::CommsReleaseAck
@@ -1355,6 +1359,8 @@ impl Link {
                     | LinkMessageType::CloseConnectionAck
                     | LinkMessageType::NetConfig
                     | LinkMessageType::NetConfigAck
+                    | LinkMessageType::PairingWindow
+                    | LinkMessageType::PairingWindowAck
                     | LinkMessageType::TimeOffer
                     | LinkMessageType::TimeOfferAck
                     | LinkMessageType::CommsRelease

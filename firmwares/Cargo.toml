@@ -98,6 +98,9 @@ arithmetic_side_effects = "deny"
 # when the ring has room and masks the receive interrupt until it does
 # (F-090). This pin goes back to a release when one carries that commit.
 [patch.crates-io]
+# km43's Command and Ack codecs (origin89hq/km43#85), merged and not yet
+# released. This pin goes back to a release when km43 0.4.2 is published.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "b6f8598b36b43dd524d9419ccbdbccfd41c824df" }
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
