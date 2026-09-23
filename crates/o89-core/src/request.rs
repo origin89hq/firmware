@@ -126,9 +126,8 @@ pub enum Admission<'a, E> {
     /// Refused before anything executed.
     Refused(Refusal<E>),
     /// A `req_id` the session accepted already or that is below its window,
-    /// refused after the MAC and before the counter was read (P-022).
-    /// KM43 allocates no error for it (DEFERRED entry 12), so it has no
-    /// wire answer.
+    /// refused after the MAC and before the counter was read. P-022 says it
+    /// is not answered, so it has no wire answer.
     OutOfWindow(OutOfWindow),
 }
 

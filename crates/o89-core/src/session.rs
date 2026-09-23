@@ -203,9 +203,9 @@ pub enum SessionNote {
     TooLarge,
     /// A request that verified under the session's key and was dropped
     /// unanswered for its `req_id` (P-022): nothing acted, the counter was
-    /// not read, and the session was not refreshed. KM43 allocates no error
-    /// for it (DEFERRED entry 12), and an answer under the key would be a
-    /// second genuine response to a `(session_id, req_id)` already answered.
+    /// not read, and the session was not refreshed. P-022 says it is not
+    /// answered, and an answer under the key would be a second genuine
+    /// response to a `(session_id, req_id)` already answered.
     OutOfWindow(OutOfWindow),
 }
 

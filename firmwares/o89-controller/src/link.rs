@@ -637,7 +637,7 @@ fn session_note(note: SessionNote) {
             defmt::warn!("session: no challenge to give; the counter did not land");
         }
         SessionNote::TooLarge => defmt::error!("session: an answer did not fit its buffer"),
-        // Dropped unanswered: KM43 has no error for it yet (DEFERRED 12).
+        // Dropped unanswered, as P-022 requires.
         SessionNote::OutOfWindow(why) => {
             defmt::warn!("session: a verified request refused by its req_id: {}", why);
         }
