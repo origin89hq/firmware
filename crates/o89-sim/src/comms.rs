@@ -19,9 +19,10 @@
 use std::collections::VecDeque;
 
 use km43::{
-    ClientUp, ClockOffer, Envelope, ErrorBody, FrameReader, FrameWriter, Header, Heartbeat,
-    Incoming, LinkEnvelope, LinkHeader, LinkMessageType, LinkTransport, LinkUp, MAX_FRAME,
-    MessageType, Received, ReqId, SessionId, Side, Version,
+    ClientDown, ClientUp, ClockOffer, CloseConnections, CloseReason, DisconnectReason, Envelope,
+    ErrorBody, FrameReader, FrameWriter, Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader,
+    LinkMessageType, LinkTransport, LinkUp, MAX_FRAME, MessageType, Received, ReqId, SessionId,
+    Side, Version,
 };
 use o89_comms_core::{Frame, Identity, Link as CommsLink};
 use o89_core::{HEARTBEAT_PERIOD, Millis, OURS, Tick};
@@ -160,6 +161,24 @@ pub enum Heard {
     HeartbeatAck {
         /// Our request id, echoed.
         req_id: ReqId,
+    },
+    /// A frame for a client, which the comms processor would put on the
+    /// connection its `session_id` names: every client-space frame but a
+    /// refusal of a link frame of its own.
+    ToClient {
+        /// The handle it is addressed to.
+        session: u16,
+        /// The envelope, as it arrived.
+        frame: Vec<u8>,
+    },
+    /// The controller asked for a connection to be closed.
+    Close {
+        /// Its request id.
+        req_id: ReqId,
+        /// The handle, 0 for every one.
+        conn: u16,
+        /// Why.
+        reason: CloseReason,
     },
     /// A refusal, with the code as the wire carries it.
     Refusal {
@@ -413,19 +432,79 @@ impl HostileComms {
         Ok(self.wire(&frame, Some(LinkMessageType::HeartbeatAck), now))
     }
 
-    /// A connection announced with this handle.
+    /// A connection announced with this handle, over local Wi-Fi.
     pub fn announce_connection(&mut self, conn: u16, now: Tick) -> Result<Vec<u8>, Broken> {
+        self.announce_as(conn, LinkTransport::WifiLocal, "192.168.4.2", now)
+    }
+
+    /// A connection announced with this handle, claiming this transport and
+    /// this peer: assertions the controller must not decide on (L-072).
+    pub fn announce_as(
+        &mut self,
+        conn: u16,
+        transport: LinkTransport,
+        peer: &str,
+        now: Tick,
+    ) -> Result<Vec<u8>, Broken> {
         let req_id = self.take_injected();
         let mut dst = [0u8; MAX_FRAME];
         let len = ClientUp {
             conn,
-            transport: LinkTransport::WifiLocal,
-            peer: "192.168.4.2",
+            transport,
+            peer,
         }
         .write(header(LinkMessageType::ClientConnected, req_id), &mut dst)
         .map_err(|_| Broken::Body)?;
         let frame = self.frame(&dst, len, Some(LinkMessageType::ClientConnected))?;
         Ok(self.queue(frame, now))
+    }
+
+    /// A connection released, with this handle.
+    pub fn release_connection(&mut self, conn: u16, now: Tick) -> Result<Vec<u8>, Broken> {
+        let req_id = self.take_injected();
+        let mut dst = [0u8; MAX_FRAME];
+        let len = ClientDown {
+            conn,
+            reason: DisconnectReason::ClosedByClient,
+        }
+        .write(
+            header(LinkMessageType::ClientDisconnected, req_id),
+            &mut dst,
+        )
+        .map_err(|_| Broken::Body)?;
+        let frame = self.frame(&dst, len, Some(LinkMessageType::ClientDisconnected))?;
+        Ok(self.queue(frame, now))
+    }
+
+    /// A client's envelope, relayed as it stands: whatever `session_id` it
+    /// carries is what the controller reads, which is the stamp an honest
+    /// comms processor puts there (P-021) or any other one it chooses.
+    /// Nothing from a peer that answers nothing.
+    pub fn relay(&mut self, envelope: &[u8], now: Tick) -> Result<Vec<u8>, Broken> {
+        if self.caps.answers == Answers::Nothing {
+            return Ok(Vec::new());
+        }
+        let frame = self.frame(envelope, envelope.len(), None)?;
+        Ok(self.queue(frame, now))
+    }
+
+    /// Every frame the controller addressed to the client on `session`.
+    #[must_use]
+    pub fn to_client(&self, session: u16) -> Vec<Vec<u8>> {
+        self.heard
+            .iter()
+            .filter_map(|heard| match heard {
+                Heard::ToClient { session: to, frame } if *to == session => Some(frame.clone()),
+                Heard::ToClient { .. }
+                | Heard::Close { .. }
+                | Heard::LinkUp { .. }
+                | Heard::LinkUpAck { .. }
+                | Heard::Heartbeat { .. }
+                | Heard::HeartbeatAck { .. }
+                | Heard::Refusal { .. }
+                | Heard::Other { .. } => None,
+            })
+            .collect()
     }
 
     /// A time offer.
@@ -597,6 +676,17 @@ impl HostileComms {
         };
         let opcode = envelope.opcode();
         let req_id = envelope.req_id();
+        let session = u16::from(envelope.session());
+        let link_local = (0x60..=0x7E).contains(&(opcode & 0x7F));
+        let about_ours =
+            opcode == MessageType::ErrorResponse as u8 && session == 0 && req_id == ReqId(0);
+        if !link_local && !about_ours {
+            self.heard.push(Heard::ToClient {
+                session,
+                frame: frame.to_vec(),
+            });
+            return;
+        }
         if opcode == MessageType::ErrorResponse as u8 {
             // A refusal travels as the shared `Error 0xFF`, which the link
             // envelope admits; the body is read as the client path reads
@@ -619,39 +709,47 @@ impl HostileComms {
             }
             return;
         }
-        let heard = match LinkMessageType::try_from(opcode) {
-            Ok(LinkMessageType::LinkUp) => {
-                LinkUp::decode(envelope).ok().map(|theirs| Heard::LinkUp {
-                    req_id,
-                    boot_id: theirs.boot_id,
-                    fw: theirs.fw.to_owned(),
-                    version: theirs.version,
-                })
-            }
-            Ok(LinkMessageType::LinkUpAck) => {
-                LinkUp::decode(envelope)
-                    .ok()
-                    .map(|theirs| Heard::LinkUpAck {
+        let heard =
+            match LinkMessageType::try_from(opcode) {
+                Ok(LinkMessageType::LinkUp) => {
+                    LinkUp::decode(envelope).ok().map(|theirs| Heard::LinkUp {
                         req_id,
                         boot_id: theirs.boot_id,
+                        fw: theirs.fw.to_owned(),
+                        version: theirs.version,
                     })
-            }
-            Ok(LinkMessageType::Heartbeat) => {
-                Heartbeat::decode(envelope)
+                }
+                Ok(LinkMessageType::LinkUpAck) => {
+                    LinkUp::decode(envelope)
+                        .ok()
+                        .map(|theirs| Heard::LinkUpAck {
+                            req_id,
+                            boot_id: theirs.boot_id,
+                        })
+                }
+                Ok(LinkMessageType::Heartbeat) => {
+                    Heartbeat::decode(envelope)
+                        .ok()
+                        .map(|beat| Heard::Heartbeat {
+                            req_id,
+                            uptime_s: beat.uptime_s,
+                            conns: beat.conns,
+                        })
+                }
+                Ok(LinkMessageType::HeartbeatAck) => Some(Heard::HeartbeatAck { req_id }),
+                Ok(LinkMessageType::CloseConnection) => CloseConnections::decode(envelope)
                     .ok()
-                    .map(|beat| Heard::Heartbeat {
+                    .map(|close| Heard::Close {
                         req_id,
-                        uptime_s: beat.uptime_s,
-                        conns: beat.conns,
-                    })
-            }
-            Ok(LinkMessageType::HeartbeatAck) => Some(Heard::HeartbeatAck { req_id }),
-            Ok(_) | Err(()) => Some(Heard::Other {
-                opcode,
-                req_id,
-                outcome: first_value(envelope),
-            }),
-        };
+                        conn: close.conn,
+                        reason: close.reason,
+                    }),
+                Ok(_) | Err(()) => Some(Heard::Other {
+                    opcode,
+                    req_id,
+                    outcome: first_value(envelope),
+                }),
+            };
         if let Some(heard) = heard {
             self.heard.push(heard);
         }

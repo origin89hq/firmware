@@ -1,6 +1,6 @@
 //! The panel inputs; all gesture and permission decisions live in o89-core.
 
-use crate::{recorder, supervisor::Uptime};
+use crate::{link, supervisor::Uptime};
 use core::cell::Cell;
 use embassy_stm32::gpio::Input;
 use embassy_sync::blocking_mutex::CriticalSectionMutex;
@@ -30,7 +30,7 @@ impl Selector {
             match gesture {
                 Gesture::Pairing | Gesture::FloorOverride => {}
                 Gesture::FactoryReset => {
-                    if recorder::request_reset().is_err() {
+                    if link::request_reset().is_err() {
                         defmt::error!("selector: reset request refused; pairing stays blocked");
                     }
                 }
@@ -44,7 +44,7 @@ pub fn pairing_open() -> bool {
     PANEL.lock(|cell| cell.get().pairing_open(Uptime.now()))
 }
 
-/// The recorder completed the epoch/table transaction, or failed closed.
+/// The link task completed the epoch/table transaction, or failed closed.
 pub fn reset_finished(succeeded: bool) {
     PANEL.lock(|cell| {
         let mut panel = cell.get();

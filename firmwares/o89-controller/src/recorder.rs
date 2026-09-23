@@ -1,11 +1,13 @@
-//! The one task that owns the FRAM and the NOR.
+//! The one task that owns the NOR, and the records on the FRAM that are not
+//! the client protocol's.
 //!
 //! The store was read in `main`, before any output moved, because the run
 //! reason has to be known before the contact is (F-022, F-016); this task
-//! takes it from there. It identifies the NOR, opens the ring, writes the
-//! boot record, and from then on holds both parts for whoever asks: the
-//! requests arrive with the milestones that make them (M4's counters, M5's
-//! configuration, the event queue). A board whose NOR does not answer
+//! takes the ladder's cuts and the boot count from there, and the link task
+//! takes the epoch, the challenge counter and the client table, each
+//! through its own lease on the part. It identifies the NOR, opens the
+//! ring, writes the boot record, publishes the span of the log a `Hello`
+//! reports, and from then on holds the ring for whoever asks. A board whose NOR does not answer
 //! still has its store; the ring is simply absent and says so. The rail
 //! task hands it the recovery ladder's cuts to keep before the rail goes
 //! off, and polls for the answer without waiting on it (F-017).
@@ -25,11 +27,12 @@ use km43::{
     MAX_EVENT_QUEUE, ReqId, TimeOffer,
 };
 use o89_core::{
-    Class, CutsRecord, Keep, KeepAnswer, LinkEvent, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime,
-    Outgoing, RecentCuts, Ring, SCRATCH, Store, Task, Tick, UnixMillis, WallClock,
+    BootCount, CUTS_RECORD_BYTES, Class, CutsRecord, Keep, KeepAnswer, Kept, LinkEvent, LogSpan,
+    MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring, SCRATCH, Task,
+    Tick, UnixMillis, WallClock,
 };
 
-use crate::fram::Fram;
+use crate::fram::Lease;
 use crate::mailbox;
 use crate::nor::{JEDEC, Nor, SECTOR};
 use crate::rtc::CalendarClock;
@@ -115,15 +118,6 @@ const PERIOD: Duration = Duration::from_millis(100);
 /// as the protocol's event queue; a task whose event does not fit is told
 /// so and says so, and nothing is evicted.
 static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
-
-/// At most one reset waits for the FRAM owner. A full queue refuses;
-/// requests never replace an earlier physical act.
-static RESETS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-
-/// Queue a physical reset. The panel has already closed enrolment.
-pub fn request_reset() -> Result<(), TrySendError<()>> {
-    RESETS.try_send(())
-}
 
 /// The recovery ladder's cuts, to be kept on the FRAM before the rail
 /// moves, under the request's number. One at a time: a request the
@@ -215,6 +209,36 @@ impl CutsKeeper {
     }
 }
 
+/// The span of the log, as the ring last stood: zero for none (P-104's
+/// reading of an empty log), until the ring opens.
+static SPAN: Mutex<CriticalSectionRawMutex, Cell<LogSpan>> = Mutex::new(Cell::new(LogSpan {
+    oldest: LogSeq(0),
+    newest: LogSeq(0),
+}));
+
+/// The log's span, for a `Hello` (keys 7 and 8).
+pub fn log_span() -> LogSpan {
+    SPAN.lock(Cell::get)
+}
+
+fn publish(ring: &Ring<Nor>) {
+    let head = ring.head();
+    let span = LogSpan {
+        oldest: LogSeq(head.oldest.unwrap_or(0)),
+        newest: LogSeq(head.next_seq.saturating_sub(1)),
+    };
+    SPAN.lock(|cell| cell.set(span));
+}
+
+/// The ladder's cuts as the boot read them, and the boot count they are
+/// kept under (F-018). No record is a boot without a store.
+pub struct Cuts {
+    /// The record.
+    pub kept: Option<Kept<CutsRecord, CUTS_RECORD_BYTES>>,
+    /// The count the part holds.
+    pub boot: Option<BootCount>,
+}
+
 /// Queue an event for the ring, or hand it back when the queue is full.
 pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
     EVENTS.try_send(event).map_err(|refused| match refused {
@@ -222,12 +246,12 @@ pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
     })
 }
 
-/// The recorder task: the only owner of the FRAM and the NOR, and so the
-/// one that serves the bench tool's mailbox.
+/// The recorder task: the only owner of the NOR, and so the one that serves
+/// the bench tool's mailbox.
 #[embassy_executor::task]
 pub async fn run(
-    mut store: Option<Store>,
-    mut fram: Fram,
+    mut cuts: Cuts,
+    mut fram: Lease,
     nor: Nor,
     boot: Boot,
     mut calendar: CalendarClock,
@@ -242,24 +266,21 @@ pub async fn run(
         defmt::info!("recorder: writing the boot record");
         boot_records(ring, &mut scratch, boot, calendar.now()).await;
     }
-    let boot = store
-        .as_ref()
-        .and_then(|store| store.boots.present().map(|count| count.get()))
-        .unwrap_or(0);
+    if let Some(ring) = ring.as_ref() {
+        publish(ring);
+    }
+    let boot = cuts.boot.map_or(0, BootCount::get);
     mailbox::init();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
         match select(ticker.next(), CUTS.wait()).await {
             Either::First(()) => {
-                if RESETS.try_receive().is_ok() {
-                    reset_clients(store.as_mut(), &mut fram).await;
-                }
                 serve_time(
                     ring.as_mut(),
                     &mut scratch,
                     &mut calendar,
-                    &mut store,
+                    &mut cuts,
                     &mut fram,
                 )
                 .await;
@@ -283,9 +304,13 @@ pub async fn run(
                     boot,
                 })
                 .await;
+                // Records appended this turn, and a block the bench dropped.
+                if let Some(ring) = ring.as_ref() {
+                    publish(ring);
+                }
             }
-            Either::Second((request, cuts)) => {
-                keep_cuts(&mut store, &mut fram, request, cuts).await;
+            Either::Second((request, recent)) => {
+                keep_cuts(&mut cuts, &mut fram, request, recent).await;
             }
         }
         check_in(Task::Recorder);
@@ -440,22 +465,16 @@ fn process_offer(
     OfferResult::AwaitingAudit
 }
 
-async fn keep_cuts(store: &mut Option<Store>, fram: &mut Fram, request: u32, cuts: RecentCuts) {
+async fn keep_cuts(cuts: &mut Cuts, fram: &mut Lease, request: u32, recent: RecentCuts) {
     // Under the boot count the part holds, by which a later
     // boot counts the boots whose own record never landed
     // (F-018).
-    let kept = match store.as_mut() {
-        Some(store) => {
-            let record = CutsRecord {
-                boot: store.boots.present().copied(),
-                cuts,
-            };
-            store
-                .cuts
-                .write(fram, record)
-                .await
-                .map_err(|_| NotKept::Refused)
-        }
+    let boot = cuts.boot;
+    let kept = match cuts.kept.as_mut() {
+        Some(kept) => kept
+            .write(fram, CutsRecord { boot, cuts: recent })
+            .await
+            .map_err(|_| NotKept::Refused),
         None => Err(NotKept::NoStore),
     };
     CUTS_KEPT.signal((request, kept));
@@ -466,8 +485,8 @@ async fn keep_cuts(store: &mut Option<Store>, fram: &mut Fram, request: u32, cut
 async fn recover_floor(
     ring: &mut Ring<Nor>,
     scratch: &mut [u8],
-    store: &mut Option<Store>,
-    fram: &mut Fram,
+    cuts: &mut Cuts,
+    fram: &mut Lease,
 ) -> Option<UnixMillis> {
     let scan = embassy_time::with_timeout(Duration::from_secs(30), ring.floor(scratch));
     let mut scan = core::pin::pin!(scan);
@@ -490,7 +509,7 @@ async fn recover_floor(
                     }
                 };
             }
-            Either3::Second((request, cuts)) => keep_cuts(store, fram, request, cuts).await,
+            Either3::Second((request, recent)) => keep_cuts(cuts, fram, request, recent).await,
             Either3::Third(()) => {}
         }
         check_in(Task::Recorder);
@@ -542,8 +561,8 @@ async fn serve_time(
     ring: Option<&mut Ring<Nor>>,
     scratch: &mut [u8],
     calendar: &mut CalendarClock,
-    store: &mut Option<Store>,
-    fram: &mut Fram,
+    cuts: &mut Cuts,
+    fram: &mut Lease,
 ) {
     let Some(ring) = ring else {
         return;
@@ -582,7 +601,7 @@ async fn serve_time(
     {
         let floor = match calendar.read() {
             Ok(Some(current)) => Some(current), // Known-clock admission does not use the floor.
-            Ok(None) => recover_floor(ring, scratch, store, fram).await,
+            Ok(None) => recover_floor(ring, scratch, cuts, fram).await,
             Err(error) => {
                 defmt::error!("clock: calendar unavailable: {}", error);
                 None
@@ -603,35 +622,4 @@ async fn serve_time(
             }
         }
     }
-}
-
-/// Serve one physical reset on the task that owns persistence.
-/// P-085 failures reach the probe here. The persisted `ConcernRaised` body
-/// requires the concern lifecycle and inventory from firmware#12; an empty
-/// map is not a valid concern event. That integration remains part of #85.
-async fn reset_clients(store: Option<&mut Store>, fram: &mut Fram) {
-    let succeeded = if let Some(store) = store {
-        match o89_core::reset_clients(&mut store.epoch, &mut store.clients, fram).await {
-            Ok(()) => {
-                defmt::info!("factory reset: epoch advanced and clients cleared");
-                true
-            }
-            Err(error) => {
-                defmt::error!("factory reset: {}; pairing blocked", error);
-                match error {
-                    o89_core::ResetFailed::Epoch(_) => {
-                        defmt::error!("reset fault: epoch write failed");
-                    }
-                    o89_core::ResetFailed::Clients(_) => {
-                        defmt::error!("reset fault: client clear failed");
-                    }
-                }
-                false
-            }
-        }
-    } else {
-        defmt::error!("reset fault: epoch write failed, no store; pairing blocked");
-        false
-    };
-    crate::selector::reset_finished(succeeded);
 }

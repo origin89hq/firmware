@@ -55,6 +55,12 @@ impl Secret {
         DeviceId::new(self.device_id)
     }
 
+    /// The same sixteen bytes, as key 3 of a `Discover` carries them.
+    #[must_use]
+    pub const fn device_id_bytes(&self) -> [u8; DEVICE_ID_BYTES] {
+        self.device_id
+    }
+
     /// The pair every key on the device descends from.
     #[must_use]
     pub const fn device_secret(&self) -> DeviceSecret {

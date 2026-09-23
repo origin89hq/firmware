@@ -12,19 +12,63 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU16;
 
+use embassy_futures::block_on;
 use km43::{
-    FrameReader, FrameWriter, LinkEnvelope, LinkMessageType, MAX_FRAME, Received, ReqId, SessionId,
-    Version,
+    ClientKind, FrameReader, FrameWriter, LinkMessageType, LogSeq, MAX_FRAME, MAX_PAYLOAD,
+    Received, ReqId, SessionId, Version,
 };
 use o89_core::{
-    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Identity, Keep,
-    Link, LinkEvent, LinkText, Millis, NotKept, Note, Outgoing, Rail, RailEvent, RailLine,
-    RailRequest, RailSequencer, RailThroughReset, Recovery, Revision, Tick,
+    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Endpoint,
+    Identity, Keep, Keys, Label, Link, LinkEvent, LinkText, Local, LogSpan, Millis, NotKept, Note,
+    Outgoing, Rail, RailEvent, RailLine, RailRequest, RailSequencer, RailThroughReset, Recovery,
+    Revision, Secret, Sessions, Store, Tick,
 };
 
-use crate::{Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, Statement};
+use crate::{
+    Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, SimFram, Statement,
+};
 
-const STEP: Millis = Millis::from_millis(10);
+pub(crate) const STEP: Millis = Millis::from_millis(10);
+
+/// What the unit calls itself in a `Discover`.
+pub(crate) const MODEL: &str = "origin89 controller";
+
+/// The log's span as the recorder would publish it.
+pub(crate) const LOG: LogSpan = LogSpan {
+    oldest: LogSeq(1),
+    newest: LogSeq(9),
+};
+
+/// The unit's device id and printed secret.
+pub(crate) const DEVICE: [u8; 16] = [7; 16];
+/// The printed secret.
+pub(crate) const PRINTED: [u8; 32] = [9; 32];
+
+/// A unit as its first boot leaves it, with its secret written and one
+/// client, a phone, enrolled at slot 1: the store booted on the part, and
+/// the four records the sessions take from it, as `main` hands them over.
+pub(crate) fn unit() -> (SimFram, Keys) {
+    let mut part = SimFram::fresh();
+    let (mut store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
+    let secret = Secret::new(DEVICE, PRINTED).expect("entropy");
+    block_on(store.secret.write(&mut part, secret)).expect("lands");
+    let label = Label::new("phone").expect("fits");
+    let paired = block_on(
+        store
+            .clients
+            .update(&mut part, |table| table.pair(label, ClientKind::App)),
+    )
+    .expect("lands");
+    assert!(paired.is_ok(), "slot 1 enrolled");
+    let keys = Keys {
+        secret: store.secret.present().copied(),
+        epoch: report.epoch.epoch(),
+        epoch_record: store.epoch,
+        clients: store.clients,
+        challenges: store.challenges,
+    };
+    (part, keys)
+}
 
 fn boot_count(n: u32) -> BootCount {
     // The sole way to a count is the store; a test builds one from bytes.
@@ -42,13 +86,16 @@ fn identity() -> Identity {
     }
 }
 
-struct Bench {
+pub(crate) struct Bench {
     clock: o89_core::WallClock,
     calendar: Option<(o89_core::UnixMillis, Tick)>,
     clock_records: Vec<km43::ControllerRecord>,
-    now: Tick,
-    link: Link,
-    comms: HostileComms,
+    pub(crate) now: Tick,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) comms: HostileComms,
+    pub(crate) fram: SimFram,
+    /// Answers to clients, framed, waiting for the pump.
+    answers: Vec<Vec<u8>>,
     reader: FrameReader,
     writer: FrameWriter,
     rail: Rail,
@@ -75,7 +122,7 @@ struct Bench {
 impl Bench {
     /// Boot at one second on the tick: the rail powered, the module coming
     /// up when it settles.
-    fn new(caps: Capabilities) -> Self {
+    pub(crate) fn new(caps: Capabilities) -> Self {
         Self::on(Revision::A, caps)
     }
 
@@ -85,13 +132,19 @@ impl Bench {
         let mut sequencer = RailSequencer::new(revision);
         let _ = sequencer.power_on(now);
         let rail = Rail::new(sequencer, None);
+        let (fram, keys) = unit();
         let mut bench = Self {
             clock: o89_core::WallClock::new(),
             calendar: None,
             clock_records: Vec::new(),
             now,
-            link: Link::new(identity(), now),
+            endpoint: Endpoint {
+                link: Link::new(identity(), now),
+                sessions: Sessions::new(keys),
+            },
             comms: HostileComms::new(caps),
+            fram,
+            answers: Vec::new(),
             reader: FrameReader::new(),
             writer: FrameWriter::new(),
             rail,
@@ -118,18 +171,18 @@ impl Bench {
     /// is told, and the peer boots.
     fn settled(&mut self) {
         let now = self.now;
-        self.link.noise(self.run);
+        self.endpoint.link.noise(self.run);
         self.noise = self.noise.saturating_add(self.run);
         self.run = 0;
         self.reader.discard();
-        let actions = self.link.module_settled(now);
-        self.perform(actions);
+        let actions = self.endpoint.link.module_settled(now);
+        self.perform(&actions);
         let bytes = self.comms.boot(now).expect("the peer boots");
         self.module_booted = true;
         self.feed(&bytes);
     }
 
-    fn run_for(&mut self, span: Millis) {
+    pub(crate) fn run_for(&mut self, span: Millis) {
         let until = self.now.after(span).expect("fits");
         while self.now.since(until).is_none() {
             self.step();
@@ -154,21 +207,24 @@ impl Bench {
         }
         let late = self.comms.drain(now);
         self.feed(&late);
-        let actions = self.link.tick(now, self.install_in_flight);
+        let actions = self.endpoint.tick(now, self.install_in_flight);
         if actions.iter().next().is_some() {
             self.ticked.push((now, actions));
         }
-        self.perform(actions);
+        self.perform(&actions);
     }
 
     /// Perform actions, pumping what the peer answers back through the
     /// controller's reader until nothing moves.
-    fn perform(&mut self, actions: Actions) {
+    fn perform(&mut self, actions: &Actions) {
         let mut to_comms: VecDeque<Vec<u8>> = VecDeque::new();
-        let mut pending: VecDeque<Actions> = VecDeque::from([actions]);
+        let mut pending: VecDeque<Actions> = VecDeque::from([*actions]);
         // Bounded: every round either consumes a queued frame or a queued
         // set of actions, and the peer answers a frame with at most one.
         for _ in 0..10_000 {
+            // A client's answer goes out before the actions its frame asked
+            // for, as the adapter sends it.
+            to_comms.extend(self.answers.drain(..));
             if let Some(actions) = pending.pop_front() {
                 for action in &actions {
                     self.asked.push((self.now, *action));
@@ -176,6 +232,7 @@ impl Bench {
                         Action::Send(outgoing) => {
                             let mut dst = [0u8; MAX_FRAME];
                             let len = self
+                                .endpoint
                                 .link
                                 .encode(*outgoing, self.now, &mut self.writer, &mut dst)
                                 .expect("every outgoing frame encodes");
@@ -208,7 +265,7 @@ impl Bench {
                                 self.comms.power_off();
                                 self.module_booted = false;
                             }
-                            pending.push_back(self.link.rail(recovery, self.now));
+                            pending.push_back(self.endpoint.link.rail(recovery, self.now));
                         }
                         Action::OfferTime { req_id, unix_ms } => {
                             let current = self.calendar.map(|(at, tick)| {
@@ -230,7 +287,7 @@ impl Bench {
                                 }
                                 Err(outcome) => outcome,
                             };
-                            pending.push_back(self.link.time_verdict(*req_id, outcome));
+                            pending.push_back(self.endpoint.link.time_verdict(*req_id, outcome));
                         }
                         Action::DropConnections(_) | Action::Log(_) | Action::Note(_) => {}
                     }
@@ -249,10 +306,10 @@ impl Bench {
     }
 
     /// Bytes from the peer into the controller's reader.
-    fn feed(&mut self, bytes: &[u8]) {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
         let answered = self.receive(bytes);
         for actions in answered {
-            self.perform(actions);
+            self.perform(&actions);
         }
     }
 
@@ -264,15 +321,36 @@ impl Bench {
                 Received::Frame(frame) => {
                     // A frame's bytes, malformed or not, are not noise.
                     self.run = 0;
-                    let Ok(envelope) = LinkEnvelope::decode(frame) else {
+                    let mut dst = [0u8; MAX_PAYLOAD];
+                    let local = Local {
+                        model: MODEL,
+                        log: LOG,
+                        time_known: false,
+                    };
+                    let step = block_on(self.endpoint.frame(
+                        frame,
+                        self.now,
+                        &local,
+                        &mut self.fram,
+                        &mut dst,
+                    ));
+                    let Some(step) = step else {
                         continue;
                     };
-                    out.push(self.link.received(envelope, self.now));
+                    if let Some(len) = step.reply.and_then(|reply| reply.answer) {
+                        let mut framed = [0u8; MAX_FRAME];
+                        let len = self
+                            .writer
+                            .write(&dst[..len], &mut framed)
+                            .expect("an answer frames");
+                        self.answers.push(framed[..len].to_vec());
+                    }
+                    out.push(step.actions);
                 }
                 Received::Dropped(_) | Received::Abandoned => {
                     self.refusals = self.refusals.saturating_add(1);
                     self.noise = self.noise.saturating_add(self.run);
-                    self.link.noise(self.run);
+                    self.endpoint.link.noise(self.run);
                     self.run = 0;
                 }
                 Received::Nothing => {}
@@ -330,7 +408,7 @@ impl Bench {
             .collect()
     }
 
-    fn sent(&self, wanted: fn(Outgoing) -> bool) -> Vec<(Tick, Outgoing)> {
+    pub(crate) fn sent(&self, wanted: fn(Outgoing) -> bool) -> Vec<(Tick, Outgoing)> {
         self.asked
             .iter()
             .filter_map(|(at, action)| match action {
@@ -365,8 +443,8 @@ fn l_030_both_sides_state_themselves_at_boot_and_one_exchange_brings_the_link_up
     // Capabilities: none.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(1_000));
-    assert!(bench.link.is_up());
-    let peer = bench.link.peer().expect("a peer");
+    assert!(bench.endpoint.link.is_up());
+    let peer = bench.endpoint.link.peer().expect("a peer");
     assert_eq!(peer.boot_id, bench.comms.boot_id());
     assert_eq!(peer.fw.as_str(), "0.1.0-sim+g89abcdef");
     assert_eq!(peer.net_version, Some(0));
@@ -388,8 +466,8 @@ fn l_030_both_sides_state_themselves_at_boot_and_one_exchange_brings_the_link_up
     let first = bench.comms.boot_id();
     let same = bench.comms.restate(bench.now).expect("the peer builds it");
     bench.feed(&same);
-    assert!(bench.link.is_up());
-    assert_eq!(bench.link.peer().expect("a peer").boot_id, first);
+    assert!(bench.endpoint.link.is_up());
+    assert_eq!(bench.endpoint.link.peer().expect("a peer").boot_id, first);
     assert!(bench.drops().is_empty(), "the same boot_id drops nothing");
 }
 
@@ -399,10 +477,14 @@ fn l_110_traffic_that_is_not_a_heartbeat_keeps_no_link_alive() {
     // offers instead, which the controller answers.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().beats = Beats::Withheld;
     bench.comms.capabilities().answers = Answers::Nothing;
-    let quiet_from = bench.link.last_heard().expect("something was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("something was heard");
     // An offer every second: answered every time, and not a heartbeat.
     for _ in 0..8 {
         bench.run_for(Millis::from_millis(1_000));
@@ -412,7 +494,7 @@ fn l_110_traffic_that_is_not_a_heartbeat_keeps_no_link_alive() {
             .expect("the peer builds it");
         bench.feed(&bytes);
     }
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     let (at, why) = bench.drops().first().copied().expect("a drop");
     assert_eq!(why, DropReason::LinkLost);
     let silence = at.since(quiet_from).expect("after").as_millis();
@@ -437,12 +519,17 @@ fn l_031_the_last_statement_is_kept_through_a_drop() {
     // Capabilities: answers nothing, from the moment the link is up.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    let fw = bench.link.peer().expect("a peer").fw;
+    let fw = bench.endpoint.link.peer().expect("a peer").fw;
     bench.comms.capabilities().answers = Answers::Nothing;
     bench.run_for(Millis::from_millis(7_000));
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     assert_eq!(
-        bench.link.peer().expect("kept through the drop").fw,
+        bench
+            .endpoint
+            .link
+            .peer()
+            .expect("kept through the drop")
+            .fw,
         fw,
         "fw_comms is the last successful statement's"
     );
@@ -454,10 +541,13 @@ fn l_033_the_controller_and_the_comms_processors_own_link_come_up_together_and_s
     // module runs it.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up(), "the controller is linked");
+    assert!(bench.endpoint.link.is_up(), "the controller is linked");
     assert!(bench.comms.is_linked(), "and so is the comms processor");
     bench.run_for(Millis::from_millis(60_000));
-    assert!(bench.link.is_up() && bench.comms.is_linked(), "a minute on");
+    assert!(
+        bench.endpoint.link.is_up() && bench.comms.is_linked(),
+        "a minute on"
+    );
     assert!(bench.cuts().is_empty(), "nothing was cut");
     // Each side beat on its own clock and heard the other's answers.
     let beats = bench
@@ -484,7 +574,7 @@ fn l_033_a_request_before_the_link_is_up_is_refused_with_258() {
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(1_000));
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     let bytes = bench
         .comms
         .offer_time(1_800_000_000_000, bench.now)
@@ -514,9 +604,12 @@ fn l_113_a_module_taken_for_a_flash_suspends_the_ladder_and_records_no_loss() {
     // install an image through its ROM, which is an install in flight.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
-    let taken = bench.link.module_taken();
-    assert!(!bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
+    let taken = bench
+        .endpoint
+        .link
+        .module_taken(&mut bench.endpoint.sessions);
+    assert!(!bench.endpoint.link.is_up());
     let actions: Vec<Action> = (&taken).into_iter().copied().collect();
     assert_eq!(
         actions,
@@ -528,11 +621,11 @@ fn l_113_a_module_taken_for_a_flash_suspends_the_ladder_and_records_no_loss() {
     let mut now = bench.now;
     for _ in 0..9_000 {
         now = now.after(STEP).expect("fits");
-        let ticked = bench.link.tick(now, false);
+        let ticked = bench.endpoint.tick(now, false);
         assert_eq!((&ticked).into_iter().count(), 0, "silent at {now:?}");
     }
     // Given back, the module is stated to as after any power-up.
-    let settled = bench.link.module_settled(now);
+    let settled = bench.endpoint.link.module_settled(now);
     assert!(
         (&settled)
             .into_iter()
@@ -567,7 +660,7 @@ fn l_181_an_error_from_the_peer_is_noted_and_never_answered() {
         refusals_before, refusals_after,
         "an error is never answered with one"
     );
-    assert!(bench.link.is_up(), "a refusal is not a drop");
+    assert!(bench.endpoint.link.is_up(), "a refusal is not a drop");
     // An error carrying a session is a client's frame, not a refusal of
     // anything of ours.
     let session = SessionId::Assigned(NonZeroU16::new(5).expect("not zero"));
@@ -629,9 +722,12 @@ fn l_033_a_statement_received_does_not_link_until_ours_is_answered() {
             .any(|h| matches!(h, Heard::LinkUpAck { .. })),
         "and was answered"
     );
-    assert!(!bench.link.is_up(), "a statement received is not a link");
+    assert!(
+        !bench.endpoint.link.is_up(),
+        "a statement received is not a link"
+    );
     assert_eq!(
-        bench.link.peer().expect("recorded").boot_id,
+        bench.endpoint.link.peer().expect("recorded").boot_id,
         bench.comms.boot_id(),
         "though it is recorded"
     );
@@ -639,7 +735,7 @@ fn l_033_a_statement_received_does_not_link_until_ours_is_answered() {
     // that is the link.
     bench.comms.capabilities().answers = Answers::Everything;
     bench.run_for(Millis::from_millis(2_500));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
 }
 
 #[test]
@@ -647,15 +743,19 @@ fn l_100_the_peers_own_heartbeats_do_not_keep_a_link_alive() {
     // Capabilities: talks only, once the link is up.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::TalksOnly;
-    let quiet_from = bench.link.last_heard().expect("an answer was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("an answer was heard");
     bench.run_for(Millis::from_millis(7_000));
     assert!(
         bench.comms.sent.contains(&LinkMessageType::Heartbeat),
         "the peer kept beating"
     );
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     let (at, why) = bench.drops().first().copied().expect("a drop");
     assert_eq!(why, DropReason::LinkLost);
     let silence = at.since(quiet_from).expect("after").as_millis();
@@ -671,9 +771,13 @@ fn l_100_an_answer_to_a_heartbeat_never_sent_keeps_no_link_alive() {
     // answers with request ids the controller never used.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::TalksOnly;
-    let quiet_from = bench.link.last_heard().expect("an answer was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("an answer was heard");
     for forged in 0..7u32 {
         bench.run_for(Millis::from_millis(1_000));
         let bytes = bench
@@ -682,7 +786,7 @@ fn l_100_an_answer_to_a_heartbeat_never_sent_keeps_no_link_alive() {
             .expect("the peer builds it");
         bench.feed(&bytes);
     }
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     assert!(
         bench
             .notes()
@@ -703,7 +807,7 @@ fn l_100_a_heartbeat_answer_counts_once_and_never_after_a_drop() {
     // to the last heartbeat it heard, every second, for seventy seconds.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     let last_beat = bench
         .comms
         .heard
@@ -715,7 +819,11 @@ fn l_100_a_heartbeat_answer_counts_once_and_never_after_a_drop() {
         })
         .expect("the controller beat");
     bench.comms.capabilities().answers = Answers::TalksOnly;
-    let quiet_from = bench.link.last_heard().expect("an answer was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("an answer was heard");
     for _ in 0..70 {
         bench.run_for(Millis::from_millis(1_000));
         let bytes = bench
@@ -745,7 +853,7 @@ fn l_041_after_a_peer_reboots_an_answer_to_a_beat_of_the_old_boot_does_not_count
     // replays the answer to a beat of its old boot.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::TalksOnly;
     bench.run_for(Millis::from_millis(2_100));
     let unanswered = bench
@@ -760,15 +868,15 @@ fn l_041_after_a_peer_reboots_an_answer_to_a_beat_of_the_old_boot_does_not_count
         .expect("a beat the peer did not answer");
     let bytes = bench.comms.boot(bench.now).expect("the peer builds it");
     bench.feed(&bytes);
-    assert!(!bench.link.is_up(), "a new boot unlinks");
-    let before = bench.link.last_heard();
+    assert!(!bench.endpoint.link.is_up(), "a new boot unlinks");
+    let before = bench.endpoint.link.last_heard();
     let replay = bench
         .comms
         .unsolicited_heartbeat_ack(unanswered, bench.now)
         .expect("the peer builds it");
     bench.feed(&replay);
     assert_eq!(
-        bench.link.last_heard(),
+        bench.endpoint.link.last_heard(),
         before,
         "an answer to the old boot's beat is not heard"
     );
@@ -887,7 +995,7 @@ fn l_111_a_peer_that_talks_but_cannot_hear_is_cut_at_sixty_seconds() {
         bench.run_for(Millis::from_millis(2_000));
         let bytes = bench.comms.restate(bench.now).expect("the peer builds it");
         bench.feed(&bytes);
-        assert!(!bench.link.is_up(), "never linked");
+        assert!(!bench.endpoint.link.is_up(), "never linked");
     }
     let cut = bench.cuts().first().copied().expect("a cut");
     let after = cut.since(settled).expect("after").as_millis();
@@ -907,7 +1015,7 @@ fn l_033_heartbeats_alone_do_not_bring_the_link_up_and_a_statement_does() {
     });
     bench.run_for(Millis::from_millis(10_000));
     assert!(
-        !bench.link.is_up(),
+        !bench.endpoint.link.is_up(),
         "beats were answered but nobody stated itself"
     );
     let acks = bench
@@ -934,7 +1042,7 @@ fn l_033_heartbeats_alone_do_not_bring_the_link_up_and_a_statement_does() {
     bench.comms.capabilities().statement = Statement::Given;
     let bytes = bench.comms.boot(bench.now).expect("the peer builds it");
     bench.feed(&bytes);
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
 }
 
 #[test]
@@ -947,7 +1055,7 @@ fn l_041_a_link_up_with_a_new_comms_boot_id_drops_every_connection() {
     let same = bench.comms.restate(bench.now).expect("the peer builds it");
     bench.feed(&same);
     assert!(bench.drops().is_empty(), "the same boot_id drops nothing");
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     let bytes = bench.comms.boot(bench.now).expect("the peer builds it");
     bench.feed(&bytes);
     assert_ne!(bench.comms.boot_id(), first);
@@ -959,9 +1067,9 @@ fn l_041_a_link_up_with_a_new_comms_boot_id_drops_every_connection() {
             .collect::<Vec<_>>(),
         vec![DropReason::CommsRebooted]
     );
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     assert_eq!(
-        bench.link.peer().expect("a peer").boot_id,
+        bench.endpoint.link.peer().expect("a peer").boot_id,
         bench.comms.boot_id()
     );
 }
@@ -974,9 +1082,9 @@ fn l_050_a_major_mismatch_keeps_link_up_and_heartbeats_and_refuses_the_rest_with
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(5_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     assert_eq!(
-        bench.link.compat(),
+        bench.endpoint.link.compat(),
         Some(Compat::MajorMismatch {
             theirs: Version { major: 2, minor: 0 }
         })
@@ -1012,11 +1120,11 @@ fn l_051_a_minor_mismatch_proceeds_at_the_lower_minor() {
     });
     bench.run_for(Millis::from_millis(1_000));
     assert_eq!(
-        bench.link.compat(),
+        bench.endpoint.link.compat(),
         Some(Compat::Agreed(Version { major: 1, minor: 0 }))
     );
     assert_eq!(
-        bench.link.peer().expect("a peer").version,
+        bench.endpoint.link.peer().expect("a peer").version,
         Version { major: 1, minor: 4 }
     );
 }
@@ -1053,7 +1161,7 @@ fn l_100_a_heartbeat_goes_out_every_two_seconds_and_the_peers_is_answered_at_onc
         answered, theirs,
         "every beat of theirs answered in the same tick"
     );
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
 }
 
 #[test]
@@ -1061,11 +1169,15 @@ fn l_110_six_seconds_of_silence_is_link_down_with_the_record_and_no_cut() {
     // Capabilities: answers nothing, from the moment the link is up.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::Nothing;
-    let quiet_from = bench.link.last_heard().expect("something was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("something was heard");
     bench.run_for(Millis::from_millis(7_000));
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     let (at, why) = bench.drops().first().copied().expect("a drop");
     assert_eq!(why, DropReason::LinkLost);
     let silence = at.since(quiet_from).expect("after").as_millis();
@@ -1085,9 +1197,13 @@ fn l_111_sixty_seconds_of_silence_cuts_the_rail_and_logs_the_cycle_with_its_coun
     // Capabilities: answers nothing, from the moment the link is up.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::Nothing;
-    let quiet_from = bench.link.last_heard().expect("something was heard");
+    let quiet_from = bench
+        .endpoint
+        .link
+        .last_heard()
+        .expect("something was heard");
     bench.run_for(Millis::from_millis(70_000));
     let cut = bench.cuts().first().copied().expect("a cut");
     let silence = cut.since(quiet_from).expect("after").as_millis();
@@ -1136,7 +1252,7 @@ fn l_112_the_third_cycle_in_an_hour_leaves_the_rail_on_and_raises_unrecoverable_
         RailLine::On,
         "revision A leaves the rail on"
     );
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
 }
 
 #[test]
@@ -1199,13 +1315,13 @@ fn l_113_an_install_in_flight_suspends_the_first_rung_too() {
     // is being written.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(3_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     bench.comms.capabilities().answers = Answers::Nothing;
     bench.install_in_flight = true;
     let recorded_before = bench.events().len();
     bench.run_for(Millis::from_millis(30_000));
     assert!(
-        bench.link.is_up(),
+        bench.endpoint.link.is_up(),
         "no link loss while a release is written"
     );
     assert!(bench.drops().is_empty());
@@ -1324,7 +1440,7 @@ fn f_031_the_bytes_a_boot_attempt_reads_as_non_frames_are_recorded_once_at_link_
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(1_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     assert!(
         bench.noise > 200,
         "every byte of the ROM's text counted, and its delimiters: {}",
@@ -1413,7 +1529,10 @@ fn l_001_a_frame_from_the_wrong_side_is_refused_with_256_on_session_zero_and_req
         .expect("a refusal");
     // L-181: session and request both zero.
     assert_eq!(refusal, (256, 0, 0));
-    assert!(bench.link.is_up(), "a refused frame is not a dead link");
+    assert!(
+        bench.endpoint.link.is_up(),
+        "a refused frame is not a dead link"
+    );
 }
 
 #[test]
@@ -1431,26 +1550,6 @@ fn l_012_a_link_local_frame_on_a_session_is_refused_with_263() {
         Heard::Refusal {
             code: 263,
             session: 0,
-            ..
-        }
-    )));
-}
-
-#[test]
-fn a_connection_before_the_session_layer_is_refused_as_a_full_table() {
-    // Capabilities: none.
-    let mut bench = Bench::new(Capabilities::default());
-    bench.run_for(Millis::from_millis(1_000));
-    let bytes = bench
-        .comms
-        .announce_connection(1, bench.now)
-        .expect("the peer builds it");
-    bench.feed(&bytes);
-    assert!(bench.comms.heard.iter().any(|h| matches!(
-        h,
-        Heard::Other {
-            opcode: 0xE2,
-            outcome: Some(2),
             ..
         }
     )));
@@ -1511,11 +1610,11 @@ fn p_031_a_request_whose_body_does_not_decode_is_neither_heard_nor_answered() {
     ] {
         let mut bench = Bench::new(Capabilities::default());
         bench.run_for(Millis::from_millis(1_000));
-        assert!(bench.link.is_up());
+        assert!(bench.endpoint.link.is_up());
         // One step of silence, so the last thing heard is behind the clock
         // and a frame counted as heard would move it.
         bench.now = bench.now.after(STEP).expect("the clock has room");
-        let before = bench.link.last_heard();
+        let before = bench.endpoint.link.last_heard();
         assert_ne!(before, Some(bench.now));
         let bytes = bench
             .comms
@@ -1523,7 +1622,7 @@ fn p_031_a_request_whose_body_does_not_decode_is_neither_heard_nor_answered() {
             .expect("the peer builds it");
         bench.feed(&bytes);
         assert_eq!(
-            bench.link.last_heard(),
+            bench.endpoint.link.last_heard(),
             before,
             "{kind:?}: a body that is not the message keeps no link alive"
         );
@@ -1553,7 +1652,7 @@ fn a_statement_claiming_to_be_a_controller_is_refused_and_brings_nothing_up() {
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(1_000));
-    assert!(!bench.link.is_up());
+    assert!(!bench.endpoint.link.is_up());
     assert!(bench.notes().contains(&Note::WrongRole));
     assert!(
         bench
@@ -1572,7 +1671,7 @@ fn a_late_peer_is_still_a_peer_inside_the_timeout() {
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(10_000));
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
     assert!(bench.drops().is_empty());
     assert!(
         !bench
@@ -1589,7 +1688,7 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
         ..Capabilities::default()
     });
     bench.run_for(Millis::from_millis(1_000));
-    assert!(bench.link.is_up(), "up through a cut statement");
+    assert!(bench.endpoint.link.is_up(), "up through a cut statement");
     let before = bench.refusals;
     let sent_before = bench.comms.sent.len();
     for _ in 0..1_000 {
@@ -1620,5 +1719,5 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
         answered >= 1_000,
         "every whole beat behind a cut one was answered: {answered}"
     );
-    assert!(bench.link.is_up());
+    assert!(bench.endpoint.link.is_up());
 }

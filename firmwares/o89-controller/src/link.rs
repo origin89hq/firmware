@@ -29,25 +29,28 @@ use embassy_stm32::gpio::{Flex, Pull};
 use embassy_stm32::usart::{BufferedUart, BufferedUartTx, Config, Error};
 use embassy_stm32::{Peri, bind_interrupts, usart};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::{Read, Write};
 use km43::{
     DownloadReason, DownloadRequest, FrameReader, FrameWriter, LinkEnvelope, LinkHeader,
-    LinkMessageType, MAX_FRAME, Received, ReqId, SessionId,
+    LinkMessageType, MAX_FRAME, MAX_PAYLOAD, Received, ReqId, SessionId,
 };
 use o89_core::mailbox::DownloadEntry;
 use o89_core::{
-    Action, Actions, Clock, Identity, KnockAnswer, Link, ModuleBoot, ModuleReset, Note, Recovery,
-    Task, knock_answer,
+    Action, Actions, Clock, Endpoint, Identity, Keys, KnockAnswer, Link, Local, ModuleBoot,
+    ModuleReset, Note, Recovery, Reply, SessionNote, Sessions, Task, knock_answer,
 };
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use crate::board::{EspCts, EspRts, EspRx, EspTx, EspUsart};
+use crate::fram::Lease;
 use crate::mailbox;
 use crate::rail::{self, RailWord};
 use crate::recorder;
+use crate::selector;
 use crate::supervisor::{Uptime, check_in};
 
 /// What the bench asks of the link, through the mailbox (F-038).
@@ -178,13 +181,46 @@ enum Ended {
     Download(Asked),
 }
 
+/// At most one factory reset waits for the link task, which keeps the epoch
+/// and the client table. A full queue refuses; a request never replaces an
+/// earlier physical act.
+static RESETS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+
+/// Queue a physical reset. The panel has already closed enrolment.
+pub fn request_reset() -> Result<(), TrySendError<()>> {
+    RESETS.try_send(())
+}
+
+/// Serve a reset the panel asked for, if one waits (P-085). Every session
+/// ends with it, landed or not, and the panel hears which.
+async fn serve_reset(sessions: &mut Sessions, fram: &mut Lease) {
+    if RESETS.try_receive().is_err() {
+        return;
+    }
+    let succeeded = match sessions.factory_reset(fram).await {
+        Ok(()) => {
+            defmt::info!("factory reset: epoch advanced and clients cleared");
+            true
+        }
+        Err(error) => {
+            defmt::error!("factory reset: {}; pairing blocked", error);
+            false
+        }
+    };
+    selector::reset_finished(succeeded);
+}
+
+/// What a `Discover` calls this unit (key 4).
+const MODEL: &str = "origin89 controller";
+
 /// The link task. No identity is a boot without a written count (F-039):
 /// the link never comes up, though the module is powered as on every boot
 /// (F-005), and this task keeps its place on the roll for the life of the
-/// part and nothing more.
+/// part and nothing more. With one come the records the sessions keep, and
+/// a lease on the part to keep them through.
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins, identity: Option<Identity>) {
-    let Some(identity) = identity else {
+pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) {
+    let Some((identity, keys)) = linked else {
         // The bench's requests are answered, not served: a unit without
         // its store has no link, and the FRAM is what is serviced first.
         loop {
@@ -194,6 +230,11 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                 }
                 Err(_) => {}
             }
+            if RESETS.try_receive().is_ok() {
+                // The epoch and the table are kept only with a store.
+                defmt::error!("factory reset: no store this boot; pairing blocked");
+                selector::reset_finished(false);
+            }
             check_in(Task::Link);
         }
     };
@@ -202,7 +243,13 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
         tx: TX_RING.init([0; MAX_FRAME]),
     };
     let mut rings = rings;
-    let mut link = Link::new(identity, Uptime.now());
+    let mut machine = Machine {
+        endpoint: Endpoint {
+            link: Link::new(identity, Uptime.now()),
+            sessions: Sessions::new(keys),
+        },
+        fram,
+    };
     let mut reader = FrameReader::new();
     let mut writer = FrameWriter::new();
     #[cfg(feature = "frames")]
@@ -210,11 +257,17 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
     let mut resume = false;
     check_in(Task::Link);
     loop {
+        serve_reset(&mut machine.endpoint.sessions, &mut machine.fram).await;
         // The bench first: a request while the module is off is served the
         // same way, and one for the normal state answers at once.
         match REQUEST.try_take() {
             Some((seq, Request::Download { reason, entry })) => {
-                perform_quiet(&link.module_taken());
+                perform_quiet(
+                    &machine
+                        .endpoint
+                        .link
+                        .module_taken(&mut machine.endpoint.sessions),
+                );
                 download(
                     &mut pins,
                     &mut rings,
@@ -234,43 +287,18 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
         let first = if core::mem::take(&mut resume) {
             Some(Actions::NONE)
         } else {
-            match with_timeout(TICK, rail::words().receive()).await {
-                Ok(RailWord::Settled) => {
-                    defmt::info!("link: the rail settled; USART1 up");
-                    Some(link.module_settled(Uptime.now()))
-                }
-                Ok(RailWord::Reset(_)) => None,
-                Ok(RailWord::Recovered(recovery)) => {
-                    let actions = link.rail(recovery, Uptime.now());
-                    perform_quiet(&actions);
-                    match recovery {
-                        Recovery::Cycling { .. } => None,
-                        Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
-                            // The rail did not move: the module is still
-                            // powered, and the UART comes back with no new
-                            // statement.
-                            defmt::info!("link: the rail stays on; USART1 up again");
-                            Some(Actions::NONE)
-                        }
-                    }
-                }
-                Err(_) => {
-                    let actions = link.tick(Uptime.now(), install_in_flight());
-                    perform_quiet(&actions);
-                    None
-                }
-            }
+            unpowered(&mut machine.endpoint).await
         };
         if let Some(first) = first {
             // Bounded: an episode ends on a cut or a refusal, and a refusal
             // is tried again after the next word.
             let ended = episode(
-                &mut link,
+                &mut machine,
                 &mut pins,
                 &mut rings,
                 &mut reader,
                 &mut writer,
-                first,
+                &first,
                 #[cfg(feature = "frames")]
                 &mut counts,
             )
@@ -290,12 +318,48 @@ pub async fn run(mut pins: Pins, identity: Option<Identity>) {
                     rail::request_recovery();
                 }
                 Ended::Download(asked) => {
-                    perform_quiet(&link.module_taken());
+                    perform_quiet(
+                        &machine
+                            .endpoint
+                            .link
+                            .module_taken(&mut machine.endpoint.sessions),
+                    );
                     download(&mut pins, &mut rings, &mut reader, &mut writer, asked).await;
                 }
             }
         }
         check_in(Task::Link);
+    }
+}
+
+/// One tick with the module off or being cut: the rail's word, or the
+/// state machine's tick. What the next episode starts with, when the rail
+/// says the module is powered.
+async fn unpowered(endpoint: &mut Endpoint) -> Option<Actions> {
+    match with_timeout(TICK, rail::words().receive()).await {
+        Ok(RailWord::Settled) => {
+            defmt::info!("link: the rail settled; USART1 up");
+            Some(endpoint.link.module_settled(Uptime.now()))
+        }
+        Ok(RailWord::Reset(_)) => None,
+        Ok(RailWord::Recovered(recovery)) => {
+            let actions = endpoint.link.rail(recovery, Uptime.now());
+            perform_quiet(&actions);
+            match recovery {
+                Recovery::Cycling { .. } => None,
+                Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
+                    // The rail did not move: the module is still powered,
+                    // and the UART comes back with no new statement.
+                    defmt::info!("link: the rail stays on; USART1 up again");
+                    Some(Actions::NONE)
+                }
+            }
+        }
+        Err(_) => {
+            let actions = endpoint.tick(Uptime.now(), install_in_flight());
+            perform_quiet(&actions);
+            None
+        }
     }
 }
 
@@ -313,6 +377,13 @@ const fn install_in_flight() -> bool {
 fn park(pins: &mut Pins) {
     Flex::new(pins.tx.reborrow()).set_as_input(Pull::None);
     Flex::new(pins.rts.reborrow()).set_as_input(Pull::None);
+}
+
+/// The state machine, and the lease on the part its records are kept
+/// through.
+struct Machine {
+    endpoint: Endpoint,
+    fram: Lease,
 }
 
 /// The driver's rings, owned for the life of the part and lent to each
@@ -341,14 +412,15 @@ fn bench_download() -> Option<Asked> {
 }
 
 async fn episode(
-    link: &mut Link,
+    machine: &mut Machine,
     pins: &mut Pins,
     rings: &mut Rings,
     reader: &mut FrameReader,
     writer: &mut FrameWriter,
-    first: Actions,
+    first: &Actions,
     #[cfg(feature = "frames")] counts: &mut frames::Counts,
 ) -> Ended {
+    let Machine { endpoint, fram } = machine;
     // A new UART starts a new run: the tail of a frame cut off by the last
     // episode's end, by a cut or by a stall, would merge into this one's
     // first frame and count its noise against the wrong boot (F-031).
@@ -358,9 +430,11 @@ async fn episode(
         Err(ended) => return ended,
     };
     let (mut tx, mut rx) = uart.split();
-    if let Some(ended) = perform(link, &mut tx, writer, &first).await {
+    if let Some(ended) = perform(&endpoint.link, &mut tx, writer, first).await {
         return ended;
     }
+    // A client's answer, built before it is framed.
+    let mut answer = [0u8; MAX_PAYLOAD];
     let mut chunk = [0u8; 64];
     let mut last_byte = Instant::now();
     // Bytes pushed since the reader last handed up a frame, a refusal or an
@@ -383,30 +457,27 @@ async fn episode(
                             run = 0;
                             #[cfg(feature = "frames")]
                             counts.frame(frame);
-                            if let Ok(envelope) = LinkEnvelope::decode(frame) {
-                                let was_up = link.is_up();
-                                let actions = link.received(envelope, Uptime.now());
-                                // The peer's own statement records it without
-                                // linking (L-033): only the transition is news.
-                                if !was_up
-                                    && link.is_up()
-                                    && let Some(peer) = link.peer()
-                                {
-                                    defmt::info!("link: up; the module is {}", peer);
-                                    #[cfg(feature = "frames")]
-                                    counts.linked();
-                                }
-                                perform(link, &mut tx, writer, &actions).await
-                            } else {
-                                None
+                            let was_up = endpoint.link.is_up();
+                            let ended =
+                                on_frame(endpoint, fram, &mut tx, writer, &mut answer, frame).await;
+                            // The peer's own statement records it without
+                            // linking (L-033): only the transition is news.
+                            if !was_up
+                                && endpoint.link.is_up()
+                                && let Some(peer) = endpoint.link.peer()
+                            {
+                                defmt::info!("link: up; the module is {}", peer);
+                                #[cfg(feature = "frames")]
+                                counts.linked();
                             }
+                            ended
                         }
                         refused @ (Received::Dropped(_) | Received::Abandoned) => {
                             #[cfg(feature = "frames")]
                             counts.refused(refused);
                             #[cfg(not(feature = "frames"))]
                             let _ = refused;
-                            link.noise(run);
+                            endpoint.link.noise(run);
                             run = 0;
                             None
                         }
@@ -432,7 +503,7 @@ async fn episode(
                 if let Received::Abandoned = reader.tick(None, quiet) {
                     #[cfg(feature = "frames")]
                     counts.abandoned();
-                    link.noise(run);
+                    endpoint.link.noise(run);
                     run = 0;
                 }
             }
@@ -451,14 +522,15 @@ async fn episode(
                     defmt::warn!("link: the rail settled while the link was up");
                 }
                 RailWord::Recovered(recovery) => {
-                    let actions = link.rail(recovery, Uptime.now());
-                    if let Some(ended) = perform(link, &mut tx, writer, &actions).await {
+                    let actions = endpoint.link.rail(recovery, Uptime.now());
+                    if let Some(ended) = perform(&endpoint.link, &mut tx, writer, &actions).await {
                         break 'episode ended;
                     }
                 }
             }
         }
-        if let Some(ended) = service_tick(link, &mut tx, writer).await {
+        serve_reset(&mut endpoint.sessions, fram).await;
+        if let Some(ended) = service_tick(endpoint, &mut tx, writer).await {
             break 'episode ended;
         }
         check_in(Task::Link);
@@ -468,8 +540,84 @@ async fn episode(
     // The run the reader holds when the episode ends is thrown away with the
     // UART, whatever ended it, so its bytes are this attempt's noise and are
     // counted now, before the caller can close the attempt (F-031).
-    link.noise(run);
+    endpoint.link.noise(run);
     ended
+}
+
+/// One whole frame from the module, through the link or the sessions, and
+/// what it asked for performed: a client's answer first, then the actions,
+/// so a close its frame asked for comes after it.
+async fn on_frame(
+    endpoint: &mut Endpoint,
+    fram: &mut Lease,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &mut [u8],
+    frame: &[u8],
+) -> Option<Ended> {
+    let local = Local {
+        model: MODEL,
+        log: recorder::log_span(),
+        // No clock before its slice.
+        time_known: false,
+    };
+    let step = endpoint
+        .frame(frame, Uptime.now(), &local, fram, answer)
+        .await?;
+    if let Some(ended) = reply(tx, writer, answer, step.reply).await {
+        return Some(ended);
+    }
+    perform(&endpoint.link, tx, writer, &step.actions).await
+}
+
+/// A client's answer onto the wire, under the write deadline every frame
+/// has, and its note on the probe. A stall ends the episode as any frame's
+/// does.
+async fn reply(
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &[u8],
+    reply: Option<Reply>,
+) -> Option<Ended> {
+    let reply = reply?;
+    if let Some(note) = reply.note {
+        session_note(note);
+    }
+    let envelope = answer.get(..reply.answer?)?;
+    let mut frame = [0u8; MAX_FRAME];
+    let Ok(len) = writer.write(envelope, &mut frame) else {
+        defmt::error!(
+            "link: a client answer of {} bytes did not frame",
+            envelope.len()
+        );
+        return None;
+    };
+    match with_timeout(WRITE_DEADLINE, send(tx, frame.get(..len).unwrap_or(&[]))).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => {
+            defmt::warn!("link: a client answer not sent: {}", error);
+            None
+        }
+        Err(_) => {
+            defmt::warn!("link: a client answer stalled; the module holds CTS");
+            Some(Ended::Stalled)
+        }
+    }
+}
+
+fn session_note(note: SessionNote) {
+    match note {
+        SessionNote::Bound(conn) => defmt::info!("session: bound on {}", conn),
+        SessionNote::Unbound(conn) => defmt::info!("session: goodbye on {}", conn),
+        SessionNote::NoChallenge => {
+            defmt::warn!("session: no challenge to give; the counter did not land");
+        }
+        SessionNote::TooLarge => defmt::error!("session: an answer did not fit its buffer"),
+        SessionNote::Unreadable
+        | SessionNote::NoHandle
+        | SessionNote::Refused(_)
+        | SessionNote::ClientError => defmt::debug!("session: {}", note),
+    }
 }
 
 /// A download request with the number that names it. Every report goes
@@ -814,7 +962,7 @@ async fn perform(
             Action::CutRail => defmt::warn!("link: asking the rail for a cut"),
             Action::DropConnections(why) => {
                 recorder::cancel_offers();
-                // No connection rows before M4; the drop is the log line.
+                // The rows went with the link; this is the log line.
                 defmt::info!("link: every connection dropped: {}", why);
             }
             Action::OfferTime { req_id, unix_ms } => {
@@ -1130,17 +1278,23 @@ mod frames {
 
 /// Service recorder replies and the link's monotonic deadlines each turn.
 async fn service_tick(
-    link: &mut Link,
+    endpoint: &mut Endpoint,
     tx: &mut BufferedUartTx<'_>,
     writer: &mut FrameWriter,
 ) -> Option<Ended> {
     if let Some((req_id, outcome)) = recorder::time_answer()
-        && let Some(ended) = perform(link, tx, writer, &link.time_verdict(req_id, outcome)).await
+        && let Some(ended) = perform(
+            &endpoint.link,
+            tx,
+            writer,
+            &endpoint.link.time_verdict(req_id, outcome),
+        )
+        .await
     {
         return Some(ended);
     }
-    let actions = link.tick(Uptime.now(), install_in_flight());
-    perform(link, tx, writer, &actions).await
+    let actions = endpoint.tick(Uptime.now(), install_in_flight());
+    perform(&endpoint.link, tx, writer, &actions).await
 }
 
 /// Encode and send one answer. True means CTS held the transmitter past its deadline.
