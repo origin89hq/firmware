@@ -33,7 +33,7 @@
 use km43::{ClientCapability, ClientId, ClientKind, Counter, Epoch, MAX_CLIENTS, MAX_LABEL};
 
 use crate::body::{Body, Held, Kept, Malformed, Reader, Writer};
-use crate::dedup::{DEDUP_BYTES, Dedup, Fingerprint, Recorded, Reserved, Verdict};
+use crate::dedup::{DEDUP_BYTES, Dedup, Fingerprint, Recorded, Reserved, Settling, Verdict};
 use crate::epoch::Clearing;
 use crate::fram::{Fram, Refused};
 use crate::text::Text;
@@ -330,6 +330,11 @@ impl ClientTable {
     /// Say what a reserved command did, or that it did nothing.
     pub fn finished(&mut self, seat: Reserved, outcome: Option<Recorded>) {
         self.dedup.finished(seat, outcome);
+    }
+
+    /// Settle an entry left in flight, if it still is and no permit holds it.
+    pub(crate) fn settled(&mut self, seat: Reserved, outcome: Option<Recorded>) -> Settling {
+        self.dedup.settled(seat, outcome)
     }
 
     /// Let go of a reserved entry whose outcome did not land.

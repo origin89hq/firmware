@@ -38,7 +38,7 @@ use km43::{
 
 use crate::body::{Kept, Unchanged};
 use crate::clients::{Admitted, CLIENT_TABLE_BYTES, Check, ClientTable};
-use crate::dedup::{Fingerprint, Recorded, Reserved};
+use crate::dedup::{Fingerprint, Recorded, Reserved, Settling};
 use crate::fram::Fram;
 use crate::tick::Tick;
 
@@ -316,30 +316,40 @@ impl<'a> InFlight<'a> {
 
     /// The hardware is already where the command asked: the entry completes
     /// as accepted and the retry is answered `duplicate`. Nothing executes.
+    ///
+    /// Another retry handed the same entry may have settled it first. If it
+    /// ran the command again, the entry is that permit's, and this retry is
+    /// [`Refusal::Running`] rather than a `duplicate` of a command still
+    /// executing.
     pub async fn already<F: Fram>(
         self,
         clients: &mut Clients,
         fram: &mut F,
-    ) -> Finished<'static, F::Error> {
+    ) -> Result<Finished<'static, F::Error>, Refusal<F::Error>> {
         let seat = self.seat;
-        let recorded = clients
-            .update(fram, |table| {
-                table.finished(seat, Some(Recorded::Accepted));
-            })
-            .await;
-        Finished {
+        let recorded = match clients
+            .update(fram, |table| table.settled(seat, Some(Recorded::Accepted)))
+            .await
+        {
+            Ok(Settling::Held) => return Err(Refusal::Running),
+            Ok(Settling::Settled | Settling::Gone) => Ok(()),
+            Err(why) => Err(why),
+        };
+        Ok(Finished {
             ack: CommandAck {
                 cmd_id: self.command.cmd_id,
                 outcome: Command::Duplicate,
                 detail: DUPLICATE,
             },
             recorded,
-        }
+        })
     }
 
     /// The hardware is not where the command asked: the entry is discarded
     /// and the retry runs as a fresh command, its counter and a new entry
-    /// landing in the same one write as the discard.
+    /// landing in the same one write as the discard. An entry another retry
+    /// settled first is left as that retry left it, and this one is answered
+    /// from it: running, or the outcome it recorded.
     pub async fn again<F: Fram>(
         self,
         clients: &mut Clients,
@@ -358,9 +368,11 @@ impl<'a> InFlight<'a> {
             return Admission::Refused(Refusal::NoSuchClient);
         };
         let admitted = clients
-            .update(fram, |table| {
-                table.finished(seat, None);
-                table.admit(client, counter, command.cmd_id, fingerprint, now)
+            .update(fram, |table| match table.settled(seat, None) {
+                Settling::Held => Admitted::Running,
+                Settling::Settled | Settling::Gone => {
+                    table.admit(client, counter, command.cmd_id, fingerprint, now)
+                }
             })
             .await;
         let asked = Asked {
@@ -1123,7 +1135,8 @@ mod tests {
             };
             assert_eq!(in_flight.command().cmd_id, 42);
             if hardware_already_there {
-                let finished = block_on(in_flight.already(&mut rig.clients, &mut rig.part));
+                let finished = block_on(in_flight.already(&mut rig.clients, &mut rig.part))
+                    .expect("nothing else settled it");
                 assert_eq!(finished.recorded, Ok(()));
                 assert_eq!(finished.ack.outcome, Command::Duplicate);
                 // Completed on the part: a third try is the plain duplicate.
@@ -1165,6 +1178,84 @@ mod tests {
             answer(rig.admit(third.bytes(), 200)).outcome,
             Command::Duplicate
         );
+    }
+
+    /// A reset left an entry in flight and two retries of it arrive before
+    /// either is settled. Whichever settles second meets the entry the first
+    /// settled, not the one both were handed, and must not discard it for a
+    /// second permit or answer it `duplicate` while its command still runs.
+    #[test]
+    fn p_080_two_retries_of_one_entry_left_in_flight_never_get_two_permits() {
+        let mut rig = Rig::new();
+        let first = start(&rig, 1, 42);
+        drop(permitted(rig.admit(first.bytes(), 0)));
+        let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
+        assert_eq!(
+            block_on(clients.booted(&mut rig.part, Epoch::FIRST)),
+            Ok(Booted::Rebased)
+        );
+        rig.clients = clients;
+        let (a, b, c) = (start(&rig, 2, 42), start(&rig, 3, 42), start(&rig, 4, 42));
+        let Admission::InFlight(a) = rig.admit(a.bytes(), 10) else {
+            panic!("the first retry meets the entry in flight");
+        };
+        let Admission::InFlight(b) = rig.admit(b.bytes(), 11) else {
+            panic!("so does the second, before the first is settled");
+        };
+        let Admission::InFlight(c) = rig.admit(c.bytes(), 12) else {
+            panic!("and the third");
+        };
+        let running = permitted(block_on(a.again(
+            &mut rig.clients,
+            &mut rig.part,
+            Tick::ZERO,
+        )));
+        let writes = rig.part.writes;
+        // Told the hardware has not moved either, the second finds the
+        // first one's command running.
+        match block_on(b.again(&mut rig.clients, &mut rig.part, Tick::ZERO)) {
+            Admission::Refused(why) => assert_eq!(why, Refusal::Running),
+            other => panic!("a second permit beside the first: {other:?}"),
+        }
+        // Told the hardware is there, the third may not complete it.
+        match block_on(c.already(&mut rig.clients, &mut rig.part)) {
+            Err(why) => assert_eq!(why, Refusal::Running),
+            Ok(finished) => panic!("answered while it runs: {finished:?}"),
+        }
+        assert_eq!(rig.part.writes, writes, "nothing was settled for either");
+        let _ = rig.finish(running, Executed::Accepted);
+        let last = start(&rig, 5, 42);
+        assert_eq!(
+            answer(rig.admit(last.bytes(), 13)).outcome,
+            Command::Duplicate
+        );
+    }
+
+    /// The same race settled the other way: the first retry finds the
+    /// hardware already there, and the second, handed the same entry, is
+    /// answered from what the first recorded.
+    #[test]
+    fn p_080_a_retry_settling_an_entry_another_already_completed_is_its_duplicate() {
+        let mut rig = Rig::new();
+        let first = start(&rig, 1, 42);
+        drop(permitted(rig.admit(first.bytes(), 0)));
+        let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
+        let _ = block_on(clients.booted(&mut rig.part, Epoch::FIRST));
+        rig.clients = clients;
+        let (a, b) = (start(&rig, 2, 42), start(&rig, 3, 42));
+        let Admission::InFlight(a) = rig.admit(a.bytes(), 10) else {
+            panic!("in flight");
+        };
+        let Admission::InFlight(b) = rig.admit(b.bytes(), 11) else {
+            panic!("in flight");
+        };
+        let settled = block_on(a.already(&mut rig.clients, &mut rig.part)).expect("settled");
+        assert_eq!(settled.ack.outcome, Command::Duplicate);
+        let again = block_on(b.again(&mut rig.clients, &mut rig.part, Tick::ZERO));
+        match again {
+            Admission::Answered(ack) => assert_eq!(ack.outcome, Command::Duplicate),
+            other => panic!("the completed command ran again: {other:?}"),
+        }
     }
 
     #[test]

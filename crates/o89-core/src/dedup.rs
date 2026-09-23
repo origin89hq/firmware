@@ -149,6 +149,18 @@ pub enum Verdict {
     Busy,
 }
 
+/// What settling an entry left in flight found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a settlement that found the command running must not answer for it"]
+pub(crate) enum Settling {
+    /// It was still in flight and unheld, and is settled now.
+    Settled,
+    /// A permit holds it: its command is running.
+    Held,
+    /// It is not in flight any more: settled, completed or reused since.
+    Gone,
+}
+
 /// One remembered command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
@@ -307,6 +319,35 @@ impl Dedup {
                 entry.held = false;
             }
             None => *slot = None,
+        }
+    }
+
+    /// Settle an entry a boot, or a spent permit, left in flight, as the state
+    /// store decided: completed with `outcome`, or discarded for `None`. Only
+    /// if the seat still names that entry as it was handed out: in flight and
+    /// held by no permit. Two retries can be handed the same entry, and the
+    /// one that settles second meets what the first did with it, which it
+    /// must leave alone.
+    pub(crate) fn settled(&mut self, seat: Reserved, outcome: Option<Recorded>) -> Settling {
+        let Some(slot) = self.entries.get_mut(seat.at) else {
+            return Settling::Gone;
+        };
+        let Some(entry) = slot else {
+            return Settling::Gone;
+        };
+        if entry.client != seat.client || entry.cmd != seat.cmd {
+            return Settling::Gone;
+        }
+        match (entry.status, entry.held) {
+            (Some(_), _) => Settling::Gone,
+            (None, true) => Settling::Held,
+            (None, false) => {
+                match outcome {
+                    Some(recorded) => entry.status = Some(recorded),
+                    None => *slot = None,
+                }
+                Settling::Settled
+            }
         }
     }
 
