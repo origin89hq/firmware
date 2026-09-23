@@ -266,11 +266,11 @@ impl<const N: usize> Record<N> {
     /// Use only a prefix of an unwritten reservation without moving slot B.
     /// The CRC follows the prefix; this is a new encoding, not a migration.
     ///
-    /// # Panics
-    /// A prefix larger than its reservation is a const-time layout error.
+    /// A prefix larger than its reservation fails compilation, including
+    /// when called at runtime.
     #[must_use]
     pub const fn prefix<const M: usize>(self) -> Record<M> {
-        assert!(M <= N, "prefix exceeds reservation");
+        const { assert!(M <= N, "prefix exceeds reservation") };
         Record {
             magic: self.magic,
             a: self.a,
