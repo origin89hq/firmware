@@ -47,6 +47,15 @@ const PERIOD: Duration = Duration::from_millis(100);
 /// so and says so, and nothing is evicted.
 static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
 
+/// At most one reset waits for the FRAM owner. A full queue refuses;
+/// requests never replace an earlier physical act.
+static RESETS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+
+/// Queue a physical reset. The panel has already closed enrolment.
+pub fn request_reset() -> Result<(), TrySendError<()>> {
+    RESETS.try_send(())
+}
+
 /// The recovery ladder's cuts, to be kept on the FRAM before the rail
 /// moves, under the request's number. One at a time: a request the
 /// recorder has not taken is replaced by the next.
@@ -202,6 +211,9 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor, boot: B
     loop {
         match select(ticker.next(), CUTS.wait()).await {
             Either::First(()) => {
+                if RESETS.try_receive().is_ok() {
+                    reset_clients(store.as_mut(), &mut fram).await;
+                }
                 // Bounded by the queue's depth: what arrives meanwhile waits
                 // a turn.
                 for _ in 0..MAX_EVENT_QUEUE {
@@ -245,6 +257,37 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor, boot: B
         }
         check_in(Task::Recorder);
     }
+}
+
+/// Serve one physical reset on the task that owns persistence.
+/// P-085 failures reach the probe here. The persisted `ConcernRaised` body
+/// requires the concern lifecycle and inventory from firmware#12; an empty
+/// map is not a valid concern event. That integration remains part of #85.
+async fn reset_clients(store: Option<&mut Store>, fram: &mut Fram) {
+    let succeeded = if let Some(store) = store {
+        match o89_core::reset_clients(&mut store.epoch, &mut store.clients, fram).await {
+            Ok(()) => {
+                defmt::info!("factory reset: epoch advanced and clients cleared");
+                true
+            }
+            Err(error) => {
+                defmt::error!("factory reset: {}; pairing blocked", error);
+                match error {
+                    o89_core::ResetFailed::Epoch(_) => {
+                        defmt::error!("reset fault: epoch write failed");
+                    }
+                    o89_core::ResetFailed::Clients(_) => {
+                        defmt::error!("reset fault: client clear failed");
+                    }
+                }
+                false
+            }
+        }
+    } else {
+        defmt::error!("reset fault: epoch write failed, no store; pairing blocked");
+        false
+    };
+    crate::selector::reset_finished(succeeded);
 }
 
 /// The class A boot record (`0x0601`): why the part reset, what the RTC

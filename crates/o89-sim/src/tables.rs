@@ -80,8 +80,7 @@ fn p_085_a_reset_cut_at_any_step_leaves_the_old_epoch_with_its_rows_or_a_higher_
         &start,
         |part| {
             let (mut epochs, mut clients) = boot(part);
-            let clearing = block_on(epochs.advance(part)).map_err(|_| ())?;
-            block_on(clients.write(part, ClientTable::cleared(&clearing))).map_err(|_| ())
+            block_on(o89_core::reset_clients(&mut epochs, &mut clients, part)).map_err(|_| ())
         },
         |part, step| {
             let (epochs, mut clients) = boot(part);
@@ -452,4 +451,64 @@ fn f_022_a_stop_cut_at_any_step_leaves_the_run_or_the_stop_and_never_a_reason_fo
     });
     let crashes = declare_cut_at_every_step(manual, RunReason::Stopped);
     assert!(crashes.steps > RUN_REASON_BYTES, "{crashes:?}");
+}
+
+#[test]
+fn p_085_reset_refuses_without_clearing_when_the_supply_falls_and_retries_after_recovery() {
+    let mut part = with_one_phone();
+    let (mut epochs, mut clients) = boot(&mut part);
+    part.set_supply(crate::Supply::Falling);
+    assert_eq!(
+        block_on(o89_core::reset_clients(
+            &mut epochs,
+            &mut clients,
+            &mut part
+        )),
+        Err(o89_core::ResetFailed::Epoch(o89_core::EpochFailed::Write(
+            o89_core::Refused::SupplyFalling
+        )))
+    );
+    assert_eq!(epochs.present(), Some(&Epoch::FIRST));
+    assert_eq!(clients.present().expect("the old table").enrolled(), 1);
+    part.set_supply(crate::Supply::Steady);
+    assert_eq!(
+        block_on(o89_core::reset_clients(
+            &mut epochs,
+            &mut clients,
+            &mut part
+        )),
+        Ok(())
+    );
+    assert_eq!(epochs.present(), Some(&epoch(2)));
+    assert_eq!(clients.present().expect("cleared table").enrolled(), 0);
+}
+
+#[test]
+fn p_085_reset_refuses_an_unknown_or_exhausted_epoch_without_touching_clients() {
+    for value in [None, Some(epoch(u32::MAX))] {
+        let mut part = with_one_phone();
+        let (mut epochs, mut clients) = boot(&mut part);
+        let expected = match value {
+            None => {
+                let mut empty = SimFram::fresh();
+                epochs = block_on(Epochs::read(EPOCH, &mut empty)).expect("empty part reads");
+                o89_core::EpochFailed::Unknown
+            }
+            Some(value) => {
+                block_on(epochs.write(&mut part, value)).expect("epoch written");
+                o89_core::EpochFailed::AtTheCeiling
+            }
+        };
+        let before = part.bytes_written();
+        assert_eq!(
+            block_on(o89_core::reset_clients(
+                &mut epochs,
+                &mut clients,
+                &mut part
+            )),
+            Err(o89_core::ResetFailed::Epoch(expected))
+        );
+        assert_eq!(part.bytes_written(), before);
+        assert_eq!(clients.present().expect("old table").enrolled(), 1);
+    }
 }

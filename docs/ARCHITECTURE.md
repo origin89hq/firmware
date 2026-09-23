@@ -596,6 +596,30 @@ button ([origin89hq/hardware#11](https://github.com/origin89hq/hardware/issues/1
 A-42) takes over with at least the same three gestures; the selector gestures
 stay defined so a unit with either board reads the same.
 
+On revision A, hold **Off for two seconds**, then make three excursions,
+returning to Off after each. Hold each outer position for at least 300 ms;
+no outer-position or intermediate-Off leg may exceed three seconds:
+
+| Excursions from Off | Final Off hold | Act |
+| --- | --- | --- |
+| Auto, Auto, Auto | 2 s | Open the 120 s pairing window |
+| Manual, Manual, Manual | 2 s | Arm one floor-crossing time write |
+| Auto, Manual, Auto | 10 s | Advance the epoch and clear clients, counters and dedup |
+
+The controller samples every 10 ms and accepts a position after 50 ms of
+unchanged samples. Both contacts low is unknown. Unknown input, a sample
+gap greater than 100 ms, or an invalid sequence cancels the gesture. A
+completed gesture fires once; leave Off before starting another. The floor
+permission ends on consumption, departure from Off (before debounce), lost
+sampling, or 120 seconds. Pairing never arms it. The time-operation handler
+must check it when processing the request and consume it only on an accepted
+floor-crossing write; rate-limit refusal does not consume it.
+
+During the pairing window the status lamp is steady. A watchdog fault
+retains priority over that indication. Reset closes the window before
+requesting persistence. A failed reset keeps enrolment blocked; after a
+successful reset, a new pairing gesture is still required.
+
 **One lamp, meaning by pattern.** Two LEDs share one light pipe, so what a
 person sees is one lamp: a slow heartbeat is a controller that is alive,
 linked and on the network; a double heartbeat is alive with no network; a

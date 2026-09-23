@@ -143,6 +143,8 @@ pub async fn run(
         }
         let pattern = if withheld.is_some() {
             Pattern::Fault
+        } else if crate::selector::pairing_open() {
+            Pattern::Pairing
         } else {
             // No link yet: alive with no network.
             Pattern::DoubleHeartbeat
