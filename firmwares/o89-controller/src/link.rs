@@ -368,7 +368,7 @@ async fn episode(
     let mut run: u32 = 0;
     // Bounded by the cut the state machine asks for, and every turn by the
     // tick: the read waits `TICK` at most.
-    loop {
+    let ended = 'episode: loop {
         // Every call below reads the clock itself: a read can wait a whole
         // tick, and a frame stamped before the wait is heard a tick early.
         match with_timeout(TICK, rx.read(&mut chunk)).await {
@@ -413,7 +413,7 @@ async fn episode(
                         Received::Nothing => None,
                     };
                     if let Some(ended) = ended {
-                        return ended;
+                        break 'episode ended;
                     }
                 }
             }
@@ -440,7 +440,7 @@ async fn episode(
         #[cfg(feature = "frames")]
         counts.report();
         if let Some(asked) = bench_download() {
-            return Ended::Download(asked);
+            break 'episode Ended::Download(asked);
         }
         while let Ok(word) = rail::words().try_receive() {
             match word {
@@ -453,19 +453,24 @@ async fn episode(
                 RailWord::Recovered(recovery) => {
                     let actions = link.rail(recovery, Uptime.now());
                     if let Some(ended) = perform(link, &mut tx, writer, &actions).await {
-                        return ended;
+                        break 'episode ended;
                     }
                 }
             }
         }
         let actions = link.tick(Uptime.now(), install_in_flight());
         if let Some(ended) = perform(link, &mut tx, writer, &actions).await {
-            return ended;
+            break 'episode ended;
         }
         check_in(Task::Link);
         // A ready read never yields: the other tasks get every turn's end.
         yield_now().await;
-    }
+    };
+    // The run the reader holds when the episode ends is thrown away with the
+    // UART, whatever ended it, so its bytes are this attempt's noise and are
+    // counted now, before the caller can close the attempt (F-031).
+    link.noise(run);
+    ended
 }
 
 /// A download request with the number that names it. Every report goes

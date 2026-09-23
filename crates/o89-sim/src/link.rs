@@ -106,10 +106,16 @@ impl Bench {
         bench
     }
 
-    /// The module is powered and booting: the link is told, and the peer
-    /// boots.
+    /// The module is powered and booting: the run the reader held is thrown
+    /// away with the reset and counted against the attempt it belonged to,
+    /// as the controller's adapter does when its episode ends, then the link
+    /// is told, and the peer boots.
     fn settled(&mut self) {
         let now = self.now;
+        self.link.noise(self.run);
+        self.noise = self.noise.saturating_add(self.run);
+        self.run = 0;
+        self.reader.discard();
         let actions = self.link.module_settled(now);
         self.perform(actions);
         let bytes = self.comms.boot(now).expect("the peer boots");
@@ -1299,6 +1305,26 @@ fn f_031_the_bytes_a_boot_attempt_reads_as_non_frames_are_recorded_once_at_link_
     let bytes = bench.comms.boot(bench.now).expect("the peer builds it");
     bench.feed(&bytes);
     assert_eq!(boot_noise(&bench).len(), 1, "one attempt, one record");
+}
+
+#[test]
+fn f_031_a_run_cut_off_by_a_reset_counts_against_the_attempt_it_arrived_in() {
+    // Capabilities: answers nothing, so the attempt stays open.
+    let mut bench = Bench::new(Capabilities {
+        answers: Answers::Nothing,
+        ..Capabilities::default()
+    });
+    bench.run_for(Millis::from_millis(500));
+    // Thirty bytes and no delimiter: a run the reader still holds.
+    bench.feed(&[0x11; 30]);
+    assert!(boot_noise(&bench).is_empty(), "the attempt is still open");
+    // The module is reset under it: the run goes with the reset.
+    bench.settled();
+    assert_eq!(
+        boot_noise(&bench),
+        vec![30],
+        "the cut-off run counted, and against the attempt it arrived in"
+    );
 }
 
 #[test]
