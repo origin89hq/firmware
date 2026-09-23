@@ -24,18 +24,19 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker};
 use km43::{
     BOOT_MAX_BYTES, Boot, CONTROLLER_RECORD_MAX_BYTES, ControllerRecord, Event, EventKind, LogSeq,
-    MAX_EVENT_QUEUE, ReqId, TimeOffer,
+    MAX_EVENT_QUEUE, ReqId, Time, TimeAck, TimeOffer,
 };
 use o89_core::{
-    BootCount, CUTS_RECORD_BYTES, Class, CutsRecord, Keep, KeepAnswer, Kept, LinkEvent, LogSpan,
-    MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring, SCRATCH, Task,
-    Tick, UnixMillis, WallClock,
+    Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
+    LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
+    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, time_expired,
 };
 
 use crate::fram::Lease;
 use crate::mailbox;
 use crate::nor::{JEDEC, Nor, SECTOR};
 use crate::rtc::CalendarClock;
+use crate::selector;
 use crate::supervisor::check_in;
 
 /// Pending work and replies share the protocol's four-request bound. Excess
@@ -50,6 +51,11 @@ static TIME_ANSWER: Channel<
     TIME_REQUESTS,
 > = Channel::new();
 static TIME_GENERATION: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+
+/// One client `Time` at a time: the session keeps one waiting and refuses
+/// the next with 7 (P-118), so a depth of one never refuses a request.
+static CLIENT_TIME: Channel<CriticalSectionRawMutex, (TimeAsked, Tick), 1> = Channel::new();
+static CLIENT_ANSWER: Channel<CriticalSectionRawMutex, (u32, TimeAnswer), 1> = Channel::new();
 
 static CLOCK: Mutex<CriticalSectionRawMutex, RefCell<WallClock>> =
     Mutex::new(RefCell::new(WallClock::new()));
@@ -87,6 +93,25 @@ pub fn offer(req_id: ReqId, at: u64) -> Option<Outgoing> {
             }
         }
     }
+}
+
+/// Hand a client's `Time` to the recorder, anchored to the tick it arrived
+/// on so a wait in the queue or a floor scan advances it (as an offer's).
+pub fn client_time(asked: TimeAsked) {
+    let now = Tick::from_millis(Instant::now().as_millis());
+    // The session holds one at a time, so a request still queued is one it
+    // has forgotten: this replaces it rather than being dropped behind it.
+    if CLIENT_TIME.try_receive().is_ok() {
+        defmt::warn!("clock: a forgotten client time dropped from the queue");
+    }
+    if CLIENT_TIME.try_send((asked, now)).is_err() {
+        defmt::error!("clock: a client time found the queue full");
+    }
+}
+
+/// The recorder's answer to a client's `Time`, for the session that asked.
+pub fn client_time_answer() -> Option<(u32, TimeAnswer)> {
+    CLIENT_ANSWER.try_receive().ok()
 }
 
 pub fn time_answer() -> Option<(ReqId, TimeOffer)> {
@@ -270,6 +295,9 @@ pub async fn run(
         publish(ring);
     }
     let boot = cuts.boot.map_or(0, BootCount::get);
+    // The client whose set is applied and owed to the log, and the clock it
+    // set, answered once the record lands.
+    let mut client_waiting: Option<(u32, u64)> = None;
     mailbox::init();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
@@ -282,6 +310,7 @@ pub async fn run(
                     &mut calendar,
                     &mut cuts,
                     &mut fram,
+                    &mut client_waiting,
                 )
                 .await;
                 // Bounded by the queue's depth: what arrives meanwhile waits
@@ -465,6 +494,107 @@ fn process_offer(
     OfferResult::AwaitingAudit
 }
 
+fn answer_client(ticket: u32, answer: TimeAnswer) {
+    if CLIENT_ANSWER.try_send((ticket, answer)).is_err() {
+        defmt::error!("clock: a client time answer found the queue full");
+    }
+}
+
+/// A client's signed `Time`, its counter already spent: decided against the
+/// RTC and the floor the log gives (P-113, P-114), with the override read
+/// now (P-117 rule 3), and applied as an offer is: the calendar, then the
+/// audit, then the answer once the `time set` record lands (P-111).
+async fn serve_client(
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    calendar: &mut CalendarClock,
+    cuts: &mut Cuts,
+    fram: &mut Lease,
+    (asked, received): (TimeAsked, Tick),
+    client_waiting: &mut Option<(u32, u64)>,
+) {
+    let now = Tick::from_millis(Instant::now().as_millis());
+    if time_expired(received, now) {
+        defmt::warn!("clock: a forgotten client time not acted on");
+        return;
+    }
+    let current = match calendar.read() {
+        Ok(current) => current,
+        Err(error) => {
+            defmt::error!("clock: calendar unavailable: {}", error);
+            return answer_client(asked.ticket, TimeAnswer::Busy);
+        }
+    };
+    if !asked.authorised {
+        return answer_client(asked.ticket, refused(Time::Unauthorised, current));
+    }
+    if CLOCK.lock(|clock| clock.borrow().client_rate_limited(now)) {
+        return answer_client(asked.ticket, TimeAnswer::Busy);
+    }
+    let Some(floor) = recover_floor(ring, scratch, cuts, fram).await else {
+        return answer_client(asked.ticket, TimeAnswer::Busy);
+    };
+    // The floor scan can take thirty seconds: a request its session forgot
+    // meanwhile must not move the clock with nobody told, and the value and
+    // the RTC are read after it, as an offer's are, or the clock is set
+    // behind by the scan.
+    let now = Tick::from_millis(Instant::now().as_millis());
+    if time_expired(received, now) {
+        defmt::warn!("clock: a client time forgotten during the floor scan");
+        return;
+    }
+    let current = match calendar.read() {
+        Ok(current) => current,
+        Err(error) => {
+            defmt::error!("clock: calendar unavailable: {}", error);
+            return answer_client(asked.ticket, TimeAnswer::Busy);
+        }
+    };
+    let Some(at) = OfferedTime::new(asked.at, received).at(now) else {
+        return answer_client(asked.ticket, refused(Time::Rejected, current));
+    };
+    let (change, stepped, overridden) =
+        match WallClock::client(at, current, floor, selector::floor_override()) {
+            ClientSet::Set {
+                change,
+                stepped,
+                overridden,
+            } => (change, stepped, overridden),
+            ClientSet::Rejected => {
+                return answer_client(asked.ticket, refused(Time::Rejected, current));
+            }
+            ClientSet::NeedsButton => {
+                return answer_client(asked.ticket, refused(Time::NeedsButton, current));
+            }
+        };
+    if let Err(error) = calendar.set(change) {
+        defmt::error!("clock: calendar write refused: {}", error);
+        return answer_client(asked.ticket, TimeAnswer::Busy);
+    }
+    let now = Tick::from_millis(Instant::now().as_millis());
+    if !CLOCK.lock(|clock| clock.borrow_mut().client_applied(change, now)) {
+        // Only the recorder applies a change and it checked none was owed.
+        defmt::error!("clock: a client set applied beside another owed to the log");
+    }
+    if overridden {
+        selector::floor_used();
+        // P-116's `floor overridden` concern waits on the concern table.
+        defmt::error!("clock: the floor was overridden at the panel");
+    }
+    if stepped {
+        // P-115's `clock stepped` concern waits on the concern table.
+        defmt::error!("clock: a client stepped the clock more than an hour");
+    }
+    *client_waiting = Some((asked.ticket, change.new_value().as_millis()));
+}
+
+/// A refusal carries the time the controller kept, omitted when it has none
+/// (P-093).
+fn refused(outcome: Time, current: Option<UnixMillis>) -> TimeAnswer {
+    TimeAck::new(outcome, current.map(UnixMillis::as_millis))
+        .map_or(TimeAnswer::Busy, TimeAnswer::Ack)
+}
+
 async fn keep_cuts(cuts: &mut Cuts, fram: &mut Lease, request: u32, recent: RecentCuts) {
     // Under the boot count the part holds, by which a later
     // boot counts the boots whose own record never landed
@@ -563,27 +693,48 @@ async fn serve_time(
     calendar: &mut CalendarClock,
     cuts: &mut Cuts,
     fram: &mut Lease,
+    client_waiting: &mut Option<(u32, u64)>,
 ) {
     let Some(ring) = ring else {
+        // No log to record a set into (P-111): a client's `Time`, its
+        // counter spent, is answered rather than left waiting.
+        if let Ok((asked, _)) = CLIENT_TIME.try_receive() {
+            answer_client(asked.ticket, TimeAnswer::Busy);
+        }
         return;
     };
     let now = Tick::from_millis(Instant::now().as_millis());
     if CLOCK.lock(|clock| clock.borrow().audit_pending()) {
         if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
-            && append_record(ring, scratch, change.offer_record(), calendar.now())
+            && append_record(ring, scratch, change.record(), calendar.now())
                 .await
                 .is_ok()
         {
             match calendar.recorded() {
                 Ok(()) => {
                     let now = Tick::from_millis(Instant::now().as_millis());
-                    if let Some(req_id) = CLOCK.lock(|clock| clock.borrow_mut().audit_written(now))
-                        && TIME_ANSWER
-                            .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
-                            .is_err()
-                    {
-                        CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
-                        defmt::warn!("clock: reply queue full; acceptance retained for retry");
+                    match CLOCK.lock(|clock| clock.borrow_mut().audit_written(now)) {
+                        Some(Answered::Offer(req_id)) => {
+                            if TIME_ANSWER
+                                .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
+                                .is_err()
+                            {
+                                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                                defmt::warn!(
+                                    "clock: reply queue full; acceptance retained for retry"
+                                );
+                            }
+                        }
+                        Some(Answered::Client) => {
+                            if let Some((ticket, at)) = client_waiting.take() {
+                                answer_client(
+                                    ticket,
+                                    TimeAck::new(Time::Accepted, Some(at))
+                                        .map_or(TimeAnswer::Busy, TimeAnswer::Ack),
+                                );
+                            }
+                        }
+                        None => {}
                     }
                 }
                 Err(error) => {
@@ -591,6 +742,19 @@ async fn serve_time(
                 }
             }
         }
+        return;
+    }
+    if let Ok((asked, received)) = CLIENT_TIME.try_receive() {
+        serve_client(
+            ring,
+            scratch,
+            calendar,
+            cuts,
+            fram,
+            (asked, received),
+            client_waiting,
+        )
+        .await;
         return;
     }
     if !CLOCK.lock(|clock| clock.borrow().ready_for_offer(now)) {

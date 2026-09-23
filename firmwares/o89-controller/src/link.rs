@@ -530,7 +530,7 @@ async fn episode(
             }
         }
         serve_reset(&mut endpoint.sessions, fram).await;
-        if let Some(ended) = service_tick(endpoint, &mut tx, writer).await {
+        if let Some(ended) = service_tick(endpoint, &mut tx, writer, &mut answer).await {
             break 'episode ended;
         }
         check_in(Task::Link);
@@ -572,6 +572,13 @@ async fn on_frame(
     {
         // One press, one enrolment: the next `Pair` meets a closed window.
         selector::enrolled();
+    }
+    if let Some(Reply {
+        note: Some(SessionNote::TimeAsked(asked)),
+        ..
+    }) = step.reply
+    {
+        recorder::client_time(asked);
     }
     if let Some(ended) = reply(tx, writer, answer, step.reply).await {
         return Some(ended);
@@ -618,6 +625,9 @@ fn session_note(note: SessionNote) {
     match note {
         SessionNote::Bound(conn) => defmt::info!("session: bound on {}", conn),
         SessionNote::Paired(client) => defmt::info!("session: paired client {}", client),
+        SessionNote::TimeAsked(asked) => {
+            defmt::info!("session: a client time, ticket {}", asked.ticket);
+        }
         SessionNote::Unbound(conn) => defmt::info!("session: goodbye on {}", conn),
         SessionNote::NoChallenge => {
             defmt::warn!("session: no challenge to give; the counter did not land");
@@ -1296,7 +1306,14 @@ async fn service_tick(
     endpoint: &mut Endpoint,
     tx: &mut BufferedUartTx<'_>,
     writer: &mut FrameWriter,
+    answer: &mut [u8],
 ) -> Option<Ended> {
+    if let Some((ticket, decided)) = recorder::client_time_answer() {
+        let answered = endpoint.sessions.time_answered(ticket, decided, answer);
+        if let Some(ended) = reply(tx, writer, answer, Some(answered)).await {
+            return Some(ended);
+        }
+    }
     if let Some((req_id, outcome)) = recorder::time_answer()
         && let Some(ended) = perform(
             &endpoint.link,

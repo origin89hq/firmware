@@ -58,12 +58,13 @@
 //! P-143, L-061, L-062, L-070, L-071, L-072, L-080, L-180, L-182, L-195
 
 use km43::{
-    Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, CommandAck, Conn, EmptyBody,
-    Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake, HandshakeError, Header,
-    HelloClaim, HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
-    MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MessageType, Outcome, PairClaim,
-    PairRequest, PairResponse, Refusal as Code, ReqId, SessionId, SessionKey, SignedClaim,
-    SignedError, StateSeq, Tagged, Topology, Version, Wrapper, WrapperError, WrapperKey,
+    CapabilityBit, Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, CommandAck,
+    Conn, EmptyBody, Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake,
+    HandshakeError, Header, HelloClaim, HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq,
+    MAX_AUTH_FAILURES, MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MAX_TIME_ACK_BYTES,
+    MessageType, Outcome, PairClaim, PairRequest, PairResponse, Refusal as Code, ReqId, SessionId,
+    SessionKey, SignedClaim, SignedError, StateSeq, Tagged, TimeAck, TimeOperation, Topology,
+    Version, Wrapper, WrapperError, WrapperKey,
 };
 
 use crate::body::Kept;
@@ -177,6 +178,8 @@ pub enum SessionNote {
     /// A `Pair` enrolled or reclaimed this client: the window that allowed it
     /// closes now (L-195).
     Paired(ClientId),
+    /// A client's `Time`, for the recorder to decide and answer.
+    TimeAsked(TimeAsked),
     /// The client said goodbye on this handle.
     Unbound(Conn),
     /// A challenge could not be minted: the counter did not land, is at its
@@ -269,6 +272,59 @@ struct Binding {
     key: SessionKey,
     /// The last frame that proved itself (P-077).
     heard: Tick,
+    /// Which binding this is, so an answer that took its time goes to the
+    /// session that asked and to no later one on the same handle.
+    serial: u32,
+}
+
+/// A client's `Time` the recorder is deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AskedTime {
+    ticket: u32,
+    to: Addressed,
+    serial: u32,
+    asked: Tick,
+}
+
+/// How long a client's `Time` waits for the recorder before it is
+/// forgotten: past the floor scan's thirty seconds, so a slow answer still
+/// lands, and short enough that a lost one does not refuse every later
+/// `Time` with 7.
+pub const TIME_ANSWER_LIMIT: Millis = Millis::from_millis(60_000);
+
+/// Whether a client `Time` handed on at `asked` has waited out
+/// [`TIME_ANSWER_LIMIT`] by `now`, or the tick gives it no age to trust. The
+/// session forgets it then, and the recorder must not act on it after: the
+/// client that asked is no longer waiting for the answer.
+#[must_use]
+pub fn time_expired(asked: Tick, now: Tick) -> bool {
+    now.since(asked)
+        .is_none_or(|waited| waited.as_millis() >= TIME_ANSWER_LIMIT.as_millis())
+}
+
+/// What a client's `Time` asks the recorder, which owns the calendar, the
+/// log the floor comes from, and the record the set is written into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TimeAsked {
+    /// What the answer is handed back with.
+    pub ticket: u32,
+    /// The operation's `at`, milliseconds since the epoch.
+    pub at: u64,
+    /// Whether the client's mask lets it set the clock; answered
+    /// `unauthorised` otherwise, with the clock the controller keeps (P-105).
+    pub authorised: bool,
+}
+
+/// The recorder's answer to a client's `Time`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TimeAnswer {
+    /// Its `TimeAck`.
+    Ack(TimeAck),
+    /// Inside fifteen minutes of the last one accepted, or another change
+    /// is still owed to the log: error 7, and nothing executed (P-118).
+    Busy,
 }
 
 struct Row {
@@ -329,6 +385,13 @@ fn alive(minted: Tick, now: Tick) -> bool {
 pub struct Sessions {
     rows: [Option<Row>; CONNECTIONS],
     keys: Keys,
+    /// The last binding's serial.
+    bindings: u32,
+    /// The one client `Time` in the recorder's hands; a second waits its
+    /// turn as error 7, which P-118's one-a-quarter-hour makes rare.
+    time: Option<AskedTime>,
+    /// The last ticket handed to the recorder.
+    tickets: u32,
 }
 
 impl Sessions {
@@ -338,6 +401,9 @@ impl Sessions {
         Self {
             rows: [const { None }; CONNECTIONS],
             keys,
+            bindings: 0,
+            time: None,
+            tickets: 0,
         }
     }
 
@@ -465,6 +531,12 @@ impl Sessions {
     /// unbound, their keys destroyed, and their transports to be closed
     /// (P-077). The row stays allocated until the transport goes.
     pub fn tick(&mut self, now: Tick) -> Expired {
+        if self
+            .time
+            .is_some_and(|asked| time_expired(asked.asked, now))
+        {
+            self.time = None;
+        }
         let mut expired = [None; CONNECTIONS];
         for (row, out) in self.rows.iter_mut().flatten().zip(expired.iter_mut()) {
             let idle = match &row.bound {
@@ -541,15 +613,14 @@ impl Sessions {
             | MessageType::GetConfig => self.wrapped_request(to, envelope, now, dst),
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
+            MessageType::Time => self.time(to, envelope, now, fram, dst).await,
             // Signed, and not served until their handlers call `admit`:
             // refused without a counter spent, after the session they need
             // is checked (P-143).
-            MessageType::SetConfig | MessageType::Firmware | MessageType::Time => {
-                match self.bound_on(to, dst) {
-                    Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
-                    Err(refused) => refused,
-                }
-            }
+            MessageType::SetConfig | MessageType::Firmware => match self.bound_on(to, dst) {
+                Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
+                Err(refused) => refused,
+            },
             // An error is never answered with another (P-031).
             MessageType::ErrorResponse => Reply::noted(SessionNote::ClientError),
             // What only the controller sends is not a request.
@@ -852,11 +923,14 @@ impl Sessions {
         };
         // Bound only once the answer exists: a session nobody can be told
         // about is a row held for fifteen minutes for nothing.
+        self.bindings = self.bindings.wrapping_add(1);
+        let serial = self.bindings;
         if let Some(row) = self.row_mut(to.conn) {
             row.bound = Bound::Session(Binding {
                 client,
                 key,
                 heard: now,
+                serial,
             });
         }
         Reply {
@@ -988,7 +1062,7 @@ impl Sessions {
             Ok(claim) => claim,
             Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
         };
-        let Self { rows, keys } = self;
+        let Self { rows, keys, .. } = self;
         let Some(Row {
             bound: Bound::Session(binding),
             ..
@@ -1052,6 +1126,138 @@ impl Sessions {
             }
             None => self.failed(to, now, dst),
         }
+    }
+
+    /// `Time 0x0A` on a session, through [`admit`]: the counter spent before
+    /// anything else (P-080), then the operation handed to the recorder,
+    /// which owns the calendar and the floor, with a ticket. The answer
+    /// comes back through [`Sessions::time_answered`]. Refusals before the
+    /// recorder are answered as a `Command`'s are.
+    async fn time<F: Fram>(
+        &mut self,
+        to: Addressed,
+        envelope: Envelope<'_>,
+        now: Tick,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        if let Err(refused) = self.bound_on(to, dst) {
+            return refused;
+        }
+        let claim = match SignedClaim::decode(envelope) {
+            Ok(claim) => claim,
+            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        };
+        let Self {
+            rows,
+            keys,
+            time,
+            tickets,
+            ..
+        } = self;
+        let Some(Row {
+            bound: Bound::Session(binding),
+            ..
+        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+        else {
+            return Reply::NOTHING;
+        };
+        let admission = admit(
+            claim,
+            &binding.key,
+            binding.client,
+            &mut keys.clients,
+            fram,
+            now,
+        )
+        .await;
+        let write = match admission {
+            Admission::Execute(Permit::Write(write)) => write,
+            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
+                return self.failed(to, now, dst);
+            }
+            Admission::Refused(why) => {
+                let mut reply = refused_under(to, &binding.key, why.code(), dst);
+                if why.raises().is_some() {
+                    reply.note = Some(SessionNote::NotKept);
+                }
+                return reply;
+            }
+            // Only a `Command` is reserved, answered from the table or left
+            // in flight; a `Time` never is.
+            Admission::Execute(Permit::Command(_))
+            | Admission::Answered(_)
+            | Admission::InFlight(_) => {
+                return wrapped(to, &binding.key, ErrorCode::UnknownMessageType, dst);
+            }
+        };
+        // The counter is spent: this frame proved itself and is fresh.
+        binding.heard = now;
+        let operation = match TimeOperation::decode(write.operation()) {
+            Ok(operation) => operation,
+            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+        };
+        if time.is_some() {
+            return wrapped(to, &binding.key, ErrorCode::BusyRetry, dst);
+        }
+        let authorised = keys
+            .clients
+            .present()
+            .and_then(|table| table.row(binding.client))
+            .is_some_and(|row| {
+                row.mask().0 & (1 << CapabilityBit::ClockSettableByClient as u16) != 0
+            });
+        *tickets = tickets.wrapping_add(1);
+        *time = Some(AskedTime {
+            ticket: *tickets,
+            to,
+            serial: binding.serial,
+            asked: now,
+        });
+        Reply::noted(SessionNote::TimeAsked(TimeAsked {
+            ticket: *tickets,
+            at: operation.at,
+            authorised,
+        }))
+    }
+
+    /// The recorder's answer to the `Time` it was handed as `ticket`,
+    /// written under the key of the session that asked. Nothing is written
+    /// for a ticket that is not the one waiting, or when that session has
+    /// ended or been bound again since: its client is not listening.
+    pub fn time_answered(&mut self, ticket: u32, answer: TimeAnswer, dst: &mut [u8]) -> Reply {
+        let Some(asked) = self.time.filter(|asked| asked.ticket == ticket) else {
+            return Reply::NOTHING;
+        };
+        self.time = None;
+        let Some(Row {
+            bound: Bound::Session(binding),
+            ..
+        }) = self.row(asked.to.conn)
+        else {
+            return Reply::NOTHING;
+        };
+        if binding.serial != asked.serial {
+            return Reply::NOTHING;
+        }
+        let ack = match answer {
+            TimeAnswer::Ack(ack) => ack,
+            TimeAnswer::Busy => return wrapped(asked.to, &binding.key, ErrorCode::BusyRetry, dst),
+        };
+        let mut body = [0u8; MAX_TIME_ACK_BYTES];
+        let written = ack
+            .encode(&mut body)
+            .ok()
+            .and_then(|len| {
+                Tagged::over(
+                    asked.to.header(MessageType::TimeResponse),
+                    body.get(..len).unwrap_or(&[]),
+                    &binding.key,
+                )
+                .ok()
+            })
+            .and_then(|tagged| tagged.write(dst).ok());
+        answered(written)
     }
 
     /// A proof or a MAC that did not verify: error 10, bare, and one more
@@ -1878,16 +2084,233 @@ mod tests {
         assert_eq!(table.dedup().live(rig.now), 0, "the entry is settled");
     }
 
+    impl Rig {
+        /// A signed `Time` on `handle` from `client` setting `at`.
+        fn time_frame(
+            &mut self,
+            handle: u16,
+            client: u32,
+            counter: u64,
+            at: u64,
+            key: &SessionKey,
+        ) -> Bytes {
+            let req_id = self.next_req();
+            let mut op = [0u8; 16];
+            let len = km43::TimeOperation { at }.encode(&mut op).expect("fits");
+            let mut dst = [0u8; 128];
+            let len = Signed::over(
+                Header {
+                    kind: MessageType::Time,
+                    session: SessionId::from(handle),
+                    req_id,
+                },
+                ClientId::new(client).expect("a slot"),
+                Counter(counter),
+                &op[..len],
+                key,
+            )
+            .expect("signs")
+            .write(&mut dst)
+            .expect("fits");
+            Bytes::of(&dst[..len])
+        }
+
+        /// Hand `answer` back for `ticket`, and the bytes it wrote.
+        fn answer_time(&mut self, ticket: u32, answer: TimeAnswer) -> (Reply, Bytes) {
+            let mut dst = [0u8; MAX_PAYLOAD];
+            let reply = self.sessions.time_answered(ticket, answer, &mut dst);
+            let bytes = reply
+                .answer
+                .map_or(Bytes::EMPTY, |len| Bytes::of(&dst[..len]));
+            (reply, bytes)
+        }
+    }
+
+    const SET_AT: u64 = 1_800_000_000_000;
+
+    fn asked(reply: &Reply) -> TimeAsked {
+        match reply.note {
+            Some(SessionNote::TimeAsked(asked)) => asked,
+            other => panic!("handed to the recorder, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_110_a_client_time_spends_its_counter_and_is_handed_to_the_recorder() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, answer) = rig.send(&frame);
+        assert!(answer.is_empty(), "answered later, by the recorder");
+        let asked = asked(&reply);
+        assert_eq!(asked.at, SET_AT);
+        assert!(asked.authorised, "an app may set the clock");
+        assert_eq!(
+            rig.accepted(),
+            Some(Counter(1)),
+            "spent before anything else"
+        );
+        let req_id = ReqId(rig.req);
+        let ack = TimeAck::new(km43::Time::Accepted, Some(SET_AT)).expect("an ack");
+        let (_, answer) = rig.answer_time(asked.ticket, TimeAnswer::Ack(ack));
+        let (header, payload) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::TimeResponse);
+        assert_eq!(header.req_id, req_id, "P-026");
+        assert_eq!(TimeAck::decode(&payload), Ok(ack));
+        // Answered once: the same ticket again writes nothing.
+        let (_, again) = rig.answer_time(asked.ticket, TimeAnswer::Ack(ack));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn p_118_a_second_time_while_one_is_decided_is_7_and_a_busy_answer_is_7_under_the_key() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let first = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, _) = rig.send(&first);
+        let ticket = asked(&reply).ticket;
+        let second = rig.time_frame(1, 1, 2, SET_AT, &key);
+        let (reply, answer) = rig.send(&second);
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::BusyRetry)
+        );
+        let (_, answer) = rig.answer_time(ticket, TimeAnswer::Busy);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::BusyRetry)
+        );
+        // The slot is free again.
+        let third = rig.time_frame(1, 1, 3, SET_AT, &key);
+        let (reply, _) = rig.send(&third);
+        assert_ne!(asked(&reply).ticket, ticket);
+    }
+
+    /// The answer takes its time; the client that asked may be gone. It goes
+    /// to the session that asked and to no later one on the same handle.
+    #[test]
+    fn a_time_answer_reaches_only_the_session_that_asked() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        let ticket = asked(&reply).ticket;
+        let ack = TimeAck::new(km43::Time::Rejected, None).expect("an ack");
+        // A wrong ticket is nobody's.
+        let (_, answer) = rig.answer_time(ticket.wrapping_add(1), TimeAnswer::Ack(ack));
+        assert!(answer.is_empty());
+        // The client says goodbye and hellos again on the same handle.
+        let bye = rig.wrapped(1, MessageType::Goodbye, &key);
+        let _ = rig.send(&bye);
+        let _ = rig.hello(1);
+        let (_, answer) = rig.answer_time(ticket, TimeAnswer::Ack(ack));
+        assert!(answer.is_empty(), "the new session did not ask");
+    }
+
+    /// One definition of when a waiting `Time` is forgotten, used by the
+    /// session to free its slot and by the recorder to never act on it after.
+    #[test]
+    fn a_time_is_expired_from_the_limit_on_and_on_a_tick_that_went_backwards() {
+        let asked = Tick::from_millis(5_000);
+        assert!(!time_expired(asked, asked));
+        let limit = asked.after(TIME_ANSWER_LIMIT).expect("fits");
+        assert!(!time_expired(
+            asked,
+            Tick::from_millis(limit.as_millis() - 1)
+        ));
+        assert!(time_expired(asked, limit));
+        assert!(
+            time_expired(asked, Tick::from_millis(4_999)),
+            "no age to trust"
+        );
+    }
+
+    #[test]
+    fn a_time_the_recorder_never_answers_is_forgotten_and_the_next_is_taken() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        let lost = asked(&reply).ticket;
+        rig.at(TIME_ANSWER_LIMIT.as_millis() - 1);
+        let _ = rig.sessions.tick(rig.now);
+        let frame = rig.time_frame(1, 1, 2, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)), "still waiting");
+        rig.at(1);
+        let _ = rig.sessions.tick(rig.now);
+        let frame = rig.time_frame(1, 1, 3, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        let taken = asked(&reply).ticket;
+        assert_ne!(taken, lost);
+        let ack = TimeAck::new(km43::Time::Rejected, None).expect("an ack");
+        let (_, answer) = rig.answer_time(lost, TimeAnswer::Ack(ack));
+        assert!(answer.is_empty(), "the forgotten one answers nothing");
+    }
+
+    /// The cloud's mask does not reach the clock (P-105): handed on as
+    /// unauthorised, so the answer can carry the clock the controller keeps.
+    #[test]
+    fn p_105_a_client_whose_mask_does_not_reach_the_clock_is_asked_as_unauthorised() {
+        let mut rig = Rig::new();
+        let cloud = Label::new("cloud").expect("fits");
+        let paired = block_on(
+            rig.sessions
+                .keys
+                .clients
+                .update(&mut rig.part, |table| table.pair(cloud, ClientKind::Cloud)),
+        );
+        assert!(matches!(paired, Ok(Ok(Paired::Enrolled(_)))));
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let frame = rig.hello_frame(1, 2, challenge, &device(), epoch(1), Version::V1_0, [4; 16]);
+        let _ = rig.send(&frame);
+        let key = device()
+            .enrolment(epoch(1), ClientId::new(2).expect("a slot"))
+            .session_key(
+                &Handshake {
+                    challenge,
+                    client_nonce: [4; 16],
+                },
+                SessionId::from(1),
+            );
+        let frame = rig.time_frame(1, 2, 1, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        assert!(!asked(&reply).authorised);
+    }
+
+    #[test]
+    fn a_client_time_under_another_key_is_10_and_one_replayed_is_11() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let forged = rig.time_frame(1, 1, 1, SET_AT, &other_key());
+        let (reply, answer) = rig.send(&forged);
+        assert_eq!(hint(&answer), Some(10));
+        assert_eq!(reply.close, None);
+        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, _) = rig.send(&frame);
+        let ack = TimeAck::new(km43::Time::Accepted, Some(SET_AT)).expect("an ack");
+        let _ = rig.answer_time(asked(&reply).ticket, TimeAnswer::Ack(ack));
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Refused(11)));
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::CounterNotFresh)
+        );
+    }
+
     #[test]
     fn a_signed_request_not_served_yet_is_2_and_spends_no_counter() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, _) = rig.hello(1);
-        for kind in [
-            MessageType::Time,
-            MessageType::SetConfig,
-            MessageType::Firmware,
-        ] {
+        for kind in [MessageType::SetConfig, MessageType::Firmware] {
             let frame = rig.empty(1, kind);
             let (_, answer) = rig.send(&frame);
             assert_eq!(hint(&answer), Some(2), "{kind:?}");

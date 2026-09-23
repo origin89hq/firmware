@@ -2,12 +2,17 @@
 //! last. A reset before that marker leaves the clock unknown; a reset after it
 //! recovers the exact old/new values without applying the calendar again.
 
+use km43::TimeSource;
+
 use crate::{Calendar, ClockChange, UnixMillis};
 
 /// One marker/fraction word and two words for each timestamp; no spare slots.
 pub const CLOCK_BACKUP_WORDS: usize = 5;
 const CLEAN: u32 = 0x8934_0000;
+/// A change owed to the log, one marker per source, so a reset cannot
+/// turn a client's write into NTP's (P-111).
 const PENDING: u32 = 0x8935_0000;
+const PENDING_CLIENT: u32 = 0x8937_0000;
 const FRACTION: u32 = 0x0000_FFFF;
 
 /// Calendar and retained-word operations supplied by the adapter.
@@ -63,9 +68,15 @@ impl ClockJournal {
         if fraction >= 1_000 {
             return None;
         }
-        let pending = match word & !FRACTION {
+        let source = match word & !FRACTION {
             CLEAN => None,
-            PENDING => {
+            PENDING => Some(TimeSource::NtpViaComms),
+            PENDING_CLIENT => Some(TimeSource::Client),
+            _ => return None,
+        };
+        let pending = match source {
+            None => None,
+            Some(source) => {
                 let old = read_time(store, 1, 2)?;
                 let new = UnixMillis::new(read_time(store, 3, 4)?)?;
                 Calendar::from_unix(new)?;
@@ -76,9 +87,8 @@ impl ClockJournal {
                 if let Some(old) = old {
                     Calendar::from_unix(old)?;
                 }
-                Some(ClockChange::recovered(old, new))
+                Some(ClockChange::recovered(old, new, source))
             }
-            _ => return None,
         };
         Some(Self {
             fraction: Some(fraction),
@@ -125,7 +135,11 @@ impl ClockJournal {
         write_time(store, 1, 2, old)?;
         write_time(store, 3, 4, at.as_millis())?;
         store.set_calendar(at).map_err(JournalError::Calendar)?;
-        put(store, 0, PENDING | fraction)?;
+        let marker = match change.source() {
+            TimeSource::NtpViaComms => PENDING,
+            TimeSource::Client => PENDING_CLIENT,
+        };
+        put(store, 0, marker | fraction)?;
         *self = Self {
             fraction: Some(fraction),
             pending: Some(change),
@@ -229,6 +243,7 @@ mod tests {
         ClockChange::recovered(
             UnixMillis::new(1_800_000_000_000),
             UnixMillis::new(1_800_000_001_123).unwrap(),
+            TimeSource::NtpViaComms,
         )
     }
 
@@ -247,6 +262,43 @@ mod tests {
             } else {
                 assert!(result.is_err());
                 assert_eq!(recovered, ClockJournal::UNKNOWN);
+            }
+        }
+    }
+
+    /// A reset between applying a client's set and its record landing must
+    /// not turn the client's write into NTP's when the boot finishes the
+    /// record: the source is fixed by which message moved the clock (P-111).
+    #[test]
+    fn p_111_a_change_owed_to_the_log_keeps_its_source_across_a_reset() {
+        for source in [TimeSource::Client, TimeSource::NtpViaComms] {
+            let change = ClockChange::recovered(
+                UnixMillis::new(1_800_000_000_000),
+                UnixMillis::new(1_800_000_001_123).unwrap(),
+                source,
+            );
+            // Every cut: unknown, or the change with its own source.
+            for cut in 0..=7 {
+                let mut part = Part::new(cut);
+                let mut journal = ClockJournal::UNKNOWN;
+                let result = journal.apply(&mut part, change);
+                let rebooted = ClockJournal::load(&part);
+                if result.is_ok() {
+                    assert_eq!(rebooted.pending(), Some(change), "{source:?} cut {cut}");
+                    let Some(pending) = rebooted.pending() else {
+                        panic!("a change owed to the log");
+                    };
+                    assert_eq!(
+                        pending.record(),
+                        km43::ControllerRecord::TimeSet {
+                            old: Some(1_800_000_000_000),
+                            new: 1_800_000_001_123,
+                            source,
+                        }
+                    );
+                } else {
+                    assert_eq!(rebooted, ClockJournal::UNKNOWN, "{source:?} cut {cut}");
+                }
             }
         }
     }
@@ -277,7 +329,7 @@ mod tests {
     #[test]
     fn first_set_has_no_old_value_and_corrupt_metadata_is_unknown() {
         let mut part = Part::new(usize::MAX);
-        let first = ClockChange::recovered(None, change().new_value());
+        let first = ClockChange::recovered(None, change().new_value(), TimeSource::NtpViaComms);
         let mut journal = ClockJournal::UNKNOWN;
         journal.apply(&mut part, first).unwrap();
         assert_eq!(ClockJournal::load(&part).pending(), Some(first));

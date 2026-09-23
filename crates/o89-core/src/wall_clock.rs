@@ -7,7 +7,7 @@
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
-use crate::{Millis, Tick, UnixMillis};
+use crate::{Calendar, Millis, Tick, UnixMillis};
 
 /// Ten Julian years, in milliseconds, shared by both clock-setting paths.
 pub const PLAUSIBILITY_SPAN: u64 = 315_576_000_000;
@@ -20,6 +20,11 @@ pub const OFFER_STEP: u64 = 5_000;
 pub const OFFER_REPLAY: Millis = Millis::from_millis(1_500);
 /// A failed audit append is retried at most once per second.
 pub const AUDIT_RETRY: Millis = Millis::from_millis(1_000);
+/// One accepted client `Time` per fifteen minutes on the tick, the width of
+/// the offers' limit and counted apart from it (P-118).
+pub const CLIENT_INTERVAL: Millis = Millis::from_millis(900_000);
+/// A move of a known clock past this raises `clock stepped` (P-115).
+pub const TIME_STEP_ALARM: u64 = 3_600_000;
 
 /// A received time value anchored to the controller's monotonic tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +50,52 @@ impl OfferedTime {
 #[derive(Debug, Clone, Copy)]
 struct Audit {
     change: ClockChange,
-    reply: Option<(ReqId, u64)>,
+    reply: Owed,
     retry_at: Option<Tick>,
+}
+
+/// Who is answered once an audit lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// Nobody: recovered at boot, or its link was lost.
+    Nobody,
+    /// A link offer, replayable by its request id and value.
+    Offer(ReqId, u64),
+    /// The client whose signed `Time` moved the clock.
+    Client,
+}
+
+/// Who an audit that landed is answered to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an acceptance nobody answers is a client left to time out"]
+pub enum Answered {
+    /// The link offer with this request id.
+    Offer(ReqId),
+    /// The client whose `Time` is waiting.
+    Client,
+}
+
+/// What a client's signed `Time 0x0A` becomes, decided before the clock
+/// moves and never with the clock moved for a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a decision nobody applies is a client answered by nothing"]
+pub enum ClientSet {
+    /// Move the clock to this, record it, and answer `accepted` once the
+    /// record is durable.
+    Set {
+        /// The change, sourced `client` (P-111).
+        change: ClockChange,
+        /// A known clock moved by more than an hour: `clock stepped` (P-115).
+        stepped: bool,
+        /// Below the floor, accepted on the armed override: `floor
+        /// overridden`, and the override is spent (P-116, P-117).
+        overridden: bool,
+    },
+    /// Outcome 2: past the window's upper edge, which nothing lifts (P-113).
+    Rejected,
+    /// Outcome 4: below the floor with no override armed (P-114).
+    NeedsButton,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +109,7 @@ struct Completed {
 #[derive(Debug, Default)]
 pub struct WallClock {
     last_offer: Option<Tick>,
+    last_client: Option<Tick>,
     rate_refusals: u64,
     pending: [Option<ReqId>; MAX_INFLIGHT],
     audit: Option<Audit>,
@@ -82,27 +132,44 @@ pub enum OfferIntake {
 }
 
 /// A proposed change. Applying it and recording it belong to the adapter.
+///
+/// It carries its source from the decision that made it to the record that
+/// names it, through the calendar's journal across a reset, because the
+/// source is fixed by which message moved the clock and read from nowhere
+/// else (P-111).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ClockChange {
     old: Option<UnixMillis>,
     new: UnixMillis,
+    source: TimeSource,
 }
 
 impl ClockChange {
-    pub(crate) const fn recovered(old: Option<UnixMillis>, new: UnixMillis) -> Self {
-        Self { old, new }
+    pub(crate) const fn recovered(
+        old: Option<UnixMillis>,
+        new: UnixMillis,
+        source: TimeSource,
+    ) -> Self {
+        Self { old, new, source }
     }
 
-    /// Audit body for an accepted link offer. Its source is the registry's
-    /// comms source, never the link-local source number (P-111, L-162).
+    /// The `time set` record's body (P-111, P-215): `ntp-via-comms` for an
+    /// accepted link offer, never the link-local source number (L-162), and
+    /// `client` for a signed client write.
     #[must_use]
-    pub fn offer_record(self) -> ControllerRecord {
+    pub fn record(self) -> ControllerRecord {
         ControllerRecord::TimeSet {
             old: self.old.map(UnixMillis::as_millis),
             new: self.new.as_millis(),
-            source: TimeSource::NtpViaComms,
+            source: self.source,
         }
+    }
+
+    /// Which message moved the clock.
+    #[must_use]
+    pub const fn source(self) -> TimeSource {
+        self.source
     }
 
     /// The previous reading, absent when the RTC was unknown.
@@ -124,6 +191,7 @@ impl WallClock {
     pub const fn new() -> Self {
         Self {
             last_offer: None,
+            last_client: None,
             rate_refusals: 0,
             pending: [None; MAX_INFLIGHT],
             audit: None,
@@ -171,7 +239,11 @@ impl WallClock {
             }
         }
         let new = UnixMillis::new(at).ok_or(TimeOffer::RefusedImplausible)?;
-        Ok(ClockChange { old: current, new })
+        Ok(ClockChange {
+            old: current,
+            new,
+            source: TimeSource::NtpViaComms,
+        })
     }
 
     /// Reserve a request until its answer is taken. Storage work and queued
@@ -218,8 +290,10 @@ impl WallClock {
     pub fn cancel_pending(&mut self) {
         self.pending.fill(None);
         self.completed = None;
-        if let Some(audit) = self.audit.as_mut() {
-            audit.reply = None;
+        if let Some(audit) = self.audit.as_mut()
+            && matches!(audit.reply, Owed::Offer(..))
+        {
+            audit.reply = Owed::Nobody;
         }
     }
 
@@ -240,7 +314,7 @@ impl WallClock {
         self.offer_applied(now);
         self.audit = Some(Audit {
             change,
-            reply: Some((req_id, offered.at)),
+            reply: Owed::Offer(req_id, offered.at),
             retry_at: Some(now),
         });
         true
@@ -254,7 +328,7 @@ impl WallClock {
         }
         self.audit = Some(Audit {
             change,
-            reply: None,
+            reply: Owed::Nobody,
             retry_at: Some(Tick::ZERO),
         });
         true
@@ -289,15 +363,90 @@ impl WallClock {
     /// Complete only after both append and journal acknowledgement succeed.
     /// Retain the accepted result through L-015's retry horizon, even if its
     /// UART reply is lost. A cancelled link gets no reply.
-    pub fn audit_written(&mut self, now: Tick) -> Option<ReqId> {
+    pub fn audit_written(&mut self, now: Tick) -> Option<Answered> {
         let audit = self.audit.take()?;
-        let (req_id, at) = audit.reply?;
-        self.completed = Some(Completed {
-            req_id,
-            at,
-            expires: now.after(OFFER_REPLAY),
+        match audit.reply {
+            Owed::Nobody => None,
+            Owed::Client => Some(Answered::Client),
+            Owed::Offer(req_id, at) => {
+                self.completed = Some(Completed {
+                    req_id,
+                    at,
+                    expires: now.after(OFFER_REPLAY),
+                });
+                Some(Answered::Offer(req_id))
+            }
+        }
+    }
+
+    /// Decide a client's signed `Time` against the RTC and the floor, the
+    /// same floor an offer meets (P-113, P-114, L-140). Every client write
+    /// meets it, a known clock's too: there is no drift allowance on this
+    /// door. The override lifts the floor and nothing else; the ten-year
+    /// edge above it binds whatever the panel says (P-116, P-117).
+    ///
+    /// This does not move the clock or spend the override: the adapter sets
+    /// the calendar, then calls [`client_applied`](Self::client_applied),
+    /// then spends the override if this was `overridden`.
+    pub fn client(
+        at: u64,
+        current: Option<UnixMillis>,
+        floor: UnixMillis,
+        override_armed: bool,
+    ) -> ClientSet {
+        let lower = floor.as_millis();
+        if at.saturating_sub(lower) > PLAUSIBILITY_SPAN {
+            return ClientSet::Rejected;
+        }
+        let overridden = at < lower;
+        if overridden && !override_armed {
+            return ClientSet::NeedsButton;
+        }
+        // The override has no lower bound and the RTC holds one century:
+        // what the calendar cannot hold is refused before the clock moves.
+        let Some(new) = UnixMillis::new(at).filter(|new| Calendar::from_unix(*new).is_some())
+        else {
+            return ClientSet::Rejected;
+        };
+        // A first set is not a step: there is nothing to subtract (P-115).
+        let stepped = current.is_some_and(|old| at.abs_diff(old.as_millis()) > TIME_STEP_ALARM);
+        ClientSet::Set {
+            change: ClockChange {
+                old: current,
+                new,
+                source: TimeSource::Client,
+            },
+            stepped,
+            overridden,
+        }
+    }
+
+    /// Whether a client's `Time` arrives inside the fifteen minutes after
+    /// the last one accepted: error 7, before it executes, override or not
+    /// (P-117 rule 4, P-118).
+    #[must_use]
+    pub fn client_rate_limited(&self, now: Tick) -> bool {
+        self.last_client.is_some_and(|last| {
+            now.since(last)
+                .is_none_or(|elapsed| elapsed < CLIENT_INTERVAL)
+        })
+    }
+
+    /// Retain a client's applied change until its audit is durable, and
+    /// start P-118's window. Refused, like an offer's, while another audit
+    /// is owed.
+    #[must_use]
+    pub fn client_applied(&mut self, change: ClockChange, now: Tick) -> bool {
+        if self.audit.is_some() {
+            return false;
+        }
+        self.last_client = Some(now);
+        self.audit = Some(Audit {
+            change,
+            reply: Owed::Client,
+            retry_at: Some(now),
         });
-        Some(req_id)
+        true
     }
 
     /// Refuse and count an offer at intake without waiting for storage. This
@@ -385,7 +534,7 @@ mod tests {
         ));
         let now = Tick::from_millis(1_000);
         assert_eq!(clock.audit_due(now), Some(change));
-        assert_eq!(clock.audit_written(now), Some(ReqId(1)));
+        assert_eq!(clock.audit_written(now), Some(Answered::Offer(ReqId(1))));
         clock.finished(ReqId(1)); // UART can now fail or the response can be lost.
         for tick in [1_000, 1_500, 2_499] {
             assert_eq!(
@@ -430,7 +579,7 @@ mod tests {
         let mut clock = WallClock::new();
         applied(&mut clock);
         let now = Tick::from_millis(900_000);
-        assert_eq!(clock.audit_written(now), Some(ReqId(1)));
+        assert_eq!(clock.audit_written(now), Some(Answered::Offer(ReqId(1))));
         clock.finished(ReqId(1));
         assert!(!clock.ready_for_offer(now));
         assert!(clock.ready_for_offer(Tick::from_millis(901_500)));
@@ -528,7 +677,8 @@ mod tests {
                 clock.offer(at, None, time(FLOOR), Tick::ZERO),
                 Ok(ClockChange {
                     old: None,
-                    new: time(at)
+                    new: time(at),
+                    source: TimeSource::NtpViaComms,
                 })
             );
         }
@@ -578,7 +728,7 @@ mod tests {
                 .offer(FLOOR + 1, old, time(FLOOR), Tick::ZERO)
                 .unwrap();
             assert_eq!(
-                change.offer_record(),
+                change.record(),
                 ControllerRecord::TimeSet {
                     old: old.map(UnixMillis::as_millis),
                     new: FLOOR + 1,
@@ -586,10 +736,10 @@ mod tests {
                 }
             );
             let mut bytes = [0; km43::CONTROLLER_RECORD_MAX_BYTES];
-            let len = change.offer_record().encode(&mut bytes).unwrap();
+            let len = change.record().encode(&mut bytes).unwrap();
             assert_eq!(
                 ControllerRecord::decode(km43::EventKind::TIME_SET, &bytes[..len]),
-                Ok(change.offer_record())
+                Ok(change.record())
             );
         }
     }
@@ -614,5 +764,156 @@ mod tests {
             clock.offer(1, None, time(u64::MAX - 1), Tick::ZERO),
             Err(TimeOffer::RefusedImplausible)
         );
+    }
+
+    fn at_floor(offset: i64) -> u64 {
+        FLOOR.checked_add_signed(offset).unwrap()
+    }
+
+    #[test]
+    fn p_113_a_client_time_past_the_ten_year_edge_is_rejected_armed_or_not() {
+        for armed in [false, true] {
+            assert_eq!(
+                WallClock::client(FLOOR + PLAUSIBILITY_SPAN + 1, None, time(FLOOR), armed),
+                ClientSet::Rejected
+            );
+            assert_eq!(
+                WallClock::client(u64::MAX, Some(time(FLOOR)), time(FLOOR), armed),
+                ClientSet::Rejected
+            );
+        }
+        // The edge itself is inside.
+        assert!(matches!(
+            WallClock::client(FLOOR + PLAUSIBILITY_SPAN, None, time(FLOOR), false),
+            ClientSet::Set { .. }
+        ));
+    }
+
+    /// Every client write meets the floor, a known clock's too: there is no
+    /// drift allowance on this door (P-114's "one floor, both doors").
+    #[test]
+    fn p_114_a_client_time_below_the_floor_needs_the_button_even_with_a_known_clock() {
+        for current in [None, Some(time(FLOOR + 10_000))] {
+            assert_eq!(
+                WallClock::client(at_floor(-1), current, time(FLOOR), false),
+                ClientSet::NeedsButton
+            );
+        }
+        assert!(matches!(
+            WallClock::client(FLOOR, None, time(FLOOR), false),
+            ClientSet::Set {
+                overridden: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn p_116_the_armed_override_accepts_below_the_floor_and_says_so() {
+        let decided =
+            WallClock::client(at_floor(-86_400_000), Some(time(FLOOR)), time(FLOOR), true);
+        let ClientSet::Set {
+            change,
+            stepped,
+            overridden,
+        } = decided
+        else {
+            panic!("accepted on the override: {decided:?}");
+        };
+        assert!(overridden);
+        assert!(stepped, "a day back from a known clock is a step too");
+        assert_eq!(change.source(), TimeSource::Client);
+        assert_eq!(change.new_value(), time(at_floor(-86_400_000)));
+        // Above the floor, an armed override changes nothing and is not
+        // spent.
+        assert!(matches!(
+            WallClock::client(at_floor(1), None, time(FLOOR), true),
+            ClientSet::Set {
+                overridden: false,
+                ..
+            }
+        ));
+    }
+
+    /// The override lifts the floor with no lower bound, and the RTC holds
+    /// only its century: a value it cannot hold is refused here, before the
+    /// clock moves, rather than failing at the write and answered busy for
+    /// a retry that can never land.
+    #[test]
+    fn p_116_an_armed_override_below_the_calendar_century_is_rejected() {
+        assert_eq!(
+            WallClock::client(0, Some(time(FLOOR)), time(FLOOR), true),
+            ClientSet::Rejected
+        );
+        assert_eq!(
+            WallClock::client(946_684_799_999, None, time(FLOOR), true),
+            ClientSet::Rejected
+        );
+        assert!(matches!(
+            WallClock::client(946_684_800_000, None, time(FLOOR), true),
+            ClientSet::Set {
+                overridden: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn p_115_only_a_known_clock_moved_past_an_hour_is_a_step() {
+        let known = Some(time(FLOOR + TIME_STEP_ALARM));
+        let set = |at| WallClock::client(at, known, time(FLOOR), false);
+        let stepped = |decided: ClientSet| match decided {
+            ClientSet::Set { stepped, .. } => stepped,
+            ClientSet::Rejected | ClientSet::NeedsButton => panic!("{decided:?}"),
+        };
+        assert!(
+            !stepped(set(FLOOR + TIME_STEP_ALARM * 2)),
+            "exactly an hour"
+        );
+        assert!(stepped(set(FLOOR + TIME_STEP_ALARM * 2 + 1)));
+        assert!(!stepped(set(FLOOR)), "exactly an hour back");
+        // A first set is never a step, however far.
+        assert!(!stepped(WallClock::client(
+            FLOOR + PLAUSIBILITY_SPAN,
+            None,
+            time(FLOOR),
+            false
+        )));
+    }
+
+    #[test]
+    fn p_118_one_client_time_per_fifteen_minutes_counted_apart_from_offers() {
+        let mut clock = WallClock::new();
+        let start = Tick::from_millis(1_000);
+        assert!(!clock.client_rate_limited(start));
+        let ClientSet::Set { change, .. } = WallClock::client(FLOOR, None, time(FLOOR), false)
+        else {
+            panic!("accepted");
+        };
+        assert!(clock.client_applied(change, start));
+        let limit = start.after(CLIENT_INTERVAL).unwrap();
+        assert!(clock.client_rate_limited(Tick::from_millis(1_001)));
+        assert!(clock.client_rate_limited(Tick::from_millis(limit.as_millis() - 1)));
+        assert!(!clock.client_rate_limited(limit));
+        // An offer's limit is its own: a client set does not start it.
+        assert!(!clock.refuse_rate_limited(Tick::from_millis(1_001)));
+    }
+
+    #[test]
+    fn a_client_set_waits_for_its_audit_and_is_answered_to_the_client() {
+        let mut clock = WallClock::new();
+        let ClientSet::Set { change, .. } = WallClock::client(FLOOR, None, time(FLOOR), false)
+        else {
+            panic!("accepted");
+        };
+        assert!(clock.client_applied(change, Tick::ZERO));
+        // One audit at a time: another change waits for this one.
+        assert!(!clock.client_applied(change, Tick::ZERO));
+        assert!(!clock.ready_for_offer(Tick::ZERO));
+        assert_eq!(clock.audit_due(Tick::ZERO), Some(change));
+        // A lost link cancels offers' replies and not a client's.
+        clock.cancel_pending();
+        assert_eq!(clock.audit_written(Tick::ZERO), Some(Answered::Client));
+        assert!(clock.ready_for_offer(Tick::ZERO));
     }
 }
