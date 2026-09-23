@@ -12,8 +12,8 @@
 //! a request of ours, never from what it says of its own accord (L-110,
 //! L-111, L-112 through the rail sequencer, L-113 while an install is in
 //! flight), the request counter with its four outstanding and its three
-//! attempts (L-013, L-014, L-015), and the ROM's boot text counted per
-//! module boot (F-031).
+//! attempts (L-013, L-014, L-015), and the ROM's boot text counted in bytes
+//! and recorded once per boot attempt, zero included (F-031).
 //!
 //! **Before the session layer exists**, a connection the comms processor
 //! announces is refused as a full table, which a table of no rows is, a
@@ -25,16 +25,18 @@
 //!
 //! cites: F-031, F-039
 
+use core::num::NonZeroU32;
 use km43::{
     ClientConnected, ClientDisconnected, ClientDown, ClientDownAck, ClientUp, ClientUpAck,
-    ClockOffer, EventKind, FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkError, LinkErrorCode,
-    LinkMessageType, LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, ReqId, Side, TimeOffer, TimeVerdict,
-    Version, arriving,
+    ClockOffer, ControllerRecord, EventKind, FrameWriter, Heartbeat, Intake, LinkEnvelope,
+    LinkError, LinkErrorCode, LinkMessageType, LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, ReqId, Side,
+    TimeOffer, TimeVerdict, Version, arriving,
 };
+
 use sha2::{Digest, Sha256};
 
 use crate::BootCount;
-use crate::rail::Recovery;
+use crate::rail::{CUT, Recovery};
 use crate::text::Text;
 use crate::tick::{Millis, Tick};
 use o89_link::{
@@ -146,7 +148,7 @@ pub enum DropReason {
     ModuleTaken,
 }
 
-/// A record the ring gets.
+/// A record the ring gets, each with the body KM43 gives it (P-215).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum LinkEvent {
@@ -157,18 +159,39 @@ pub enum LinkEvent {
         /// This cycle included.
         count: u8,
     },
-    /// Comms unrecoverable, `0x0803`: the third rung, executed or not.
-    Unrecoverable,
+    /// Comms unrecoverable, `0x0803`: the third rung, and which of its two
+    /// branches the board took (L-112).
+    Unrecoverable {
+        /// Left on and uncycled, on a board that cannot switch the rail
+        /// back on after that long; otherwise off for the pause.
+        rail_on: bool,
+    },
+    /// Comms boot noise, `0x0805`: the bytes the controller read as
+    /// non-frames in one boot attempt of the module, zero included (F-031).
+    BootNoise {
+        /// Bytes, saturating.
+        count: u32,
+    },
 }
 
 impl LinkEvent {
     /// The registry's kind.
     #[must_use]
-    pub const fn kind(self) -> EventKind {
+    pub fn kind(self) -> EventKind {
+        self.record().kind()
+    }
+
+    /// The record's body. A cycle count is at least one, since the cycle
+    /// it is logged for is counted in it.
+    #[must_use]
+    pub fn record(self) -> ControllerRecord {
         match self {
-            Self::LinkLost => EventKind::COMMS_LINK_LOST,
-            Self::PowerCycled { .. } => EventKind::COMMS_POWER_CYCLED,
-            Self::Unrecoverable => EventKind::COMMS_UNRECOVERABLE,
+            Self::LinkLost => ControllerRecord::CommsLinkLost,
+            Self::PowerCycled { count } => ControllerRecord::CommsPowerCycled {
+                count: NonZeroU32::new(u32::from(count)).unwrap_or(NonZeroU32::MIN),
+            },
+            Self::Unrecoverable { rail_on } => ControllerRecord::CommsUnrecoverable { rail_on },
+            Self::BootNoise { count } => ControllerRecord::CommsBootNoise { count },
         }
     }
 }
@@ -177,12 +200,6 @@ impl LinkEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Note {
-    /// Bytes that were not frames since the module last booted (F-031):
-    /// the ROM's text at its own baud, or a link that is wrong.
-    RomText {
-        /// Refusals and abandoned runs, counted.
-        count: u32,
-    },
     /// A frame refused back to the peer with this code.
     Refused(LinkErrorCode),
     /// A request of ours unanswered after every attempt (L-015).
@@ -386,8 +403,12 @@ pub struct Link {
     /// peer heard (L-100).
     beats: Beats,
     next_req_id: u32,
-    /// Refusals and abandoned runs since the module last booted (F-031).
+    /// Bytes read as non-frames in the module's boot attempt (F-031).
     noise: u32,
+    /// A boot attempt of the module is open: started when it settled, and
+    /// closed at the first `LinkUp` or when the next one starts, with one
+    /// boot-noise record either way.
+    attempt: bool,
     /// Allocated connection rows, for the heartbeat (L-101): none until M4.
     conns: u8,
 }
@@ -412,6 +433,7 @@ impl Link {
             beats: Beats::NONE,
             next_req_id: 1,
             noise: 0,
+            attempt: false,
             conns: 0,
         }
     }
@@ -443,19 +465,25 @@ impl Link {
         &self.identity
     }
 
-    /// The adapter saw bytes between delimiters that were not a frame, or a
-    /// run nothing finished: counted per module boot (F-031).
-    pub fn noise(&mut self) {
-        self.noise = self.noise.saturating_add(1);
+    /// The adapter read `bytes` that were not a frame: a run between
+    /// delimiters whose CRC did not hold, or one nothing finished. Counted
+    /// while a boot attempt is open, which is the interval the record
+    /// covers (F-031); a frame whose CRC held and whose body did not read is
+    /// a malformed frame and is not counted here.
+    pub fn noise(&mut self, bytes: u32) {
+        if self.attempt {
+            self.noise = self.noise.saturating_add(bytes);
+        }
     }
 
-    /// The rail is up and `EN` released: the module is booting. The ladder's
-    /// clock restarts, what the ROM said since the last boot is noted, and
-    /// this side states itself (L-030): the module may not hear it yet,
-    /// which is what the attempts are for.
+    /// The rail is up and `EN` released: the module is booting. An attempt
+    /// still open is abandoned and recorded, a new one opens, the ladder's
+    /// clock restarts, and this side states itself (L-030): the module may
+    /// not hear it yet, which is what the attempts are for.
     pub fn module_settled(&mut self, now: Tick) -> Actions {
         let mut actions = Actions::NONE;
-        self.note_rom_text(&mut actions);
+        self.close_attempt(&mut actions);
+        self.attempt = true;
         self.cut_pending = false;
         self.module_up_since = now;
         self.earliest_cut = now.after(CUT_AFTER).unwrap_or(now);
@@ -478,6 +506,9 @@ impl Link {
     /// module reset normally.
     pub fn module_taken(&mut self) -> Actions {
         let mut actions = Actions::NONE;
+        // The bench took the module in the middle of an attempt, which the
+        // controller abandons.
+        self.close_attempt(&mut actions);
         if let Phase::Up { .. } = self.phase {
             actions.push(Action::DropConnections(DropReason::ModuleTaken));
         }
@@ -495,14 +526,21 @@ impl Link {
         let mut actions = Actions::NONE;
         self.earliest_cut = now.after(CUT_AFTER).unwrap_or(now);
         match recovery {
-            Recovery::Cycling { count, .. } => {
+            Recovery::Cycling { count, off_for } => {
                 actions.push(Action::Log(LinkEvent::PowerCycled { count }));
+                // A cut longer than the ladder's own is the third rung
+                // executed: the rail off for its pause, raised as the rung
+                // it is (L-112).
+                if off_for.as_millis() > CUT.as_millis() && !self.raised {
+                    self.raised = true;
+                    actions.push(Action::Log(LinkEvent::Unrecoverable { rail_on: false }));
+                }
             }
             Recovery::LeftOnAndRaised => {
                 self.cut_pending = false;
                 if !self.raised {
                     self.raised = true;
-                    actions.push(Action::Log(LinkEvent::Unrecoverable));
+                    actions.push(Action::Log(LinkEvent::Unrecoverable { rail_on: true }));
                 }
             }
             Recovery::Busy => {}
@@ -900,7 +938,7 @@ impl Link {
             self.beats.forget();
             actions.push(Action::DropConnections(DropReason::CommsRebooted));
         }
-        self.note_rom_text(actions);
+        self.close_attempt(actions);
         self.last_peer = Some(peer);
         self.heard(now);
         self.raised = false;
@@ -927,11 +965,13 @@ impl Link {
         }
     }
 
-    fn note_rom_text(&mut self, actions: &mut Actions) {
-        if self.noise > 0 {
-            actions.push(Action::Note(Note::RomText { count: self.noise }));
-            self.noise = 0;
+    /// Record the open attempt's noise, zero included, once (F-031).
+    fn close_attempt(&mut self, actions: &mut Actions) {
+        if self.attempt {
+            actions.push(Action::Log(LinkEvent::BootNoise { count: self.noise }));
         }
+        self.attempt = false;
+        self.noise = 0;
     }
 
     fn down(&mut self, why: DropReason, now: Tick, actions: &mut Actions) {
@@ -1058,6 +1098,69 @@ mod tests {
     };
 
     use super::*;
+
+    /// Every event goes to the ring as the body KM43 defines for its kind,
+    /// and reads back the same.
+    #[test]
+    fn l_112_every_link_event_is_the_record_km43_defines_for_its_kind() {
+        let events = [
+            (LinkEvent::LinkLost, EventKind::COMMS_LINK_LOST),
+            (
+                LinkEvent::PowerCycled { count: 3 },
+                EventKind::COMMS_POWER_CYCLED,
+            ),
+            (
+                LinkEvent::Unrecoverable { rail_on: true },
+                EventKind::COMMS_UNRECOVERABLE,
+            ),
+            (
+                LinkEvent::Unrecoverable { rail_on: false },
+                EventKind::COMMS_UNRECOVERABLE,
+            ),
+            (
+                LinkEvent::BootNoise { count: 0 },
+                EventKind::COMMS_BOOT_NOISE,
+            ),
+            (
+                LinkEvent::BootNoise { count: u32::MAX },
+                EventKind::COMMS_BOOT_NOISE,
+            ),
+        ];
+        for (event, kind) in events {
+            assert_eq!(event.kind(), kind, "{event:?}");
+            let record = event.record();
+            let mut body = [0u8; km43::CONTROLLER_RECORD_MAX_BYTES];
+            let len = record.encode(&mut body).expect("encodes");
+            assert_eq!(
+                ControllerRecord::decode(kind, &body[..len]),
+                Ok(record),
+                "{event:?}"
+            );
+        }
+        assert_eq!(
+            LinkEvent::Unrecoverable { rail_on: false }.record(),
+            ControllerRecord::CommsUnrecoverable { rail_on: false },
+            "the branch taken, not a default"
+        );
+    }
+
+    /// A cycle is counted in its own record, so its count is never zero;
+    /// the widest a `u8` holds carries whole.
+    #[test]
+    fn a_power_cycle_counts_itself_and_its_count_carries_whole() {
+        let one = NonZeroU32::new(1).expect("one");
+        assert_eq!(
+            LinkEvent::PowerCycled { count: 0 }.record(),
+            ControllerRecord::CommsPowerCycled { count: one },
+            "a zero that cannot happen reads as the one cycle that did"
+        );
+        assert_eq!(
+            LinkEvent::PowerCycled { count: u8::MAX }.record(),
+            ControllerRecord::CommsPowerCycled {
+                count: NonZeroU32::new(255).expect("nonzero")
+            }
+        );
+    }
     use crate::{BOOT_COUNT_BYTES, Body};
 
     fn boot(n: u32) -> BootCount {

@@ -177,10 +177,12 @@ Source: [hardware#13][h13], [#2][i2]. M3.
 
 **F-031** — The boot text arriving on the link at the ROM's baud after every
 module reset, the ROM's and the second-stage bootloader's, is resynchronised
-through and counted, and the count per boot is logged. The bench fixed the
-baseline at about 1 140 refusals per boot with the ESP-IDF bootloader's log
-(2026-09-19 §4 and §5); a count far from that baseline, in either direction,
-is a link fault. The count is of the boots the link task hears at its own
+through and counted in bytes, and each boot attempt the controller starts
+is recorded as `comms boot noise` (`0x0805`), zero included (KM43 P-215).
+The bench measured about 1 140 refused runs per boot with the ESP-IDF
+bootloader's log (2026-09-19 §4 and §5), and 4 656 bytes on each of four
+boots (2026-09-23), the same image and bootloader. A count far from that,
+in either direction, is a link fault. The count is of the boots the link task hears at its own
 rate; a boot into the ROM's loader for the bench is bridged at the ROM's rate,
 byte for byte, and never counted. Source: [#2][i2]. M3.
 
