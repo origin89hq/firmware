@@ -525,21 +525,33 @@ async fn serve_client(
             return answer_client(asked.ticket, TimeAnswer::Busy);
         }
     };
-    let refused = |outcome| {
-        TimeAck::new(outcome, current.map(UnixMillis::as_millis))
-            .map_or(TimeAnswer::Busy, TimeAnswer::Ack)
-    };
     if !asked.authorised {
-        return answer_client(asked.ticket, refused(Time::Unauthorised));
+        return answer_client(asked.ticket, refused(Time::Unauthorised, current));
     }
     if CLOCK.lock(|clock| clock.borrow().client_rate_limited(now)) {
         return answer_client(asked.ticket, TimeAnswer::Busy);
     }
-    let Some(at) = OfferedTime::new(asked.at, received).at(now) else {
-        return answer_client(asked.ticket, refused(Time::Rejected));
-    };
     let Some(floor) = recover_floor(ring, scratch, cuts, fram).await else {
         return answer_client(asked.ticket, TimeAnswer::Busy);
+    };
+    // The floor scan can take thirty seconds: a request its session forgot
+    // meanwhile must not move the clock with nobody told, and the value and
+    // the RTC are read after it, as an offer's are, or the clock is set
+    // behind by the scan.
+    let now = Tick::from_millis(Instant::now().as_millis());
+    if time_expired(received, now) {
+        defmt::warn!("clock: a client time forgotten during the floor scan");
+        return;
+    }
+    let current = match calendar.read() {
+        Ok(current) => current,
+        Err(error) => {
+            defmt::error!("clock: calendar unavailable: {}", error);
+            return answer_client(asked.ticket, TimeAnswer::Busy);
+        }
+    };
+    let Some(at) = OfferedTime::new(asked.at, received).at(now) else {
+        return answer_client(asked.ticket, refused(Time::Rejected, current));
     };
     let (change, stepped, overridden) =
         match WallClock::client(at, current, floor, selector::floor_override()) {
@@ -548,17 +560,13 @@ async fn serve_client(
                 stepped,
                 overridden,
             } => (change, stepped, overridden),
-            ClientSet::Rejected => return answer_client(asked.ticket, refused(Time::Rejected)),
+            ClientSet::Rejected => {
+                return answer_client(asked.ticket, refused(Time::Rejected, current));
+            }
             ClientSet::NeedsButton => {
-                return answer_client(asked.ticket, refused(Time::NeedsButton));
+                return answer_client(asked.ticket, refused(Time::NeedsButton, current));
             }
         };
-    // The floor scan can take thirty seconds: a request its session forgot
-    // meanwhile must not move the clock with nobody told.
-    if time_expired(received, Tick::from_millis(Instant::now().as_millis())) {
-        defmt::warn!("clock: a client time forgotten during the floor scan");
-        return;
-    }
     if let Err(error) = calendar.set(change) {
         defmt::error!("clock: calendar write refused: {}", error);
         return answer_client(asked.ticket, TimeAnswer::Busy);
@@ -578,6 +586,13 @@ async fn serve_client(
         defmt::error!("clock: a client stepped the clock more than an hour");
     }
     *client_waiting = Some((asked.ticket, change.new_value().as_millis()));
+}
+
+/// A refusal carries the time the controller kept, omitted when it has none
+/// (P-093).
+fn refused(outcome: Time, current: Option<UnixMillis>) -> TimeAnswer {
+    TimeAck::new(outcome, current.map(UnixMillis::as_millis))
+        .map_or(TimeAnswer::Busy, TimeAnswer::Ack)
 }
 
 async fn keep_cuts(cuts: &mut Cuts, fram: &mut Lease, request: u32, recent: RecentCuts) {

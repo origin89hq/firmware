@@ -7,7 +7,7 @@
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
-use crate::{Millis, Tick, UnixMillis};
+use crate::{Calendar, Millis, Tick, UnixMillis};
 
 /// Ten Julian years, in milliseconds, shared by both clock-setting paths.
 pub const PLAUSIBILITY_SPAN: u64 = 315_576_000_000;
@@ -402,7 +402,10 @@ impl WallClock {
         if overridden && !override_armed {
             return ClientSet::NeedsButton;
         }
-        let Some(new) = UnixMillis::new(at) else {
+        // The override has no lower bound and the RTC holds one century:
+        // what the calendar cannot hold is refused before the clock moves.
+        let Some(new) = UnixMillis::new(at).filter(|new| Calendar::from_unix(*new).is_some())
+        else {
             return ClientSet::Rejected;
         };
         // A first set is not a step: there is nothing to subtract (P-115).
@@ -827,6 +830,29 @@ mod tests {
             WallClock::client(at_floor(1), None, time(FLOOR), true),
             ClientSet::Set {
                 overridden: false,
+                ..
+            }
+        ));
+    }
+
+    /// The override lifts the floor with no lower bound, and the RTC holds
+    /// only its century: a value it cannot hold is refused here, before the
+    /// clock moves, rather than failing at the write and answered busy for
+    /// a retry that can never land.
+    #[test]
+    fn p_116_an_armed_override_below_the_calendar_century_is_rejected() {
+        assert_eq!(
+            WallClock::client(0, Some(time(FLOOR)), time(FLOOR), true),
+            ClientSet::Rejected
+        );
+        assert_eq!(
+            WallClock::client(946_684_799_999, None, time(FLOOR), true),
+            ClientSet::Rejected
+        );
+        assert!(matches!(
+            WallClock::client(946_684_800_000, None, time(FLOOR), true),
+            ClientSet::Set {
+                overridden: true,
                 ..
             }
         ));
