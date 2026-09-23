@@ -222,12 +222,22 @@ dev-write-epoch epoch *args:
 dev-write-secret *args:
     cargo run -q -p o89-dev -- store write-secret {{args}}
 
-# ERASE `count` 4 KiB blocks of the NOR from `block`, one request each, the
-# ring finding its head again after each block of its own. Effect: records
-# in those blocks are gone; the ring's sequence restarts at one when every
-# block of it is erased. Recovery: none; the log is the log.
+# DROP the event ring's `count` oldest 4 KiB blocks, one request each, the
+# oldest first. Effect: the records in them are gone and the oldest sequence
+# moves up; the next sequence is untouched until the last block goes, when
+# the ring is empty and starts again at one. Recovery: none; the log is the
+# log.
 #
-# ERASE NOR blocks from `block`; records there are gone.
+# DROP the ring's oldest blocks; the records in them are gone.
+dev-drop-ring count="1" *args:
+    cargo run -q -p o89-dev -- {{args}} drop-ring --count {{count}}
+
+# ERASE `count` 4 KiB blocks of the NOR outside the event ring from `block`,
+# one request each. A block of the ring's is refused: only the oldest goes,
+# with `dev-drop-ring` (#78). Effect: what those blocks held is gone.
+# Recovery: none.
+#
+# ERASE NOR blocks outside the ring from `block`.
 dev-erase-nor block count="1" *args:
     cargo run -q -p o89-dev -- {{args}} erase-nor {{block}} --count {{count}}
 

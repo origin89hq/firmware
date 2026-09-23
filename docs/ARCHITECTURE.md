@@ -743,8 +743,8 @@ a year.
 **The bench reaches the parts through the firmware, never around it.** The
 last 8 KB of RAM is a mailbox the recorder task polls, with the two rings of
 the module's bridge and the host's lease on it at its end: the host lands a
-request over SWD, read these bytes, write these, erase this block, reboot,
-and its sequence last; the recorder serves it through the same seams the
+request over SWD, read these bytes, write these, erase this block outside
+the ring or drop the ring's oldest, reboot, and its sequence last; the recorder serves it through the same seams the
 store and the ring use, and lands the same sequence as its answer. So a
 write from the bench meets the voltage detector's refusal as the firmware's
 own would, and the bytes it writes are framed by this crate's own records
@@ -756,7 +756,10 @@ newest events are walked by the ring's own reader and handed back a page at
 a time, because the ring is the one thing that knows where it starts and
 ends, and a host finding the head a mailbox request at a time would probe
 thousands of empty blocks at a tenth of a second each. The host decodes
-each event, a boot's reason and last words included, with KM43's codecs.
+each event, a boot's reason and last words included, with KM43's codecs. The
+ring's own blocks are erased only from the old end, as the firmware erases
+them: a block erased anywhere else leaves a hole the head search reads as
+the end of the log, and the next record would reuse a sequence (#78).
 The region is one the runtime never loads or zeroes and the
 stack never reaches, at the address both sides share from one constant.
 

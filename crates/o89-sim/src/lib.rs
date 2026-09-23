@@ -17,9 +17,8 @@
 //! count and panic record, the ladder's cuts, and a run reason's start and
 //! stop; on the NOR, an append, a page turn and its erase ahead, and the
 //! boot that erases a block a torn record closed, itself cut, and a head a
-//! torn write closed moving into a block the erase ahead missed. The bench's
-//! `erase_block` is not, because it reuses sequences even uncut (#78);
-//! and the hostile comms processor, the comms processor's own
+//! torn write closed moving into a block the erase ahead missed, and the
+//! bench's drop of the oldest block; and the hostile comms processor, the comms processor's own
 //! link from `o89-comms-core` with a named set of capabilities on top that
 //! every test using it declares, driving the link's state machine through
 //! what a real one can do to it. This crate is host-only:
