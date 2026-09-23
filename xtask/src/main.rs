@@ -50,6 +50,10 @@ enum Command {
         #[arg(long)]
         record: bool,
     },
+    /// Print the flags every image is built with, as
+    /// `CARGO_ENCODED_RUSTFLAGS` takes them, for a recipe that builds an
+    /// image with `cargo run`.
+    Rustflags,
 }
 
 fn main() -> Result<()> {
@@ -66,6 +70,7 @@ fn main() -> Result<()> {
             images::enforce(&measured)?;
             println!("xtask check: clear");
         }
+        Command::Rustflags => print!("{}", images::rustflags(&repo)?),
         Command::Sizes { record } => {
             let measured = images::build_and_measure(&repo)?;
             images::report(&measured);

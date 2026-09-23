@@ -111,13 +111,13 @@ flash-controller: sizes
 # Flash and run the production controller image with the log on the probe.
 # The runner is `probe-rs run`, which flashes the ELF's own regions only, so
 # the bootloader stays. Effect: as `flash-controller`, then the defmt log.
-# `cargo run` builds without the images' flags (`xtask/src/images.rs`): the
-# paths stay unremapped and SHA-256 unrolled, so the bytes are not the
-# measured image's, and the behaviour is.
+# Every recipe here that builds an image takes the gate's flags from
+# `cargo xtask rustflags` (the path remapping, SHA-256's compact backend), so
+# the bytes a bench flashes are the bytes the gate measured.
 #
 # Flash and run the production controller image with the log on the probe.
 run-controller:
-    cd firmwares/o89-controller && cargo run --release
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release
 
 # Flash and run the BENCH image: linked at 0x08000000 with no bootloader, and
 # carrying the one-shot proofs. Effect: overwrites the bootloader's 8 KB in
@@ -129,7 +129,7 @@ run-controller:
 #
 # Flash and run the BENCH image at 0x08000000 with the one-shot proofs; never on a unit that will take an update.
 run-controller-bench:
-    cd firmwares/o89-controller && cargo run --release --features bench
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release --features bench
 
 # As `run-controller-bench`, halting on the panic with its message on the
 # probe instead of writing the last words and resetting: for chasing a panic,
@@ -137,7 +137,7 @@ run-controller-bench:
 #
 # The bench image halting on a panic with the message on the probe, for chasing one.
 run-controller-bench-halting:
-    cd firmwares/o89-controller && cargo run --release --features bench,panic-probe
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release --features bench,panic-probe
 
 # FLASH and run the comms image on an ESP32-C6 devkit over the devkit's own
 # USB serial, with espflash's monitor. Never board A: its module has no
@@ -150,7 +150,7 @@ run-controller-bench-halting:
 #
 # FLASH and run the comms image on a devkit over its own USB serial; never board A.
 run-comms-devkit:
-    cd firmwares/o89-comms && cargo run --release --features devkit
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-comms && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release --features devkit
 
 # Read the defmt log of whatever the controller is running, without flashing
 # or resetting it: the way to read a boot record after a reset the probe did
@@ -300,7 +300,7 @@ dev-flash-comms-whole *args: sizes
 #
 # FLASH and run the controller with the frames bench's counters.
 run-controller-frames:
-    cd firmwares/o89-controller && cargo run --release --features frames
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release --features frames
 
 # FLASH and run the controller with the frames bench and NO FLOW CONTROL
 # (F-087): USART1 opened without RTS and CTS, which is the half of the rule
@@ -312,7 +312,7 @@ run-controller-frames:
 # since this controller leaves that net undriven.
 # FLASH and run the controller with the frames bench and no flow control.
 run-controller-frames-no-flow:
-    cd firmwares/o89-controller && cargo run --release --features no-flow
+    flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release --features no-flow
 
 # FLASH the comms image built with the frames bench onto the module, into
 # its OTA slot (F-087): after a matching bench-controller identity and heartbeat it
@@ -327,7 +327,7 @@ run-controller-frames-no-flow:
 #
 # FLASH the module with the frames bench; it sends 10 000 frames once linked.
 dev-flash-comms-frames *args:
-    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features frames
+    CARGO_ENCODED_RUSTFLAGS="$(cargo xtask rustflags)" cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features frames
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH the no-flow bench sender into its OTA slot. CTS is disabled in the
@@ -336,7 +336,7 @@ dev-flash-comms-frames *args:
 # flow control, then start `run-controller-frames-no-flow`. The sender waits
 # for that controller's matching bench identity and a validated heartbeat.
 dev-flash-comms-frames-no-flow *args:
-    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
+    CARGO_ENCODED_RUSTFLAGS="$(cargo xtask rustflags)" cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-flow
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH the cut bench into the module's OTA slot (F-086): the frames bench
@@ -350,7 +350,7 @@ dev-flash-comms-frames-no-flow *args:
 #
 # FLASH the module with the cut bench; it pulls the pair a thousand times once linked.
 dev-flash-comms-cuts *args:
-    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features cuts
+    CARGO_ENCODED_RUSTFLAGS="$(cargo xtask rustflags)" cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features cuts
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH the image #1's acceptance test delivers first: one that panics as
@@ -365,7 +365,7 @@ dev-flash-comms-cuts *args:
 #
 # FLASH the acceptance image that crashes before its window; the bootloader must roll it back.
 dev-flash-comms-crash *args:
-    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features crash-at-boot
+    CARGO_ENCODED_RUSTFLAGS="$(cargo xtask rustflags)" cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features crash-at-boot
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # FLASH the image #1's acceptance test delivers second: one whose window is
@@ -378,7 +378,7 @@ dev-flash-comms-crash *args:
 #
 # FLASH the acceptance image whose window is omitted; the next reset must roll it back.
 dev-flash-comms-no-window *args:
-    cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-window
+    CARGO_ENCODED_RUSTFLAGS="$(cargo xtask rustflags)" cargo build --release {{firmwares}} -p o89-comms --target {{riscv}} --features no-window
     cargo run -q -p o89-dev -- flash-comms {{comms_elf}} --layout slot {{args}}
 
 # LISTEN to the module through the bridge: the firmware resets it, by

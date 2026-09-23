@@ -49,9 +49,9 @@ const KIB: u64 = 1024;
 /// default, rolled into a loop. On the controller, which has no hash
 /// peripheral and hashes at most a frame's worth at a time, the unrolled
 /// `compress256` was 9.4 KB of the slot and the loop is 488 bytes. A `cfg`
-/// sha2 reads, and only a flag can set it; this is where the images' flags
-/// live, so a recipe that builds with `cargo run` instead gets the unrolled
-/// one, larger and otherwise identical.
+/// sha2 reads, and only a flag can set it. The recipes that build an image
+/// with `cargo run` take the same flags from `cargo xtask rustflags`, so a
+/// bench run exercises the backend that ships.
 const IMAGE_FLAGS: &[&str] = &["--cfg=sha2_backend_soft=\"compact\""];
 
 /// The three images, their targets and their budgets.
@@ -241,20 +241,36 @@ fn cargo_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cargo"))
 }
 
-fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
-    let manifest = repo.firmware_manifest();
-    let mut command = repo.cargo();
+/// Every flag an image is built with, as `CARGO_ENCODED_RUSTFLAGS` takes
+/// them: the environment's, the images' own, then the path remapping.
+fn image_flags(
+    inherited: &[String],
+    root: &Path,
+    cargo_home: &Path,
+    sysroot: &Path,
+) -> Result<String> {
+    let mut asked = inherited.to_vec();
+    asked.extend(IMAGE_FLAGS.iter().map(|flag| (*flag).to_owned()));
+    remapped(&asked, root, cargo_home, sysroot)
+}
+
+/// The flags every image is built with here, for the gate's builds and for
+/// a recipe that builds an image with `cargo run`: one source, so what a
+/// bench flashes is what the gate measured.
+pub fn rustflags(repo: &Repo) -> Result<String> {
     let cargo_home = cargo_home()?;
     no_config_rustflags(repo.root(), &cargo_home)?;
-    let mut inherited = inherited(
+    let inherited = inherited(
         std::env::var_os("CARGO_ENCODED_RUSTFLAGS").as_deref(),
         std::env::var_os("RUSTFLAGS").as_deref(),
     )?;
-    inherited.extend(IMAGE_FLAGS.iter().map(|flag| (*flag).to_owned()));
-    command.env(
-        "CARGO_ENCODED_RUSTFLAGS",
-        remapped(&inherited, repo.root(), &cargo_home, &sysroot()?)?,
-    );
+    image_flags(&inherited, repo.root(), &cargo_home, &sysroot()?)
+}
+
+fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
+    let manifest = repo.firmware_manifest();
+    let mut command = repo.cargo();
+    command.env("CARGO_ENCODED_RUSTFLAGS", rustflags(repo)?);
     command.args(["build", "--locked", "--release", "--manifest-path"]);
     command.arg(&manifest);
     command.args(["-p", image.package, "--target", image.target]);
@@ -425,6 +441,27 @@ mod tests {
                 "--remap-path-prefix=/c=/cargo",
                 "--remap-path-prefix=/c/checkouts/firmware=/o89",
                 "--remap-path-prefix=/c/checkouts/firmware/toolchain=/rustc",
+            ]
+        );
+    }
+
+    /// The images' own flags sit between the environment's and the remapping,
+    /// so a bench build asked for through `cargo xtask rustflags` compiles the
+    /// SHA-256 backend the gate measured.
+    #[test]
+    fn an_image_is_built_with_its_own_flags_after_the_environments() {
+        let asked = ["-Cforce-frame-pointers=yes".to_owned()];
+        let flags = image_flags(&asked, Path::new("/r"), Path::new("/c"), Path::new("/s"))
+            .expect("UTF-8 paths");
+        let flags: Vec<&str> = flags.split('\u{1f}').collect();
+        assert_eq!(
+            flags,
+            [
+                "-Cforce-frame-pointers=yes",
+                "--cfg=sha2_backend_soft=\"compact\"",
+                "--remap-path-prefix=/r=/o89",
+                "--remap-path-prefix=/c=/cargo",
+                "--remap-path-prefix=/s=/rustc",
             ]
         );
     }
