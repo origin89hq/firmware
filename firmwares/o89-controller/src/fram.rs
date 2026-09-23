@@ -15,13 +15,24 @@
 //! about thirty milliseconds at 400 kHz, which the executor absorbs. The
 //! DMA path is a bench question filed on its own, not a rule.
 //!
+//! Past the boot the part is shared: the recorder keeps the ladder's cuts
+//! and serves the bench, the link task keeps the challenge counter and the
+//! client table, and each writes only its own records. They meet at one
+//! async mutex, a [`Lease`] each, held for one transfer: the transfer
+//! blocks and never awaits, so the lock never waits on anything but the
+//! transfer in front of it, and a NOR erase in the recorder never holds a
+//! challenge back.
+//!
 //! cites: F-021
 
 use core::future::Future;
 
 use embassy_stm32::i2c::{I2c, Master};
 use embassy_stm32::mode::Blocking;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused};
+use static_cell::StaticCell;
 
 use crate::pvd;
 
@@ -95,5 +106,40 @@ impl Fram {
         self.i2c
             .blocking_write_vectored(ADDRESS, &[&at.0.to_be_bytes(), bytes])
             .map_err(|error| Refused::Bus(FramError::Bus(error)))
+    }
+}
+
+/// The part, once the boot hands it over.
+static SHARED: StaticCell<Mutex<CriticalSectionRawMutex, Fram>> = StaticCell::new();
+
+/// One task's way to the part: a transfer at a time, under the lock.
+#[derive(Clone, Copy)]
+pub struct Lease(&'static Mutex<CriticalSectionRawMutex, Fram>);
+
+/// Hand the part over after the boot, once, as a lease that copies to
+/// every task that keeps records on it.
+pub fn share(fram: Fram) -> Lease {
+    Lease(SHARED.init(Mutex::new(fram)))
+}
+
+impl FramSeam for Lease {
+    type Error = FramError;
+
+    fn read(
+        &mut self,
+        at: Address,
+        into: &mut [u8],
+    ) -> impl Future<Output = Result<(), FramError>> {
+        let part = self.0;
+        async move { part.lock().await.read_now(at, into) }
+    }
+
+    fn write(
+        &mut self,
+        at: Address,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<(), Refused<FramError>>> {
+        let part = self.0;
+        async move { part.lock().await.write_now(at, bytes) }
     }
 }

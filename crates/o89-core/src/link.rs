@@ -15,20 +15,26 @@
 //! attempts (L-013, L-014, L-015), and the ROM's boot text counted in bytes
 //! and recorded once per boot attempt, zero included (F-031).
 //!
-//! **Before the session layer exists**, a connection the comms processor
-//! announces is refused as a full table, which a table of no rows is, a
-//! handle it releases is unknown. Time offers are decoded here and handed
-//! to the recorder, which owns the floor and RTC. Its verdict returns through
-//! `time_verdict`; a pending offer never stalls heartbeat processing.
+//! The connection rows are the session layer's ([`Rows`]): a connection the
+//! comms processor announces is admitted or refused by it, a release frees
+//! its row, and every row goes with the link (L-041). A connection the
+//! session layer wants closed goes to the comms processor as a
+//! `CloseConnection` request, tracked and retried like any other, and its
+//! row is freed when the answer says the transport is gone (L-090).
+//!
+//! Time offers are decoded here and handed to the recorder, which owns the
+//! floor and RTC. Its verdict returns through `time_verdict`; a pending
+//! offer never stalls heartbeat processing.
 //!
 //! cites: F-031, F-039
 
 use core::num::NonZeroU32;
 use km43::{
     ClientConnected, ClientDisconnected, ClientDown, ClientDownAck, ClientUp, ClientUpAck,
-    ClockOffer, ControllerRecord, EventKind, FrameWriter, Heartbeat, Intake, LinkEnvelope,
-    LinkError, LinkErrorCode, LinkMessageType, LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, ReqId, Side,
-    TimeOffer, TimeVerdict, Version, arriving,
+    ClockOffer, CloseConnections, CloseReason, CloseReport, Conn, ControllerRecord, EventKind,
+    FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkError, LinkErrorCode, LinkMessageType,
+    LinkUp, MAX_INFLIGHT, MAX_LINK_TEXT, MAX_SESSIONS, ReqId, Side, TimeOffer, TimeVerdict,
+    Version, arriving,
 };
 
 use sha2::{Digest, Sha256};
@@ -45,6 +51,33 @@ use o89_link::{
 pub use o89_link::{
     ATTEMPTS, DEAD_AFTER, EncodeError, HEARTBEAT_PERIOD, LINKUP_PERIOD, OURS, RESPONSE_TIMEOUT,
 };
+
+/// The connection rows the link admits into and frees, which the session
+/// layer holds. The link decides when; the rows decide whether.
+pub trait Rows {
+    /// A transport the comms processor announced (L-060, L-061, L-080).
+    fn admit(&mut self, conn: Conn) -> ClientConnected;
+    /// A transport that went, by the comms processor's word or by the
+    /// answer to a close the controller asked for.
+    fn release(&mut self, conn: Conn) -> ClientDisconnected;
+    /// Every row goes (L-041).
+    fn drop_all(&mut self);
+    /// Rows allocated, bound or not, for the heartbeat (L-101).
+    fn allocated(&self) -> u8;
+}
+
+/// Closes that can be outstanding: one per row.
+const CLOSING: usize = MAX_SESSIONS;
+
+/// A close asked for and not yet answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Closing {
+    conn: Conn,
+    reason: CloseReason,
+    /// Its request, once one was issued; none while four others are in
+    /// flight (L-014).
+    req_id: Option<ReqId>,
+}
 
 /// Sixty seconds of silence: the rail is cut (L-111).
 pub const CUT_AFTER: Millis = Millis::from_millis(60_000);
@@ -259,6 +292,15 @@ pub enum Outgoing {
         /// What became of it.
         outcome: TimeOffer,
     },
+    /// Close a transport, or every one.
+    CloseConnection {
+        /// From our counter.
+        req_id: ReqId,
+        /// Which.
+        conn: Conn,
+        /// Why.
+        reason: CloseReason,
+    },
     /// A refusal, with session and request both zero (L-181).
     Refuse {
         /// Why.
@@ -291,12 +333,13 @@ pub enum Action {
     Note(Note),
 }
 
-/// How many actions one call can hand out. The most is a comms `LinkUp`
-/// with a new `boot_id` arriving on a dead link: the ROM-text note, the
-/// drop, the acknowledgement; a tick can add a cut and a `LinkUp` of its
-/// own. Eight is room for every combination and a dropped action is a
-/// bug, counted rather than hidden.
-pub const ACTIONS: usize = 8;
+/// How many actions one call can hand out. A tick is the most: a request
+/// slot given up and its note, resent or newly issued, four in all because
+/// four is every slot (L-014), each given-up slot then reissued as a close
+/// (four more), and the link falling with its drop and its record. Sixteen
+/// is room for every combination and a dropped action is a bug, counted
+/// rather than hidden.
+pub const ACTIONS: usize = 16;
 
 /// The actions of one call, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +359,7 @@ impl Actions {
         dropped: 0,
     };
 
-    fn push(&mut self, action: Action) {
+    pub(crate) fn push(&mut self, action: Action) {
         if let Some(slot) = self.items.get_mut(self.len) {
             *slot = Some(action);
             self.len = self.len.saturating_add(1);
@@ -414,8 +457,11 @@ pub struct Link {
     /// closed at the first `LinkUp` or when the next one starts, with one
     /// boot-noise record either way.
     attempt: bool,
-    /// Allocated connection rows, for the heartbeat (L-101): none until M4.
+    /// Allocated connection rows, for the heartbeat (L-101), as the rows
+    /// last said.
     conns: u8,
+    /// Closes asked for and not yet answered.
+    closing: [Option<Closing>; CLOSING],
 }
 
 impl Link {
@@ -440,6 +486,7 @@ impl Link {
             noise: 0,
             attempt: false,
             conns: 0,
+            closing: [None; CLOSING],
         }
     }
 
@@ -509,13 +556,13 @@ impl Link {
     /// as lost, because the controller did it on purpose; nothing is said
     /// and no silence is measured until [`Link::module_settled`] reports the
     /// module reset normally.
-    pub fn module_taken(&mut self) -> Actions {
+    pub fn module_taken(&mut self, rows: &mut impl Rows) -> Actions {
         let mut actions = Actions::NONE;
         // The bench took the module in the middle of an attempt, which the
         // controller abandons.
         self.close_attempt(&mut actions);
         if let Phase::Up { .. } = self.phase {
-            actions.push(Action::DropConnections(DropReason::ModuleTaken));
+            self.drop_rows(DropReason::ModuleTaken, rows, &mut actions);
         }
         self.phase = Phase::Down { next_linkup: None };
         // A request to a module in its ROM will never be answered, and no
@@ -559,7 +606,12 @@ impl Link {
     }
 
     /// A frame from the peer, decoded by the adapter.
-    pub fn received(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Actions {
+    pub fn received(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        now: Tick,
+        rows: &mut impl Rows,
+    ) -> Actions {
         let mut actions = Actions::NONE;
         if is_peer_refusal(&envelope) {
             // The peer refused something of ours. It stays on the UART and is
@@ -592,7 +644,7 @@ impl Link {
                 Ok(theirs) => {
                     if let Some((peer, compat)) = Self::accept(&theirs, &mut actions) {
                         actions.push(Action::Send(Outgoing::LinkUpAck { req_id }));
-                        self.stated(peer, compat, now, &mut actions);
+                        self.stated(peer, compat, now, rows, &mut actions);
                     }
                 }
                 Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
@@ -609,7 +661,7 @@ impl Link {
                     Ok(theirs) => {
                         if let Some((peer, compat)) = Self::accept(&theirs, &mut actions) {
                             let _ = self.requests.answered(req_id, LinkMessageType::LinkUp);
-                            self.linked(peer, compat, now, &mut actions);
+                            self.linked(peer, compat, now, rows, &mut actions);
                         }
                     }
                     Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
@@ -642,9 +694,11 @@ impl Link {
             },
             LinkMessageType::ClientConnected
             | LinkMessageType::ClientDisconnected
-            | LinkMessageType::TimeOffer => self.answer(kind, envelope, &mut actions),
-            LinkMessageType::CloseConnectionAck
-            | LinkMessageType::NetConfigAck
+            | LinkMessageType::TimeOffer => self.answer(kind, envelope, rows, &mut actions),
+            LinkMessageType::CloseConnectionAck => {
+                self.close_answered(envelope, rows, &mut actions);
+            }
+            LinkMessageType::NetConfigAck
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownloadAck => {
                 // Requests this firmware does not send yet, so nothing
@@ -683,29 +737,44 @@ impl Link {
     /// acknowledgement the peer could act on (P-031), and none of them is a
     /// heartbeat. Before the link is up only the handshake is admitted
     /// (L-033): `ClientConnected` has an outcome for that, the others are
-    /// refused with 258. Connection requests await the session layer; time
-    /// offers go to the recorder so their floor and calendar share an owner.
-    fn answer(&mut self, kind: LinkMessageType, envelope: LinkEnvelope<'_>, actions: &mut Actions) {
+    /// refused with 258. The rows decide a connection; time offers go to
+    /// the recorder so their floor and calendar share an owner.
+    fn answer(
+        &mut self,
+        kind: LinkMessageType,
+        envelope: LinkEnvelope<'_>,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
         if !self.is_up() && refused_before_link(Side::Controller, kind) {
             Self::refuse(LinkErrorCode::BeforeLinkUp, actions);
             return;
         }
         let req_id = envelope.req_id();
         let outgoing = match kind {
-            LinkMessageType::ClientConnected => ClientUp::decode(envelope).map(|_| {
-                let outcome = if self.is_up() {
-                    ClientConnected::RefusedTableFull
-                } else {
-                    ClientConnected::RefusedLinkNotUp
+            // Neither `transport` nor `peer` is read past the decode: both are
+            // the untrusted chip's assertions (L-072).
+            LinkMessageType::ClientConnected => ClientUp::decode(envelope).map(|up| {
+                let outcome = match (self.is_up(), Conn::new(up.conn)) {
+                    (true, Some(conn)) => rows.admit(conn),
+                    // The decode refuses handle 0; an arm rather than a
+                    // guess if it ever did not.
+                    (true, None) => ClientConnected::RefusedHandleInUse,
+                    (false, _) => ClientConnected::RefusedLinkNotUp,
                 };
                 Outgoing::ClientUpAck { req_id, outcome }
             }),
-            LinkMessageType::ClientDisconnected => {
-                ClientDown::decode(envelope).map(|_| Outgoing::ClientDownAck {
-                    req_id,
-                    outcome: ClientDisconnected::UnknownHandle,
-                })
-            }
+            LinkMessageType::ClientDisconnected => ClientDown::decode(envelope).map(|down| {
+                let outcome =
+                    Conn::new(down.conn).map_or(ClientDisconnected::UnknownHandle, |conn| {
+                        // The transport is gone, and the answer lets its handle
+                        // go to the next one (L-080): a close still owed for it
+                        // would close, or its late answer free, the next owner.
+                        self.forget_close(conn);
+                        rows.release(conn)
+                    });
+                Outgoing::ClientDownAck { req_id, outcome }
+            }),
             LinkMessageType::TimeOffer => {
                 match ClockOffer::decode(envelope) {
                     Ok(offer) => actions.push(Action::OfferTime {
@@ -742,12 +811,147 @@ impl Link {
             Ok(outgoing) => actions.push(Action::Send(outgoing)),
             Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
         }
+        self.conns = rows.allocated();
+    }
+
+    /// The session layer wants `conn` closed (P-051, P-077). Asked once:
+    /// a close already outstanding for it stands. Sent now when the link is
+    /// up and a request slot is free, else on a later tick; a link that
+    /// falls meanwhile takes every row with it, and the close with them.
+    pub fn close(&mut self, conn: Conn, reason: CloseReason, now: Tick) -> Actions {
+        let mut actions = Actions::NONE;
+        self.close_into(conn, reason, now, &mut actions);
+        actions
+    }
+
+    /// [`Link::close`], into actions already being gathered.
+    pub(crate) fn close_into(
+        &mut self,
+        conn: Conn,
+        reason: CloseReason,
+        now: Tick,
+        actions: &mut Actions,
+    ) {
+        if self
+            .closing
+            .iter()
+            .flatten()
+            .any(|closing| closing.conn == conn)
+        {
+            return;
+        }
+        let Some(free) = self.closing.iter_mut().find(|slot| slot.is_none()) else {
+            // One per row, and a row is closed once: full is a bug.
+            debug_assert!(false, "more closes outstanding than rows");
+            actions.push(Action::Note(Note::RequestFailed(
+                LinkMessageType::CloseConnection,
+            )));
+            return;
+        };
+        *free = Some(Closing {
+            conn,
+            reason,
+            req_id: None,
+        });
+        self.issue_closes(now, actions);
+    }
+
+    /// Issue every close not yet in flight, while the link is up and a
+    /// request slot is free (L-014).
+    fn issue_closes(&mut self, now: Tick, actions: &mut Actions) {
+        if !self.is_up() {
+            return;
+        }
+        for index in 0..CLOSING {
+            let waiting = self
+                .closing
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|closing| closing.req_id.is_none());
+            let Some(closing) = waiting else {
+                continue;
+            };
+            let Some(req_id) = self.request(LinkMessageType::CloseConnection, now) else {
+                return;
+            };
+            if let Some(Some(slot)) = self.closing.get_mut(index) {
+                slot.req_id = Some(req_id);
+            }
+            actions.push(Action::Send(Outgoing::CloseConnection {
+                req_id,
+                conn: closing.conn,
+                reason: closing.reason,
+            }));
+        }
+    }
+
+    /// The answer to a close: the transport is gone, closed now or unknown
+    /// already, and its row goes with it. An answer nothing waits for, or
+    /// one that does not read, leaves the request to its retries (L-015).
+    fn close_answered(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
+        let req_id = envelope.req_id();
+        if !self
+            .requests
+            .awaits(req_id, LinkMessageType::CloseConnection)
+        {
+            actions.push(Action::Note(Note::UnexpectedAck(
+                LinkMessageType::CloseConnectionAck,
+            )));
+            return;
+        }
+        if CloseReport::decode(envelope).is_err() {
+            actions.push(Action::Note(Note::Malformed(
+                LinkMessageType::CloseConnectionAck,
+            )));
+            return;
+        }
+        let _ = self
+            .requests
+            .answered(req_id, LinkMessageType::CloseConnection);
+        if let Some(closing) = self.take_closing(req_id) {
+            let _ = rows.release(closing.conn);
+        }
+        self.conns = rows.allocated();
+    }
+
+    /// Forget the close owed for `conn`, and retire the request carrying
+    /// it, so neither a retry nor a late answer reaches the handle's next
+    /// owner.
+    fn forget_close(&mut self, conn: Conn) {
+        let owed = self
+            .closing
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|closing| closing.conn == conn))
+            .and_then(Option::take);
+        if let Some(Closing {
+            req_id: Some(req_id),
+            ..
+        }) = owed
+        {
+            let _ = self
+                .requests
+                .answered(req_id, LinkMessageType::CloseConnection);
+        }
+    }
+
+    fn take_closing(&mut self, req_id: ReqId) -> Option<Closing> {
+        self.closing
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|closing| closing.req_id == Some(req_id)))
+            .and_then(Option::take)
     }
 
     /// Time passed. `install_in_flight` is L-113: a release being written
     /// suspends the ladder.
-    pub fn tick(&mut self, now: Tick, install_in_flight: bool) -> Actions {
+    pub fn tick(&mut self, now: Tick, install_in_flight: bool, rows: &mut impl Rows) -> Actions {
         let mut actions = Actions::NONE;
+        self.conns = rows.allocated();
         if self.cut_pending {
             // The rail task is cycling the module: nothing sent now reaches
             // a peer, and a request retried into the dark only burns its
@@ -763,6 +967,7 @@ impl Link {
             return actions;
         }
         self.retry(now, &mut actions);
+        self.issue_closes(now, &mut actions);
         match self.phase {
             Phase::Up { next_beat, .. } => {
                 let silent = self
@@ -771,7 +976,7 @@ impl Link {
                     .is_some_and(|silence| silence.as_millis() >= DEAD_AFTER.as_millis());
                 // L-113 suspends the whole ladder, its first rung included.
                 if silent && !install_in_flight {
-                    self.down(DropReason::LinkLost, now, &mut actions);
+                    self.down(DropReason::LinkLost, now, rows, &mut actions);
                     actions.push(Action::Log(LinkEvent::LinkLost));
                 } else if now.since(next_beat).is_some() {
                     self.beat(now, &mut actions);
@@ -837,6 +1042,18 @@ impl Link {
             ),
             Outgoing::TimeVerdict { req_id, outcome } => TimeVerdict { outcome }.write(
                 link_header(LinkMessageType::TimeOfferAck, req_id),
+                &mut envelope,
+            ),
+            Outgoing::CloseConnection {
+                req_id,
+                conn,
+                reason,
+            } => CloseConnections {
+                conn: conn.get(),
+                reason,
+            }
+            .write(
+                link_header(LinkMessageType::CloseConnection, req_id),
                 &mut envelope,
             ),
             Outgoing::Refuse { code } => {
@@ -922,7 +1139,14 @@ impl Link {
     /// rebooted: every connection goes (L-041), and the link with them,
     /// because the new boot has answered nothing of ours. Unlinked, this side
     /// states itself at once.
-    fn stated(&mut self, peer: Peer, compat: Compat, now: Tick, actions: &mut Actions) {
+    fn stated(
+        &mut self,
+        peer: Peer,
+        compat: Compat,
+        now: Tick,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
         let rebooted = self
             .last_peer
             .is_some_and(|known| known.boot_id != peer.boot_id);
@@ -930,7 +1154,7 @@ impl Link {
         if rebooted && self.is_up() {
             // The common way down: every connection drops, and no answer to
             // a beat of the old boot counts (L-041, L-100).
-            self.down(DropReason::CommsRebooted, now, actions);
+            self.down(DropReason::CommsRebooted, now, rows, actions);
         } else if let Phase::Up {
             peer: known,
             compat: agreed,
@@ -949,12 +1173,19 @@ impl Link {
     /// Our statement was answered (L-033): the answer carries the peer's,
     /// and answering proves it holds ours. That is the link, and it is a
     /// round trip, so the peer is heard (L-100).
-    fn linked(&mut self, peer: Peer, compat: Compat, now: Tick, actions: &mut Actions) {
+    fn linked(
+        &mut self,
+        peer: Peer,
+        compat: Compat,
+        now: Tick,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
         if let Phase::Up { peer: known, .. } = self.phase
             && known.boot_id != peer.boot_id
         {
             self.beats.forget();
-            actions.push(Action::DropConnections(DropReason::CommsRebooted));
+            self.drop_rows(DropReason::CommsRebooted, rows, actions);
         }
         self.close_attempt(actions);
         self.last_peer = Some(peer);
@@ -992,12 +1223,29 @@ impl Link {
         self.noise = 0;
     }
 
-    fn down(&mut self, why: DropReason, now: Tick, actions: &mut Actions) {
+    fn down(&mut self, why: DropReason, now: Tick, rows: &mut impl Rows, actions: &mut Actions) {
         // A beat of the link that fell is answered by nothing that counts.
         self.beats.forget();
         self.phase = Phase::Down {
             next_linkup: Some(now),
         };
+        self.drop_rows(why, rows, actions);
+    }
+
+    /// Every connection goes, and every close asked for with it: there is
+    /// no transport left to close, and a close retried into the next link
+    /// would name a handle the comms processor may have given to somebody
+    /// else (L-041, L-080).
+    fn drop_rows(&mut self, why: DropReason, rows: &mut impl Rows, actions: &mut Actions) {
+        rows.drop_all();
+        self.conns = rows.allocated();
+        for closing in self.closing.iter_mut().filter_map(Option::take) {
+            if let Some(req_id) = closing.req_id {
+                let _ = self
+                    .requests
+                    .answered(req_id, LinkMessageType::CloseConnection);
+            }
+        }
         actions.push(Action::DropConnections(why));
     }
 
@@ -1064,17 +1312,38 @@ impl Link {
         for _ in 0..MAX_INFLIGHT {
             match self.requests.overdue(now) {
                 None => return,
-                Some(Overdue::GivenUp { kind, .. }) => {
-                    // The only request tracked before M4 is a `LinkUp`, which
-                    // goes out only while unlinked, so there is no link for
-                    // L-015 to take down; the first request sent while linked
-                    // brings that arm, and heartbeats unanswered take a link
-                    // down at six seconds meanwhile (L-100).
+                Some(Overdue::GivenUp { kind, req_id }) => {
+                    // Failed to whatever asked, and nothing more: whether
+                    // the link is down is L-100's timer alone (L-015). A
+                    // close given up leaves its row to the transport's own
+                    // release, or to the link falling.
+                    if kind == LinkMessageType::CloseConnection {
+                        let _ = self.take_closing(req_id);
+                    }
                     actions.push(Action::Note(Note::RequestFailed(kind)));
                 }
                 Some(Overdue::Resend { kind, req_id }) => match kind {
                     LinkMessageType::LinkUp => {
                         actions.push(Action::Send(Outgoing::LinkUp { req_id }));
+                    }
+                    LinkMessageType::CloseConnection => {
+                        match self
+                            .closing
+                            .iter()
+                            .flatten()
+                            .find(|closing| closing.req_id == Some(req_id))
+                        {
+                            Some(closing) => {
+                                actions.push(Action::Send(Outgoing::CloseConnection {
+                                    req_id,
+                                    conn: closing.conn,
+                                    reason: closing.reason,
+                                }));
+                            }
+                            None => {
+                                let _ = self.requests.answered(req_id, kind);
+                            }
+                        }
                     }
                     LinkMessageType::LinkUpAck
                     | LinkMessageType::Heartbeat
@@ -1083,7 +1352,6 @@ impl Link {
                     | LinkMessageType::ClientConnectedAck
                     | LinkMessageType::ClientDisconnected
                     | LinkMessageType::ClientDisconnectedAck
-                    | LinkMessageType::CloseConnection
                     | LinkMessageType::CloseConnectionAck
                     | LinkMessageType::NetConfig
                     | LinkMessageType::NetConfigAck
@@ -1180,6 +1448,25 @@ mod tests {
         );
     }
     use crate::{BOOT_COUNT_BYTES, Body};
+
+    /// A table of no rows.
+    struct NoRows;
+
+    impl Rows for NoRows {
+        fn admit(&mut self, _: Conn) -> ClientConnected {
+            ClientConnected::RefusedTableFull
+        }
+
+        fn release(&mut self, _: Conn) -> ClientDisconnected {
+            ClientDisconnected::UnknownHandle
+        }
+
+        fn drop_all(&mut self) {}
+
+        fn allocated(&self) -> u8 {
+            0
+        }
+    }
 
     fn boot(n: u32) -> BootCount {
         let mut bytes = [0u8; BOOT_COUNT_BYTES];
@@ -1316,6 +1603,34 @@ mod tests {
     }
 
     #[test]
+    fn l_071_the_answer_to_a_connection_carries_its_outcome_and_no_challenge() {
+        let link = Link::new(identity(), Tick::ZERO);
+        for outcome in [
+            ClientConnected::Accepted,
+            ClientConnected::RefusedTableFull,
+            ClientConnected::RefusedHandleInUse,
+            ClientConnected::RefusedLinkNotUp,
+        ] {
+            let (bytes, len) = envelope_of(
+                &link,
+                Outgoing::ClientUpAck {
+                    req_id: ReqId(4),
+                    outcome,
+                },
+                Tick::ZERO,
+            );
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("decodes");
+            assert_eq!(
+                envelope.keys(),
+                1,
+                "{outcome:?}: the outcome and nothing else"
+            );
+            let ack = ClientUpAck::decode(envelope).expect("an ack");
+            assert_eq!(ack.outcome, outcome);
+        }
+    }
+
+    #[test]
     fn l_181_a_refusal_carries_session_zero_and_request_zero() {
         let link = Link::new(identity(), Tick::ZERO);
         let (bytes, len) = envelope_of(
@@ -1347,7 +1662,7 @@ mod tests {
     #[test]
     fn nothing_is_said_and_no_silence_is_measured_before_the_module_is_powered() {
         let mut link = Link::new(identity(), Tick::ZERO);
-        let actions = link.tick(Tick::from_millis(120_000), false);
+        let actions = link.tick(Tick::from_millis(120_000), false, &mut NoRows);
         assert!(actions.is_empty(), "{actions:?}");
         let actions = link.module_settled(Tick::from_millis(120_000));
         assert!(

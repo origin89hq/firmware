@@ -60,7 +60,7 @@ use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Ticker, Timer};
 use o89_core::{
     Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, Contact, CutsOnPart, CutsRecord, FailState,
-    Feedback, Identity, LastWords, Line, LinkText, Millis, Pull as DeclaredPull, Rail,
+    Feedback, Identity, Keys, LastWords, Line, LinkText, Millis, Pull as DeclaredPull, Rail,
     RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Store, Task,
 };
 
@@ -223,6 +223,8 @@ async fn main(spawner: Spawner) {
         b.i2c2, b.fram_scl, b.fram_sda, i2c_config,
     ));
     let mut boot_count = None;
+    // The epoch keys derive under, if the boot established one (P-085).
+    let mut epoch = None;
     // With no store the ladder starts full, since a count the part lost is
     // never zero.
     let mut carried = CarriedCuts::FULL;
@@ -238,6 +240,7 @@ async fn main(spawner: Spawner) {
             // again next boot, which is the `boot_id` L-040 forbids; only
             // a written one names this boot (F-039).
             boot_count = report.boot_recorded.is_ok().then_some(report.boot);
+            epoch = report.epoch.epoch();
             carried = CutsRecord::carried(store.cuts.held(), report.boot);
             if boot_count.is_none() {
                 defmt::error!("store: the boot count was not written; no boot_id this boot");
@@ -351,6 +354,41 @@ async fn main(spawner: Spawner) {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");
     }
 
+    // The store splits here: the client protocol's records to the link task,
+    // which keeps them, the ladder's cuts and the boot count to the recorder,
+    // and the part itself to both, a transfer at a time.
+    let (keys, cuts) = match store {
+        Some(Store {
+            secret,
+            epoch: epoch_record,
+            clients,
+            challenges,
+            cuts,
+            boots,
+            ..
+        }) => (
+            Some(Keys {
+                secret: secret.present().copied(),
+                epoch,
+                epoch_record,
+                clients,
+                challenges,
+            }),
+            recorder::Cuts {
+                kept: Some(cuts),
+                boot: boots.present().copied(),
+            },
+        ),
+        None => (
+            None,
+            recorder::Cuts {
+                kept: None,
+                boot: None,
+            },
+        ),
+    };
+    let fram = fram::share(fram);
+
     // 9a. The link, which builds its UART only once the rail task says the
     // rail has settled (F-006), and drops it before every cut (F-003).
     supervisor::check_in(Task::Link);
@@ -361,7 +399,7 @@ async fn main(spawner: Spawner) {
         rts: b.module.rts,
         cts: b.module.cts,
     };
-    if let Ok(token) = link::run(link_pins, identity) {
+    if let Ok(token) = link::run(link_pins, identity.zip(keys), fram) {
         spawner.spawn(token);
     } else {
         defmt::error!("the link task did not spawn; the watchdog will reset the part");
@@ -374,7 +412,7 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(store, fram, nor, record.body(), calendar) {
+    if let Ok(token) = recorder::run(cuts, fram, nor, record.body(), calendar) {
         spawner.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");

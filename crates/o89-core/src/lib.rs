@@ -21,8 +21,10 @@
 //! cannot leave without, the run reason with the [`Declared`] an output
 //! cannot move without, the secret, the panic record, the boot count, the
 //! log's byte budget, the authorised comms release and the network master
-//! copy. The behaviours and the link-local state machines arrive with the
-//! milestones that name them.
+//! copy. Then the link to the comms processor, the connection rows and the
+//! [`Sessions`] bound onto them, and the [`Endpoint`] that sends each frame
+//! to one or the other. The behaviours arrive with the milestones that
+//! name them.
 
 #![no_std]
 
@@ -33,6 +35,7 @@ mod challenge;
 mod clients;
 mod clock_journal;
 mod dedup;
+mod endpoint;
 mod epoch;
 mod fail_state;
 mod feedback;
@@ -57,6 +60,7 @@ mod ring;
 mod rollcall;
 mod run_reason;
 mod secret;
+mod session;
 mod store;
 mod text;
 mod tick;
@@ -70,6 +74,7 @@ pub use challenge::*;
 pub use clients::*;
 pub use clock_journal::*;
 pub use dedup::*;
+pub use endpoint::*;
 pub use epoch::*;
 pub use fail_state::*;
 pub use feedback::*;
@@ -92,6 +97,7 @@ pub use ring::*;
 pub use rollcall::*;
 pub use run_reason::*;
 pub use secret::*;
+pub use session::*;
 pub use store::*;
 pub use text::*;
 pub use tick::*;

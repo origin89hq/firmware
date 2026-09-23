@@ -28,7 +28,7 @@ use o89_core::mailbox::{
 use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, RingError, Wants};
 use portable_atomic::{AtomicU8, AtomicU32};
 
-use crate::fram::Fram;
+use crate::fram::Lease;
 use crate::link::{self, Report, Request};
 use crate::nor::{CAPACITY, Nor};
 
@@ -106,7 +106,7 @@ pub fn init() {
 /// What the recorder holds for the mailbox to serve.
 pub struct Parts<'a> {
     /// The FRAM, through the seam.
-    pub fram: &'a mut Fram,
+    pub fram: &'a mut Lease,
     /// The ring on the NOR, if it opened.
     pub ring: Option<&'a mut NorRing<Nor>>,
     /// The ring's scratch, for the head search after an erase.
@@ -272,7 +272,7 @@ fn span(at: u32, len: u32, part: usize) -> Option<(usize, usize)> {
     (len <= DATA_BYTES && end <= part).then_some((at, len))
 }
 
-async fn read_fram(fram: &mut Fram, at: u32, len: u32) -> (Status, u32) {
+async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
     let Some((at, len)) = span(at, len, FRAM_BYTES) else {
         return (Status::OutOfRange, 0);
     };
@@ -292,7 +292,7 @@ async fn read_fram(fram: &mut Fram, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-async fn write_fram(fram: &mut Fram, at: u32, len: u32) -> (Status, u32) {
+async fn write_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
     let Some((at, len)) = span(at, len, FRAM_BYTES) else {
         return (Status::OutOfRange, 0);
     };

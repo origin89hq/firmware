@@ -355,10 +355,15 @@ role; `BOARD-A.md` maps them to pins.
 ### Tasks and the watchdog
 
 Each task owns a peripheral and declares a check-in period: supervisor,
-control, link, recorder (the only owner of the FRAM and NOR buses), one per
+control, link, recorder (the only owner of the NOR bus), one per
 RS-485 channel, CAN, one per VE.Direct port, 1-Wire, ADC, selector, lamp.
 Bounded channels between them, `static_cell` for what the executor needs, no
-allocator. Nothing blocks; a bus that hangs is a task that misses its
+allocator. The FRAM is the one part two tasks keep records on: the boot
+reads every record, then hands each to the task that writes it, the client
+protocol's to the link task and the rest to the recorder, and the part to
+both behind one async mutex held for a single blocking transfer. A task
+never writes another's record, so the RAM copy each keeps is the part's.
+Nothing blocks; a bus that hangs is a task that misses its
 check-in, which is a reset, which is the fail state. The supervisor runs
 from its own interrupt above the thread executor, so a transfer that never
 returns and holds the executor is still a task named in the last words
@@ -628,7 +633,29 @@ protocol and renders it; the board has no lamp of its own for the radio.
 
 ### Sessions and writes
 
-Enrolment is gated by the gesture. Challenges are derived as above, with the
+Sessions are a state machine in `o89-core`, `Sessions`, driven by the link
+task beside the link-local one, and host-tested the same way: frames and
+ticks in, answers and closes out. The link admits and frees connection rows
+on the comms processor's word through a `Rows` seam and drops every row with
+the link; the sessions decide what a row holds: at most one live challenge,
+minted when the row is accepted and again by a `Discover` that finds it
+spent or 120 seconds old, and at most one session, bound by a `Hello` whose
+proof verifies under the enrolment's key for the current epoch and replaced
+by the next one that does (P-076). The session's id is the row's handle. Only
+a frame whose MAC verified refreshes a session; fifteen quiet minutes, or
+eight failures inside a minute on the connection, close it through a
+`CloseConnection` the link tracks and retries, and the row goes when the
+comms processor answers. `Endpoint` is the one place a frame goes to one
+state machine or the other, by opcode, and the adapter and the simulator
+both drive it.
+
+The link task keeps the records the client protocol writes, the epoch, the
+challenge counter and the client table, through its own lease on the FRAM;
+a mint is one FRAM transfer, so a challenge never waits behind a NOR erase
+in the recorder. The selector's factory reset is served there too, because
+the sessions derive under the epoch it retires: every session ends before
+the epoch moves, and keys derive afterwards under whatever the record then
+holds, nothing at all if the advance failed. Enrolment is gated by the gesture. Challenges are derived as above, with the
 counter written before the challenge leaves. A signed request is verified in
 P-080's order; the counter and the dedup entry are written in one FRAM
 transaction, and a write that fails fails closed (P-079). Commands are
@@ -662,9 +689,9 @@ count (F-039): the G0 has no RNG, and what L-040 needs is a number that
 is new at every boot and never read back from RAM, which a boot count kept
 on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
-Until the session layer exists, a connection the comms processor announces
-is refused as not yet linked before the `LinkUp` exchange and as a full table
-after it; a handle it releases is unknown. Time offers go through a bounded
+A connection the comms processor announces is refused as not yet linked
+before the `LinkUp` exchange and otherwise goes to the session layer's rows
+(above). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first

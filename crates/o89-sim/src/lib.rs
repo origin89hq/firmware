@@ -20,8 +20,9 @@
 //! torn write closed moving into a block the erase ahead missed, and the
 //! bench's drop of the oldest block; and the hostile comms processor, the comms processor's own
 //! link from `o89-comms-core` with a named set of capabilities on top that
-//! every test using it declares, driving the link's state machine through
-//! what a real one can do to it. This crate is host-only:
+//! every test using it declares, driving the link's state machine and the
+//! sessions over it through what a real one can do to it, with a client
+//! from `km43`'s own client half on the far side. This crate is host-only:
 //! it is never cross-compiled, so it may hold a whole part's bytes on the
 //! heap; the rules that bind the domain crates bind what it tests, not
 //! itself.
@@ -31,6 +32,8 @@ mod fram;
 #[cfg(test)]
 mod link;
 mod nor;
+#[cfg(test)]
+mod sessions;
 #[cfg(test)]
 mod tables;
 
