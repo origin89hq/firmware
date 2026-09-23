@@ -189,10 +189,8 @@ pub struct Board {
     pub ain_tank: Peri<'static, p::PB2>,
 
     /// `SEL_AUTO`, pulled up, switch to ground.
-    #[expect(dead_code, reason = "taken in M4, the gestures")]
     pub sel_auto: Peri<'static, p::PB12>,
     /// `SEL_MANUAL`, pulled up, switch to ground.
-    #[expect(dead_code, reason = "taken in M4, the gestures")]
     pub sel_manual: Peri<'static, p::PB15>,
 
     /// The module.

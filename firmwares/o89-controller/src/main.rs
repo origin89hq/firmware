@@ -40,6 +40,7 @@ mod pvd;
 mod rail;
 mod recorder;
 mod reset;
+mod selector;
 #[expect(
     unsafe_code,
     reason = "the supervisor's executor is polled from the interrupt started for it; the one call is under a SAFETY line"
@@ -48,6 +49,7 @@ mod supervisor;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::I2c;
 use embassy_stm32::spi::Spi;
@@ -311,6 +313,10 @@ async fn main(spawner: Spawner) {
         },
     );
     let mut contact: Option<Contact> = None;
+    let selector = selector::Selector {
+        auto: Input::new(b.sel_auto, Pull::Up),
+        manual: Input::new(b.sel_manual, Pull::Up),
+    };
 
     supervisor::check_in(Task::Supervisor);
     // The pool holds one supervisor and this is its only spawn; an unfed
@@ -369,10 +375,17 @@ async fn main(spawner: Spawner) {
     // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
     supervisor::check_in(Task::Control);
     let mut ticker = Ticker::every(Duration::from_secs(1));
+    let mut samples = Ticker::every(Duration::from_millis(10));
     #[cfg(feature = "bench")]
     let mut proof = bench::Proof::new(words);
     loop {
-        ticker.next().await;
+        match select(ticker.next(), samples.next()).await {
+            Either::First(()) => {}
+            Either::Second(()) => {
+                selector.sample();
+                continue;
+            }
+        }
         let seen = Feedback::contact(feedback.is_high());
         if contact != Some(seen) {
             defmt::info!("generator contact: {}", seen);

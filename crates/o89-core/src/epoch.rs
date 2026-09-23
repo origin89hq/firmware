@@ -121,6 +121,32 @@ impl Kept<Epoch, EPOCH_BYTES> {
     }
 }
 
+/// Why the physical reset did not finish. Both failures forbid pairing
+/// until a later successful reset; the caller retains that latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ResetFailed<E> {
+    /// Epoch advance or verification failed; nothing else was cleared.
+    Epoch(EpochFailed<E>),
+    /// The epoch advanced, but the table did not clear. Boot finishes it.
+    Clients(Refused<E>),
+}
+
+/// Advance and verify the epoch, then clear clients, counters and dedup in
+/// their single record. Session owners must drop their bindings before
+/// permitting another request after this operation.
+pub async fn reset_clients<F: Fram>(
+    epoch: &mut Kept<Epoch, EPOCH_BYTES>,
+    clients: &mut Kept<crate::ClientTable, { crate::CLIENT_TABLE_BYTES }>,
+    fram: &mut F,
+) -> Result<(), ResetFailed<F::Error>> {
+    let clearing = epoch.advance(fram).await.map_err(ResetFailed::Epoch)?;
+    clients
+        .write(fram, crate::ClientTable::cleared(&clearing))
+        .await
+        .map_err(ResetFailed::Clients)
+}
+
 #[cfg(test)]
 mod tests {
     use core::future::Future;

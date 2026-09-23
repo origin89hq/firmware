@@ -15,6 +15,8 @@ use crate::Millis;
 pub enum Pattern {
     /// Alive, linked and on the network: one short pulse every two seconds.
     Heartbeat,
+    /// Enrolment is open: steady status, fault dark.
+    Pairing,
     /// Alive with no network: two short pulses every two seconds.
     DoubleHeartbeat,
     /// A fault: the fault lamp at 5 Hz, the status lamp dark.
@@ -42,6 +44,10 @@ impl Pattern {
     pub const fn lamps(self, since_boot: Millis) -> Lamps {
         let slot = (since_boot.as_millis() / SLOT) % PERIOD;
         match self {
+            Self::Pairing => Lamps {
+                status: true,
+                fault: false,
+            },
             Self::Heartbeat => Lamps {
                 status: slot == 0,
                 fault: false,
@@ -73,6 +79,19 @@ mod tests {
             lit[slot] = pattern.lamps(at(ms)).status;
         }
         lit
+    }
+
+    #[test]
+    fn pairing_is_steady_status_with_no_fault() {
+        for ms in 0..4_000 {
+            assert_eq!(
+                Pattern::Pairing.lamps(at(ms)),
+                Lamps {
+                    status: true,
+                    fault: false
+                }
+            );
+        }
     }
 
     #[test]
