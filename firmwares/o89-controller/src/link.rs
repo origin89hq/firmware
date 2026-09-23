@@ -613,6 +613,11 @@ fn session_note(note: SessionNote) {
             defmt::warn!("session: no challenge to give; the counter did not land");
         }
         SessionNote::TooLarge => defmt::error!("session: an answer did not fit its buffer"),
+        // P-079's `counter write failed` concern, until the concern table
+        // records it (#100).
+        SessionNote::NotKept => {
+            defmt::error!("session: a signed request's record did not land on the FRAM");
+        }
         SessionNote::Unreadable
         | SessionNote::NoHandle
         | SessionNote::Refused(_)
