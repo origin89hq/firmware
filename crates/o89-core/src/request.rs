@@ -74,6 +74,10 @@ pub enum Refusal<E> {
     /// No room in the dedup table, or in this client's half of it: error 7,
     /// rather than evicting (P-122).
     Busy,
+    /// The same command is still executing under a permit this boot handed
+    /// out: error 7, so the client retries once it has run, and no second
+    /// permit is issued beside the first.
+    Running,
     /// The counter did not land: error 7, and the operation does not run
     /// (P-079).
     NotKept(Unchanged<E>),
@@ -87,7 +91,7 @@ impl<E> Refusal<E> {
             Self::Signed(why) => why.refusal(),
             Self::Operation(why) => why.refusal(),
             Self::NoSuchClient => Code::Client(ErrorCode::UnknownClient),
-            Self::Busy | Self::NotKept(_) => Code::Client(ErrorCode::BusyRetry),
+            Self::Busy | Self::Running | Self::NotKept(_) => Code::Client(ErrorCode::BusyRetry),
         }
     }
 
@@ -98,7 +102,11 @@ impl<E> Refusal<E> {
     pub const fn raises(&self) -> Option<Condition> {
         match self {
             Self::NotKept(_) => Some(Condition::COUNTER_WRITE_FAILED),
-            Self::Signed(_) | Self::Operation(_) | Self::NoSuchClient | Self::Busy => None,
+            Self::Signed(_)
+            | Self::Operation(_)
+            | Self::NoSuchClient
+            | Self::Busy
+            | Self::Running => None,
         }
     }
 }
@@ -148,8 +156,11 @@ impl<'a> Write<'a> {
 
 /// A command whose entry is reserved in flight on the part.
 ///
-/// Consumed by [`finished`](Self::finished), which is P-080 step 6; dropped,
-/// it leaves an entry a retry will meet as [`InFlight`].
+/// Consumed by [`finished`](Self::finished), which is P-080 step 6. While it
+/// is held, a retry of the same command is [`Refusal::Running`]: the state
+/// store would see the hardware not moved yet and run it a second time.
+/// Dropped unfinished, its entry stays held until it expires or the next
+/// boot hands it to the state store.
 #[derive(Debug)]
 #[must_use = "a reserved command never finished is a retry answered from the state store"]
 pub struct Reservation<'a> {
@@ -179,7 +190,8 @@ impl<'a> Reservation<'a> {
     ///
     /// The ack is what the command did whether or not the record landed. A
     /// write that fails leaves the entry in flight, on the part and in RAM,
-    /// which is the case the state store answers on the next retry.
+    /// released from this permit, which is the case the state store answers
+    /// on the next retry.
     pub async fn finished<'d, F: Fram>(
         self,
         clients: &mut Clients,
@@ -191,6 +203,15 @@ impl<'a> Reservation<'a> {
         let recorded = clients
             .update(fram, |table| table.finished(seat, executed.recorded()))
             .await;
+        if recorded.is_err()
+            && let Some(table) = clients.present()
+        {
+            // The part never held that a permit had the entry, so this
+            // moves RAM nowhere the part is not.
+            let mut released = table.clone();
+            released.released(seat);
+            clients.rebase(released);
+        }
         Finished {
             ack: CommandAck {
                 cmd_id: self.command.cmd_id,
@@ -503,6 +524,7 @@ impl<'a> Asked<'a> {
                 seat,
             }),
             Ok(Admitted::Busy) => Admission::Refused(Refusal::Busy),
+            Ok(Admitted::Running) => Admission::Refused(Refusal::Running),
             Ok(Admitted::Stale) => Admission::Refused(Refusal::Signed(SignedError::StaleCounter {
                 last,
                 sent: counter,
@@ -1118,6 +1140,31 @@ mod tests {
                 assert_eq!(finished.ack.outcome, Command::Accepted);
             }
         }
+    }
+
+    /// The retry that arrives while its command is still executing on this
+    /// boot. Handed to the state store, it would find the hardware not moved
+    /// yet and permit the command a second time, beside the first.
+    #[test]
+    fn p_080_a_retry_while_its_command_still_executes_is_busy_and_gets_no_second_permit() {
+        let mut rig = Rig::new();
+        let first = start(&rig, 1, 42);
+        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let writes = rig.part.writes;
+        let retry = start(&rig, 2, 42);
+        let why = refusal(rig.admit(retry.bytes(), 100));
+        assert_eq!(why, Refusal::Running);
+        assert_eq!(why.code(), Code::Client(ErrorCode::BusyRetry));
+        assert_eq!(why.raises(), None);
+        assert_eq!(rig.part.writes, writes, "the retry moved nothing");
+        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
+        // Once the first has run, the next retry is its duplicate.
+        let _ = rig.finish(reservation, Executed::Accepted);
+        let third = start(&rig, 3, 42);
+        assert_eq!(
+            answer(rig.admit(third.bytes(), 200)).outcome,
+            Command::Duplicate
+        );
     }
 
     #[test]

@@ -167,8 +167,12 @@ pub enum Admitted {
     Fresh(Reserved),
     /// A retry of a command that finished: answer with what was recorded.
     Already(Recorded),
-    /// A retry of a command that only started: ask the state store.
+    /// A retry of a command that only started, on an earlier boot or under a
+    /// permit already spent: ask the state store.
     InFlight(Reserved),
+    /// A retry of a command still executing under this boot's permit:
+    /// error 7, and no second permit.
+    Running,
     /// A `cmd_id` reused for different bytes: `rejected`, never executed.
     ReusedId,
     /// No room: error 7.
@@ -317,6 +321,7 @@ impl ClientTable {
             }
             Verdict::Already(recorded) => Admitted::Already(recorded),
             Verdict::InFlight(seat) => Admitted::InFlight(seat),
+            Verdict::Running => Admitted::Running,
             Verdict::ReusedId => Admitted::ReusedId,
             Verdict::Busy => Admitted::Busy,
         }
@@ -325,6 +330,11 @@ impl ClientTable {
     /// Say what a reserved command did, or that it did nothing.
     pub fn finished(&mut self, seat: Reserved, outcome: Option<Recorded>) {
         self.dedup.finished(seat, outcome);
+    }
+
+    /// Let go of a reserved entry whose outcome did not land.
+    pub(crate) fn released(&mut self, seat: Reserved) {
+        self.dedup.released(seat);
     }
 
     /// The table as read at boot, with every dedup entry restarted at this
@@ -696,9 +706,17 @@ mod tests {
             before[dedup_at..dedup_at + 25],
             after[dedup_at..dedup_at + 25]
         );
-        // A retry with the next counter is the entry in flight.
+        // A retry with the next counter, while this boot's permit holds the
+        // entry, is refused; after a boot it is the entry in flight.
         assert_eq!(
             table.admit(id, Counter(8), 1, start, Tick::from_millis(20)),
+            Admitted::Running
+        );
+        assert_eq!(
+            table
+                .clone()
+                .rebased()
+                .admit(id, Counter(8), 1, start, Tick::from_millis(20)),
             Admitted::InFlight(seat)
         );
         table.finished(seat, Some(Recorded::Accepted));
