@@ -1261,13 +1261,36 @@ impl Sessions {
             Ok(operation) => operation,
             Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
         };
-        let ack = match keys
-            .configuration
-            .set(operation, &mut keys.network, fram)
-            .await
-        {
-            Ok(ack) => ack,
-            Err(code) => return wrapped(to, &binding.key, code, dst),
+        // Like Time, spend the admitted counter before checking the row's mask.
+        let required = km43::ClientCapability::WRITE_CONFIG.0
+            | if matches!(
+                operation.section,
+                km43::ConfigSection::Network | km43::ConfigSection::Cloud
+            ) {
+                km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
+            } else {
+                0
+            };
+        let authorised = keys
+            .clients
+            .present()
+            .and_then(|table| table.row(binding.client))
+            .is_some_and(|row| row.mask().0 & required == required);
+        let ack = if authorised {
+            match keys
+                .configuration
+                .set(operation, &mut keys.network, fram)
+                .await
+            {
+                Ok(ack) => ack,
+                Err(code) => return wrapped(to, &binding.key, code, dst),
+            }
+        } else {
+            km43::SetConfigAck {
+                section: operation.section,
+                version: keys.configuration.version(operation.section, &keys.network),
+                outcome: km43::SetConfig::Unauthorised,
+            }
         };
         let mut body = [0; km43::MAX_SET_CONFIG_ACK_BYTES];
         let written = ack
@@ -2635,6 +2658,174 @@ mod tests {
             .expect("frame");
             self.send(&Bytes::of(&frame[..len]))
         }
+    }
+
+    fn config_client(kind: ClientKind, mask: Option<u16>) -> (Rig, SessionKey) {
+        use crate::Body;
+        let mut rig = Rig::new();
+        let _ = block_on(rig.sessions.keys.clients.update(&mut rig.part, |table| {
+            table.pair(Label::new("phone").expect("label"), kind)
+        }))
+        .expect("persist")
+        .expect("pair");
+        if let Some(mask) = mask {
+            let mut bytes = rig.sessions.keys.clients.present().expect("table").encode();
+            let offset = 4 + 1 + 1 + km43::MAX_LABEL;
+            bytes[offset..offset + 2].copy_from_slice(&mask.to_le_bytes());
+            let table = ClientTable::decode(&bytes).expect("table");
+            block_on(rig.sessions.keys.clients.write(&mut rig.part, table)).expect("persist mask");
+        }
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        (rig, key)
+    }
+
+    fn config_section_frame(
+        rig: &mut Rig,
+        section: km43::ConfigSection,
+        body: &[u8],
+        key: &SessionKey,
+    ) -> Bytes {
+        let mut operation = [0; 192];
+        let len = km43::SetConfigOperation {
+            section,
+            expected_version: 0,
+            body,
+        }
+        .encode(&mut operation)
+        .expect("operation");
+        let mut frame = [0; 256];
+        let len = Signed::over(
+            Header {
+                kind: MessageType::SetConfig,
+                session: SessionId::from(1),
+                req_id: rig.next_req(),
+            },
+            ClientId::new(1).expect("client"),
+            Counter(1),
+            &operation[..len],
+            key,
+        )
+        .expect("signed")
+        .write(&mut frame)
+        .expect("frame");
+        Bytes::of(&frame[..len])
+    }
+
+    fn network_write_body() -> Bytes {
+        let mut bytes = [0; 192];
+        let len = km43::NetworkWrite {
+            join: Some(km43::JoinWrite {
+                ssid: km43::Ssid::new("cabin").expect("ssid"),
+                psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+            }),
+            country: km43::Country::new("CA").expect("country"),
+            hostname: km43::Hostname::new("origin89").expect("hostname"),
+        }
+        .encode(&mut bytes)
+        .expect("network");
+        Bytes::of(&bytes[..len])
+    }
+
+    #[test]
+    fn p_105_cloud_network_and_cloud_writes_are_refused_under_the_session_key() {
+        for section in [km43::ConfigSection::Network, km43::ConfigSection::Cloud] {
+            let (mut rig, key) = config_client(ClientKind::Cloud, None);
+            let before = rig.part.bytes;
+            let frame = config_section_frame(&mut rig, section, &network_write_body(), &key);
+            let (_, answer) = rig.send(&frame);
+            let (header, body) = under(&answer, &key);
+            assert_eq!(header.kind, MessageType::SetConfigResponse);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Unauthorised
+            );
+            assert_eq!(
+                rig.accepted(),
+                Some(Counter(1)),
+                "refusal still spends the counter"
+            );
+            let start = usize::from(crate::map::COMMS_RELEASE.end().0);
+            let end = usize::from(crate::map::NETWORK.end().0);
+            assert_eq!(&rig.part.bytes[start..end], &before[start..end]);
+        }
+    }
+
+    #[test]
+    fn p_105_cloud_identity_and_behaviour_writes_succeed() {
+        for (section, body) in [
+            (
+                km43::ConfigSection::IdentityAndSite,
+                &[0xa1, 1, 0x61, b'a'][..],
+            ),
+            (
+                km43::ConfigSection::GeneratorBehaviour,
+                &[0xa1, 1, 0xf5][..],
+            ),
+        ] {
+            let (mut rig, key) = config_client(ClientKind::Cloud, None);
+            let frame = config_section_frame(&mut rig, section, body, &key);
+            let (_, answer) = rig.send(&frame);
+            let (_, body) = under(&answer, &key);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Accepted
+            );
+        }
+    }
+
+    #[test]
+    fn p_105_without_write_config_every_section_is_refused() {
+        for section in [
+            km43::ConfigSection::IdentityAndSite,
+            km43::ConfigSection::Channels,
+            km43::ConfigSection::BusesAndDevices,
+            km43::ConfigSection::GeneratorBehaviour,
+            km43::ConfigSection::FrostBehaviour,
+            km43::ConfigSection::ScheduleBehaviour,
+            km43::ConfigSection::LoadShedBehaviour,
+            km43::ConfigSection::Network,
+            km43::ConfigSection::Cloud,
+        ] {
+            let (mut rig, key) = config_client(
+                ClientKind::App,
+                Some(km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0),
+            );
+            let frame = config_section_frame(&mut rig, section, &[0xa1, 1, 0x61, b'a'], &key);
+            let (_, answer) = rig.send(&frame);
+            let (header, body) = under(&answer, &key);
+            assert_eq!(header.kind, MessageType::SetConfigResponse);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Unauthorised
+            );
+        }
+    }
+
+    #[test]
+    fn p_105_app_network_write_succeeds() {
+        let (mut rig, key) = config_client(ClientKind::App, None);
+        let frame = config_section_frame(
+            &mut rig,
+            km43::ConfigSection::Network,
+            &network_write_body(),
+            &key,
+        );
+        let (_, answer) = rig.send(&frame);
+        let (_, body) = under(&answer, &key);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::Accepted
+        );
+        assert_eq!(
+            rig.sessions
+                .keys
+                .network
+                .present()
+                .expect("network")
+                .version(),
+            1
+        );
     }
 
     #[test]

@@ -109,6 +109,31 @@ impl Configuration {
             .map_err(|_| ErrorCode::BusyRetry)
     }
 
+    /// Known version for a refused write; zero when no version can be read.
+    pub(crate) fn version(
+        &self,
+        section: ConfigSection,
+        network: &Kept<Network, NETWORK_BYTES>,
+    ) -> u32 {
+        match section {
+            ConfigSection::IdentityAndSite => {
+                self.identity.present().map_or(0, |value| value.version)
+            }
+            ConfigSection::GeneratorBehaviour => {
+                self.generator.present().map_or(0, |value| value.version)
+            }
+            ConfigSection::FrostBehaviour => self.frost.present().map_or(0, |value| value.version),
+            ConfigSection::ScheduleBehaviour => {
+                self.schedule.present().map_or(0, |value| value.version)
+            }
+            ConfigSection::LoadShedBehaviour => {
+                self.load_shed.present().map_or(0, |value| value.version)
+            }
+            ConfigSection::Network => network.present().map_or(0, Network::version),
+            ConfigSection::Channels | ConfigSection::BusesAndDevices | ConfigSection::Cloud => 0,
+        }
+    }
+
     /// Apply an operation only after request admission has persisted its counter.
     /// Version comparison precedes every section decoder (P-100).
     pub async fn set<F: Fram>(
