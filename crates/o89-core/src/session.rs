@@ -824,9 +824,11 @@ impl Sessions {
     /// and the client it was bound to. A signed body that does not read is
     /// answered bare, like any frame nothing verified; a MAC that fails
     /// counts against the connection (P-051); everything past the MAC is
-    /// answered under the key. It refreshes the session (P-077) unless the
-    /// counter refused it: a replay verifies too, and one the comms
-    /// processor holds back would otherwise keep an idle session alive.
+    /// answered under the key. It refreshes the session (P-077) only when it
+    /// spent its counter, which is when a permit came back: a replay
+    /// verifies too, and so does a command refused before its counter
+    /// landed, whose bytes stay fresh for as long as the comms processor
+    /// cares to replay them and would keep an idle session alive.
     async fn command<F: Fram>(
         &mut self,
         to: Addressed,
@@ -864,10 +866,7 @@ impl Sessions {
             // command asked: the state store's answer is always to run it.
             admission = retry.again(&mut keys.clients, fram, now).await;
         }
-        let replayed = matches!(
-            admission,
-            Admission::Refused(Refusal::Signed(SignedError::StaleCounter { .. }))
-        );
+        let spent = matches!(admission, Admission::Execute(_));
         let reply = match admission {
             Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => None,
             Admission::Refused(why) => {
@@ -902,7 +901,7 @@ impl Sessions {
         };
         match reply {
             Some(reply) => {
-                if !replayed {
+                if spent {
                     binding.heard = now;
                 }
                 reply
@@ -1532,6 +1531,44 @@ mod tests {
         assert_eq!(rig.accepted(), Some(Counter(1)));
         // The replay was the last frame, and the session still ends on the
         // time the genuine one set.
+        rig.at(1_000);
+        let expired = rig.sessions.tick(rig.now);
+        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
+    }
+
+    /// A command refused before its counter lands leaves the counter where it
+    /// was, so the same bytes stay fresh and the comms processor can replay
+    /// them as often as it likes. None of those refresh the session.
+    #[test]
+    fn p_077_a_command_refused_before_its_counter_lands_refreshes_nothing() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let req_id = rig.next_req();
+        let mut dst = [0u8; 128];
+        let len = Signed::over(
+            Header {
+                kind: MessageType::Command,
+                session: SessionId::from(1),
+                req_id,
+            },
+            ClientId::new(1).expect("a slot"),
+            Counter(1),
+            &[0x07],
+            &key,
+        )
+        .expect("signs")
+        .write(&mut dst)
+        .expect("fits");
+        let unreadable = Bytes::of(&dst[..len]);
+        let naming_another = rig.command(1, 2, 1, START, &key);
+        rig.at(SESSION_IDLE.as_millis() - 2_000);
+        for frame in [&unreadable, &naming_another] {
+            let (_, answer) = rig.send(frame);
+            assert!(matches!(code_under(&answer, &key), Incoming::Client(_)));
+            rig.at(500);
+        }
+        assert_eq!(rig.accepted(), Some(Counter(0)), "nothing was spent");
         rig.at(1_000);
         let expired = rig.sessions.tick(rig.now);
         assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
