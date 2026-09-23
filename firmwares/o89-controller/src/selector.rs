@@ -44,6 +44,21 @@ pub fn pairing_open() -> bool {
     PANEL.lock(|cell| cell.get().pairing_open(Uptime.now()))
 }
 
+/// Whether the floor override is armed, read at the instant a client's
+/// `Time` is decided (P-117 rule 3).
+pub fn floor_override() -> bool {
+    PANEL.lock(|cell| cell.get().floor_override(Uptime.now()))
+}
+
+/// A client's `Time` crossed the floor on the override: it is spent.
+pub fn floor_used() {
+    PANEL.lock(|cell| {
+        let mut panel = cell.get();
+        panel.floor_used();
+        cell.set(panel);
+    });
+}
+
 /// A `Pair` enrolled or reclaimed a client: its window closes (L-195).
 pub fn enrolled() {
     PANEL.lock(|cell| {
