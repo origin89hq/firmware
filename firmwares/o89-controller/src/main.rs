@@ -40,6 +40,7 @@ mod pvd;
 mod rail;
 mod recorder;
 mod reset;
+mod rtc;
 mod selector;
 #[expect(
     unsafe_code,
@@ -156,9 +157,7 @@ async fn main(spawner: Spawner) {
             site.line
         );
     }
-    let record = BootRecord::new(cause, words, rtc, backup, REVISION);
-    defmt::info!("boot: {}", record);
-    if let RtcClock::Fault { lse_ready, source } = record.rtc {
+    if let RtcClock::Fault { lse_ready, source } = rtc {
         defmt::error!(
             "the RTC is not on the LSE: lse_ready={} source={}; a fault, not a fallback",
             lse_ready,
@@ -171,6 +170,15 @@ async fn main(spawner: Spawner) {
     // 4. The watchdog, armed now and fed only by the rollcall.
     let mut wdg = IndependentWatchdog::new(b.iwdg, supervisor::WATCHDOG_US);
     wdg.unleash();
+
+    let calendar = rtc::CalendarClock::new(b.rtc, b.tamp, rtc, backup);
+    let backup = if calendar.now().is_some() {
+        o89_core::BackupDomain::Valid
+    } else {
+        o89_core::BackupDomain::Invalid
+    };
+    let record = BootRecord::new(cause, words, rtc, backup, REVISION);
+    defmt::info!("boot: {}", record);
 
     // 5. The voltage detector.
     pvd::arm();
@@ -366,7 +374,7 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(store, fram, nor, record.body()) {
+    if let Ok(token) = recorder::run(store, fram, nor, record.body(), calendar) {
         spawner.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");

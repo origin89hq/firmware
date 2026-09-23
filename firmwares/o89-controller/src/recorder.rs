@@ -12,26 +12,95 @@
 //!
 //! cites: F-023
 
+use core::cell::{Cell, RefCell};
 use core::num::NonZeroU32;
-use embassy_futures::select::{Either, select};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::{Channel, TrySendError};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker};
-
 use km43::{
     BOOT_MAX_BYTES, Boot, CONTROLLER_RECORD_MAX_BYTES, ControllerRecord, Event, EventKind, LogSeq,
-    MAX_EVENT_QUEUE,
+    MAX_EVENT_QUEUE, ReqId, TimeOffer,
 };
 use o89_core::{
-    Class, CutsRecord, Keep, KeepAnswer, LinkEvent, MAX_PAYLOAD, NotKept, RecentCuts, Ring,
-    SCRATCH, Store, Task,
+    Class, CutsRecord, Keep, KeepAnswer, LinkEvent, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime,
+    Outgoing, RecentCuts, Ring, SCRATCH, Store, Task, Tick, UnixMillis, WallClock,
 };
 
 use crate::fram::Fram;
 use crate::mailbox;
 use crate::nor::{JEDEC, Nor, SECTOR};
+use crate::rtc::CalendarClock;
 use crate::supervisor::check_in;
+
+/// Pending work and replies share the protocol's four-request bound. Excess
+/// work is refused, never overwritten; retries retain their original request.
+/// The link continues its heartbeat loop while the recorder recovers the floor.
+const TIME_REQUESTS: usize = km43::MAX_INFLIGHT;
+static TIME: Channel<CriticalSectionRawMutex, (u32, ReqId, OfferedTime), TIME_REQUESTS> =
+    Channel::new();
+static TIME_ANSWER: Channel<
+    CriticalSectionRawMutex,
+    (u32, ReqId, Option<TimeOffer>),
+    TIME_REQUESTS,
+> = Channel::new();
+static TIME_GENERATION: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+
+static CLOCK: Mutex<CriticalSectionRawMutex, RefCell<WallClock>> =
+    Mutex::new(RefCell::new(WallClock::new()));
+
+fn generation() -> u32 {
+    TIME_GENERATION.lock(Cell::get)
+}
+
+pub fn offer(req_id: ReqId, at: u64) -> Option<Outgoing> {
+    let now = Tick::from_millis(Instant::now().as_millis());
+    match CLOCK.lock(|clock| clock.borrow_mut().intake(req_id, at, now)) {
+        OfferIntake::Pending => None,
+        OfferIntake::Accepted => Some(Outgoing::TimeVerdict {
+            req_id,
+            outcome: TimeOffer::Accepted,
+        }),
+        OfferIntake::RateLimited => Some(Outgoing::TimeVerdict {
+            req_id,
+            outcome: TimeOffer::RefusedRateLimited,
+        }),
+        OfferIntake::Full => Some(Outgoing::Refuse {
+            code: km43::LinkErrorCode::TooManyOutstanding,
+        }),
+        OfferIntake::Queued => {
+            if TIME
+                .try_send((generation(), req_id, OfferedTime::new(at, now)))
+                .is_err()
+            {
+                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                Some(Outgoing::Refuse {
+                    code: km43::LinkErrorCode::TooManyOutstanding,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn time_answer() -> Option<(ReqId, TimeOffer)> {
+    let (epoch, req_id, outcome) = TIME_ANSWER.try_receive().ok()?;
+    if epoch != generation() {
+        return None;
+    }
+    CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+    outcome.map(|outcome| (req_id, outcome))
+}
+
+pub fn cancel_offers() {
+    CLOCK.lock(|clock| clock.borrow_mut().cancel_pending());
+    TIME_GENERATION.lock(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    while TIME.try_receive().is_ok() {}
+    while TIME_ANSWER.try_receive().is_ok() {}
+}
 
 /// The ring's span: 14.5 MiB of the 16, in sectors. The rest is for the
 /// aggregates and, later, the last authorised comms image.
@@ -156,15 +225,286 @@ pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
 /// The recorder task: the only owner of the FRAM and the NOR, and so the
 /// one that serves the bench tool's mailbox.
 #[embassy_executor::task]
-pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor, boot: Boot) {
+pub async fn run(
+    mut store: Option<Store>,
+    mut fram: Fram,
+    nor: Nor,
+    boot: Boot,
+    mut calendar: CalendarClock,
+) {
+    if let Some(change) = calendar.pending() {
+        let _ = CLOCK.lock(|clock| clock.borrow_mut().recover_audit(change));
+    }
     let mut scratch = [0u8; SCRATCH];
+    let ring = open_ring(nor, &mut scratch).await;
+    let mut ring = ring;
+    if let Some(ring) = ring.as_mut() {
+        defmt::info!("recorder: writing the boot record");
+        boot_records(ring, &mut scratch, boot, calendar.now()).await;
+    }
+    let boot = store
+        .as_ref()
+        .and_then(|store| store.boots.present().map(|count| count.get()))
+        .unwrap_or(0);
+    mailbox::init();
+    let mut ticker = Ticker::every(PERIOD);
+    check_in(Task::Recorder);
+    loop {
+        match select(ticker.next(), CUTS.wait()).await {
+            Either::First(()) => {
+                if RESETS.try_receive().is_ok() {
+                    reset_clients(store.as_mut(), &mut fram).await;
+                }
+                serve_time(
+                    ring.as_mut(),
+                    &mut scratch,
+                    &mut calendar,
+                    &mut store,
+                    &mut fram,
+                )
+                .await;
+                // Bounded by the queue's depth: what arrives meanwhile waits
+                // a turn.
+                for _ in 0..MAX_EVENT_QUEUE {
+                    let Ok(event) = EVENTS.try_receive() else {
+                        break;
+                    };
+                    if let Some(ring) = ring.as_mut() {
+                        let _ =
+                            append_record(ring, &mut scratch, event.record(), calendar.now()).await;
+                    } else {
+                        defmt::error!("recorder: no ring; {} not recorded", event);
+                    }
+                }
+                mailbox::serve(mailbox::Parts {
+                    fram: &mut fram,
+                    ring: ring.as_mut(),
+                    scratch: &mut scratch,
+                    boot,
+                })
+                .await;
+            }
+            Either::Second((request, cuts)) => {
+                keep_cuts(&mut store, &mut fram, request, cuts).await;
+            }
+        }
+        check_in(Task::Recorder);
+    }
+}
+
+/// The class A boot record (`0x0601`): why the part reset, what the RTC
+/// kept, and the previous run's last words, in KM43's body (F-009, L-143).
+/// Written first, because a boot nobody had a probe on is one only the
+/// ring remembers.
+async fn boot_records(
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    boot: Boot,
+    at: Option<UnixMillis>,
+) {
+    boot_record(ring, scratch, boot, at).await;
+    if let Some(count) = NonZeroU32::new(ring.damage().failed_crc) {
+        let _ = append_record(
+            ring,
+            scratch,
+            ControllerRecord::RecordFailedCrc { count },
+            at,
+        )
+        .await;
+    }
+}
+
+async fn boot_record(ring: &mut Ring<Nor>, scratch: &mut [u8], boot: Boot, at: Option<UnixMillis>) {
+    let mut body = [0u8; BOOT_MAX_BYTES];
+    match boot.encode(&mut body) {
+        Ok(len) => {
+            let _ = append_body(
+                ring,
+                scratch,
+                EventKind::BOOT,
+                body.get(..len).unwrap_or(&[]),
+                at,
+            )
+            .await;
+        }
+        Err(error) => defmt::error!("record 0x0601: the boot body did not encode: {}", error),
+    }
+}
+
+/// One class A record with the body KM43 gives its kind (P-215).
+async fn append_record(
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    record: ControllerRecord,
+    at: Option<UnixMillis>,
+) -> Result<(), ()> {
+    let mut body = [0; CONTROLLER_RECORD_MAX_BYTES];
+    match record.encode(&mut body) {
+        Ok(len) => {
+            append_body(
+                ring,
+                scratch,
+                record.kind(),
+                body.get(..len).unwrap_or(&[]),
+                at,
+            )
+            .await
+        }
+        Err(error) => {
+            defmt::error!(
+                "record {=u16:#06x}: the body did not encode: {}",
+                record.kind().0,
+                error
+            );
+            Err(())
+        }
+    }
+}
+
+/// One class A record of `kind` carrying `body`, a CBOR map KM43 defines.
+async fn append_body(
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    kind: EventKind,
+    body: &[u8],
+    at: Option<UnixMillis>,
+) -> Result<(), ()> {
+    let mut payload = [0u8; MAX_PAYLOAD];
+    let Ok(event) = Event::new(
+        LogSeq(ring.next_seq()),
+        at.map(UnixMillis::as_millis),
+        kind,
+        body,
+    ) else {
+        defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
+        return Err(());
+    };
+    let Ok(len) = event.encode(&mut payload) else {
+        defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
+        return Err(());
+    };
+    match ring
+        .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
+        .await
+    {
+        Ok(seq) => {
+            defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq);
+            Ok(())
+        }
+        Err(error) => {
+            defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error);
+            Err(())
+        }
+    }
+}
+
+/// A failed floor scan or calendar write produces no successful acknowledgement.
+/// No fallback is permitted for an unreadable history.
+enum OfferResult {
+    AwaitingAudit,
+    Finished(Option<TimeOffer>),
+}
+
+fn process_offer(
+    calendar: &mut CalendarClock,
+    epoch: u32,
+    req_id: ReqId,
+    offered: OfferedTime,
+    floor: UnixMillis,
+) -> OfferResult {
+    if epoch != generation() {
+        return OfferResult::Finished(None);
+    }
+    let now = Tick::from_millis(Instant::now().as_millis());
+    let Some(at) = offered.at(now) else {
+        return OfferResult::Finished(Some(TimeOffer::RefusedImplausible));
+    };
+    let current = match calendar.read() {
+        Ok(at) => at,
+        Err(error) => {
+            defmt::error!("clock: calendar read failed: {}", error);
+            return OfferResult::Finished(None);
+        }
+    };
+    let change = match CLOCK.lock(|clock| clock.borrow_mut().offer(at, current, floor, now)) {
+        Ok(change) => change,
+        Err(outcome) => return OfferResult::Finished(Some(outcome)),
+    };
+    if let Err(error) = calendar.set(change) {
+        defmt::error!("clock: calendar write refused: {}", error);
+        return OfferResult::Finished(None);
+    }
+    // No await between durable apply and retaining its completion. serve_time
+    // refuses another offer while an audit is pending.
+    let _ = CLOCK.lock(|clock| clock.borrow_mut().applied(req_id, offered, change, now));
+    OfferResult::AwaitingAudit
+}
+
+async fn keep_cuts(store: &mut Option<Store>, fram: &mut Fram, request: u32, cuts: RecentCuts) {
+    // Under the boot count the part holds, by which a later
+    // boot counts the boots whose own record never landed
+    // (F-018).
+    let kept = match store.as_mut() {
+        Some(store) => {
+            let record = CutsRecord {
+                boot: store.boots.present().copied(),
+                cuts,
+            };
+            store
+                .cuts
+                .write(fram, record)
+                .await
+                .map_err(|_| NotKept::Refused)
+        }
+        None => Err(NotKept::NoStore),
+    };
+    CUTS_KEPT.signal((request, kept));
+}
+
+/// Floor recovery may walk the whole NOR. Keep serving the FRAM recovery
+/// requests while it yields; a scan must not hold the rail's cut past its deadline.
+async fn recover_floor(
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    store: &mut Option<Store>,
+    fram: &mut Fram,
+) -> Option<UnixMillis> {
+    let scan = embassy_time::with_timeout(Duration::from_secs(30), ring.floor(scratch));
+    let mut scan = core::pin::pin!(scan);
+    let mut ticker = Ticker::every(PERIOD);
+    loop {
+        match select3(&mut scan, CUTS.wait(), ticker.next()).await {
+            Either3::First(result) => {
+                return match result {
+                    Ok(Ok(newest)) => env!("BUILD_UNIX_MS")
+                        .parse()
+                        .ok()
+                        .and_then(|build| WallClock::floor(newest, build)),
+                    Ok(Err(error)) => {
+                        defmt::error!("clock: floor unavailable: {}", error);
+                        None
+                    }
+                    Err(_) => {
+                        defmt::error!("clock: floor scan timed out");
+                        None
+                    }
+                };
+            }
+            Either3::Second((request, cuts)) => keep_cuts(store, fram, request, cuts).await,
+            Either3::Third(()) => {}
+        }
+        check_in(Task::Recorder);
+    }
+}
+
+async fn open_ring(mut nor: Nor, scratch: &mut [u8]) -> Option<Ring<Nor>> {
     defmt::info!("recorder: identifying the NOR");
     let jedec = nor.jedec().await;
     defmt::info!("recorder: identification answered {}", jedec);
-    let ring = match jedec {
+    match jedec {
         Ok(JEDEC) => {
             defmt::info!("recorder: opening the ring");
-            let opened = Ring::open(nor, 0, RING_BLOCKS, &mut scratch).await;
+            let opened = Ring::open(nor, 0, RING_BLOCKS, scratch).await;
             match opened {
                 Ok(ring) => {
                     defmt::info!(
@@ -195,67 +535,73 @@ pub async fn run(mut store: Option<Store>, mut fram: Fram, mut nor: Nor, boot: B
             defmt::error!("nor: no answer to the identification: {}; no ring", error);
             None
         }
-    };
-    let mut ring = ring;
-    if let Some(ring) = ring.as_mut() {
-        defmt::info!("recorder: writing the boot record");
-        boot_records(ring, &mut scratch, boot).await;
     }
-    let boot = store
-        .as_ref()
-        .and_then(|store| store.boots.present().map(|count| count.get()))
-        .unwrap_or(0);
-    mailbox::init();
-    let mut ticker = Ticker::every(PERIOD);
-    check_in(Task::Recorder);
-    loop {
-        match select(ticker.next(), CUTS.wait()).await {
-            Either::First(()) => {
-                if RESETS.try_receive().is_ok() {
-                    reset_clients(store.as_mut(), &mut fram).await;
-                }
-                // Bounded by the queue's depth: what arrives meanwhile waits
-                // a turn.
-                for _ in 0..MAX_EVENT_QUEUE {
-                    let Ok(event) = EVENTS.try_receive() else {
-                        break;
-                    };
-                    if let Some(ring) = ring.as_mut() {
-                        append_record(ring, &mut scratch, event.record()).await;
-                    } else {
-                        defmt::error!("recorder: no ring; {} not recorded", event);
+}
+
+async fn serve_time(
+    ring: Option<&mut Ring<Nor>>,
+    scratch: &mut [u8],
+    calendar: &mut CalendarClock,
+    store: &mut Option<Store>,
+    fram: &mut Fram,
+) {
+    let Some(ring) = ring else {
+        return;
+    };
+    let now = Tick::from_millis(Instant::now().as_millis());
+    if CLOCK.lock(|clock| clock.borrow().audit_pending()) {
+        if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
+            && append_record(ring, scratch, change.offer_record(), calendar.now())
+                .await
+                .is_ok()
+        {
+            match calendar.recorded() {
+                Ok(()) => {
+                    let now = Tick::from_millis(Instant::now().as_millis());
+                    if let Some(req_id) = CLOCK.lock(|clock| clock.borrow_mut().audit_written(now))
+                        && TIME_ANSWER
+                            .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
+                            .is_err()
+                    {
+                        CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                        defmt::warn!("clock: reply queue full; acceptance retained for retry");
                     }
                 }
-                mailbox::serve(mailbox::Parts {
-                    fram: &mut fram,
-                    ring: ring.as_mut(),
-                    scratch: &mut scratch,
-                    boot,
-                })
-                .await;
-            }
-            Either::Second((request, cuts)) => {
-                // Under the boot count the part holds, by which a later
-                // boot counts the boots whose own record never landed
-                // (F-018).
-                let kept = match store.as_mut() {
-                    Some(store) => {
-                        let record = CutsRecord {
-                            boot: store.boots.present().copied(),
-                            cuts,
-                        };
-                        store
-                            .cuts
-                            .write(&mut fram, record)
-                            .await
-                            .map_err(|_| NotKept::Refused)
-                    }
-                    None => Err(NotKept::NoStore),
-                };
-                CUTS_KEPT.signal((request, kept));
+                Err(error) => {
+                    defmt::error!("clock: audit journal acknowledgement failed: {}", error);
+                }
             }
         }
-        check_in(Task::Recorder);
+        return;
+    }
+    if !CLOCK.lock(|clock| clock.borrow().ready_for_offer(now)) {
+        return;
+    }
+    if let Ok((epoch, req_id, offered)) = TIME.try_receive()
+        && epoch == generation()
+    {
+        let floor = match calendar.read() {
+            Ok(Some(current)) => Some(current), // Known-clock admission does not use the floor.
+            Ok(None) => recover_floor(ring, scratch, store, fram).await,
+            Err(error) => {
+                defmt::error!("clock: calendar unavailable: {}", error);
+                None
+            }
+        };
+        let result = match floor {
+            Some(floor) => process_offer(calendar, epoch, req_id, offered, floor),
+            None => OfferResult::Finished(None),
+        };
+        match result {
+            OfferResult::AwaitingAudit => {}
+            OfferResult::Finished(outcome) => {
+                if epoch == generation() && TIME_ANSWER.try_send((epoch, req_id, outcome)).is_err()
+                {
+                    CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                    defmt::warn!("clock: reply queue full");
+                }
+            }
+        }
     }
 }
 
@@ -288,67 +634,4 @@ async fn reset_clients(store: Option<&mut Store>, fram: &mut Fram) {
         false
     };
     crate::selector::reset_finished(succeeded);
-}
-
-/// The class A boot record (`0x0601`): why the part reset, what the RTC
-/// kept, and the previous run's last words, in KM43's body (F-009, L-143).
-/// Written first, because a boot nobody had a probe on is one only the
-/// ring remembers. Then the boot's scan of the ring, summed once it
-/// finished: the records it stepped over because their CRC failed (P-096,
-/// P-215), when there were any.
-async fn boot_records(ring: &mut Ring<Nor>, scratch: &mut [u8], boot: Boot) {
-    boot_record(ring, scratch, boot).await;
-    if let Some(count) = NonZeroU32::new(ring.damage().failed_crc) {
-        append_record(ring, scratch, ControllerRecord::RecordFailedCrc { count }).await;
-    }
-}
-
-async fn boot_record(ring: &mut Ring<Nor>, scratch: &mut [u8], boot: Boot) {
-    let mut body = [0u8; BOOT_MAX_BYTES];
-    match boot.encode(&mut body) {
-        Ok(len) => {
-            append_body(
-                ring,
-                scratch,
-                EventKind::BOOT,
-                body.get(..len).unwrap_or(&[]),
-            )
-            .await;
-        }
-        Err(error) => defmt::error!("record 0x0601: the boot body did not encode: {}", error),
-    }
-}
-
-/// One class A record with the body KM43 gives its kind (P-215): the
-/// ladder's counts and branch, the boot noise, the CRC failures.
-async fn append_record(ring: &mut Ring<Nor>, scratch: &mut [u8], record: ControllerRecord) {
-    let mut body = [0u8; CONTROLLER_RECORD_MAX_BYTES];
-    match record.encode(&mut body) {
-        Ok(len) => append_body(ring, scratch, record.kind(), body.get(..len).unwrap_or(&[])).await,
-        Err(error) => defmt::error!(
-            "record {=u16:#06x}: the body did not encode: {}",
-            record.kind().0,
-            error
-        ),
-    }
-}
-
-/// One class A record of `kind` carrying `body`, a CBOR map KM43 defines.
-async fn append_body(ring: &mut Ring<Nor>, scratch: &mut [u8], kind: EventKind, body: &[u8]) {
-    let mut payload = [0u8; MAX_PAYLOAD];
-    let Ok(event) = Event::new(LogSeq(ring.next_seq()), None, kind, body) else {
-        defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
-        return;
-    };
-    let Ok(len) = event.encode(&mut payload) else {
-        defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
-        return;
-    };
-    match ring
-        .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
-        .await
-    {
-        Ok(seq) => defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq),
-        Err(error) => defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error),
-    }
 }

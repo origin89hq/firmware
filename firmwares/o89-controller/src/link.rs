@@ -458,8 +458,7 @@ async fn episode(
                 }
             }
         }
-        let actions = link.tick(Uptime.now(), install_in_flight());
-        if let Some(ended) = perform(link, &mut tx, writer, &actions).await {
+        if let Some(ended) = service_tick(link, &mut tx, writer).await {
             break 'episode ended;
         }
         check_in(Task::Link);
@@ -810,32 +809,21 @@ async fn perform(
                 defmt::warn!("link: {} not sent; the transmitter is stalled", outgoing);
             }
             Action::Send(outgoing) => {
-                let mut frame = [0u8; MAX_FRAME];
-                let len = match link.encode(*outgoing, Uptime.now(), writer, &mut frame) {
-                    Ok(len) => len,
-                    Err(error) => {
-                        defmt::error!("link: {} did not encode: {}", outgoing, error);
-                        continue;
-                    }
-                };
-                let bytes = frame.get(..len).unwrap_or(&[]);
-                match with_timeout(WRITE_DEADLINE, send(tx, bytes)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => defmt::warn!("link: {} not sent: {}", outgoing, error),
-                    Err(_) => {
-                        defmt::warn!(
-                            "link: {} stalled after {} ms; the module holds CTS",
-                            outgoing,
-                            WRITE_DEADLINE.as_millis()
-                        );
-                        stalled = true;
-                    }
-                }
+                stalled = send_outgoing(link, tx, writer, *outgoing).await;
             }
             Action::CutRail => defmt::warn!("link: asking the rail for a cut"),
             Action::DropConnections(why) => {
+                recorder::cancel_offers();
                 // No connection rows before M4; the drop is the log line.
                 defmt::info!("link: every connection dropped: {}", why);
+            }
+            Action::OfferTime { req_id, unix_ms } => {
+                if let Some(outgoing) = recorder::offer(*req_id, *unix_ms)
+                    && !cut
+                    && !stalled
+                {
+                    stalled = send_outgoing(link, tx, writer, outgoing).await;
+                }
             }
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
@@ -870,8 +858,10 @@ fn perform_quiet(actions: &Actions) {
             }
             Action::CutRail => defmt::error!("link: a cut asked for with the module off"),
             Action::DropConnections(why) => {
+                recorder::cancel_offers();
                 defmt::info!("link: every connection dropped: {}", why);
             }
+            Action::OfferTime { .. } => defmt::error!("clock: offer while UART is off"),
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
         }
@@ -1136,4 +1126,50 @@ mod frames {
             }
         }
     }
+}
+
+/// Service recorder replies and the link's monotonic deadlines each turn.
+async fn service_tick(
+    link: &mut Link,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+) -> Option<Ended> {
+    if let Some((req_id, outcome)) = recorder::time_answer()
+        && let Some(ended) = perform(link, tx, writer, &link.time_verdict(req_id, outcome)).await
+    {
+        return Some(ended);
+    }
+    let actions = link.tick(Uptime.now(), install_in_flight());
+    perform(link, tx, writer, &actions).await
+}
+
+/// Encode and send one answer. True means CTS held the transmitter past its deadline.
+async fn send_outgoing(
+    link: &Link,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    outgoing: o89_core::Outgoing,
+) -> bool {
+    let mut frame = [0u8; MAX_FRAME];
+    let len = match link.encode(outgoing, Uptime.now(), writer, &mut frame) {
+        Ok(len) => len,
+        Err(error) => {
+            defmt::error!("link: {} did not encode: {}", outgoing, error);
+            return false;
+        }
+    };
+    let bytes = frame.get(..len).unwrap_or(&[]);
+    match with_timeout(WRITE_DEADLINE, send(tx, bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => defmt::warn!("link: {} not sent: {}", outgoing, error),
+        Err(_) => {
+            defmt::warn!(
+                "link: {} stalled after {} ms; the module holds CTS",
+                outgoing,
+                WRITE_DEADLINE.as_millis()
+            );
+            return true;
+        }
+    }
+    false
 }
