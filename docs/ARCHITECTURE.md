@@ -658,7 +658,10 @@ the epoch moves, and keys derive afterwards under whatever the record then
 holds, nothing at all if the advance failed. Enrolment is gated by the gesture. Challenges are derived as above, with the
 counter written before the challenge leaves. A signed request is verified in
 P-080's order; the counter and the dedup entry are written in one FRAM
-transaction, and a write that fails fails closed (P-079). Commands are
+transaction, and a write that fails fails closed (P-079). Between the MAC
+and the counter, each session holds the highest `req_id` it accepted and
+the four below it, and drops a request whose `req_id` it accepted already or
+that is below that window, unanswered, as P-022 requires. Commands are
 reserved until an output has been granted authority.
 
 ### The link
@@ -691,7 +694,14 @@ on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
-(above). Time offers go through a bounded
+(above). Each answer to a heartbeat of the controller's carries the comms
+processor's count of connections; three in a row that disagree with the
+rows close every connection with one `CloseConnection` naming handle 0, and
+its answer frees every row (L-102), so a release lost on the wire leaks a
+row for six seconds rather than until the next reboot. Under a major
+mismatch the peer would refuse that close (L-050), so nothing is counted
+and a close already owed waits for an agreed version. The comms firmware
+counts no connections until it has a table (#90). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first

@@ -9,15 +9,15 @@ use std::cell::RefCell;
 
 use embassy_futures::block_on;
 use km43::{
-    Attempt, ClientId, ClientKind, CloseReason, Conn, DeviceId, DeviceSecret, Discovery, EmptyBody,
-    Envelope, Epoch, ErrorBody, Handshake, Header, HelloInner, Incoming, LinkTransport,
-    MessageType, PairAckClaim, PairRequest, PairResponse, PrintedSecret, ReqId, Session, SessionId,
-    SessionKey, Tagged, Version, Wrapper,
+    Attempt, ClientId, ClientKind, CloseReason, CommandKind, CommandOperation, Conn, Counter,
+    DeviceId, DeviceSecret, Discovery, EmptyBody, Envelope, Epoch, ErrorBody, Handshake, Header,
+    HelloInner, Incoming, LinkTransport, MessageType, PairAckClaim, PairRequest, PairResponse,
+    PrintedSecret, ReqId, Session, SessionId, SessionKey, Signed, Tagged, Version, Wrapper,
 };
-use o89_core::{Facts, Millis, Sessions};
+use o89_core::{DropReason, Facts, Millis, Sessions};
 
 use crate::link::{Bench, DEVICE, LOG, MODEL, PRINTED, unit};
-use crate::{Answers, Capabilities, Heard, SimFram, crash_at_every_step};
+use crate::{Answers, Capabilities, Heard, Releases, SimFram, crash_at_every_step};
 
 fn device() -> DeviceSecret {
     DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
@@ -155,6 +155,31 @@ impl Client {
         assert_eq!(session.report().log_newest_seq, LOG.newest);
         self.key = Some(enrolment.session_key(&handshake, SessionId::from(self.handle)));
         frame
+    }
+
+    /// A signed `Command` under `counter`, as the client signs it.
+    fn command(&mut self, counter: u64, cmd_id: u32, key: &SessionKey) -> Vec<u8> {
+        let header = self.header(MessageType::Command);
+        let mut op = [0u8; 16];
+        let len = CommandOperation {
+            cmd_id,
+            kind: CommandKind::StartGenerator,
+            args: &[0xa0],
+        }
+        .encode(&mut op)
+        .expect("fits");
+        let mut dst = [0u8; 128];
+        let len = Signed::over(
+            header,
+            ClientId::new(1).expect("a slot"),
+            Counter(counter),
+            &op[..len],
+            key,
+        )
+        .expect("signs")
+        .write(&mut dst)
+        .expect("fits");
+        dst[..len].to_vec()
     }
 
     fn wrapped(&mut self, kind: MessageType, key: &SessionKey) -> Vec<u8> {
@@ -397,19 +422,137 @@ fn l_041_a_comms_reboot_takes_every_row_and_session_with_it() {
 
 #[test]
 fn l_062_a_transport_whose_release_was_dropped_is_reclaimed_by_the_reboot_that_follows() {
-    // Capabilities: drop, reboot.
+    // Capabilities: lose a release, reboot.
     let mut bench = linked();
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
     // The transport goes and the release never reaches the controller: the
     // row stays, and the heartbeat says so (L-101).
+    bench.comms.capabilities().releases = Releases::Lost;
+    release(&mut bench, 1);
     bench.run_for(Millis::from_millis(2_100));
     assert_eq!(conns(&bench), Some(1));
+    // The reboot comes before three beats have disagreed, so it is what
+    // reclaims the row here; L-102's resync is the path without one.
     let bytes = bench.comms.boot(bench.now).expect("the peer reboots");
     bench.feed(&bytes);
     bench.run_for(Millis::from_millis(3_000));
     assert_eq!(conns(&bench), Some(0), "no row leaked past the reboot");
+    assert!(
+        closes(&bench).is_empty(),
+        "reclaimed by the reboot, not a resync"
+    );
+}
+
+/// Proven against the simulated peer only. The comms firmware keeps no
+/// connection table yet and counts none in its heartbeats, so the real
+/// ESP32 cannot drive this resync until #90 gives it the table, the count
+/// and the re-announce.
+#[test]
+fn l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_without_a_reboot() {
+    // Capabilities: lose a release.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    announce(&mut bench, 2);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let boot_id = bench.comms.boot_id();
+    bench.comms.capabilities().releases = Releases::Lost;
+    release(&mut bench, 1);
+    assert_eq!(
+        bench.endpoint.sessions.allocated(),
+        2,
+        "the controller was never told"
+    );
+    let lost_at = bench.comms.heard.len();
+    bench.run_for(Millis::from_millis(7_000));
+    // The close of every connection went out on the third beat the two
+    // counts disagreed on, and not before.
+    let since = &bench.comms.heard[lost_at..];
+    let close = since
+        .iter()
+        .position(|heard| matches!(heard, Heard::Close { .. }))
+        .expect("a resync");
+    let beats = since[..close]
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Heartbeat { .. }))
+        .count();
+    assert_eq!(beats, 3);
+    assert_eq!(closes(&bench), vec![(0, CloseReason::Resync)]);
+    // Its answer freed every row, with the session on it, and no reboot.
+    assert_eq!(bench.endpoint.sessions.allocated(), 0);
+    assert!(
+        !bench
+            .endpoint
+            .sessions
+            .is_bound(Conn::new(1).expect("a handle"))
+    );
+    assert!(
+        bench
+            .drops()
+            .iter()
+            .any(|(_, why)| *why == DropReason::Resync)
+    );
+    assert_eq!(bench.comms.boot_id(), boot_id, "no reboot");
+    assert!(bench.endpoint.link.is_up());
+    bench.run_for(Millis::from_millis(2_100));
+    assert_eq!(conns(&bench), Some(0));
+    // The client that was still connected reconnects and is announced
+    // again, and the counts agree from there on.
+    bench.comms.capabilities().releases = Releases::Sent;
+    announce(&mut bench, 2);
+    assert_eq!(outcomes(&bench, 0xE2), vec![1, 1, 1]);
+    let mut again = Client::on(2);
+    let _ = again.open(&mut bench);
+    bench.run_for(Millis::from_millis(10_000));
+    assert_eq!(conns(&bench), Some(1));
+    assert_eq!(closes(&bench), vec![(0, CloseReason::Resync)], "once");
+}
+
+#[test]
+fn p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once() {
+    // Capabilities: replay.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let key = client.key.take().expect("a session");
+    let frame = client.command(1, 7, &key);
+    let answers = client.send(&mut bench, &frame);
+    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
+    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
+    let accepted = |bench: &Bench| {
+        bench
+            .endpoint
+            .sessions
+            .keys()
+            .clients
+            .present()
+            .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
+    };
+    assert_eq!(accepted(&bench), Some(Counter(1)));
+    // The same bytes, relayed again and again as the comms processor
+    // chooses: nothing reaches the client that it could take for an answer,
+    // the counter is not read again, and the connection is not shed.
+    for n in 1..=9 {
+        let answers = client.send(&mut bench, &frame);
+        assert!(answers.is_empty(), "replay {n} answered");
+    }
+    assert_eq!(accepted(&bench), Some(Counter(1)));
+    assert!(closes(&bench).is_empty());
+    assert!(
+        bench
+            .endpoint
+            .sessions
+            .is_bound(Conn::new(1).expect("a handle"))
+    );
+    // The client's next request is served as if nothing had happened.
+    let next = client.command(2, 8, &key);
+    let answers = client.send(&mut bench, &next);
+    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
+    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
+    assert_eq!(accepted(&bench), Some(Counter(2)));
 }
 
 #[test]

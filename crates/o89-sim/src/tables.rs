@@ -27,8 +27,8 @@ use o89_core::{
     Admission, Admitted, Because, Behaviour, BootCount, Booted, CHALLENGE_COUNTER_BYTES,
     CLIENT_TABLE_BYTES, CUTS_RECORD_BYTES, ChallengeCounter, ClientTable, CutsRecord, EPOCH_BYTES,
     Executed, Fingerprint, Held, Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Permit,
-    Plan, RUN_REASON_BYTES, RailSequencer, Recovery, Revision, RunReason, Running, StartKind,
-    Store, Tick, UnixMillis, admit,
+    Plan, RUN_REASON_BYTES, RailSequencer, Recovery, ReqWindow, Revision, RunReason, Running,
+    StartKind, Store, Tick, UnixMillis, admit,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -239,6 +239,7 @@ fn p_080_a_signed_command_cut_at_any_step_is_permitted_only_once_its_counter_and
                 claim,
                 &key,
                 client(1),
+                &mut ReqWindow::opened_by(ReqId(0)),
                 &mut clients,
                 part,
                 Tick::from_millis(5_000),

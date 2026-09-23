@@ -1,5 +1,6 @@
 //! Signed requests in P-080's order: the MAC, the session's client, the
-//! counter, the dedup table, one FRAM write, and only then the operation.
+//! session's `req_id` window (P-022), the counter, the dedup table, one
+//! FRAM write, and only then the operation.
 //!
 //! **The order is the types.** `km43` refuses to hand out a counter before
 //! the MAC and the session's `client_id` have both checked out, and the
@@ -29,7 +30,7 @@
 //! belong to the behaviour an output is granted to; this file stops at the
 //! permit and takes the outcome back.
 //!
-//! cites: P-079, P-080, P-084, P-120, P-124
+//! cites: P-022, P-079, P-080, P-084, P-120, P-124
 
 use km43::{
     ClientId, Command, CommandAck, CommandError, CommandOperation, Condition, Counter, ErrorCode,
@@ -40,6 +41,7 @@ use crate::body::{Kept, Unchanged};
 use crate::clients::{Admitted, CLIENT_TABLE_BYTES, Check, ClientTable};
 use crate::dedup::{Fingerprint, Recorded, Reserved, Settling};
 use crate::fram::Fram;
+use crate::req_window::{OutOfWindow, ReqWindow};
 use crate::tick::Tick;
 
 /// The client table as the session layer keeps it.
@@ -123,6 +125,10 @@ pub enum Admission<'a, E> {
     InFlight(InFlight<'a>),
     /// Refused before anything executed.
     Refused(Refusal<E>),
+    /// A `req_id` the session accepted already or that is below its window,
+    /// refused after the MAC and before the counter was read. P-022 says it
+    /// is not answered, so it has no wire answer.
+    OutOfWindow(OutOfWindow),
 }
 
 /// An operation the part has already recorded the counter for.
@@ -390,15 +396,16 @@ impl<'a> InFlight<'a> {
 /// P-080 steps 1 to 4 for one signed request on a session bound to
 /// `bound` under `key`.
 ///
-/// The MAC is checked before anything else and the counter before any
-/// table is consulted; nothing is written for a request refused at either.
-/// A request that passes both lands its counter, and a command its
-/// in-flight entry with it, in one write; the [`Permit`] comes back only
-/// once the part has them.
+/// The MAC is checked before anything else, the session's `req_id` window
+/// next (P-022), and the counter before any table is consulted; nothing is
+/// written for a request refused at any of them. A request that passes
+/// them lands its counter, and a command its in-flight entry with it, in
+/// one write; the [`Permit`] comes back only once the part has them.
 pub async fn admit<'a, F: Fram>(
     claim: SignedClaim<'a>,
     key: &SessionKey,
     bound: ClientId,
+    window: &mut ReqWindow,
     clients: &mut Clients,
     fram: &mut F,
     now: Tick,
@@ -407,6 +414,9 @@ pub async fn admit<'a, F: Fram>(
         Ok(signed) => signed,
         Err(why) => return Admission::Refused(Refusal::Signed(why)),
     };
+    if let Err(why) = window.accept(signed.header().req_id) {
+        return Admission::OutOfWindow(why);
+    }
     let Some(last) = clients.present().and_then(|table| table.accepted(bound)) else {
         return Admission::Refused(Refusal::NoSuchClient);
     };
@@ -669,13 +679,27 @@ mod tests {
             }
         }
 
+        /// Admitted on a session of its own, whose window has seen
+        /// nothing but its `Hello`: what P-080 decides, whatever the
+        /// `req_id` is.
         fn admit<'a>(&mut self, frame: &'a [u8], now: u64) -> Admission<'a, ()> {
+            self.admit_in(&mut ReqWindow::opened_by(ReqId(0)), frame, now)
+        }
+
+        /// Admitted on the session whose window is `window`.
+        fn admit_in<'a>(
+            &mut self,
+            window: &mut ReqWindow,
+            frame: &'a [u8],
+            now: u64,
+        ) -> Admission<'a, ()> {
             let claim = SignedClaim::decode(Envelope::decode(frame).expect("an envelope"))
                 .expect("a signed body");
             block_on(admit(
                 claim,
                 &self.key,
                 self.bound,
+                window,
                 &mut self.clients,
                 &mut self.part,
                 Tick::from_millis(now),
@@ -705,10 +729,21 @@ mod tests {
             operation: &[u8],
             key: &SessionKey,
         ) -> Self {
+            Self::signed_as(ReqId(17), kind, from, counter, operation, key)
+        }
+
+        fn signed_as(
+            req_id: ReqId,
+            kind: MessageType,
+            from: ClientId,
+            counter: u64,
+            operation: &[u8],
+            key: &SessionKey,
+        ) -> Self {
             let header = Header {
                 kind,
                 session: SessionId::from(1),
-                req_id: ReqId(17),
+                req_id,
             };
             let signed = Signed::over(header, from, Counter(counter), operation, key)
                 .expect("a signed type");
@@ -748,6 +783,26 @@ mod tests {
 
     fn start(rig: &Rig, counter: u64, cmd_id: u32) -> Frame {
         command(rig, counter, cmd_id, CommandKind::StartGenerator)
+    }
+
+    /// A start under `req_id`.
+    fn start_as(rig: &Rig, req_id: u32, counter: u64, cmd_id: u32) -> Frame {
+        let (op, len) = operation(cmd_id, CommandKind::StartGenerator);
+        Frame::signed_as(
+            ReqId(req_id),
+            MessageType::Command,
+            rig.bound,
+            counter,
+            &op[..len],
+            &rig.key,
+        )
+    }
+
+    fn out_of_window(admission: Admission<'_, ()>) -> OutOfWindow {
+        match admission {
+            Admission::OutOfWindow(why) => why,
+            other => panic!("refused by the req_id window, not {other:?}"),
+        }
     }
 
     fn permitted(admission: Admission<'_, ()>) -> Reservation<'_> {
@@ -880,6 +935,7 @@ mod tests {
                     claim,
                     &rig.key,
                     rig.bound,
+                    &mut ReqWindow::opened_by(ReqId(0)),
                     &mut rig.clients,
                     &mut rig.part,
                     Tick::ZERO,
@@ -1276,6 +1332,100 @@ mod tests {
             rig.admit(retry.bytes(), 1),
             Admission::InFlight(_)
         ));
+    }
+
+    #[test]
+    fn p_022_a_replayed_req_id_is_refused_before_its_counter_is_read_and_writes_nothing() {
+        let mut rig = Rig::new();
+        let mut window = ReqWindow::opened_by(ReqId(19));
+        let first = start_as(&rig, 20, 1, 42);
+        let reservation = permitted(rig.admit_in(&mut window, first.bytes(), 0));
+        let _ = rig.finish(reservation, Executed::Accepted);
+        let writes = rig.part.writes;
+        // The same req_id under a counter that is ahead and a cmd_id the
+        // table has never seen: everything P-080 checks would pass, and
+        // the window refuses it before any of it is consulted.
+        let replay = start_as(&rig, 20, 2, 43);
+        assert_eq!(
+            out_of_window(rig.admit_in(&mut window, replay.bytes(), 1)),
+            OutOfWindow::Replayed
+        );
+        // The frame itself again, whose counter is spent: refused by the
+        // window too, not answered from the table or by error 11.
+        assert_eq!(
+            out_of_window(rig.admit_in(&mut window, first.bytes(), 2)),
+            OutOfWindow::Replayed
+        );
+        assert_eq!(rig.part.writes, writes, "nothing written");
+        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
+    }
+
+    #[test]
+    fn p_022_a_signed_request_below_the_window_is_refused_with_its_counter_untouched() {
+        let mut rig = Rig::new();
+        let mut window = ReqWindow::opened_by(ReqId(1));
+        let newest = start_as(&rig, 30, 1, 1);
+        let reservation = permitted(rig.admit_in(&mut window, newest.bytes(), 0));
+        let _ = rig.finish(reservation, Executed::Accepted);
+        let writes = rig.part.writes;
+        // Signed at nine and held back: its counter would still be ahead.
+        let withheld = start_as(&rig, 25, 2, 2);
+        assert_eq!(
+            out_of_window(rig.admit_in(&mut window, withheld.bytes(), 1)),
+            OutOfWindow::BelowWindow
+        );
+        assert_eq!(rig.part.writes, writes);
+        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
+        // At the floor, 30 − 4, it is inside and goes on to P-080.
+        let floor = start_as(&rig, 26, 2, 2);
+        let _ = permitted(rig.admit_in(&mut window, floor.bytes(), 2));
+    }
+
+    #[test]
+    fn p_022_signed_requests_reordered_inside_the_window_both_reach_the_counter() {
+        let mut rig = Rig::new();
+        let mut window = ReqWindow::opened_by(ReqId(10));
+        // Sent as 11 then 12, with counters 1 then 2; 12 arrives first.
+        let later = start_as(&rig, 12, 2, 2);
+        let earlier = start_as(&rig, 11, 1, 1);
+        let reservation = permitted(rig.admit_in(&mut window, later.bytes(), 0));
+        let _ = rig.finish(reservation, Executed::Accepted);
+        // Inside the window, so the counter decides, and 1 is behind 2.
+        let why = refusal(rig.admit_in(&mut window, earlier.bytes(), 1));
+        assert_eq!(why.code(), Code::Client(ErrorCode::CounterNotFresh));
+        // Counters in the order the ids arrived: both permitted.
+        let mut rig = Rig::new();
+        let mut window = ReqWindow::opened_by(ReqId(10));
+        let later = start_as(&rig, 12, 1, 1);
+        let earlier = start_as(&rig, 11, 2, 2);
+        let reservation = permitted(rig.admit_in(&mut window, later.bytes(), 0));
+        let _ = rig.finish(reservation, Executed::Accepted);
+        let reservation = permitted(rig.admit_in(&mut window, earlier.bytes(), 1));
+        let _ = rig.finish(reservation, Executed::Accepted);
+    }
+
+    #[test]
+    fn p_022_a_frame_that_fails_its_mac_does_not_spend_its_req_id() {
+        let mut rig = Rig::new();
+        let mut window = ReqWindow::opened_by(ReqId(1));
+        let (op, len) = operation(9, CommandKind::StartGenerator);
+        let forged = Frame::signed_as(
+            ReqId(2),
+            MessageType::Command,
+            rig.bound,
+            1,
+            &op[..len],
+            &key(client(2)),
+        );
+        let why = refusal(rig.admit_in(&mut window, forged.bytes(), 0));
+        assert!(
+            matches!(why, Refusal::Signed(SignedError::Mac(_))),
+            "{why:?}"
+        );
+        // The client's own request under that id is still accepted: the
+        // comms processor cannot burn ids it holds no key for.
+        let genuine = start_as(&rig, 2, 1, 9);
+        let _ = permitted(rig.admit_in(&mut window, genuine.bytes(), 1));
     }
 
     #[test]

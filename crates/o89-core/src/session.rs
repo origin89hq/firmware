@@ -22,6 +22,12 @@
 //! and fails, do not; a failure counts against the connection, eight inside
 //! a minute sheds it, and a new `Hello` does not reset the count (P-051).
 //!
+//! **A verified request is then held to the session's `req_id` window**
+//! (P-022), before its counter is read or its body acted on: one the
+//! session accepted already, or one below the highest less `MAX_INFLIGHT`,
+//! is dropped without an answer or a refresh. It proved itself, so it is
+//! not a failure against the connection.
+//!
 //! Every answer is addressed to the frame it answers: the handle in
 //! `session_id`, the request's `req_id` echoed (P-026, L-182). Before a
 //! session exists, and whenever the controller holds no key for the one
@@ -53,7 +59,7 @@
 //! (theirs). Each is an arm of the exhaustive match below, which is where
 //! those slices land.
 //!
-//! cites: P-021, P-026, P-051, P-058, P-060, P-061, P-062, P-063, P-064,
+//! cites: P-021, P-022, P-026, P-051, P-058, P-060, P-061, P-062, P-063, P-064,
 //! P-066, P-067, P-073, P-076, P-077, P-078, P-079, P-080, P-084, P-086,
 //! P-143, L-061, L-062, L-070, L-071, L-072, L-080, L-180, L-182, L-195
 
@@ -73,6 +79,7 @@ use crate::clients::{CLIENT_TABLE_BYTES, ClientTable, Label, Paired, TableFull};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::Rows;
+use crate::req_window::{OutOfWindow, ReqWindow};
 use crate::request::{Admission, Executed, Permit, Refusal, admit};
 use crate::secret::Secret;
 use crate::tick::{Millis, Tick};
@@ -194,6 +201,12 @@ pub enum SessionNote {
     NotKept,
     /// The answer did not fit the buffer: a bug in a cap.
     TooLarge,
+    /// A request that verified under the session's key and was dropped
+    /// unanswered for its `req_id` (P-022): nothing acted, the counter was
+    /// not read, and the session was not refreshed. P-022 says it is not
+    /// answered, and an answer under the key would be a second genuine
+    /// response to a `(session_id, req_id)` already answered.
+    OutOfWindow(OutOfWindow),
 }
 
 /// What the adapter does with one client frame.
@@ -275,6 +288,8 @@ struct Binding {
     /// Which binding this is, so an answer that took its time goes to the
     /// session that asked and to no later one on the same handle.
     serial: u32,
+    /// The `req_id`s this session accepted (P-022), gone with it.
+    window: ReqWindow,
 }
 
 /// A client's `Time` the recorder is deciding.
@@ -931,6 +946,7 @@ impl Sessions {
                 key,
                 heard: now,
                 serial,
+                window: ReqWindow::opened_by(to.req_id),
             });
         }
         Reply {
@@ -997,6 +1013,11 @@ impl Sessions {
             return Reply::NOTHING;
         };
         if let Bound::Session(binding) = bound {
+            // After the MAC and before anything reads the body or refreshes
+            // the session (P-022, P-077); no wire answer, per the note.
+            if let Err(why) = binding.window.accept(to.req_id) {
+                return Reply::noted(SessionNote::OutOfWindow(why));
+            }
             binding.heard = now;
         }
         if kind != MessageType::Goodbye || !goodbye {
@@ -1074,6 +1095,7 @@ impl Sessions {
             claim,
             &binding.key,
             binding.client,
+            &mut binding.window,
             &mut keys.clients,
             fram,
             now,
@@ -1086,6 +1108,7 @@ impl Sessions {
         }
         let spent = matches!(admission, Admission::Execute(_));
         let reply = match admission {
+            Admission::OutOfWindow(why) => Some(Reply::noted(SessionNote::OutOfWindow(why))),
             Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => None,
             Admission::Refused(why) => {
                 let mut reply = refused_under(to, &binding.key, why.code(), dst);
@@ -1166,6 +1189,7 @@ impl Sessions {
             claim,
             &binding.key,
             binding.client,
+            &mut binding.window,
             &mut keys.clients,
             fram,
             now,
@@ -1173,6 +1197,7 @@ impl Sessions {
         .await;
         let write = match admission {
             Admission::Execute(Permit::Write(write)) => write,
+            Admission::OutOfWindow(why) => return Reply::noted(SessionNote::OutOfWindow(why)),
             Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
                 return self.failed(to, now, dst);
             }
@@ -1904,14 +1929,17 @@ mod tests {
     /// Conformance 8 at the session: the same bytes again are refused by the
     /// counter, under the key, and do not keep the session alive.
     #[test]
-    fn p_080_a_replayed_command_is_11_under_the_key_and_refreshes_nothing() {
+    fn p_080_a_command_reusing_its_counter_is_11_under_the_key_and_refreshes_nothing() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, key) = rig.hello(1);
         let frame = rig.command(1, 1, 1, START, &key);
         let _ = rig.send(&frame);
         rig.at(SESSION_IDLE.as_millis() - 1_000);
-        let (reply, answer) = rig.send(&frame);
+        // Signed again under a new req_id, with the counter already spent:
+        // past the window, and refused at the counter.
+        let again = rig.command(1, 1, 1, START, &key);
+        let (reply, answer) = rig.send(&again);
         assert_eq!(
             code_under(&answer, &key),
             Incoming::Client(ErrorCode::CounterNotFresh)
@@ -1923,6 +1951,113 @@ mod tests {
         rig.at(1_000);
         let expired = rig.sessions.tick(rig.now);
         assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
+    }
+
+    #[test]
+    fn p_022_a_verified_command_replayed_on_its_session_is_dropped_unanswered() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.command(1, 1, 1, START, &key);
+        let (_, answer) = rig.send(&frame);
+        assert!(!answer.is_empty(), "the genuine one is answered");
+        let part = rig.part.bytes;
+        rig.at(SESSION_IDLE.as_millis() - 1_000);
+        // Eight replays: no answer to play against the client, nothing
+        // written, no failure counted, and no refresh.
+        for n in 1..=8 {
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(
+                reply.note,
+                Some(SessionNote::OutOfWindow(OutOfWindow::Replayed)),
+                "{n}"
+            );
+            assert!(answer.is_empty(), "{n}");
+            assert_eq!(reply.close, None, "{n}");
+        }
+        assert!(rig.part.bytes == part, "nothing written");
+        assert_eq!(rig.accepted(), Some(Counter(1)));
+        rig.at(1_000);
+        let expired = rig.sessions.tick(rig.now);
+        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
+    }
+
+    #[test]
+    fn p_022_a_wrapped_request_replayed_or_below_the_window_is_dropped_unanswered() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        // Signed first and held back while the client moves on five.
+        let withheld = rig.wrapped(1, MessageType::Readings, &key);
+        let sent: [Bytes; 5] =
+            core::array::from_fn(|_| rig.wrapped(1, MessageType::Readings, &key));
+        for frame in &sent {
+            let (_, answer) = rig.send(frame);
+            assert_eq!(
+                code_under(&answer, &key),
+                Incoming::Client(ErrorCode::UnknownMessageType)
+            );
+        }
+        let (reply, answer) = rig.send(&withheld);
+        assert_eq!(
+            reply.note,
+            Some(SessionNote::OutOfWindow(OutOfWindow::BelowWindow))
+        );
+        assert!(answer.is_empty());
+        let (reply, answer) = rig.send(&sent[4]);
+        assert_eq!(
+            reply.note,
+            Some(SessionNote::OutOfWindow(OutOfWindow::Replayed))
+        );
+        assert!(answer.is_empty());
+        assert!(rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_022_wrapped_requests_reordered_inside_the_window_are_each_answered_once() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frames: [Bytes; 4] =
+            core::array::from_fn(|_| rig.wrapped(1, MessageType::Readings, &key));
+        for at in [3, 0, 2, 1] {
+            let (_, answer) = rig.send(&frames[at]);
+            assert_eq!(
+                code_under(&answer, &key),
+                Incoming::Client(ErrorCode::UnknownMessageType),
+                "{at}"
+            );
+        }
+        for frame in &frames {
+            let (reply, answer) = rig.send(frame);
+            assert_eq!(
+                reply.note,
+                Some(SessionNote::OutOfWindow(OutOfWindow::Replayed))
+            );
+            assert!(answer.is_empty());
+        }
+    }
+
+    #[test]
+    fn p_022_the_window_goes_with_the_binding_and_a_new_session_starts_its_own() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.wrapped(1, MessageType::Readings, &key);
+        let _ = rig.send(&frame);
+        let goodbye = rig.wrapped(1, MessageType::Goodbye, &key);
+        let _ = rig.send(&goodbye);
+        // A frame of the ended session is refused by the session check,
+        // never read against a window that no longer exists.
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(hint(&answer), Some(9));
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.wrapped(1, MessageType::Readings, &key);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::UnknownMessageType)
+        );
     }
 
     /// A command refused before its counter lands leaves the counter where it
@@ -2285,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_time_under_another_key_is_10_and_one_replayed_is_11() {
+    fn a_client_time_under_another_key_is_10_and_one_reusing_its_counter_is_11() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, key) = rig.hello(1);
@@ -2297,7 +2432,8 @@ mod tests {
         let (reply, _) = rig.send(&frame);
         let ack = TimeAck::new(km43::Time::Accepted, Some(SET_AT)).expect("an ack");
         let _ = rig.answer_time(asked(&reply).ticket, TimeAnswer::Ack(ack));
-        let (reply, answer) = rig.send(&frame);
+        let again = rig.time_frame(1, 1, 1, SET_AT, &key);
+        let (reply, answer) = rig.send(&again);
         assert_eq!(reply.note, Some(SessionNote::Refused(11)));
         assert_eq!(
             code_under(&answer, &key),

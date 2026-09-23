@@ -11,6 +11,12 @@
 # The KM43 rules this repository's tests cite are counted against the rules
 # the pinned km43 ships, `km43::REQUIREMENTS` (origin89hq/km43#31), and
 # reported, not ratcheted.
+#
+# A KM43 rule binding both firmwares reads as covered once either side has
+# its test, so the halves still missing are named here:
+# - L-102: the controller's half is tested against the simulated peer; the
+#   comms processor's count, its close report and the re-announce wait on
+#   the comms connection table (#90).
 
 # The list somebody defends at each audit round: the F rules that have
 # neither a test nor a declaration below, by name. The check fails when a
