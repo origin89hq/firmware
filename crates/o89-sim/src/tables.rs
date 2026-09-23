@@ -1,7 +1,7 @@
 //! The tables' write paths, each cut at every byte, with the invariant a
 //! boot needs asserted after every cut (F-025).
 //!
-//! Six paths, six invariants. A factory reset leaves the old epoch
+//! Seven paths, seven invariants. A factory reset leaves the old epoch
 //! with its rows, or a higher epoch whose table the next boot clears. A
 //! command leaves its counter and its in-flight entry together or leaves
 //! neither. A pairing leaves the rows that were there, with or without the
@@ -9,16 +9,20 @@
 //! the next mint is past every one before it. A boot leaves a boot count
 //! that climbs and a panic record that is whole or absent. The recovery
 //! ladder's cuts leave the ones before the cut or the ones after it, and
-//! never fewer than were kept.
+//! never fewer than were kept. A run reason leaves the reason before it or
+//! the one being declared, and the contact is moved only on one the part
+//! holds.
 
 use embassy_futures::block_on;
 use km43::{ClientId, ClientKind, Counter, Epoch};
-use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS};
+use std::cell::Cell;
+
+use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS, RUN_REASON};
 use o89_core::{
-    Admitted, Because, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
+    Admitted, Because, Behaviour, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
     CUTS_RECORD_BYTES, ChallengeCounter, ClientTable, CutsRecord, EPOCH_BYTES, Fingerprint, Held,
-    Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Plan, RailSequencer, Recovery,
-    Revision, Store, Tick,
+    Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Plan, RUN_REASON_BYTES,
+    RailSequencer, Recovery, Revision, RunReason, Running, StartKind, Store, Tick, UnixMillis,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -27,6 +31,7 @@ type Epochs = Kept<Epoch, EPOCH_BYTES>;
 type Clients = Kept<ClientTable, CLIENT_TABLE_BYTES>;
 type Counters = Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>;
 type Cuts = Kept<CutsRecord, CUTS_RECORD_BYTES>;
+type Runs = Kept<RunReason, RUN_REASON_BYTES>;
 
 fn client(n: u32) -> ClientId {
     ClientId::new(n).expect("a nonzero client")
@@ -388,4 +393,63 @@ fn f_018_three_resets_are_the_third_rung_though_every_boots_ladder_write_after_t
             "cut at {step}: the fourth boot's first request"
         );
     }
+}
+
+/// A part holding `reason` as the run reason.
+fn with_run_reason(reason: RunReason) -> SimFram {
+    let mut part = SimFram::fresh();
+    let mut runs = block_on(Runs::read(RUN_REASON, &mut part)).expect("the part answers");
+    let declared = block_on(runs.declare(&mut part, reason)).expect("the supply is steady");
+    assert_eq!(declared.reason(), reason);
+    part
+}
+
+/// Declare `to` over a part holding `from`, cut at every step: the boot
+/// finds `from` or `to` and nothing else, and a `Declared` handed out under
+/// a cut names what the part holds.
+fn declare_cut_at_every_step(from: RunReason, to: RunReason) -> Crashes {
+    let start = with_run_reason(from);
+    let declared = Cell::new(None);
+    crash_at_every_step(
+        &start,
+        |part| {
+            declared.set(None);
+            let mut runs = block_on(Runs::read(RUN_REASON, part)).map_err(|_| ())?;
+            let permission = block_on(runs.declare(part, to)).map_err(|_| ())?;
+            declared.set(Some(permission.reason()));
+            Ok(())
+        },
+        |part, step| {
+            let runs = block_on(Runs::read(RUN_REASON, part)).expect("the part is back");
+            let held = *runs.present().expect("a reason, never neither");
+            assert!(held == from || held == to, "cut at {step}: {held:?}");
+            if let Some(moved) = declared.get() {
+                assert_eq!(
+                    held, moved,
+                    "cut at {step}: the contact moved on a reason the part lost"
+                );
+            }
+        },
+    )
+    .expect("the path runs uncut")
+}
+
+#[test]
+fn f_022_a_start_cut_at_any_step_leaves_the_part_stopped_or_holding_the_start_it_moves_on() {
+    let start = RunReason::Running(Running {
+        kind: StartKind::Automatic(Behaviour::Frost),
+        started: UnixMillis::new(1_790_000_000_000),
+    });
+    let crashes = declare_cut_at_every_step(RunReason::Stopped, start);
+    assert!(crashes.steps > RUN_REASON_BYTES, "{crashes:?}");
+}
+
+#[test]
+fn f_022_a_stop_cut_at_any_step_leaves_the_run_or_the_stop_and_never_a_reason_for_neither() {
+    let manual = RunReason::Running(Running {
+        kind: StartKind::Manual,
+        started: None,
+    });
+    let crashes = declare_cut_at_every_step(manual, RunReason::Stopped);
+    assert!(crashes.steps > RUN_REASON_BYTES, "{crashes:?}");
 }
