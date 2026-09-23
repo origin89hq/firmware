@@ -29,7 +29,7 @@ use km43::{
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
     LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
-    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock,
+    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, time_expired,
 };
 
 use crate::fram::Lease;
@@ -99,8 +99,12 @@ pub fn offer(req_id: ReqId, at: u64) -> Option<Outgoing> {
 /// on so a wait in the queue or a floor scan advances it (as an offer's).
 pub fn client_time(asked: TimeAsked) {
     let now = Tick::from_millis(Instant::now().as_millis());
+    // The session holds one at a time, so a request still queued is one it
+    // has forgotten: this replaces it rather than being dropped behind it.
+    if CLIENT_TIME.try_receive().is_ok() {
+        defmt::warn!("clock: a forgotten client time dropped from the queue");
+    }
     if CLIENT_TIME.try_send((asked, now)).is_err() {
-        // The session holds one at a time; the next expires unanswered.
         defmt::error!("clock: a client time found the queue full");
     }
 }
@@ -510,6 +514,10 @@ async fn serve_client(
     client_waiting: &mut Option<(u32, u64)>,
 ) {
     let now = Tick::from_millis(Instant::now().as_millis());
+    if time_expired(received, now) {
+        defmt::warn!("clock: a forgotten client time not acted on");
+        return;
+    }
     let current = match calendar.read() {
         Ok(current) => current,
         Err(error) => {
@@ -545,6 +553,12 @@ async fn serve_client(
                 return answer_client(asked.ticket, refused(Time::NeedsButton));
             }
         };
+    // The floor scan can take thirty seconds: a request its session forgot
+    // meanwhile must not move the clock with nobody told.
+    if time_expired(received, Tick::from_millis(Instant::now().as_millis())) {
+        defmt::warn!("clock: a client time forgotten during the floor scan");
+        return;
+    }
     if let Err(error) = calendar.set(change) {
         defmt::error!("clock: calendar write refused: {}", error);
         return answer_client(asked.ticket, TimeAnswer::Busy);
@@ -667,6 +681,11 @@ async fn serve_time(
     client_waiting: &mut Option<(u32, u64)>,
 ) {
     let Some(ring) = ring else {
+        // No log to record a set into (P-111): a client's `Time`, its
+        // counter spent, is answered rather than left waiting.
+        if let Ok((asked, _)) = CLIENT_TIME.try_receive() {
+            answer_client(asked.ticket, TimeAnswer::Busy);
+        }
         return;
     };
     let now = Tick::from_millis(Instant::now().as_millis());

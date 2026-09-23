@@ -292,6 +292,16 @@ struct AskedTime {
 /// `Time` with 7.
 pub const TIME_ANSWER_LIMIT: Millis = Millis::from_millis(60_000);
 
+/// Whether a client `Time` handed on at `asked` has waited out
+/// [`TIME_ANSWER_LIMIT`] by `now`, or the tick gives it no age to trust. The
+/// session forgets it then, and the recorder must not act on it after: the
+/// client that asked is no longer waiting for the answer.
+#[must_use]
+pub fn time_expired(asked: Tick, now: Tick) -> bool {
+    now.since(asked)
+        .is_none_or(|waited| waited.as_millis() >= TIME_ANSWER_LIMIT.as_millis())
+}
+
 /// What a client's `Time` asks the recorder, which owns the calendar, the
 /// log the floor comes from, and the record the set is written into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,10 +531,10 @@ impl Sessions {
     /// unbound, their keys destroyed, and their transports to be closed
     /// (P-077). The row stays allocated until the transport goes.
     pub fn tick(&mut self, now: Tick) -> Expired {
-        if self.time.is_some_and(|asked| {
-            now.since(asked.asked)
-                .is_none_or(|waited| waited.as_millis() >= TIME_ANSWER_LIMIT.as_millis())
-        }) {
+        if self
+            .time
+            .is_some_and(|asked| time_expired(asked.asked, now))
+        {
             self.time = None;
         }
         let mut expired = [None; CONNECTIONS];
@@ -2199,6 +2209,24 @@ mod tests {
         let _ = rig.hello(1);
         let (_, answer) = rig.answer_time(ticket, TimeAnswer::Ack(ack));
         assert!(answer.is_empty(), "the new session did not ask");
+    }
+
+    /// One definition of when a waiting `Time` is forgotten, used by the
+    /// session to free its slot and by the recorder to never act on it after.
+    #[test]
+    fn a_time_is_expired_from_the_limit_on_and_on_a_tick_that_went_backwards() {
+        let asked = Tick::from_millis(5_000);
+        assert!(!time_expired(asked, asked));
+        let limit = asked.after(TIME_ANSWER_LIMIT).expect("fits");
+        assert!(!time_expired(
+            asked,
+            Tick::from_millis(limit.as_millis() - 1)
+        ));
+        assert!(time_expired(asked, limit));
+        assert!(
+            time_expired(asked, Tick::from_millis(4_999)),
+            "no age to trust"
+        );
     }
 
     #[test]
