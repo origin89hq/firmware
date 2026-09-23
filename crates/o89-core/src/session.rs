@@ -31,20 +31,32 @@
 //! is a response it could hold back and play against the client's real
 //! request later.
 //!
+//! **A `Command` goes through [`admit`]**, in P-080's order, under the
+//! session's key and the client it was bound to (P-084). No command kind
+//! has an argument schema yet (km43's DEFERRED entry 8), so what is
+//! permitted is answered `rejected` and nothing reaches an output: its
+//! counter is spent and its dedup entry discarded, as P-120 has for a
+//! command that did not run. A retry meeting an entry a reset left in
+//! flight runs again for the same reason: no output can already be where
+//! a command asked.
+//!
 //! What this slice does not serve yet is refused with error 2, bare or
-//! under the key by the rule above: `Pair` (the pairing slice), the four
-//! signed requests (theirs), and the wrapped reads (theirs). Each is an arm
-//! of the exhaustive match below, which is where those slices land.
+//! under the key by the rule above: `Pair` (the pairing slice), the three
+//! other signed requests, whose handlers call [`admit`] when they land,
+//! and the wrapped reads (theirs). Each is an arm of the exhaustive match
+//! below, which is where those slices land.
 //!
 //! cites: P-021, P-026, P-051, P-060, P-061, P-062, P-063, P-073, P-076,
-//! P-077, P-143, L-061, L-062, L-070, L-071, L-072, L-080, L-180, L-182
+//! P-077, P-079, P-080, P-084, P-143, L-061, L-062, L-070, L-071, L-072,
+//! L-080, L-180, L-182
 
 use km43::{
-    Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, Conn, EmptyBody, Envelope,
-    EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake, HandshakeError, Header, HelloClaim,
-    HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
-    MAX_HELLO_REPORT, MAX_SESSIONS, MessageType, ReqId, SessionId, SessionKey, StateSeq, Tagged,
-    Topology, Version, Wrapper, WrapperError, WrapperKey,
+    Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, CommandAck, Conn, EmptyBody,
+    Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake, HandshakeError, Header,
+    HelloClaim, HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
+    MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MessageType, Refusal as Code, ReqId,
+    SessionId, SessionKey, SignedClaim, SignedError, StateSeq, Tagged, Topology, Version, Wrapper,
+    WrapperError, WrapperKey,
 };
 
 use crate::body::Kept;
@@ -53,6 +65,7 @@ use crate::clients::{CLIENT_TABLE_BYTES, ClientTable};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::Rows;
+use crate::request::{Admission, Executed, Permit, Refusal, admit};
 use crate::secret::Secret;
 use crate::tick::{Millis, Tick};
 
@@ -70,6 +83,9 @@ pub const SESSION_IDLE: Millis = Millis::from_millis(15 * 60 * 1_000);
 
 /// The window `MAX_AUTH_FAILURES` is counted over (P-051).
 pub const FAILURE_WINDOW: Millis = Millis::from_millis(60_000);
+
+/// What a permitted command is told while no kind has an argument schema.
+pub const UNSPECIFIED: &str = "no command kind has an argument schema yet";
 
 /// Failures a connection may accumulate inside the window; the one that
 /// reaches it sheds the connection.
@@ -155,6 +171,11 @@ pub enum SessionNote {
     NoChallenge,
     /// An `Error` from a client, which is never answered.
     ClientError,
+    /// A signed request's record did not land: its counter, refused with
+    /// error 7 and nothing run, which P-079 raises as `counter write
+    /// failed`; or a command's outcome, whose entry is left for the state
+    /// store.
+    NotKept,
     /// The answer did not fit the buffer: a bug in a cap.
     TooLarge,
 }
@@ -506,16 +527,17 @@ impl Sessions {
             | MessageType::Subscribe
             | MessageType::ReadLog
             | MessageType::GetConfig => self.wrapped_request(to, envelope, now, dst),
-            // Signed: their own MAC and counter, which the signed-request
-            // slice verifies. Unverified, the refusal goes bare; the session
-            // they need is still checked first (P-143).
-            MessageType::SetConfig
-            | MessageType::Command
-            | MessageType::Firmware
-            | MessageType::Time => match self.bound_on(to, dst) {
-                Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
-                Err(refused) => refused,
-            },
+            // Signed: its own MAC and counter, in P-080's order.
+            MessageType::Command => self.command(to, envelope, now, fram, dst).await,
+            // Signed, and not served until their handlers call `admit`:
+            // refused without a counter spent, after the session they need
+            // is checked (P-143).
+            MessageType::SetConfig | MessageType::Firmware | MessageType::Time => {
+                match self.bound_on(to, dst) {
+                    Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
+                    Err(refused) => refused,
+                }
+            }
             // An error is never answered with another (P-031).
             MessageType::ErrorResponse => Reply::noted(SessionNote::ClientError),
             // What only the controller sends is not a request.
@@ -798,6 +820,96 @@ impl Sessions {
         }
     }
 
+    /// `Command 0x08` on a session, through [`admit`] under the session's key
+    /// and the client it was bound to. A signed body that does not read is
+    /// answered bare, like any frame nothing verified; a MAC that fails
+    /// counts against the connection (P-051); everything past the MAC is
+    /// answered under the key. It refreshes the session (P-077) only when it
+    /// spent its counter, which is when a permit came back: a replay
+    /// verifies too, and so does a command refused before its counter
+    /// landed, whose bytes stay fresh for as long as the comms processor
+    /// cares to replay them and would keep an idle session alive.
+    async fn command<F: Fram>(
+        &mut self,
+        to: Addressed,
+        envelope: Envelope<'_>,
+        now: Tick,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        if let Err(refused) = self.bound_on(to, dst) {
+            return refused;
+        }
+        let claim = match SignedClaim::decode(envelope) {
+            Ok(claim) => claim,
+            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        };
+        let Self { rows, keys } = self;
+        let Some(Row {
+            bound: Bound::Session(binding),
+            ..
+        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+        else {
+            return Reply::NOTHING;
+        };
+        let mut admission = admit(
+            claim,
+            &binding.key,
+            binding.client,
+            &mut keys.clients,
+            fram,
+            now,
+        )
+        .await;
+        if let Admission::InFlight(retry) = admission {
+            // No output has authority yet, so none can already be where the
+            // command asked: the state store's answer is always to run it.
+            admission = retry.again(&mut keys.clients, fram, now).await;
+        }
+        let spent = matches!(admission, Admission::Execute(_));
+        let reply = match admission {
+            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => None,
+            Admission::Refused(why) => {
+                let mut reply = refused_under(to, &binding.key, why.code(), dst);
+                if why.raises().is_some() {
+                    reply.note = Some(SessionNote::NotKept);
+                }
+                Some(reply)
+            }
+            Admission::Answered(ack) => Some(acked(to, &binding.key, ack, dst)),
+            Admission::Execute(Permit::Command(reservation)) => {
+                let finished = reservation
+                    .finished(&mut keys.clients, fram, Executed::Rejected, UNSPECIFIED)
+                    .await;
+                let mut reply = acked(to, &binding.key, finished.ack, dst);
+                if finished.recorded.is_err() {
+                    reply.note = Some(SessionNote::NotKept);
+                }
+                Some(reply)
+            }
+            // Only the three other signed types are written; a `Command` is
+            // never one.
+            Admission::Execute(Permit::Write(_)) => Some(wrapped(
+                to,
+                &binding.key,
+                ErrorCode::UnknownMessageType,
+                dst,
+            )),
+            // Settled by another retry between the two, and neither running
+            // nor recorded now: this one goes again.
+            Admission::InFlight(_) => Some(wrapped(to, &binding.key, ErrorCode::BusyRetry, dst)),
+        };
+        match reply {
+            Some(reply) => {
+                if spent {
+                    binding.heard = now;
+                }
+                reply
+            }
+            None => self.failed(to, now, dst),
+        }
+    }
+
     /// A proof or a MAC that did not verify: error 10, bare, and one more
     /// failure against the connection; the one that reaches the threshold
     /// ends any session on it and closes it (P-051).
@@ -896,6 +1008,33 @@ fn bare(to: Addressed, code: Incoming, dst: &mut [u8]) -> Reply {
     reply
 }
 
+/// A refusal of a request that verified: under the key, as P-142 has for
+/// every client code; a link-local one, which none of these is, bare.
+fn refused_under(to: Addressed, key: &SessionKey, code: Code, dst: &mut [u8]) -> Reply {
+    match code {
+        Code::Client(code) => wrapped(to, key, code, dst),
+        Code::LinkLocal(code) => bare(to, Incoming::LinkLocal(code), dst),
+    }
+}
+
+/// `Ack 0x88` under the session's key.
+fn acked(to: Addressed, key: &SessionKey, ack: CommandAck<'_>, dst: &mut [u8]) -> Reply {
+    let mut body = [0u8; MAX_COMMAND_ACK_BYTES];
+    let written = ack
+        .encode(&mut body)
+        .ok()
+        .and_then(|len| {
+            Tagged::over(
+                to.header(MessageType::CommandResponse),
+                body.get(..len).unwrap_or(&[]),
+                key,
+            )
+            .ok()
+        })
+        .and_then(|tagged| tagged.write(dst).ok());
+    answered(written)
+}
+
 /// An `Error 0xFF` under the session's key, for a request that verified.
 fn wrapped(to: Addressed, key: &SessionKey, code: ErrorCode, dst: &mut [u8]) -> Reply {
     let mut body = [0u8; 16];
@@ -933,8 +1072,8 @@ mod tests {
 
     use embassy_futures::block_on;
     use km43::{
-        ClientKind, DeviceId, DeviceSecret, ErrorBody as Body, HelloInner, Hint, MAX_PAYLOAD,
-        PrintedSecret, Session,
+        ClientKind, CommandKind, CommandOperation, Counter, DeviceId, DeviceSecret,
+        ErrorBody as Body, HelloInner, Hint, MAX_PAYLOAD, PrintedSecret, Session, Signed,
     };
 
     use super::*;
@@ -1225,6 +1364,75 @@ mod tests {
         }
     }
 
+    impl Rig {
+        /// A `Command` on `handle` claiming `client`, carrying `counter` and
+        /// the operation `cmd_id`/`kind`, signed under `key`.
+        fn command(
+            &mut self,
+            handle: u16,
+            client: u32,
+            counter: u64,
+            (cmd_id, kind): (u32, CommandKind),
+            key: &SessionKey,
+        ) -> Bytes {
+            let req_id = self.next_req();
+            let mut op = [0u8; 16];
+            let len = CommandOperation {
+                cmd_id,
+                kind,
+                args: &[0xa0],
+            }
+            .encode(&mut op)
+            .expect("fits");
+            let mut dst = [0u8; 128];
+            let len = Signed::over(
+                Header {
+                    kind: MessageType::Command,
+                    session: SessionId::from(handle),
+                    req_id,
+                },
+                ClientId::new(client).expect("a slot"),
+                Counter(counter),
+                &op[..len],
+                key,
+            )
+            .expect("signs")
+            .write(&mut dst)
+            .expect("fits");
+            Bytes::of(&dst[..len])
+        }
+
+        /// The highest counter the table holds for client 1.
+        fn accepted(&self) -> Option<Counter> {
+            self.sessions
+                .keys()
+                .clients
+                .present()
+                .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
+        }
+    }
+
+    const START: (u32, CommandKind) = (42, CommandKind::StartGenerator);
+
+    /// The payload of an answer under `key`, and its header.
+    fn under(answer: &[u8], key: &SessionKey) -> (Header, Bytes) {
+        let envelope = Envelope::decode(answer).expect("an envelope");
+        let header = envelope.header();
+        let verified = Wrapper::decode(envelope)
+            .and_then(|wrapper| wrapper.verify(key))
+            .expect("under the session's key");
+        (header, Bytes::of(verified.payload()))
+    }
+
+    /// The code of an error under `key`.
+    fn code_under(answer: &[u8], key: &SessionKey) -> Incoming {
+        let (header, payload) = under(answer, key);
+        assert_eq!(header.kind, MessageType::ErrorResponse);
+        ErrorBody::authenticated(&payload)
+            .expect("an error body")
+            .code
+    }
+
     /// The code of a bare error, read as a client reads one: a code the
     /// registry marks MAC'd does not read.
     fn hint(answer: &[u8]) -> Option<u16> {
@@ -1258,6 +1466,250 @@ mod tests {
                 },
                 SessionId::from(1),
             )
+    }
+
+    #[test]
+    fn p_080_a_command_is_verified_counted_and_answered_rejected_under_the_key() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.command(1, 1, 1, START, &key);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.close, None);
+        assert_eq!(reply.note, None);
+        let (header, payload) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::CommandResponse);
+        assert_eq!(header.req_id, ReqId(rig.req), "P-026");
+        assert_eq!(
+            CommandAck::decode(&payload),
+            Ok(CommandAck {
+                cmd_id: 42,
+                outcome: km43::Command::Rejected,
+                detail: UNSPECIFIED,
+            })
+        );
+        // The counter is spent on the part, and no entry stays behind for
+        // a command that did not run (P-120).
+        assert_eq!(rig.accepted(), Some(Counter(1)));
+        let reread = block_on(Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(
+            CLIENT_TABLE,
+            &mut rig.part,
+        ))
+        .expect("reads");
+        let table = reread.present().expect("a table");
+        assert_eq!(
+            table.accepted(ClientId::new(1).expect("a slot")),
+            Some(Counter(1))
+        );
+        assert_eq!(table.dedup().live(rig.now), 0);
+        // So a retry, with the next counter, is not a duplicate of anything.
+        let frame = rig.command(1, 1, 2, START, &key);
+        let (_, answer) = rig.send(&frame);
+        let (_, payload) = under(&answer, &key);
+        assert_eq!(
+            CommandAck::decode(&payload).map(|ack| ack.outcome),
+            Ok(km43::Command::Rejected)
+        );
+    }
+
+    /// Conformance 8 at the session: the same bytes again are refused by the
+    /// counter, under the key, and do not keep the session alive.
+    #[test]
+    fn p_080_a_replayed_command_is_11_under_the_key_and_refreshes_nothing() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.command(1, 1, 1, START, &key);
+        let _ = rig.send(&frame);
+        rig.at(SESSION_IDLE.as_millis() - 1_000);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::CounterNotFresh)
+        );
+        assert_eq!(reply.close, None);
+        assert_eq!(rig.accepted(), Some(Counter(1)));
+        // The replay was the last frame, and the session still ends on the
+        // time the genuine one set.
+        rig.at(1_000);
+        let expired = rig.sessions.tick(rig.now);
+        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
+    }
+
+    /// A command refused before its counter lands leaves the counter where it
+    /// was, so the same bytes stay fresh and the comms processor can replay
+    /// them as often as it likes. None of those refresh the session.
+    #[test]
+    fn p_077_a_command_refused_before_its_counter_lands_refreshes_nothing() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let req_id = rig.next_req();
+        let mut dst = [0u8; 128];
+        let len = Signed::over(
+            Header {
+                kind: MessageType::Command,
+                session: SessionId::from(1),
+                req_id,
+            },
+            ClientId::new(1).expect("a slot"),
+            Counter(1),
+            &[0x07],
+            &key,
+        )
+        .expect("signs")
+        .write(&mut dst)
+        .expect("fits");
+        let unreadable = Bytes::of(&dst[..len]);
+        let naming_another = rig.command(1, 2, 1, START, &key);
+        rig.at(SESSION_IDLE.as_millis() - 2_000);
+        for frame in [&unreadable, &naming_another] {
+            let (_, answer) = rig.send(frame);
+            assert!(matches!(code_under(&answer, &key), Incoming::Client(_)));
+            rig.at(500);
+        }
+        assert_eq!(rig.accepted(), Some(Counter(0)), "nothing was spent");
+        rig.at(1_000);
+        let expired = rig.sessions.tick(rig.now);
+        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
+    }
+
+    #[test]
+    fn p_077_a_command_that_verified_refreshes_the_session() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        rig.at(SESSION_IDLE.as_millis() - 1_000);
+        let frame = rig.command(1, 1, 1, START, &key);
+        let _ = rig.send(&frame);
+        rig.at(1_000);
+        assert_eq!(rig.sessions.tick(rig.now).iter().next(), None);
+        assert!(rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_051_a_command_under_another_key_is_10_bare_and_counts_against_the_connection() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, _) = rig.hello(1);
+        for n in 1..FAILURES {
+            let frame = rig.command(1, 1, 1, START, &other_key());
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(hint(&answer), Some(10), "failure {n}");
+            assert_eq!(reply.close, None, "failure {n}");
+        }
+        let frame = rig.command(1, 1, 1, START, &other_key());
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(
+            reply.close,
+            Some(Close {
+                conn: conn(1),
+                reason: CloseReason::AuthenticationFailures
+            })
+        );
+        assert_eq!(rig.accepted(), Some(Counter(0)), "no forged frame moved it");
+    }
+
+    #[test]
+    fn p_084_a_command_naming_another_client_is_12_under_the_key_and_moves_no_counter() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.command(1, 2, u64::MAX, START, &key);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::UnknownClient)
+        );
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+    }
+
+    #[test]
+    fn p_079_a_command_whose_counter_does_not_land_is_7_under_the_key_and_noted() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        rig.part.falling = true;
+        let frame = rig.command(1, 1, 1, START, &key);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::BusyRetry)
+        );
+        assert_eq!(reply.note, Some(SessionNote::NotKept));
+        assert_eq!(rig.accepted(), Some(Counter(0)), "RAM is where the part is");
+        // The supply recovers and the client's retry runs, with the next
+        // counter.
+        rig.part.falling = false;
+        let frame = rig.command(1, 1, 2, START, &key);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, None);
+        let (header, _) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::CommandResponse);
+        assert_eq!(rig.accepted(), Some(Counter(2)));
+    }
+
+    /// A reset between reserving and finishing: the entry says only that the
+    /// command started. No output has authority, so the state store's answer
+    /// is to run it again, and it is answered as a fresh command would be.
+    #[test]
+    fn p_080_a_retry_meeting_an_entry_a_reset_left_in_flight_runs_again() {
+        let mut rig = Rig::new();
+        let (op, len) = {
+            let mut op = [0u8; 16];
+            let len = CommandOperation {
+                cmd_id: START.0,
+                kind: START.1,
+                args: &[0xa0],
+            }
+            .encode(&mut op)
+            .expect("fits");
+            (op, len)
+        };
+        let client = ClientId::new(1).expect("a slot");
+        let reserved = block_on(rig.sessions.keys.clients.update(&mut rig.part, |table| {
+            table.admit(
+                client,
+                Counter(1),
+                START.0,
+                crate::dedup::Fingerprint::of(&op[..len]),
+                Tick::ZERO,
+            )
+        }));
+        assert!(matches!(reserved, Ok(crate::clients::Admitted::Fresh(_))));
+        let mut clients = block_on(Kept::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
+        let _ = block_on(clients.booted(&mut rig.part, epoch(1)));
+        rig.sessions.keys.clients = clients;
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let frame = rig.command(1, 1, 2, START, &key);
+        let (_, answer) = rig.send(&frame);
+        let (header, payload) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::CommandResponse);
+        assert_eq!(
+            CommandAck::decode(&payload).map(|ack| ack.outcome),
+            Ok(km43::Command::Rejected)
+        );
+        assert_eq!(rig.accepted(), Some(Counter(2)));
+        let table = rig.sessions.keys().clients.present().expect("a table");
+        assert_eq!(table.dedup().live(rig.now), 0, "the entry is settled");
+    }
+
+    #[test]
+    fn a_signed_request_not_served_yet_is_2_and_spends_no_counter() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, _) = rig.hello(1);
+        for kind in [
+            MessageType::Time,
+            MessageType::SetConfig,
+            MessageType::Firmware,
+        ] {
+            let frame = rig.empty(1, kind);
+            let (_, answer) = rig.send(&frame);
+            assert_eq!(hint(&answer), Some(2), "{kind:?}");
+        }
+        assert_eq!(rig.accepted(), Some(Counter(0)));
     }
 
     #[test]
@@ -1769,10 +2221,10 @@ mod tests {
             .expect("under the key");
         let body = ErrorBody::authenticated(verified.payload()).expect("an error body");
         assert_eq!(body.code, Incoming::Client(ErrorCode::UnknownMessageType));
-        // A signed request this slice cannot verify is answered bare.
+        // A signed request whose body does not read is answered bare.
         let frame = rig.empty(1, MessageType::Command);
         let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(2));
+        assert_eq!(hint(&answer), Some(1));
     }
 
     #[test]
