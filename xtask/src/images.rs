@@ -15,7 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::Artifact;
 
-use crate::repo::{CORTEX_M0, RISCV, Repo, artifacts, llvm_tool, run};
+use crate::repo::{CORTEX_M0, RISCV, Repo, artifacts, llvm_tool, run, sysroot};
 
 /// How the bytes that reach the part are produced from the ELF.
 #[derive(Clone, Copy)]
@@ -117,9 +117,44 @@ pub fn compile(repo: &Repo) -> Result<Vec<Artifact>> {
     Ok(built)
 }
 
+/// Where the build machine's paths go in an image (#74).
+///
+/// A panic's location is `file!()`, which for this checkout's `crates/`, the
+/// registry and the standard library is an absolute path, so without this
+/// the bytes and the size of an image depend on where it was built, and the
+/// panic handler's hash of the file names the machine as well as the file.
+/// Every image is measured and flashed from this build, so this is the one
+/// place the flags are set; each prefix maps to a fixed one.
+fn remapped(root: &Path, cargo_home: &Path, sysroot: &Path) -> Result<String> {
+    let pairs = [(root, "/o89"), (cargo_home, "/cargo"), (sysroot, "/rustc")];
+    let mut flags = Vec::with_capacity(pairs.len());
+    for (from, to) in pairs {
+        let from = from
+            .to_str()
+            .with_context(|| format!("{} is not UTF-8", from.display()))?;
+        flags.push(format!("--remap-path-prefix={from}={to}"));
+    }
+    // `CARGO_ENCODED_RUSTFLAGS` separates by 0x1f, so a path with a space
+    // survives; with `--target` it reaches the image and not build scripts.
+    Ok(flags.join("\u{1f}"))
+}
+
+/// Cargo's home, where the registry's sources are unpacked.
+fn cargo_home() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    let home = std::env::var_os("HOME").context("neither CARGO_HOME nor HOME is set")?;
+    Ok(PathBuf::from(home).join(".cargo"))
+}
+
 fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
     let manifest = repo.firmware_manifest();
     let mut command = repo.cargo();
+    command.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        remapped(repo.root(), &cargo_home()?, &sysroot()?)?,
+    );
     command.args(["build", "--locked", "--release", "--manifest-path"]);
     command.arg(&manifest);
     command.args(["-p", image.package, "--target", image.target]);
@@ -242,4 +277,52 @@ pub fn record(repo: &Repo, measured: &[Measured]) -> Result<()> {
     fs::write(&path, existing).with_context(|| format!("writing {}", path.display()))?;
     println!("recorded in {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::*;
+
+    #[test]
+    fn each_build_path_maps_to_a_fixed_prefix_in_one_flag_each() {
+        let flags = remapped(
+            Path::new("/home/a/firmware"),
+            Path::new("/home/a/.cargo"),
+            Path::new("/home/a/.rustup/toolchains/1.98.1"),
+        )
+        .expect("UTF-8 paths");
+        let flags: Vec<&str> = flags.split('\u{1f}').collect();
+        assert_eq!(
+            flags,
+            [
+                "--remap-path-prefix=/home/a/firmware=/o89",
+                "--remap-path-prefix=/home/a/.cargo=/cargo",
+                "--remap-path-prefix=/home/a/.rustup/toolchains/1.98.1=/rustc",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_checkout_path_with_a_space_stays_one_flag() {
+        let flags = remapped(
+            Path::new("/Users/a b/firmware"),
+            Path::new("/c"),
+            Path::new("/s"),
+        )
+        .expect("UTF-8 paths");
+        assert_eq!(
+            flags.split('\u{1f}').next(),
+            Some("--remap-path-prefix=/Users/a b/firmware=/o89")
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf_8_is_refused_rather_than_mangled() {
+        let bad = Path::new(OsStr::from_bytes(b"/home/\xff/firmware"));
+        let error = remapped(bad, Path::new("/c"), Path::new("/s")).expect_err("refused");
+        assert!(format!("{error:#}").contains("is not UTF-8"), "{error:#}");
+    }
 }
