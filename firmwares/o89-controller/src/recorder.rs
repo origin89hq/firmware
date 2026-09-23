@@ -570,7 +570,7 @@ async fn serve_time(
     let now = Tick::from_millis(Instant::now().as_millis());
     if CLOCK.lock(|clock| clock.borrow().audit_pending()) {
         if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
-            && append_record(ring, scratch, change.offer_record(), calendar.now())
+            && append_record(ring, scratch, change.record(), calendar.now())
                 .await
                 .is_ok()
         {

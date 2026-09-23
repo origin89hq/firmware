@@ -82,27 +82,44 @@ pub enum OfferIntake {
 }
 
 /// A proposed change. Applying it and recording it belong to the adapter.
+///
+/// It carries its source from the decision that made it to the record that
+/// names it, through the calendar's journal across a reset, because the
+/// source is fixed by which message moved the clock and read from nowhere
+/// else (P-111).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ClockChange {
     old: Option<UnixMillis>,
     new: UnixMillis,
+    source: TimeSource,
 }
 
 impl ClockChange {
-    pub(crate) const fn recovered(old: Option<UnixMillis>, new: UnixMillis) -> Self {
-        Self { old, new }
+    pub(crate) const fn recovered(
+        old: Option<UnixMillis>,
+        new: UnixMillis,
+        source: TimeSource,
+    ) -> Self {
+        Self { old, new, source }
     }
 
-    /// Audit body for an accepted link offer. Its source is the registry's
-    /// comms source, never the link-local source number (P-111, L-162).
+    /// The `time set` record's body (P-111, P-215): `ntp-via-comms` for an
+    /// accepted link offer, never the link-local source number (L-162), and
+    /// `client` for a signed client write.
     #[must_use]
-    pub fn offer_record(self) -> ControllerRecord {
+    pub fn record(self) -> ControllerRecord {
         ControllerRecord::TimeSet {
             old: self.old.map(UnixMillis::as_millis),
             new: self.new.as_millis(),
-            source: TimeSource::NtpViaComms,
+            source: self.source,
         }
+    }
+
+    /// Which message moved the clock.
+    #[must_use]
+    pub const fn source(self) -> TimeSource {
+        self.source
     }
 
     /// The previous reading, absent when the RTC was unknown.
@@ -171,7 +188,11 @@ impl WallClock {
             }
         }
         let new = UnixMillis::new(at).ok_or(TimeOffer::RefusedImplausible)?;
-        Ok(ClockChange { old: current, new })
+        Ok(ClockChange {
+            old: current,
+            new,
+            source: TimeSource::NtpViaComms,
+        })
     }
 
     /// Reserve a request until its answer is taken. Storage work and queued
@@ -528,7 +549,8 @@ mod tests {
                 clock.offer(at, None, time(FLOOR), Tick::ZERO),
                 Ok(ClockChange {
                     old: None,
-                    new: time(at)
+                    new: time(at),
+                    source: TimeSource::NtpViaComms,
                 })
             );
         }
@@ -578,7 +600,7 @@ mod tests {
                 .offer(FLOOR + 1, old, time(FLOOR), Tick::ZERO)
                 .unwrap();
             assert_eq!(
-                change.offer_record(),
+                change.record(),
                 ControllerRecord::TimeSet {
                     old: old.map(UnixMillis::as_millis),
                     new: FLOOR + 1,
@@ -586,10 +608,10 @@ mod tests {
                 }
             );
             let mut bytes = [0; km43::CONTROLLER_RECORD_MAX_BYTES];
-            let len = change.offer_record().encode(&mut bytes).unwrap();
+            let len = change.record().encode(&mut bytes).unwrap();
             assert_eq!(
                 ControllerRecord::decode(km43::EventKind::TIME_SET, &bytes[..len]),
-                Ok(change.offer_record())
+                Ok(change.record())
             );
         }
     }

@@ -281,7 +281,7 @@ impl Bench {
                             {
                                 Ok(change) => {
                                     self.calendar = Some((change.new_value(), self.now));
-                                    self.clock_records.push(change.offer_record());
+                                    self.clock_records.push(change.record());
                                     self.clock.offer_applied(self.now);
                                     km43::TimeOffer::Accepted
                                 }
