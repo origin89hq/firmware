@@ -50,6 +50,7 @@ mod link;
 pub mod mailbox;
 pub mod map;
 mod network;
+mod pairing_report;
 mod panic_record;
 mod rail;
 mod rail_turn;

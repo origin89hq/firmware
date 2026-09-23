@@ -307,6 +307,20 @@ impl PairingWindow {
             .is_some_and(|age| age < PAIRING_WINDOW)
     }
 
+    /// When the window closes on the monotonic tick, while it is open at
+    /// `now`; `None` once it has closed, expired or never opened. A window
+    /// opened so near the end of the tick's range that its deadline does not
+    /// fit has none to report: it reads as closed to the comms processor,
+    /// which shortens radio reachability and never grants enrolment.
+    #[must_use]
+    pub fn deadline(&self, now: Tick) -> Option<Tick> {
+        let opened = self.opened?;
+        let age = now.since(opened)?;
+        (age < PAIRING_WINDOW)
+            .then(|| opened.after(PAIRING_WINDOW))
+            .flatten()
+    }
+
     /// Close on reset or a persistence fault.
     pub fn close(&mut self) {
         self.opened = None;
@@ -374,6 +388,17 @@ impl Panel {
     #[must_use]
     pub fn pairing_open(&self, now: Tick) -> bool {
         !self.reset_blocked && self.window.is_open(now)
+    }
+
+    /// The open window's monotonic deadline, which the link reports to the
+    /// comms processor (L-195); `None` while enrolment is closed, a failed
+    /// reset's block included.
+    #[must_use]
+    pub fn pairing_deadline(&self, now: Tick) -> Option<Tick> {
+        if self.reset_blocked {
+            return None;
+        }
+        self.window.deadline(now)
     }
 
     /// Permission at the moment a time operation is processed (P-117).
@@ -592,6 +617,84 @@ mod tests {
             hold(SelectorPosition::Off, 200);
         }
         hold(SelectorPosition::Off, 10_100);
+    }
+
+    /// The deadline the link reports is the gesture's instant plus the
+    /// window, the same at every read while it is open, and gone at the
+    /// instant the window expires; a second gesture moves it.
+    #[test]
+    fn l_195_the_reported_deadline_is_fixed_by_the_opening_and_ends_with_the_window() {
+        let at = Tick::from_millis;
+        let mut window = PairingWindow::new();
+        assert_eq!(window.deadline(at(5_000)), None, "closed at boot");
+        window.gesture(Gesture::Pairing, at(5_000));
+        for now in [5_000, 60_000, 124_999] {
+            assert_eq!(window.deadline(at(now)), Some(at(125_000)), "at {now}");
+        }
+        assert_eq!(
+            window.deadline(at(125_000)),
+            None,
+            "expired at the deadline"
+        );
+        assert!(!window.is_open(at(125_000)));
+        assert_eq!(window.deadline(at(4_999)), None, "before the opening");
+        window.gesture(Gesture::Pairing, at(130_000));
+        assert_eq!(window.deadline(at(130_000)), Some(at(250_000)));
+        window.gesture(Gesture::FloorOverride, at(131_000));
+        assert_eq!(window.deadline(at(131_000)), Some(at(250_000)));
+        window.gesture(Gesture::FactoryReset, at(132_000));
+        assert_eq!(window.deadline(at(132_000)), None);
+    }
+
+    /// A window whose deadline the tick cannot hold is reported closed,
+    /// though enrolment still reads it open.
+    #[test]
+    fn l_195_a_deadline_past_the_ticks_range_is_reported_closed() {
+        let mut window = PairingWindow::new();
+        let late = Tick::from_millis(u64::MAX - 1_000);
+        window.gesture(Gesture::Pairing, late);
+        assert_eq!(window.deadline(late), None);
+        assert!(window.is_open(late));
+    }
+
+    /// Enrolment, a factory reset and a failed reset's block each leave the
+    /// panel with no deadline to report.
+    #[test]
+    fn l_195_the_panel_reports_no_deadline_once_enrolment_is_closed() {
+        use SelectorPosition::{Auto, Manual};
+        let mut panel = Panel::new();
+        let mut now = 0;
+        assert_eq!(panel.pairing_deadline(Tick::from_millis(now)), None);
+        gesture(&mut panel, [Auto; 3], &mut now);
+        let deadline = panel
+            .pairing_deadline(Tick::from_millis(now))
+            .expect("open after the gesture");
+        let left = deadline
+            .since(Tick::from_millis(now))
+            .expect("in the future")
+            .as_millis();
+        assert!(left > 100_000 && left <= 120_000, "{left} ms left");
+        panel.enrolled();
+        assert_eq!(panel.pairing_deadline(Tick::from_millis(now)), None);
+        // Leave the spent gesture, open again, then reset: closed and
+        // blocked until the reset lands.
+        panel.sample(Some(Auto), Tick::from_millis(now));
+        now += 110;
+        gesture(&mut panel, [Auto; 3], &mut now);
+        assert!(panel.pairing_deadline(Tick::from_millis(now)).is_some());
+        panel.sample(Some(Auto), Tick::from_millis(now));
+        now += 110;
+        gesture(&mut panel, [Auto, Manual, Auto], &mut now);
+        assert_eq!(panel.pairing_deadline(Tick::from_millis(now)), None);
+        panel.reset_finished(false);
+        panel.sample(Some(Auto), Tick::from_millis(now));
+        now += 110;
+        gesture(&mut panel, [Auto; 3], &mut now);
+        assert_eq!(
+            panel.pairing_deadline(Tick::from_millis(now)),
+            None,
+            "a failed reset blocks the report as it blocks enrolment"
+        );
     }
 
     /// One press, one enrolment: a `Pair` that enrolled or reclaimed closes

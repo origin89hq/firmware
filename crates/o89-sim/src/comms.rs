@@ -21,8 +21,8 @@ use std::collections::VecDeque;
 use km43::{
     ClientDown, ClientUp, ClockOffer, CloseConnections, CloseReason, DisconnectReason, Envelope,
     ErrorBody, FrameReader, FrameWriter, Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader,
-    LinkMessageType, LinkTransport, LinkUp, MAX_FRAME, MessageType, Received, ReqId, SessionId,
-    Side, Version,
+    LinkMessageType, LinkTransport, LinkUp, MAX_FRAME, MessageType, PairingWindowNotice, Received,
+    ReqId, SessionId, Side, Version,
 };
 use o89_comms_core::{Frame, Identity, Link as CommsLink};
 use o89_core::{HEARTBEAT_PERIOD, Millis, OURS, Tick};
@@ -179,6 +179,15 @@ pub enum Heard {
         conn: u16,
         /// Why.
         reason: CloseReason,
+    },
+    /// The controller reported its pairing window.
+    PairingWindow {
+        /// Its request id.
+        req_id: ReqId,
+        /// The report's revision.
+        revision: u64,
+        /// What was left of the window when it was first sent; 0 closed.
+        remaining_ms: u32,
     },
     /// A refusal, with the code as the wire carries it.
     Refusal {
@@ -502,6 +511,38 @@ impl HostileComms {
                 | Heard::Heartbeat { .. }
                 | Heard::HeartbeatAck { .. }
                 | Heard::Refusal { .. }
+                | Heard::PairingWindow { .. }
+                | Heard::Other { .. } => None,
+            })
+            .collect()
+    }
+
+    /// How long the pairing window its link learned from the controller
+    /// stays open, measured on its own clock; `None` closed, never
+    /// reported, or with no link since its power went.
+    #[must_use]
+    pub fn pairing_window(&self, now: Tick) -> Option<Millis> {
+        self.link.as_ref().and_then(|link| link.pairing_window(now))
+    }
+
+    /// Every pairing report heard, in order: request, revision, remaining.
+    #[must_use]
+    pub fn pairing_reports(&self) -> Vec<(ReqId, u64, u32)> {
+        self.heard
+            .iter()
+            .filter_map(|heard| match heard {
+                Heard::PairingWindow {
+                    req_id,
+                    revision,
+                    remaining_ms,
+                } => Some((*req_id, *revision, *remaining_ms)),
+                Heard::ToClient { .. }
+                | Heard::Close { .. }
+                | Heard::LinkUp { .. }
+                | Heard::LinkUpAck { .. }
+                | Heard::Heartbeat { .. }
+                | Heard::HeartbeatAck { .. }
+                | Heard::Refusal { .. }
                 | Heard::Other { .. } => None,
             })
             .collect()
@@ -589,6 +630,9 @@ impl HostileComms {
             Frame::CloseReport { .. } => (Some(LinkMessageType::CloseConnectionAck), false, false),
             Frame::TimeOffer { .. } => (Some(LinkMessageType::TimeOffer), false, false),
             Frame::NetReport { .. } => (Some(LinkMessageType::NetConfigAck), false, false),
+            Frame::PairingWindowAck { .. } => {
+                (Some(LinkMessageType::PairingWindowAck), false, false)
+            }
             Frame::Refuse { .. } => (None, false, false),
         };
         let silent = match self.caps.answers {
@@ -738,6 +782,13 @@ impl HostileComms {
                         })
                 }
                 Ok(LinkMessageType::HeartbeatAck) => Some(Heard::HeartbeatAck { req_id }),
+                Ok(LinkMessageType::PairingWindow) => PairingWindowNotice::decode(envelope)
+                    .ok()
+                    .map(|notice| Heard::PairingWindow {
+                        req_id,
+                        revision: notice.revision().get(),
+                        remaining_ms: notice.remaining_ms(),
+                    }),
                 Ok(LinkMessageType::CloseConnection) => CloseConnections::decode(envelope)
                     .ok()
                     .map(|close| Heard::Close {

@@ -356,7 +356,11 @@ async fn unpowered(endpoint: &mut Endpoint) -> Option<Actions> {
             }
         }
         Err(_) => {
-            let actions = endpoint.tick(Uptime.now(), install_in_flight());
+            let actions = endpoint.tick(
+                Uptime.now(),
+                install_in_flight(),
+                selector::pairing_deadline(),
+            );
             perform_quiet(&actions);
             None
         }
@@ -1325,7 +1329,14 @@ async fn service_tick(
     {
         return Some(ended);
     }
-    let actions = endpoint.tick(Uptime.now(), install_in_flight());
+    // The panel's window as it stands now, after any `Pair` this turn
+    // answered: that answer is already on the wire, so the closed report
+    // this tick owes goes out behind it (L-195).
+    let actions = endpoint.tick(
+        Uptime.now(),
+        install_in_flight(),
+        selector::pairing_deadline(),
+    );
     perform(&endpoint.link, tx, writer, &actions).await
 }
 
