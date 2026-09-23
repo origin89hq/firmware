@@ -641,20 +641,31 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         Ok(())
     }
 
-    /// The first sequence held: the first record found walking forward
-    /// from two past the head, over erased and closed blocks alike.
+    /// The first sequence held.
     ///
-    /// An erased block is not the end of the walk. Before the first wrap
-    /// the blocks after the head are erased and the walk comes round to
-    /// the first block of the part, which is the anchor's; but a dropped
-    /// oldest block (#78) leaves two erased blocks ahead of the head with
-    /// older records after them, and stopping at the first would answer
-    /// with a newer block's sequence and hide every record behind it.
+    /// Before the ring has wrapped, the records sit in one run in block
+    /// order and the oldest is the anchor's, the first block of the part
+    /// that holds any. Once it has wrapped, the oldest are the first found
+    /// walking forward from two past the head, over erased and closed
+    /// blocks alike: a dropped oldest block (#78) leaves two or more erased
+    /// blocks ahead of the head with older records after them, and stopping
+    /// at the first would answer with a newer block's sequence and hide
+    /// every record behind it.
+    ///
+    /// The last block tells the two apart in one probe: a ring that has
+    /// wrapped has written it, and one that has not has never reached it
+    /// unless the head is there. That keeps the walk to the gap ahead of
+    /// the head rather than every block of a young ring, which is a second
+    /// of reads on the part at every boot and every page turn.
     async fn find_the_oldest(
         &mut self,
         anchor: u64,
         scratch: &mut [u8],
     ) -> Result<Option<u64>, RingError<N::Error>> {
+        let last = self.blocks.saturating_sub(1);
+        if self.head.block != last && self.probe(last, scratch).await? == Probe::Erased {
+            return Ok(Some(anchor));
+        }
         let mut block = self.next_block(self.next_block(self.head.block));
         for _ in 0..self.blocks {
             yield_now().await;
@@ -1268,6 +1279,36 @@ mod tests {
             let again = open_with(&mut part, 8);
             assert_eq!(again.head(), head, "fill {fill}: a boot agrees");
         }
+    }
+
+    /// Bytes a boot reads to open a ring of `blocks` blocks holding twenty
+    /// records in its first.
+    fn open_reads(blocks: u32) -> usize {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open_with(&mut part, blocks);
+        for _ in 0..20 {
+            append(&mut ring, None);
+        }
+        close(&mut part, ring);
+        let before = part.read;
+        let ring = open_with(&mut part, blocks);
+        close(&mut part, ring);
+        part.read.saturating_sub(before)
+    }
+
+    /// A young ring's boot does not walk the blocks it has never reached to
+    /// find its oldest record: on the part that is 3712 of them and a
+    /// second of reads, at every boot and every page turn. Doubling the
+    /// ring adds a step of the head search and nothing like a probe per
+    /// block.
+    #[test]
+    fn f_023_a_young_rings_boot_reads_about_the_same_however_many_blocks_it_has() {
+        let small = open_reads(16);
+        let large = open_reads(32);
+        assert!(
+            large < small.saturating_add(16 * HEADER),
+            "{small} bytes for 16 blocks and {large} for 32: a probe per block"
+        );
     }
 
     #[test]
