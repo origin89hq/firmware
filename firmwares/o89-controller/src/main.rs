@@ -363,11 +363,15 @@ async fn main(spawner: Spawner) {
             epoch: epoch_record,
             clients,
             challenges,
+            configuration,
+            network,
             cuts,
             boots,
             ..
         }) => (
             Some(Keys {
+                configuration,
+                network,
                 secret: secret.present().copied(),
                 epoch,
                 epoch_record,

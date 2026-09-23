@@ -662,7 +662,14 @@ transaction, and a write that fails fails closed (P-079). Between the MAC
 and the counter, each session holds the highest `req_id` it accepted and
 the four below it, and drops a request whose `req_id` it accepted already or
 that is below that window, unanswered, as P-022 requires. Commands are
-reserved until an output has been granted authority.
+reserved until an output has been granted authority. `GetConfig` verifies its
+wrapper and request window before reading identity, network, or a behaviour's
+shadow flag. Signed `SetConfig` goes through `admit`: the counter lands first,
+then `check_version`, then section validation, then the inactive slot. A stale
+version or invalid body spends its authenticated counter without changing the
+section. Structure errors answer Error 1; invalid values answer SetConfigAck 3.
+Network reads use `NetworkRead`, which can report `psk_set` but cannot hold a
+passphrase. A write omitting `psk` retains it only for the byte-identical SSID.
 
 ### The link
 

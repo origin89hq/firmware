@@ -61,6 +61,8 @@ pub(crate) fn unit() -> (SimFram, Keys) {
     .expect("lands");
     assert!(paired.is_ok(), "slot 1 enrolled");
     let keys = Keys {
+        configuration: store.configuration,
+        network: store.network,
         secret: store.secret.present().copied(),
         epoch: report.epoch.epoch(),
         epoch_record: store.epoch,

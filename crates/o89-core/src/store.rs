@@ -41,6 +41,8 @@ use crate::write_volume::{WRITE_VOLUME_BYTES, WriteVolume};
 
 /// What the controller keeps on the part, as this boot read it.
 pub struct Store {
+    /// Versioned identity and behaviour sections.
+    pub configuration: crate::Configuration,
     /// The device secret every key derives from.
     pub secret: Kept<Secret, SECRET_BYTES>,
     /// The epoch (P-085).
@@ -215,6 +217,8 @@ impl Store {
         let network = Kept::<Network, NETWORK_BYTES>::read(map::NETWORK, fram).await?;
         let mut cuts = Kept::<CutsRecord, CUTS_RECORD_BYTES>::read(map::RECENT_CUTS, fram).await?;
 
+        let configuration = crate::Configuration::read(fram).await?;
+
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
             Held::Absent => match epoch.write(fram, Epoch::FIRST).await {
@@ -290,6 +294,7 @@ impl Store {
         };
         Ok((
             Self {
+                configuration,
                 secret,
                 epoch,
                 clients,
@@ -345,7 +350,7 @@ mod tests {
     use crate::tick::Tick;
 
     /// Enough of the part for every record the boot reads.
-    const PART_BYTES: usize = 4096;
+    const PART_BYTES: usize = map::END.0 as usize;
     const _: () = assert!(map::RECENT_CUTS.end().0 as usize <= PART_BYTES);
     const _: () = assert!(PART_BYTES <= FRAM_BYTES);
 

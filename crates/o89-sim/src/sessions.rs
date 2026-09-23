@@ -723,10 +723,138 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
 fn reread(part: &mut SimFram) -> Option<o89_core::Keys> {
     let (store, report) = block_on(o89_core::Store::boot(part, None)).ok()?;
     Some(o89_core::Keys {
+        configuration: store.configuration,
+        network: store.network,
         secret: store.secret.present().copied(),
         epoch: report.epoch.epoch(),
         epoch_record: store.epoch,
         clients: store.clients,
         challenges: store.challenges,
     })
+}
+
+impl Client {
+    fn config_write(
+        &mut self,
+        counter: u64,
+        expected: u32,
+        body: &[u8],
+        key: &SessionKey,
+    ) -> Vec<u8> {
+        let mut operation = [0; 128];
+        let len = km43::SetConfigOperation {
+            section: km43::ConfigSection::IdentityAndSite,
+            expected_version: expected,
+            body,
+        }
+        .encode(&mut operation)
+        .expect("operation");
+        let mut frame = [0; 256];
+        let len = Signed::over(
+            self.header(MessageType::SetConfig),
+            ClientId::new(1).expect("client"),
+            Counter(counter),
+            &operation[..len],
+            key,
+        )
+        .expect("signed")
+        .write(&mut frame)
+        .expect("frame");
+        frame[..len].to_vec()
+    }
+}
+
+#[test]
+fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
+    // Capabilities: none; cuts happen behind the FRAM seam, after authentication.
+    let mut initial = linked();
+    announce(&mut initial, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut initial);
+    let key = client.key.take().expect("key");
+    let first = client.config_write(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
+    let answers = client.send(&mut initial, &first);
+    let verified =
+        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
+            .expect("wrapper")
+            .verify(&key)
+            .expect("MAC");
+    assert_eq!(
+        km43::SetConfigAck::decode(verified.payload())
+            .expect("ack")
+            .outcome,
+        km43::SetConfig::Accepted
+    );
+    let seed = initial.fram.clone();
+    let facts = Facts {
+        model: MODEL,
+        fw_controller: "sim",
+        fw_comms: "sim",
+        log: LOG,
+        time_known: false,
+        pairing_open: false,
+        link_up: true,
+    };
+    // Establish the exact write length once; each replay below gets a fresh session
+    // over the same persisted first version, then the cut starts immediately.
+    let mut steps = None;
+    for cut in 0..3000 {
+        if steps.is_some_and(|steps| cut > steps) {
+            break;
+        }
+        let mut bench = linked();
+        bench.fram = seed.clone();
+        let keys = reread(&mut bench.fram).expect("boot");
+        bench.endpoint.sessions = Sessions::new(keys);
+        announce(&mut bench, 1);
+        let mut client = Client::on(1);
+        let _ = client.open(&mut bench);
+        let key = client.key.take().expect("key");
+        let frame = client.config_write(2, 1, &[0xa1, 1, 0x61, b'b'], &key);
+        bench.fram.reboot();
+        if steps.is_some() {
+            bench.fram.cut_after(cut - 1);
+        }
+        let mut dst = [0; 256];
+        let _ = block_on(bench.endpoint.sessions.frame(
+            &frame,
+            bench.now,
+            &facts,
+            &mut bench.fram,
+            &mut dst,
+        ));
+        if steps.is_none() {
+            steps = Some(bench.fram.bytes_written());
+            continue;
+        }
+        bench.fram.reboot();
+        let keys = reread(&mut bench.fram).expect("recover");
+        let mut body = [0; 100];
+        let len = keys
+            .configuration
+            .answer(
+                km43::ConfigSection::IdentityAndSite,
+                &keys.network,
+                &mut body,
+            )
+            .expect("answer");
+        let answer = km43::ConfigAnswer::decode(&body[..len]).expect("decode");
+        assert!(
+            matches!(
+                (answer.version(), answer.body()),
+                (1, Some([0xa1, 1, 0x61, b'a'])) | (2, Some([0xa1, 1, 0x61, b'b']))
+            ),
+            "cut {cut}"
+        );
+        if answer.version() == 2 {
+            assert_eq!(
+                keys.clients
+                    .present()
+                    .expect("table")
+                    .accepted(ClientId::new(1).expect("client")),
+                Some(Counter(2))
+            );
+        }
+    }
+    assert!(steps.is_some_and(|steps| steps > 0 && steps < 2999));
 }
