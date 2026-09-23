@@ -662,13 +662,36 @@ count (F-039): the G0 has no RNG, and what L-040 needs is a number that
 is new at every boot and never read back from RAM, which a boot count kept
 on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
-Until the session layer and the clock exist, a connection the comms
-processor announces is refused as not yet linked before the `LinkUp`
-exchange and as a full table after it, which a table of no rows is; a
-handle it releases is unknown; a time offer is refused as implausible,
-because a controller that cannot take a time cannot find one plausible.
-Every answer is a real outcome the peer acts on and never silence, which
-L-015 would read as a dead link. M4 replaces each arm.
+Until the session layer exists, a connection the comms processor announces
+is refused as not yet linked before the `LinkUp` exchange and as a full table
+after it; a handle it releases is unknown. Time offers go through a bounded
+queue to the recorder, which owns the RTC and reads the newest timestamp from
+`Ring::floor` when the calendar is unknown. Each value retains its receipt tick
+and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
+set must lie within ten Julian years of the floor; later offers may correct
+at most five seconds in either direction. The fifteen-minute acceptance limit
+uses the monotonic tick and survives comms resets. Each accepted change writes
+KM43's `time set` body with the old value, new value and `ntp-via-comms` source.
+Records acquire timestamps once the calendar is known; earlier records stay
+untouched.
+
+The RTC adapter admits reads and writes only with a ready LSE source, for
+2000–2099. Its five TAMP backup words hold a format marker, the fractional
+millisecond offset (the HAL sets whole seconds), and an unfinished change's old
+and new values. The marker is invalidated before a calendar write and committed
+after it; interruption before commit leaves the calendar unknown. An applied
+change waits for its audit append, retried at most once a second. No later offer
+is applied until that audit lands. The pending audit survives link loss and
+controller reset. A reset between append and journal acknowledgement may repeat
+the original audit record, without applying the change again. Acceptance is
+returned only after both writes succeed and remains replayable for the protocol's
+three 500 ms attempts, keyed by request ID and original value. Link loss or
+expiry clears that bounded reply cache so IDs can be reused.
+
+Boot validity requires the backup-domain flag, ready LSE and a readable marked
+calendar. Signed client Time and its floor override remain dependent on #85,
+#86 and km43#73; the reset and backup-cell tests in #87 still require board
+evidence.
 
 On the controller the link task owns USART1's pins for the life of the
 part and builds the UART only for as long as the module is powered: the
@@ -1122,9 +1145,41 @@ a hang the watchdog ends the same way, and either shows on the controller
 as a new `boot_id` and the ROM's text counted once. A console on UART1's
 unconnected pins is a bench addition when the radio work needs one.
 
-**A heap only for the radio.** The radio blobs cannot run without one; our
-own code there is written as if it had none, and `o89-comms` never depends
-on `o89-core`, which the gate refuses.
+**A heap only for the radio (F-037).** The ESP32 vendor Wi-Fi/BLE stack may
+allocate from a fixed-budget heap backed by statically reserved RAM. Initialize
+it only after the recovery download window has completed. This exception does
+not extend to the STM32, domain crates or their tests, or our ESP32 application
+and transport code. Connection tables, fragment assemblies and queues retain
+named static capacities and refuse at capacity without eviction. `o89-comms`
+never depends on `o89-core`, which the gate refuses.
+
+The pinned radio stack's required allocator and scheduler integration must be
+identified during qualification; the exception is not permission for a BLE host
+or an unrelated dependency to allocate. Disabling `esp-alloc` alone does not
+remove allocation: [Espressif's radio documentation][radio-allocation] requires
+replacement allocation functions. Heap initialization and the stack's allocator
+adapter are the only allocation plumbing our firmware may supply.
+
+[#89](https://github.com/origin89hq/firmware/issues/89) owns the shared radio
+initialization; [#96](https://github.com/origin89hq/firmware/issues/96) qualifies
+BLE and coexistence against that same memory budget. Before accepting a stack,
+record its exact pins, allocating components, reserved heap bytes, static RAM,
+task stacks, transport buffers and linked release size, with remaining margins.
+Choose the heap size from measured Wi-Fi/BLE operation; no heap size or stack
+is qualified by this exception alone.
+
+Qualification must measure peak heap use and fragmentation through repeated
+connect/disconnect cycles, full connections and queues, and BLE traffic while
+Wi-Fi associates, reconnects or fails. Exercise allocation failure during both
+initialization and operation. Where the stack returns an error, refuse the
+affected work and clean up its resources; where it cannot recover, reset the
+ESP32 through the existing reset/watchdog path. Verify that the controller keeps
+operating, stale client sessions cannot be reused, and no failure grants KM43
+permission. Revalidate the early download window with the radio stack present,
+including recovery after exhaustion. These are board acceptance obligations,
+not claims established by a host test or a fixed heap size.
+
+[radio-allocation]: https://docs.espressif.com/projects/rust/esp-radio/0.18.0/esp32c6/esp_radio/index.html#feature-flags
 
 **Partitions and recovery.** `otadata`, two OTA slots, a **factory** slot
 that OTA never writes and that always carries the window, a single-network

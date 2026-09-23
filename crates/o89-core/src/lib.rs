@@ -28,8 +28,10 @@
 
 mod body;
 mod boot_count;
+mod calendar;
 mod challenge;
 mod clients;
+mod clock_journal;
 mod dedup;
 mod epoch;
 mod fail_state;
@@ -58,12 +60,15 @@ mod secret;
 mod store;
 mod text;
 mod tick;
+mod wall_clock;
 mod write_volume;
 
 pub use body::*;
 pub use boot_count::*;
+pub use calendar::*;
 pub use challenge::*;
 pub use clients::*;
+pub use clock_journal::*;
 pub use dedup::*;
 pub use epoch::*;
 pub use fail_state::*;
@@ -90,4 +95,5 @@ pub use secret::*;
 pub use store::*;
 pub use text::*;
 pub use tick::*;
+pub use wall_clock::*;
 pub use write_volume::*;

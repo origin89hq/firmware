@@ -112,8 +112,9 @@ pub struct Module {
 pub struct Board {
     /// The independent watchdog.
     pub iwdg: Peri<'static, p::IWDG>,
+    /// The five retained backup words for calendar validity and pending audit.
+    pub tamp: Peri<'static, p::TAMP>,
     /// The RTC on the LSE.
-    #[expect(dead_code, reason = "taken in M4, the time offers")]
     pub rtc: Peri<'static, p::RTC>,
 
     /// `RUN` to board B, CN9 pin 3.
@@ -204,6 +205,7 @@ impl Board {
         Self {
             iwdg: p.IWDG,
             rtc: p.RTC,
+            tamp: p.TAMP,
             gen_run: p.PD0,
             gen_kick: p.PD1,
             gen_feedback: p.PD2,
