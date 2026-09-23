@@ -27,9 +27,9 @@ use km43::{
     MAX_EVENT_QUEUE, ReqId, TimeOffer,
 };
 use o89_core::{
-    BootCount, CUTS_RECORD_BYTES, Class, CutsRecord, Keep, KeepAnswer, Kept, LinkEvent, LogSpan,
-    MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring, SCRATCH, Task,
-    Tick, UnixMillis, WallClock,
+    Answered, BootCount, CUTS_RECORD_BYTES, Class, CutsRecord, Keep, KeepAnswer, Kept, LinkEvent,
+    LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring, SCRATCH,
+    Task, Tick, UnixMillis, WallClock,
 };
 
 use crate::fram::Lease;
@@ -577,13 +577,23 @@ async fn serve_time(
             match calendar.recorded() {
                 Ok(()) => {
                     let now = Tick::from_millis(Instant::now().as_millis());
-                    if let Some(req_id) = CLOCK.lock(|clock| clock.borrow_mut().audit_written(now))
-                        && TIME_ANSWER
-                            .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
-                            .is_err()
-                    {
-                        CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
-                        defmt::warn!("clock: reply queue full; acceptance retained for retry");
+                    match CLOCK.lock(|clock| clock.borrow_mut().audit_written(now)) {
+                        Some(Answered::Offer(req_id)) => {
+                            if TIME_ANSWER
+                                .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
+                                .is_err()
+                            {
+                                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                                defmt::warn!(
+                                    "clock: reply queue full; acceptance retained for retry"
+                                );
+                            }
+                        }
+                        // No client path moves the clock yet.
+                        Some(Answered::Client) => {
+                            defmt::warn!("clock: a client set landed with nobody to answer");
+                        }
+                        None => {}
                     }
                 }
                 Err(error) => {
