@@ -134,6 +134,11 @@ pub enum Verdict {
     /// entry cannot say which. P-080 says to answer from the state store,
     /// which knows what the hardware is doing and this table does not.
     InFlight(Reserved),
+    /// The same command, still executing under a permit this boot handed
+    /// out. Error 7: the retry waits for the answer, and is never handed to
+    /// the state store, which would see the hardware not moved yet and run
+    /// the command a second time beside the first.
+    Running,
     /// The same client and id, different bytes. A client bug: answer
     /// `rejected` with a detail a person can read, never `duplicate`, and
     /// never execute (P-124).
@@ -142,6 +147,18 @@ pub enum Verdict {
     /// because evicting the oldest entry is what makes a duplicate
     /// executable again (P-122).
     Busy,
+}
+
+/// What settling an entry left in flight found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a settlement that found the command running must not answer for it"]
+pub(crate) enum Settling {
+    /// It was still in flight and unheld, and is settled now.
+    Settled,
+    /// A permit holds it: its command is running.
+    Held,
+    /// It is not in flight any more: settled, completed or reused since.
+    Gone,
 }
 
 /// One remembered command.
@@ -153,6 +170,9 @@ struct Entry {
     inserted: Tick,
     /// In flight, or what it did.
     status: Option<Recorded>,
+    /// In flight under a permit this boot still holds. Never on the part:
+    /// every entry a boot reads was left by a run that is over.
+    held: bool,
 }
 
 /// The commands seen inside the window.
@@ -187,6 +207,7 @@ impl Dedup {
     pub fn rebased(mut self) -> Self {
         for entry in self.entries.iter_mut().flatten() {
             entry.inserted = Tick::ZERO;
+            entry.held = false;
         }
         self
     }
@@ -239,9 +260,10 @@ impl Dedup {
                 client,
                 cmd,
             };
-            return match entry.status {
-                Some(recorded) => Verdict::Already(recorded),
-                None => Verdict::InFlight(seat),
+            return match (entry.status, entry.held) {
+                (Some(recorded), _) => Verdict::Already(recorded),
+                (None, true) => Verdict::Running,
+                (None, false) => Verdict::InFlight(seat),
             };
         }
         if held_by_client >= PER_CLIENT {
@@ -259,6 +281,7 @@ impl Dedup {
             fingerprint,
             inserted: now,
             status: None,
+            held: true,
         });
         Verdict::Fresh(Reserved {
             at: index,
@@ -291,8 +314,52 @@ impl Dedup {
             return;
         }
         match outcome {
-            Some(recorded) => entry.status = Some(recorded),
+            Some(recorded) => {
+                entry.status = Some(recorded);
+                entry.held = false;
+            }
             None => *slot = None,
+        }
+    }
+
+    /// Settle an entry a boot, or a spent permit, left in flight, as the state
+    /// store decided: completed with `outcome`, or discarded for `None`. Only
+    /// if the seat still names that entry as it was handed out: in flight and
+    /// held by no permit. Two retries can be handed the same entry, and the
+    /// one that settles second meets what the first did with it, which it
+    /// must leave alone.
+    pub(crate) fn settled(&mut self, seat: Reserved, outcome: Option<Recorded>) -> Settling {
+        let Some(slot) = self.entries.get_mut(seat.at) else {
+            return Settling::Gone;
+        };
+        let Some(entry) = slot else {
+            return Settling::Gone;
+        };
+        if entry.client != seat.client || entry.cmd != seat.cmd {
+            return Settling::Gone;
+        }
+        match (entry.status, entry.held) {
+            (Some(_), _) => Settling::Gone,
+            (None, true) => Settling::Held,
+            (None, false) => {
+                match outcome {
+                    Some(recorded) => entry.status = Some(recorded),
+                    None => *slot = None,
+                }
+                Settling::Settled
+            }
+        }
+    }
+
+    /// Let go of a reserved entry whose outcome the part would not take: the
+    /// permit is spent, so the entry is one the state store settles, as it
+    /// would be after a reset. Changes nothing the part holds.
+    pub(crate) fn released(&mut self, seat: Reserved) {
+        if let Some(Some(entry)) = self.entries.get_mut(seat.at)
+            && entry.client == seat.client
+            && entry.cmd == seat.cmd
+        {
+            entry.held = false;
         }
     }
 
@@ -349,6 +416,7 @@ impl Dedup {
                 fingerprint,
                 inserted,
                 status,
+                held: false,
             });
         }
         Ok(Self { entries })
@@ -507,15 +575,35 @@ mod tests {
         ));
     }
 
+    /// An entry a permit on this boot still holds is running, and its retry
+    /// waits. One a boot found, or whose permit is spent, is handed back for
+    /// the state store, never answered from the entry.
     #[test]
-    fn p_080_an_entry_in_flight_is_handed_back_not_answered() {
+    fn p_080_an_entry_in_flight_is_running_until_its_permit_lets_go_then_handed_back() {
         let mut table = Dedup::new();
         let Verdict::Fresh(seat) = table.admit(client(1), 7, start(), at(0)) else {
             panic!("a fresh command");
         };
         assert_eq!(
             table.admit(client(1), 7, start(), at(100)),
+            Verdict::Running
+        );
+        assert_eq!(
+            table
+                .clone()
+                .rebased()
+                .admit(client(1), 7, start(), at(100)),
             Verdict::InFlight(seat)
+        );
+        table.released(seat);
+        assert_eq!(
+            table.admit(client(1), 7, start(), at(100)),
+            Verdict::InFlight(seat)
+        );
+        // A different command with the id is still the reuse it always was.
+        assert_eq!(
+            table.admit(client(1), 7, stop(), at(100)),
+            Verdict::ReusedId
         );
     }
 
@@ -530,8 +618,19 @@ mod tests {
             panic!("a fresh command in the expired slot");
         };
         table.finished(seat, Some(Recorded::Accepted));
+        // Neither completed nor let go: still client 2's, still running.
         assert_eq!(
             table.admit(client(2), 9, stop(), at(700_001)),
+            Verdict::Running
+        );
+        // Nor released by a seat that no longer names it.
+        table.released(seat);
+        assert_eq!(
+            table.admit(client(2), 9, stop(), at(700_002)),
+            Verdict::Running
+        );
+        assert_eq!(
+            table.rebased().admit(client(2), 9, stop(), at(1)),
             Verdict::InFlight(Reserved {
                 at: 0,
                 client: client(2),
@@ -559,12 +658,15 @@ mod tests {
             panic!("a fresh command");
         };
         table.finished(seat, Some(Recorded::Shadowed));
-        let Verdict::Fresh(_) = table.admit(client(3), 1, start(), at(1_236)) else {
+        let Verdict::Fresh(held) = table.admit(client(3), 1, start(), at(1_236)) else {
             panic!("a fresh command");
         };
         assert_eq!(table.live(at(1_236)), 3);
         let mut bytes = [0u8; DEDUP_BYTES];
         table.encode_into(&mut bytes);
+        // The part never holds that a permit has an entry: what it gives back
+        // is the entry a boot finds, in flight and held by nobody.
+        table.released(held);
         assert_eq!(Dedup::decode(&bytes), Ok(table));
         // A status byte nobody allocated, in the third entry.
         bytes[2 * ENTRY_BYTES + 24] = 2;

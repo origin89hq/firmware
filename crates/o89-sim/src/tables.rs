@@ -1,10 +1,11 @@
 //! The tables' write paths, each cut at every byte, with the invariant a
 //! boot needs asserted after every cut (F-025).
 //!
-//! Seven paths, seven invariants. A factory reset leaves the old epoch
+//! Eight paths, eight invariants. A factory reset leaves the old epoch
 //! with its rows, or a higher epoch whose table the next boot clears. A
 //! command leaves its counter and its in-flight entry together or leaves
-//! neither. A pairing leaves the rows that were there, with or without the
+//! neither, and a signed one is permitted to execute only once both have
+//! landed. A pairing leaves the rows that were there, with or without the
 //! new one, and never a row half written. A mint hands out no counter and
 //! the next mint is past every one before it. A boot leaves a boot count
 //! that climbs and a panic record that is whole or absent. The recovery
@@ -14,15 +15,20 @@
 //! holds.
 
 use embassy_futures::block_on;
-use km43::{ClientId, ClientKind, Counter, Epoch};
+use km43::{
+    ClientId, ClientKind, Command, CommandKind, CommandOperation, Counter, DeviceId, DeviceSecret,
+    Envelope, Epoch, Handshake, Header, MessageType, PrintedSecret, ReqId, SessionId, Signed,
+    SignedClaim,
+};
 use std::cell::Cell;
 
 use o89_core::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH, RECENT_CUTS, RUN_REASON};
 use o89_core::{
-    Admitted, Because, Behaviour, BootCount, Booted, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
-    CUTS_RECORD_BYTES, ChallengeCounter, ClientTable, CutsRecord, EPOCH_BYTES, Fingerprint, Held,
-    Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Plan, RUN_REASON_BYTES,
-    RailSequencer, Recovery, Revision, RunReason, Running, StartKind, Store, Tick, UnixMillis,
+    Admission, Admitted, Because, Behaviour, BootCount, Booted, CHALLENGE_COUNTER_BYTES,
+    CLIENT_TABLE_BYTES, CUTS_RECORD_BYTES, ChallengeCounter, ClientTable, CutsRecord, EPOCH_BYTES,
+    Executed, Fingerprint, Held, Kept, Label, LastWords, Paired, PanicRecorded, PanicSite, Permit,
+    Plan, RUN_REASON_BYTES, RailSequencer, Recovery, Revision, RunReason, Running, StartKind,
+    Store, Tick, UnixMillis, admit,
 };
 
 use crate::{Crashes, SimFram, crash_at_every_step};
@@ -173,6 +179,114 @@ fn p_080_a_command_cut_at_any_step_lands_the_counter_and_the_in_flight_entry_tog
     );
     // No cut inside the write lands the new record: only the whole of it.
     assert_eq!(landed, 0);
+}
+
+/// How far one run of a signed command got before its cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reached {
+    /// Refused, or cut before a permit came back.
+    Nothing,
+    /// A permit came back: the handler was free to execute.
+    Permitted,
+    /// Step 6's record landed too.
+    Recorded,
+}
+
+#[test]
+fn p_080_a_signed_command_cut_at_any_step_is_permitted_only_once_its_counter_and_entry_landed() {
+    let start = with_one_phone();
+    let key = DeviceSecret::new(DeviceId::new([7; 16]), PrintedSecret::new([9; 32]))
+        .enrolment(Epoch::FIRST, client(1))
+        .session_key(
+            &Handshake {
+                challenge: [1; 16],
+                client_nonce: [2; 16],
+            },
+            SessionId::from(1),
+        );
+    let mut op = [0; 16];
+    let op_len = CommandOperation {
+        cmd_id: 42,
+        kind: CommandKind::StartGenerator,
+        args: &[0xa0],
+    }
+    .encode(&mut op)
+    .expect("fits");
+    let operation = &op[..op_len];
+    let header = Header {
+        kind: MessageType::Command,
+        session: SessionId::from(1),
+        req_id: ReqId(9),
+    };
+    let mut frame = [0; 256];
+    let frame_len = Signed::over(header, client(1), Counter(1), operation, &key)
+        .expect("a command signs")
+        .write(&mut frame)
+        .expect("fits");
+    let frame = &frame[..frame_len];
+    let reached = Cell::new(Reached::Nothing);
+    let (mut refused, mut in_flight) = (0, 0);
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            reached.set(Reached::Nothing);
+            let (_, mut clients) = boot(part);
+            let booted = block_on(clients.booted(part, Epoch::FIRST)).map_err(|_| ())?;
+            assert_eq!(booted, Booted::Rebased);
+            let claim =
+                SignedClaim::decode(Envelope::decode(frame).map_err(|_| ())?).map_err(|_| ())?;
+            let admission = block_on(admit(
+                claim,
+                &key,
+                client(1),
+                &mut clients,
+                part,
+                Tick::from_millis(5_000),
+            ));
+            let Admission::Execute(Permit::Command(reservation)) = admission else {
+                return Err(());
+            };
+            reached.set(Reached::Permitted);
+            let finished =
+                block_on(reservation.finished(&mut clients, part, Executed::Accepted, "started"));
+            assert_eq!(finished.ack.outcome, Command::Accepted);
+            finished.recorded.map_err(|_| ())?;
+            reached.set(Reached::Recorded);
+            Ok(())
+        },
+        |part, step| {
+            let (_, mut clients) = boot(part);
+            assert_eq!(
+                block_on(clients.booted(part, Epoch::FIRST)),
+                Ok(Booted::Rebased),
+                "cut at {step}"
+            );
+            let table = clients.present().expect("the table");
+            let counter = table.accepted(client(1)).expect("the phone's row");
+            // The client's retry: a new counter, the same bytes.
+            let retry = table.clone().admit(
+                client(1),
+                Counter(2),
+                42,
+                Fingerprint::of(operation),
+                Tick::from_millis(1),
+            );
+            match (counter, retry, reached.get()) {
+                // Nothing landed and nothing ran: the retry is a first try.
+                (Counter(0), Admitted::Fresh(_), Reached::Nothing) => refused += 1,
+                // Both landed and the handler may have run: the state store
+                // settles the retry, never the entry.
+                (Counter(1), Admitted::InFlight(_), Reached::Permitted) => in_flight += 1,
+                other => panic!("cut at {step}: {other:?}"),
+            }
+        },
+    )
+    .expect("the path runs uncut");
+    // Two records: the counter with its entry, then the entry completed.
+    let record = 16 + CLIENT_TABLE_BYTES;
+    assert_eq!(crashes, Crashes { steps: 2 * record });
+    assert_eq!(refused, record, "every cut in step 4 permits nothing");
+    assert_eq!(in_flight, record, "every cut in step 6 leaves it in flight");
 }
 
 #[test]

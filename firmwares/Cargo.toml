@@ -24,7 +24,7 @@ publish = false
 # 0.4.1, the same pin as the host workspace: `EnterDownload`, L-034's link
 # texts, the boot record's body, decoders that refuse a repeated key, the
 # controller records' bodies, and the `defmt` feature the core enables.
-km43 = "=0.4.1"
+km43 = "=0.5.0"
 
 embassy-executor = { version = "=0.10.0", default-features = false }
 embassy-time = { version = "=0.5.1", default-features = false }

@@ -107,7 +107,9 @@ pub const fn crosses_mismatch(side: Side, kind: LinkMessageType) -> bool {
         | LinkMessageType::TimeOffer
         | LinkMessageType::TimeOfferAck
         | LinkMessageType::EnterDownload
-        | LinkMessageType::EnterDownloadAck => false,
+        | LinkMessageType::EnterDownloadAck
+        | LinkMessageType::PairingWindow
+        | LinkMessageType::PairingWindowAck => false,
     }
 }
 
@@ -115,7 +117,8 @@ pub const fn crosses_mismatch(side: Side, kind: LinkMessageType) -> bool {
 /// is refused with 258 (L-033). Before the link only the handshake and the
 /// heartbeat are admitted; the controller answers a `ClientConnected` with
 /// an outcome of its own for that, an `EnterDownload` has the window's
-/// answer at the comms processor (L-191), and an answer is not a request.
+/// answer at the comms processor (L-191), a `PairingWindow` there is
+/// discarded unanswered (L-194), and an answer is not a request.
 #[must_use]
 pub const fn refused_before_link(side: Side, kind: LinkMessageType) -> bool {
     match kind {
@@ -137,7 +140,9 @@ pub const fn refused_before_link(side: Side, kind: LinkMessageType) -> bool {
         | LinkMessageType::NetConfigAck
         | LinkMessageType::TimeOfferAck
         | LinkMessageType::CommsReleaseAck
-        | LinkMessageType::EnterDownloadAck => false,
+        | LinkMessageType::EnterDownloadAck
+        | LinkMessageType::PairingWindow
+        | LinkMessageType::PairingWindowAck => false,
     }
 }
 

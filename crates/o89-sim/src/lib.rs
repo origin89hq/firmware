@@ -13,7 +13,7 @@
 //! crashing at every step and asserts the recovery invariant after each
 //! (VERIFICATION §6, F-025). The paths run through it: on the FRAM, one
 //! record's A/B write, a factory reset's epoch and table, a command's
-//! counter and in-flight entry, a pairing, a challenge's mint, a boot's
+//! counter and in-flight entry, a signed command from its MAC to its finished entry, a pairing, a challenge's mint, a boot's
 //! count and panic record, the ladder's cuts, and a run reason's start and
 //! stop; on the NOR, an append, a page turn and its erase ahead, and the
 //! boot that erases a block a torn record closed, itself cut, and a head a
