@@ -313,179 +313,6 @@ impl PairingWindow {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use SelectorPosition::{Auto, Manual, Off};
-
-    struct Hand {
-        gestures: SelectorGestures,
-        now: u64,
-        events: [Option<Gesture>; 4],
-        count: usize,
-    }
-
-    impl Hand {
-        fn new() -> Self {
-            Self {
-                gestures: SelectorGestures::new(),
-                now: 50_000,
-                events: [None; 4],
-                count: 0,
-            }
-        }
-
-        fn hold(&mut self, position: Option<SelectorPosition>, ms: u64) {
-            for _ in 0..ms / 10 {
-                if let Some(event) = self.gestures.sample(position, Tick::from_millis(self.now)) {
-                    self.events[self.count] = Some(event);
-                    self.count = self.count.checked_add(1).expect("bounded events");
-                }
-                self.now = self.now.checked_add(10).expect("test time fits");
-            }
-        }
-
-        fn sequence(&mut self, positions: [SelectorPosition; 3]) {
-            self.hold(Some(Off), 2_100);
-            for position in positions {
-                self.hold(Some(position), 500);
-                self.hold(Some(Off), 200);
-            }
-        }
-    }
-
-    #[test]
-    fn f_053_contact_truth_table_keeps_conflict_unknown() {
-        assert_eq!(SelectorPosition::from_contacts(true, true), Some(Off));
-        assert_eq!(SelectorPosition::from_contacts(false, true), Some(Auto));
-        assert_eq!(SelectorPosition::from_contacts(true, false), Some(Manual));
-        assert_eq!(SelectorPosition::from_contacts(false, false), None);
-    }
-
-    #[test]
-    fn p_117_1_each_sequence_emits_only_its_own_gesture_once() {
-        for (positions, expected) in [
-            ([Auto, Auto, Auto], Gesture::Pairing),
-            ([Manual, Manual, Manual], Gesture::FloorOverride),
-            ([Auto, Manual, Auto], Gesture::FactoryReset),
-        ] {
-            let mut hand = Hand::new();
-            hand.sequence(positions);
-            hand.hold(Some(Off), 130_000);
-            assert_eq!(hand.count, 1);
-            assert_eq!(hand.events[0], Some(expected));
-        }
-    }
-
-    #[test]
-    fn f_040_every_other_three_excursion_sequence_is_refused() {
-        for positions in [
-            [Auto, Auto, Manual],
-            [Auto, Manual, Manual],
-            [Manual, Auto, Auto],
-            [Manual, Auto, Manual],
-            [Manual, Manual, Auto],
-        ] {
-            let mut hand = Hand::new();
-            hand.sequence(positions);
-            hand.hold(Some(Off), 11_000);
-            assert_eq!(hand.count, 0, "{positions:?}");
-        }
-    }
-
-    #[test]
-    fn f_040_reset_waits_ten_seconds_and_never_opens_pairing_first() {
-        let mut hand = Hand::new();
-        hand.sequence([Auto, Manual, Auto]);
-        let since = hand.gestures.since.as_millis();
-        hand.hold(Some(Off), 9_000);
-        assert_eq!(hand.count, 0);
-        hand.hold(Some(Off), since + 10_000 - hand.now);
-        assert_eq!(hand.count, 0);
-        hand.hold(Some(Off), 10);
-        assert_eq!(hand.events[0], Some(Gesture::FactoryReset));
-    }
-
-    #[test]
-    fn f_053_bounce_does_not_supply_an_excursion_or_bypass_the_final_hold() {
-        let mut hand = Hand::new();
-        hand.hold(Some(Off), 2_100);
-        for _ in 0..3 {
-            hand.hold(Some(Auto), 40);
-            hand.hold(Some(Off), 100);
-        }
-        hand.hold(Some(Off), 11_000);
-        assert_eq!(hand.count, 0);
-        hand.sequence([Auto, Auto, Auto]);
-        hand.hold(Some(Off), 1_700);
-        hand.hold(Some(Auto), 10);
-        hand.hold(Some(Off), 1_990);
-        assert_eq!(hand.count, 0);
-        hand.hold(Some(Off), 20);
-        assert_eq!(hand.events[0], Some(Gesture::Pairing));
-    }
-
-    #[test]
-    fn f_040_gap_conflict_reverse_time_and_missing_off_cancel_intent() {
-        for fault in 0..4 {
-            let mut hand = Hand::new();
-            hand.sequence([Auto, Auto, Auto]);
-            match fault {
-                0 => hand.now += 101,
-                1 => hand.hold(None, 10),
-                2 => hand.now -= 1_000,
-                3 => hand.hold(Some(Manual), 100),
-                _ => panic!("unknown test fault"),
-            }
-            hand.hold(Some(Off), 11_000);
-            assert_eq!(hand.count, 0);
-        }
-        let mut hand = Hand::new();
-        hand.hold(Some(Off), 2_100);
-        hand.hold(Some(Auto), 500);
-        hand.hold(Some(Manual), 500);
-        hand.hold(Some(Off), 11_000);
-        assert_eq!(hand.count, 0);
-    }
-
-    #[test]
-    fn f_040_short_detent_and_expired_leg_are_refused_and_can_recover() {
-        for dwell in [100, 3_100] {
-            let mut hand = Hand::new();
-            hand.hold(Some(Off), 2_100);
-            hand.hold(Some(Auto), dwell);
-            hand.hold(Some(Off), 200);
-            for _ in 0..2 {
-                hand.hold(Some(Auto), 500);
-                hand.hold(Some(Off), 200);
-            }
-            hand.hold(Some(Off), 11_000);
-            assert_eq!(hand.count, 0);
-            hand.sequence([Auto, Auto, Auto]);
-            hand.hold(Some(Off), 2_100);
-            assert_eq!(hand.events[0], Some(Gesture::Pairing));
-        }
-    }
-
-    #[test]
-    fn p_066_window_expires_at_120_seconds_and_boot_is_closed() {
-        let mut window = PairingWindow::new();
-        assert!(!window.is_open(Tick::ZERO));
-        let start = Tick::from_millis(5_000);
-        window.gesture(Gesture::FloorOverride, start);
-        assert!(!window.is_open(start));
-        window.gesture(Gesture::Pairing, start);
-        assert!(window.is_open(start));
-        assert!(!window.is_open(Tick::from_millis(4_999)));
-        assert!(window.is_open(Tick::from_millis(124_999)));
-        assert!(!window.is_open(Tick::from_millis(125_000)));
-        window.gesture(Gesture::Pairing, Tick::from_millis(u64::MAX - 1));
-        assert!(window.is_open(Tick::from_millis(u64::MAX)));
-        window.gesture(Gesture::FactoryReset, Tick::from_millis(u64::MAX));
-        assert!(!window.is_open(Tick::from_millis(u64::MAX)));
-    }
-}
-
 /// Permissions held by the physical panel. Reset failures block enrolment
 /// until a later reset succeeds; time permission is consumed only by an
 /// accepted floor-crossing write, never by a refused request.
@@ -575,8 +402,176 @@ impl Panel {
 }
 
 #[cfg(test)]
-mod panel_tests {
+mod tests {
     use super::*;
+    use SelectorPosition::{Auto, Manual, Off};
+
+    struct Hand {
+        gestures: SelectorGestures,
+        now: u64,
+        events: [Option<Gesture>; 4],
+        count: usize,
+    }
+
+    impl Hand {
+        fn new() -> Self {
+            Self {
+                gestures: SelectorGestures::new(),
+                now: 50_000,
+                events: [None; 4],
+                count: 0,
+            }
+        }
+
+        fn hold(&mut self, position: Option<SelectorPosition>, ms: u64) {
+            for _ in 0..ms / 10 {
+                if let Some(event) = self.gestures.sample(position, Tick::from_millis(self.now)) {
+                    self.events[self.count] = Some(event);
+                    self.count = self.count.checked_add(1).expect("bounded events");
+                }
+                self.now = self.now.checked_add(10).expect("test time fits");
+            }
+        }
+
+        fn sequence(&mut self, positions: [SelectorPosition; 3]) {
+            self.hold(Some(Off), 2_100);
+            for position in positions {
+                self.hold(Some(position), 500);
+                self.hold(Some(Off), 200);
+            }
+        }
+    }
+
+    #[test]
+    fn f_040_contact_truth_table_keeps_conflict_unknown() {
+        assert_eq!(SelectorPosition::from_contacts(true, true), Some(Off));
+        assert_eq!(SelectorPosition::from_contacts(false, true), Some(Auto));
+        assert_eq!(SelectorPosition::from_contacts(true, false), Some(Manual));
+        assert_eq!(SelectorPosition::from_contacts(false, false), None);
+    }
+
+    #[test]
+    fn p_117_1_each_sequence_emits_only_its_own_gesture_once() {
+        for (positions, expected) in [
+            ([Auto, Auto, Auto], Gesture::Pairing),
+            ([Manual, Manual, Manual], Gesture::FloorOverride),
+            ([Auto, Manual, Auto], Gesture::FactoryReset),
+        ] {
+            let mut hand = Hand::new();
+            hand.sequence(positions);
+            hand.hold(Some(Off), 130_000);
+            assert_eq!(hand.count, 1);
+            assert_eq!(hand.events[0], Some(expected));
+        }
+    }
+
+    #[test]
+    fn f_040_every_other_three_excursion_sequence_is_refused() {
+        for positions in [
+            [Auto, Auto, Manual],
+            [Auto, Manual, Manual],
+            [Manual, Auto, Auto],
+            [Manual, Auto, Manual],
+            [Manual, Manual, Auto],
+        ] {
+            let mut hand = Hand::new();
+            hand.sequence(positions);
+            hand.hold(Some(Off), 11_000);
+            assert_eq!(hand.count, 0, "{positions:?}");
+        }
+    }
+
+    #[test]
+    fn f_040_reset_waits_ten_seconds_and_never_opens_pairing_first() {
+        let mut hand = Hand::new();
+        hand.sequence([Auto, Manual, Auto]);
+        let since = hand.gestures.since.as_millis();
+        hand.hold(Some(Off), 9_000);
+        assert_eq!(hand.count, 0);
+        hand.hold(Some(Off), since + 10_000 - hand.now);
+        assert_eq!(hand.count, 0);
+        hand.hold(Some(Off), 10);
+        assert_eq!(hand.events[0], Some(Gesture::FactoryReset));
+    }
+
+    #[test]
+    fn f_040_bounce_does_not_supply_an_excursion_or_bypass_the_final_hold() {
+        let mut hand = Hand::new();
+        hand.hold(Some(Off), 2_100);
+        for _ in 0..3 {
+            hand.hold(Some(Auto), 40);
+            hand.hold(Some(Off), 100);
+        }
+        hand.hold(Some(Off), 11_000);
+        assert_eq!(hand.count, 0);
+        hand.sequence([Auto, Auto, Auto]);
+        hand.hold(Some(Off), 1_700);
+        hand.hold(Some(Auto), 10);
+        hand.hold(Some(Off), 1_990);
+        assert_eq!(hand.count, 0);
+        hand.hold(Some(Off), 20);
+        assert_eq!(hand.events[0], Some(Gesture::Pairing));
+    }
+
+    #[test]
+    fn f_040_gap_conflict_reverse_time_and_missing_off_cancel_intent() {
+        for fault in 0..4 {
+            let mut hand = Hand::new();
+            hand.sequence([Auto, Auto, Auto]);
+            match fault {
+                0 => hand.now += 101,
+                1 => hand.hold(None, 10),
+                2 => hand.now -= 1_000,
+                3 => hand.hold(Some(Manual), 100),
+                _ => panic!("unknown test fault"),
+            }
+            hand.hold(Some(Off), 11_000);
+            assert_eq!(hand.count, 0);
+        }
+        let mut hand = Hand::new();
+        hand.hold(Some(Off), 2_100);
+        hand.hold(Some(Auto), 500);
+        hand.hold(Some(Manual), 500);
+        hand.hold(Some(Off), 11_000);
+        assert_eq!(hand.count, 0);
+    }
+
+    #[test]
+    fn f_040_short_detent_and_expired_leg_are_refused_and_can_recover() {
+        for dwell in [100, 3_100] {
+            let mut hand = Hand::new();
+            hand.hold(Some(Off), 2_100);
+            hand.hold(Some(Auto), dwell);
+            hand.hold(Some(Off), 200);
+            for _ in 0..2 {
+                hand.hold(Some(Auto), 500);
+                hand.hold(Some(Off), 200);
+            }
+            hand.hold(Some(Off), 11_000);
+            assert_eq!(hand.count, 0);
+            hand.sequence([Auto, Auto, Auto]);
+            hand.hold(Some(Off), 2_100);
+            assert_eq!(hand.events[0], Some(Gesture::Pairing));
+        }
+    }
+
+    #[test]
+    fn p_066_window_expires_at_120_seconds_and_boot_is_closed() {
+        let mut window = PairingWindow::new();
+        assert!(!window.is_open(Tick::ZERO));
+        let start = Tick::from_millis(5_000);
+        window.gesture(Gesture::FloorOverride, start);
+        assert!(!window.is_open(start));
+        window.gesture(Gesture::Pairing, start);
+        assert!(window.is_open(start));
+        assert!(!window.is_open(Tick::from_millis(4_999)));
+        assert!(window.is_open(Tick::from_millis(124_999)));
+        assert!(!window.is_open(Tick::from_millis(125_000)));
+        window.gesture(Gesture::Pairing, Tick::from_millis(u64::MAX - 1));
+        assert!(window.is_open(Tick::from_millis(u64::MAX)));
+        window.gesture(Gesture::FactoryReset, Tick::from_millis(u64::MAX));
+        assert!(!window.is_open(Tick::from_millis(u64::MAX)));
+    }
 
     fn gesture(panel: &mut Panel, sequence: [SelectorPosition; 3], now: &mut u64) {
         let mut hold = |position, duration| {
