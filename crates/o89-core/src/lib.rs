@@ -23,8 +23,10 @@
 //! log's byte budget, the authorised comms release and the network master
 //! copy. Then the link to the comms processor, the connection rows and the
 //! [`Sessions`] bound onto them, and the [`Endpoint`] that sends each frame
-//! to one or the other. The behaviours arrive with the milestones that
-//! name them.
+//! to one or the other; and the signed-request path over the client table,
+//! whose [`Permit`] is the only way an operation reaches a handler, issued
+//! once the part holds the counter. The behaviours arrive with the
+//! milestones that name them.
 
 #![no_std]
 
@@ -54,6 +56,7 @@ mod rail_turn;
 mod readout;
 mod record;
 mod release;
+mod request;
 mod reset;
 mod revision;
 mod ring;
@@ -91,6 +94,7 @@ pub use rail_turn::*;
 pub use readout::*;
 pub use record::*;
 pub use release::*;
+pub use request::*;
 pub use reset::*;
 pub use revision::*;
 pub use ring::*;
