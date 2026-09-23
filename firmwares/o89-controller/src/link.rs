@@ -560,10 +560,19 @@ async fn on_frame(
         log: recorder::log_span(),
         // No clock before its slice.
         time_known: false,
+        pairing_open: selector::pairing_open(),
     };
     let step = endpoint
         .frame(frame, Uptime.now(), &local, fram, answer)
         .await?;
+    if let Some(Reply {
+        note: Some(SessionNote::Paired(_)),
+        ..
+    }) = step.reply
+    {
+        // One press, one enrolment: the next `Pair` meets a closed window.
+        selector::enrolled();
+    }
     if let Some(ended) = reply(tx, writer, answer, step.reply).await {
         return Some(ended);
     }
@@ -608,6 +617,7 @@ async fn reply(
 fn session_note(note: SessionNote) {
     match note {
         SessionNote::Bound(conn) => defmt::info!("session: bound on {}", conn),
+        SessionNote::Paired(client) => defmt::info!("session: paired client {}", client),
         SessionNote::Unbound(conn) => defmt::info!("session: goodbye on {}", conn),
         SessionNote::NoChallenge => {
             defmt::warn!("session: no challenge to give; the counter did not land");

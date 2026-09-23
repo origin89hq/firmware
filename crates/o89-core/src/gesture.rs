@@ -389,6 +389,12 @@ impl Panel {
                 .is_some_and(|age| age <= SELECTOR_SAMPLE_LIMIT)
     }
 
+    /// An enrolment or a reclaim was answered: the window it opened closes
+    /// (L-195). One press, one pairing; the next needs the gesture again.
+    pub fn enrolled(&mut self) {
+        self.window.close();
+    }
+
     /// Consume only after accepting a floor-crossing time write.
     pub fn floor_used(&mut self) {
         self.floor = None;
@@ -586,6 +592,25 @@ mod tests {
             hold(SelectorPosition::Off, 200);
         }
         hold(SelectorPosition::Off, 10_100);
+    }
+
+    /// One press, one enrolment: a `Pair` that enrolled or reclaimed closes
+    /// the window it came through, and only the gesture opens the next.
+    #[test]
+    fn l_195_an_enrolment_closes_the_window_and_the_next_needs_the_gesture() {
+        use SelectorPosition::Auto;
+        let mut panel = Panel::new();
+        let mut now = 0;
+        gesture(&mut panel, [Auto; 3], &mut now);
+        assert!(panel.pairing_open(Tick::from_millis(now)));
+        panel.enrolled();
+        assert!(!panel.pairing_open(Tick::from_millis(now)));
+        assert!(!panel.pairing_open(Tick::from_millis(now + 1_000)));
+        // Leave the spent gesture before beginning another.
+        panel.sample(Some(Auto), Tick::from_millis(now));
+        now += 110;
+        gesture(&mut panel, [Auto; 3], &mut now);
+        assert!(panel.pairing_open(Tick::from_millis(now)));
     }
 
     #[test]

@@ -44,6 +44,15 @@ pub fn pairing_open() -> bool {
     PANEL.lock(|cell| cell.get().pairing_open(Uptime.now()))
 }
 
+/// A `Pair` enrolled or reclaimed a client: its window closes (L-195).
+pub fn enrolled() {
+    PANEL.lock(|cell| {
+        let mut panel = cell.get();
+        panel.enrolled();
+        cell.set(panel);
+    });
+}
+
 /// The link task completed the epoch/table transaction, or failed closed.
 pub fn reset_finished(succeeded: bool) {
     PANEL.lock(|cell| {
