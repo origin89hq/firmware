@@ -587,7 +587,8 @@ impl HostileComms {
                 (Some(LinkMessageType::EnterDownloadAck), false, false)
             }
             Frame::CloseReport { .. } => (Some(LinkMessageType::CloseConnectionAck), false, false),
-            Frame::NetFailed { .. } => (Some(LinkMessageType::NetConfigAck), false, false),
+            Frame::TimeOffer { .. } => (Some(LinkMessageType::TimeOffer), false, false),
+            Frame::NetReport { .. } => (Some(LinkMessageType::NetConfigAck), false, false),
             Frame::Refuse { .. } => (None, false, false),
         };
         let silent = match self.caps.answers {

@@ -25,3 +25,6 @@ pub use requests::*;
 pub use rules::*;
 pub use tick::*;
 pub use wire::*;
+
+mod country;
+pub use country::{BadCountry, Country};

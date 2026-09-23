@@ -16,7 +16,7 @@
 //! has run, so a rollback lands on an image that honours it (F-036); only
 //! then the scheduler, the true random source for `boot_id` (F-035), and the
 //! link: `LinkUp`, the heartbeat, and the rules for a controller that goes
-//! quiet (L-120, L-121). The radio and the transports arrive with M4. The
+//! quiet (L-120, L-121). The radio starts after the window and confirmation. The
 //! entry is the HAL's bare one: nothing of the scheduler's or the
 //! executor's runs before the window, and the executor is entered only once
 //! the window and the confirmation are behind the boot.
@@ -29,10 +29,12 @@
 #![no_std]
 #![no_main]
 
+mod credentials;
 mod link;
 #[cfg(not(feature = "no-window"))]
 mod ota;
 mod panic;
+mod radio;
 #[cfg(not(feature = "no-window"))]
 mod window;
 
@@ -149,8 +151,18 @@ fn main() -> ! {
     // 4. The window has run: this image honours it, which is what makes it
     // safe to keep (F-036). A slot in pending verification is confirmed,
     // against the window's own proof and nothing else (F-089).
+    #[cfg_attr(
+        feature = "no-window",
+        expect(unused_mut, reason = "OTA confirmation is omitted with the window")
+    )]
+    let mut flash = esp_storage::FlashStorage::new(p.FLASH);
     #[cfg(not(feature = "no-window"))]
-    ota::confirm_if_pending(p.FLASH, ran);
+    ota::confirm_if_pending(&mut flash, ran);
+    let mut store = credentials::Store::new(flash);
+    let credential = o89_comms_core::load_credential(&mut store).ok().flatten();
+    radio::configure(credential);
+    // Fixed heap used only by the radio driver and its RTOS tasks.
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
     // 5. The scheduler, then the true random source for the `boot_id`
     // (F-035): the bare RNG is pseudo-random until the ADC feeds it.
@@ -160,21 +172,22 @@ fn main() -> ! {
     let boot_id = Rng::new().random();
 
     // 6. The executor, entered only now, and the link on it for the rest
-    // of the run. The pool holds one and this is its only spawn; a refusal
-    // leaves the watchdog unfed, which is the reset that tries again, and so
-    // does an executor that is somehow already taken.
+    // of the run. Each task pool holds one. Failed initialization resets
+    // through the recovery window; an unavailable executor leaves the
+    // watchdog unfed.
     let uart = uart.into_async();
     let Some(executor) = EXECUTOR.try_init(Executor::new()) else {
         loop {
             esp_hal::delay::Delay::new().delay_millis(1_000);
         }
     };
-    executor.run(
-        move |spawner| match link::run(uart, reader, writer, rtc.rwdt, boot_id) {
+    executor.run(move |spawner| {
+        if radio::start(spawner, p.WIFI).is_err() {
+            esp_hal::system::software_reset();
+        }
+        match link::run(uart, reader, writer, rtc.rwdt, boot_id, store, credential) {
             Ok(token) => spawner.spawn(token),
-            Err(_) => loop {
-                esp_hal::delay::Delay::new().delay_millis(1_000);
-            },
-        },
-    )
+            Err(_) => esp_hal::system::software_reset(),
+        }
+    })
 }

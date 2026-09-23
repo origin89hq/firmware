@@ -1274,7 +1274,33 @@ controller that goes quiet closes every client, stops advertising and retries
 
 **Storage**: one network, a value not a table (L-136), in its own partition;
 a failed write is reported and the RAM copy keeps the site on the air
-(L-137).
+(L-137). The comms cache uses a fixed, checksummed record in `creds`, not
+ESP-IDF's key/value NVS format. Replacement erases that partition, writes the
+record, commits its marker last, and verifies it before answering `stored`.
+An interrupted replacement may lose the cache; the controller restores it at
+link-up. A clear erases the previous passphrase and retains only the version,
+country and hostname. Duplicate successful requests do not erase again.
+
+The Wi-Fi station starts after the recovery window and OTA confirmation,
+using that cache without waiting for the controller. Association, the network
+runner and NTP have separate tasks, so a failed association does not hold up
+the UART or a future BLE task. Each task reports progress before the link
+feeds the watchdog. The radio and its RTOS use a fixed 72 KiB heap; credential
+storage and application networking buffers do not allocate. The IP stack has
+three socket slots (DHCP, DNS, NTP), and the time-offer channel holds one
+sample, refusing a new sample while full.
+
+NTP replies must match the request nonce and server endpoint and declare a
+synchronized server clock. Samples older than one second before their first send are discarded.
+Queries retry after thirty seconds unless the link attempts a fresh offer;
+only that attempt defers the next query by fifteen minutes.
+New `TimeOffer` requests are separated by at least fifteen monotonic minutes,
+including failed sends and controller refusals. An unanswered request retries
+the same sample and request ID at 500 ms, up to three attempts (L-015). The ESP32 never sets a clock
+from the response. Board-A association, reboot recovery, time delivery and
+recovery-window qualification with the radio remain the bench exit for
+[#89](https://github.com/origin89hq/firmware/issues/89); BLE coexistence is
+[#96](https://github.com/origin89hq/firmware/issues/96).
 
 ## Because it will become a product
 
