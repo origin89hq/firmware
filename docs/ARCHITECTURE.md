@@ -662,7 +662,14 @@ transaction, and a write that fails fails closed (P-079). Between the MAC
 and the counter, each session holds the highest `req_id` it accepted and
 the four below it, and drops a request whose `req_id` it accepted already or
 that is below that window, unanswered, as P-022 requires. Commands are
-reserved until an output has been granted authority.
+reserved until an output has been granted authority. `GetConfig` verifies its
+wrapper and request window before reading identity, network, or a behaviour's
+shadow flag. Signed `SetConfig` goes through `admit`: the counter lands first,
+then `check_version`, then section validation, then the inactive slot. A stale
+version or invalid body spends its authenticated counter without changing the
+section. Structure errors answer Error 1; invalid values answer SetConfigAck 3.
+Network reads use `NetworkRead`, which can report `psk_set` but cannot hold a
+passphrase. A write omitting `psk` retains it only for the byte-identical SSID.
 
 ### The link
 
@@ -671,7 +678,32 @@ writer. The core
 holds the link-local state: link-up and `boot_id` invalidation, the heartbeat
 and the recovery ladder with the board's revision policy (below), connection
 rows and challenges, network configuration push, time offers with the floor,
-cap and rate limit, and the comms release flow. The adapter owns the bytes
+cap and rate limit, and the comms release flow. After every accepted `LinkUp`, the controller
+compares the module's `net_version` with its persisted network section and
+pushes `NetConfig` whenever they differ in either direction (L-133). A local
+network write also owes a push. One immutable snapshot is tracked in the
+bounded request table; retries retain its request id and bytes. A newer write
+supersedes that request. A refused or exhausted request raises a probe note;
+the next link-up compares again.
+
+Factory reset ends sessions and writes the network clear before advancing the
+epoch. The clear increments the network version and retains country and
+hostname, so it remains encodable after reboot (L-134, L-135). After the clear
+commits, reset scrubs the entire old slot before advancing the epoch, leaving
+the current cleared record untouched. A failed clear or scrub stops the reset;
+a retry finishes removing the old credentials. A damaged network record is erased across both slots before
+the epoch advances; a failed erase also stops the reset. An absent record is
+erased too, so a retry finishes removing residue after a partial erase. No
+country or hostname is invented, and the section reads absent afterwards. A
+never-written section remains unwritten. If that unit meets
+a module reporting a nonzero network version, KM43 0.5.1 has no clear shape
+without country and hostname: the controller sends nothing and raises
+`NetworkWithoutMaster`. That protocol gap remains open in
+[KM43 #98](https://github.com/origin89hq/km43/issues/98); no regulatory country
+is guessed. The phone-to-Wi-Fi bench exit also remains open and depends on
+#90's comms side.
+
+The adapter owns the bytes
 and the rail pin. The ROM's boot text arrives on the link at 115200 after
 every module reset while the link runs at 921600; the framer resynchronises
 through it and counts it, and a count far from the bench's baseline of about
@@ -793,6 +825,20 @@ is built once. The PVD discipline above is the other
 half: no
 transaction starts on a falling supply. Every FRAM write path runs crashing
 at every step on the host, and the invariant after recovery is asserted.
+
+Identity and behaviour configuration use schema-sized prefixes of the existing
+`SITE_CONFIG`, `GENR`, `FRST`, `SCHD` and `SHED` reservations. The second slot
+keeps its reserved address; the CRC follows the encoded prefix. Identity needs
+41 bytes (4 version + 1 length + 36 CBOR), each behaviour 8 (4 + 1 + 3).
+No existing record moves. The network body uses 138 of its reserved 160 bytes:
+4 version + 1 metadata marker + 2 country + 33 hostname + 1 join marker +
+33 SSID + 64 passphrase. A clear retains country and hostname and advances the
+version. Configuration is canonicalized after validation; unknown CBOR keys
+are not persisted. Never-written records answer version zero with no body;
+damaged reads refuse rather than pretending to be unwritten. An authenticated
+replacement of a damaged section requires expected version zero because its
+version is unknowable; the validated replacement starts at version one. A
+local network replacement owes a push even when the module reports version one.
 
 **One record is one transaction, and that decides what shares a record.**
 The per-client counters and the dedup table are fields of the client table's

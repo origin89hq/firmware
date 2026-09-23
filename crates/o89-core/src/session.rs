@@ -111,6 +111,10 @@ const FAILURES: usize = MAX_AUTH_FAILURES as usize;
 /// record, the enrolled clients and the challenge counter. The records move
 /// only once the part has moved.
 pub struct Keys {
+    /// Versioned identity and behaviour sections.
+    pub configuration: crate::Configuration,
+    /// The authoritative network section.
+    pub network: Kept<crate::Network, { crate::NETWORK_BYTES }>,
     /// No secret is a unit that derives nothing: no challenge, no key.
     pub secret: Option<Secret>,
     /// No epoch is a boot that could not establish one, and derives nothing
@@ -502,7 +506,8 @@ impl Sessions {
     }
 
     /// The physical factory reset (P-085): the epoch advanced and verified,
-    /// then the table cleared under it. Every session ends first, whatever
+    /// then the table cleared under it. The network clear and old-slot scrub land before the
+    /// epoch can advance. Every session ends first, whatever
     /// comes of the writes, because each was keyed under the epoch this
     /// retires; the rows stay with their transports, and a client that
     /// pairs again under the new epoch `Hello`s on the same one. Keys derive
@@ -515,6 +520,32 @@ impl Sessions {
         for row in self.rows.iter_mut().flatten() {
             if let Bound::Session(_) = row.bound {
                 row.bound = Bound::Ended;
+            }
+        }
+        match self.keys.network.held() {
+            crate::Held::Present(held) => {
+                let mut cleared = *held;
+                cleared
+                    .clear()
+                    .map_err(|_| ResetFailed::Network(crate::Refused::AtTheCeiling))?;
+                self.keys
+                    .network
+                    .write(fram, cleared)
+                    .await
+                    .map_err(ResetFailed::Network)?;
+                self.keys
+                    .network
+                    .erase_previous(fram)
+                    .await
+                    .map_err(ResetFailed::Network)?;
+            }
+            // An interrupted erase can read absent with residue in the other slot.
+            crate::Held::Absent | crate::Held::Corrupt | crate::Held::Malformed(_) => {
+                self.keys
+                    .network
+                    .erase(fram)
+                    .await
+                    .map_err(ResetFailed::Network)?;
             }
         }
         let reset = reset_clients(&mut self.keys.epoch_record, &mut self.keys.clients, fram).await;
@@ -629,10 +660,9 @@ impl Sessions {
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
             MessageType::Time => self.time(to, envelope, now, fram, dst).await,
-            // Signed, and not served until their handlers call `admit`:
-            // refused without a counter spent, after the session they need
-            // is checked (P-143).
-            MessageType::SetConfig | MessageType::Firmware => match self.bound_on(to, dst) {
+            MessageType::SetConfig => self.set_config(to, envelope, now, fram, dst).await,
+            // Firmware remains unserved and spends no counter (P-143).
+            MessageType::Firmware => match self.bound_on(to, dst) {
                 Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
                 Err(refused) => refused,
             },
@@ -995,20 +1025,20 @@ impl Sessions {
             return Reply::NOTHING;
         };
         let verified = Wrapper::decode(envelope).and_then(|wrapper| wrapper.verify(&binding.key));
-        let goodbye = match verified {
-            Ok(verified) => {
-                kind == MessageType::Goodbye
-                    && EmptyBody::decode(MessageType::Goodbye, verified.payload()).is_ok()
-            }
+        let payload = match verified {
+            Ok(verified) => verified.payload(),
             Err(WrapperError::Mac(_) | WrapperError::Missing(WrapperKey::Mac)) => {
                 return self.failed(to, now, dst);
             }
             Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
         };
+        let goodbye = kind == MessageType::Goodbye
+            && EmptyBody::decode(MessageType::Goodbye, payload).is_ok();
+        let Self { rows, keys, .. } = self;
         let Some(Row {
             bound: bound @ Bound::Session(_),
             ..
-        }) = self.row_mut(to.conn)
+        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
         else {
             return Reply::NOTHING;
         };
@@ -1019,6 +1049,35 @@ impl Sessions {
                 return Reply::noted(SessionNote::OutOfWindow(why));
             }
             binding.heard = now;
+        }
+        if kind == MessageType::GetConfig {
+            let Bound::Session(binding) = bound else {
+                return Reply::NOTHING;
+            };
+            let request = match km43::GetConfigRequest::decode(payload) {
+                Ok(request) => request,
+                Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+            };
+            let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
+            let len = match keys
+                .configuration
+                .answer(request.section, &keys.network, &mut body)
+            {
+                Ok(len) => len,
+                Err(code) => return wrapped(to, &binding.key, code, dst),
+            };
+            let written = body
+                .get(..len)
+                .and_then(|body| {
+                    Tagged::over(
+                        to.header(MessageType::GetConfigResponse),
+                        body,
+                        &binding.key,
+                    )
+                    .ok()
+                })
+                .and_then(|tagged| tagged.write(dst).ok());
+            return answered(written);
         }
         if kind != MessageType::Goodbye || !goodbye {
             let code = if kind == MessageType::Goodbye {
@@ -1149,6 +1208,113 @@ impl Sessions {
             }
             None => self.failed(to, now, dst),
         }
+    }
+
+    /// Admit the signed write before its version or section body is examined.
+    async fn set_config<F: Fram>(
+        &mut self,
+        to: Addressed,
+        envelope: Envelope<'_>,
+        now: Tick,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        if let Err(refused) = self.bound_on(to, dst) {
+            return refused;
+        }
+        let claim = match SignedClaim::decode(envelope) {
+            Ok(claim) => claim,
+            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        };
+        let Self { rows, keys, .. } = self;
+        let Some(Row {
+            bound: Bound::Session(binding),
+            ..
+        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+        else {
+            return Reply::NOTHING;
+        };
+        let admission = admit(
+            claim,
+            &binding.key,
+            binding.client,
+            &mut binding.window,
+            &mut keys.clients,
+            fram,
+            now,
+        )
+        .await;
+        let write = match admission {
+            Admission::Execute(Permit::Write(write)) => write,
+            Admission::OutOfWindow(why) => return Reply::noted(SessionNote::OutOfWindow(why)),
+            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
+                return self.failed(to, now, dst);
+            }
+            Admission::Refused(why) => {
+                let mut reply = refused_under(to, &binding.key, why.code(), dst);
+                if why.raises().is_some() {
+                    reply.note = Some(SessionNote::NotKept);
+                }
+                return reply;
+            }
+            // Only a `Command` is reserved, answered from the table or left
+            // in flight; a `SetConfig` never is.
+            Admission::Execute(Permit::Command(_))
+            | Admission::Answered(_)
+            | Admission::InFlight(_) => {
+                return wrapped(to, &binding.key, ErrorCode::UnknownMessageType, dst);
+            }
+        };
+        binding.heard = now;
+        let operation = match km43::SetConfigOperation::decode(write.operation()) {
+            Ok(operation) => operation,
+            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+        };
+        // Like Time, spend the admitted counter before checking the row's mask.
+        let required = km43::ClientCapability::WRITE_CONFIG.0
+            | if matches!(
+                operation.section,
+                km43::ConfigSection::Network | km43::ConfigSection::Cloud
+            ) {
+                km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
+            } else {
+                0
+            };
+        let authorised = keys
+            .clients
+            .present()
+            .and_then(|table| table.row(binding.client))
+            .is_some_and(|row| row.mask().0 & required == required);
+        let ack = if authorised {
+            match keys
+                .configuration
+                .set(operation, &mut keys.network, fram)
+                .await
+            {
+                Ok(ack) => ack,
+                Err(code) => return wrapped(to, &binding.key, code, dst),
+            }
+        } else {
+            km43::SetConfigAck {
+                section: operation.section,
+                version: keys.configuration.version(operation.section, &keys.network),
+                outcome: km43::SetConfig::Unauthorised,
+            }
+        };
+        let mut body = [0; km43::MAX_SET_CONFIG_ACK_BYTES];
+        let written = ack
+            .encode(&mut body)
+            .ok()
+            .and_then(|len| {
+                Tagged::over(
+                    to.header(MessageType::SetConfigResponse),
+                    body.get(..len)?,
+                    &binding.key,
+                )
+                .ok()
+            })
+            .and_then(|tagged| tagged.write(dst).ok());
+        answered(written)
     }
 
     /// `Time 0x0A` on a session, through [`admit`]: the counter spent before
@@ -1491,7 +1657,7 @@ mod tests {
     const PRINTED: [u8; 32] = [9; 32];
 
     /// Up to the end of the client table, which is as far as this reaches.
-    const PART_BYTES: usize = CLIENT_TABLE.end().0 as usize;
+    const PART_BYTES: usize = crate::map::END.0 as usize;
     const _: () = assert!(PART_BYTES <= FRAM_BYTES);
 
     struct Part {
@@ -1503,7 +1669,8 @@ mod tests {
     }
 
     /// Where the client table's record starts: its two slots end the part.
-    const TABLE_STARTS: usize = PART_BYTES - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
+    const TABLE_STARTS: usize =
+        CLIENT_TABLE.end().0 as usize - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
 
     impl Fram for Part {
         type Error = ();
@@ -1612,6 +1779,10 @@ mod tests {
             let mut epoch_record = block_on(Kept::read(EPOCH, &mut part)).expect("reads");
             block_on(epoch_record.write(&mut part, current)).expect("lands");
             let keys = Keys {
+                configuration: block_on(crate::Configuration::read(&mut part))
+                    .expect("read config"),
+                network: block_on(Kept::read(crate::map::NETWORK, &mut part))
+                    .expect("read network"),
                 secret: Some(Secret::new(DEVICE, PRINTED).expect("entropy")),
                 epoch: Some(current),
                 epoch_record,
@@ -2441,16 +2612,350 @@ mod tests {
         );
     }
 
+    impl Rig {
+        fn config_frame(
+            &mut self,
+            counter: u64,
+            expected: u32,
+            body: &[u8],
+            key: &SessionKey,
+        ) -> Bytes {
+            let mut operation = [0; 128];
+            let len = km43::SetConfigOperation {
+                section: km43::ConfigSection::IdentityAndSite,
+                expected_version: expected,
+                body,
+            }
+            .encode(&mut operation)
+            .expect("operation");
+            let mut frame = [0; 256];
+            let len = Signed::over(
+                Header {
+                    kind: MessageType::SetConfig,
+                    session: SessionId::from(1),
+                    req_id: self.next_req(),
+                },
+                ClientId::new(1).expect("client"),
+                Counter(counter),
+                &operation[..len],
+                key,
+            )
+            .expect("signed")
+            .write(&mut frame)
+            .expect("frame");
+            Bytes::of(&frame[..len])
+        }
+        fn get_config(&mut self, key: &SessionKey) -> (Reply, Bytes) {
+            let mut body = [0; km43::MAX_GET_CONFIG_BYTES];
+            let len = km43::GetConfigRequest {
+                section: km43::ConfigSection::IdentityAndSite,
+            }
+            .encode(&mut body)
+            .expect("body");
+            let mut frame = [0; 128];
+            let len = Tagged::over(
+                Header {
+                    kind: MessageType::GetConfig,
+                    session: SessionId::from(1),
+                    req_id: self.next_req(),
+                },
+                &body[..len],
+                key,
+            )
+            .expect("wrapper")
+            .write(&mut frame)
+            .expect("frame");
+            self.send(&Bytes::of(&frame[..len]))
+        }
+    }
+
+    fn config_client(kind: ClientKind, mask: Option<u16>) -> (Rig, SessionKey) {
+        use crate::Body;
+        let mut rig = Rig::new();
+        let _ = block_on(rig.sessions.keys.clients.update(&mut rig.part, |table| {
+            table.pair(Label::new("phone").expect("label"), kind)
+        }))
+        .expect("persist")
+        .expect("pair");
+        if let Some(mask) = mask {
+            let mut bytes = rig.sessions.keys.clients.present().expect("table").encode();
+            let offset = 4 + 1 + 1 + km43::MAX_LABEL;
+            bytes[offset..offset + 2].copy_from_slice(&mask.to_le_bytes());
+            let table = ClientTable::decode(&bytes).expect("table");
+            block_on(rig.sessions.keys.clients.write(&mut rig.part, table)).expect("persist mask");
+        }
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        (rig, key)
+    }
+
+    fn config_section_frame(
+        rig: &mut Rig,
+        section: km43::ConfigSection,
+        body: &[u8],
+        key: &SessionKey,
+    ) -> Bytes {
+        let mut operation = [0; 192];
+        let len = km43::SetConfigOperation {
+            section,
+            expected_version: 0,
+            body,
+        }
+        .encode(&mut operation)
+        .expect("operation");
+        let mut frame = [0; 256];
+        let len = Signed::over(
+            Header {
+                kind: MessageType::SetConfig,
+                session: SessionId::from(1),
+                req_id: rig.next_req(),
+            },
+            ClientId::new(1).expect("client"),
+            Counter(1),
+            &operation[..len],
+            key,
+        )
+        .expect("signed")
+        .write(&mut frame)
+        .expect("frame");
+        Bytes::of(&frame[..len])
+    }
+
+    fn network_write_body() -> Bytes {
+        let mut bytes = [0; 192];
+        let len = km43::NetworkWrite {
+            join: Some(km43::JoinWrite {
+                ssid: km43::Ssid::new("cabin").expect("ssid"),
+                psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+            }),
+            country: km43::Country::new("CA").expect("country"),
+            hostname: km43::Hostname::new("origin89").expect("hostname"),
+        }
+        .encode(&mut bytes)
+        .expect("network");
+        Bytes::of(&bytes[..len])
+    }
+
+    #[test]
+    fn p_105_cloud_network_and_cloud_writes_are_refused_under_the_session_key() {
+        for section in [km43::ConfigSection::Network, km43::ConfigSection::Cloud] {
+            let (mut rig, key) = config_client(ClientKind::Cloud, None);
+            let before = rig.part.bytes;
+            let frame = config_section_frame(&mut rig, section, &network_write_body(), &key);
+            let (_, answer) = rig.send(&frame);
+            let (header, body) = under(&answer, &key);
+            assert_eq!(header.kind, MessageType::SetConfigResponse);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Unauthorised
+            );
+            assert_eq!(
+                rig.accepted(),
+                Some(Counter(1)),
+                "refusal still spends the counter"
+            );
+            let start = usize::from(crate::map::COMMS_RELEASE.end().0);
+            let end = usize::from(crate::map::NETWORK.end().0);
+            assert_eq!(&rig.part.bytes[start..end], &before[start..end]);
+        }
+    }
+
+    #[test]
+    fn p_105_cloud_identity_and_behaviour_writes_succeed() {
+        for (section, body) in [
+            (
+                km43::ConfigSection::IdentityAndSite,
+                &[0xa1, 1, 0x61, b'a'][..],
+            ),
+            (
+                km43::ConfigSection::GeneratorBehaviour,
+                &[0xa1, 1, 0xf5][..],
+            ),
+        ] {
+            let (mut rig, key) = config_client(ClientKind::Cloud, None);
+            let frame = config_section_frame(&mut rig, section, body, &key);
+            let (_, answer) = rig.send(&frame);
+            let (_, body) = under(&answer, &key);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Accepted
+            );
+        }
+    }
+
+    #[test]
+    fn p_105_without_write_config_every_section_is_refused() {
+        for section in [
+            km43::ConfigSection::IdentityAndSite,
+            km43::ConfigSection::Channels,
+            km43::ConfigSection::BusesAndDevices,
+            km43::ConfigSection::GeneratorBehaviour,
+            km43::ConfigSection::FrostBehaviour,
+            km43::ConfigSection::ScheduleBehaviour,
+            km43::ConfigSection::LoadShedBehaviour,
+            km43::ConfigSection::Network,
+            km43::ConfigSection::Cloud,
+        ] {
+            let (mut rig, key) = config_client(
+                ClientKind::App,
+                Some(km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0),
+            );
+            let frame = config_section_frame(&mut rig, section, &[0xa1, 1, 0x61, b'a'], &key);
+            let (_, answer) = rig.send(&frame);
+            let (header, body) = under(&answer, &key);
+            assert_eq!(header.kind, MessageType::SetConfigResponse);
+            assert_eq!(
+                km43::SetConfigAck::decode(&body).expect("ack").outcome,
+                km43::SetConfig::Unauthorised
+            );
+        }
+    }
+
+    #[test]
+    fn p_105_app_network_write_succeeds() {
+        let (mut rig, key) = config_client(ClientKind::App, None);
+        let frame = config_section_frame(
+            &mut rig,
+            km43::ConfigSection::Network,
+            &network_write_body(),
+            &key,
+        );
+        let (_, answer) = rig.send(&frame);
+        let (_, body) = under(&answer, &key);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::Accepted
+        );
+        assert_eq!(
+            rig.sessions
+                .keys
+                .network
+                .present()
+                .expect("network")
+                .version(),
+            1
+        );
+    }
+
+    #[test]
+    fn p_108_get_config_is_wrapped_and_tracks_the_committed_section() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let (_, answer) = rig.get_config(&key);
+        let (header, body) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::GetConfigResponse);
+        assert_eq!(
+            km43::ConfigAnswer::decode(&body).expect("answer").version(),
+            0
+        );
+        let frame = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
+        let (_, answer) = rig.send(&frame);
+        let (_, body) = under(&answer, &key);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::Accepted
+        );
+        let (_, answer) = rig.get_config(&key);
+        let (_, body) = under(&answer, &key);
+        let answer = km43::ConfigAnswer::decode(&body).expect("config");
+        assert_eq!(answer.version(), 1);
+        assert_eq!(answer.body(), Some(&[0xa1, 1, 0x61, b'a'][..]));
+    }
+
+    #[test]
+    fn p_101_config_reports_structure_and_value_errors_after_the_counter() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let malformed = rig.config_frame(1, 0, &[0xa0], &key);
+        let (_, answer) = rig.send(&malformed);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::MalformedFrame)
+        );
+        assert_eq!(rig.accepted(), Some(Counter(1)));
+        let invalid = rig.config_frame(2, 0, &[0xa1, 1, 0x60], &key);
+        let (_, answer) = rig.send(&invalid);
+        let (_, body) = under(&answer, &key);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::Invalid
+        );
+        assert_eq!(rig.accepted(), Some(Counter(2)));
+    }
+
+    #[test]
+    fn p_079_config_with_bad_mac_or_refused_counter_cannot_write_a_section() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let forged = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &other_key());
+        let (_, answer) = rig.send(&forged);
+        assert_eq!(hint(&answer), Some(10));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+        rig.part.table_refused = true;
+        let write = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
+        let (_, answer) = rig.send(&write);
+        assert_eq!(
+            code_under(&answer, &key),
+            Incoming::Client(ErrorCode::BusyRetry)
+        );
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+        let (_, answer) = rig.get_config(&key);
+        let (_, body) = under(&answer, &key);
+        assert_eq!(
+            km43::ConfigAnswer::decode(&body).expect("config").body(),
+            None
+        );
+    }
+
+    #[test]
+    fn p_100_signed_config_spends_counter_before_version_and_validation() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let mut operation = [0; 64];
+        let len = km43::SetConfigOperation {
+            section: km43::ConfigSection::IdentityAndSite,
+            expected_version: 1,
+            body: &[0xa0],
+        }
+        .encode(&mut operation)
+        .expect("operation");
+        let mut frame = [0; 256];
+        let len = Signed::over(
+            Header {
+                kind: MessageType::SetConfig,
+                session: SessionId::from(1),
+                req_id: rig.next_req(),
+            },
+            ClientId::new(1).expect("client"),
+            Counter(1),
+            &operation[..len],
+            &key,
+        )
+        .expect("signed")
+        .write(&mut frame)
+        .expect("frame");
+        let (_, answer) = rig.send(&Bytes::of(&frame[..len]));
+        assert_eq!(rig.accepted(), Some(Counter(1)));
+        let (header, body) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::SetConfigResponse);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::StaleVersion
+        );
+    }
+
     #[test]
     fn a_signed_request_not_served_yet_is_2_and_spends_no_counter() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, _) = rig.hello(1);
-        for kind in [MessageType::SetConfig, MessageType::Firmware] {
-            let frame = rig.empty(1, kind);
-            let (_, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(2), "{kind:?}");
-        }
+        let frame = rig.empty(1, MessageType::Firmware);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(hint(&answer), Some(2));
         assert_eq!(rig.accepted(), Some(Counter(0)));
     }
 
@@ -3107,14 +3612,14 @@ mod tests {
     }
 
     #[test]
-    fn p_085_a_reset_whose_epoch_does_not_land_ends_every_session_and_derives_nothing_new() {
+    fn p_085_a_reset_whose_network_erase_is_refused_ends_every_session_and_derives_nothing_new() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, _) = rig.hello(1);
         rig.part.falling = true;
         assert!(matches!(
             block_on(rig.sessions.factory_reset(&mut rig.part)),
-            Err(ResetFailed::Epoch(_))
+            Err(ResetFailed::Network(crate::Refused::SupplyFalling))
         ));
         assert_eq!(
             rig.sessions.bound(),

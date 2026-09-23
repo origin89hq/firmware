@@ -228,6 +228,7 @@ pub struct Written {
 pub struct Record<const N: usize> {
     magic: u32,
     a: Address,
+    reserved: usize,
 }
 
 impl<const N: usize> Record<N> {
@@ -255,13 +256,32 @@ impl<const N: usize> Record<N> {
             magic != 0,
             "a record's magic is never zero: zero is a slot being written"
         );
-        Self { magic, a: at }
+        Self {
+            magic,
+            a: at,
+            reserved: N,
+        }
+    }
+
+    /// Use only a prefix of an unwritten reservation without moving slot B.
+    /// The CRC follows the prefix; this is a new encoding, not a migration.
+    ///
+    /// A prefix larger than its reservation fails compilation, including
+    /// when called at runtime.
+    #[must_use]
+    pub const fn prefix<const M: usize>(self) -> Record<M> {
+        const { assert!(M <= N, "prefix exceeds reservation") };
+        Record {
+            magic: self.magic,
+            a: self.a,
+            reserved: self.reserved,
+        }
     }
 
     /// The first address past both slots: where the next record may start.
     #[must_use]
     pub const fn end(self) -> Address {
-        self.a.plus(slot_bytes(N).saturating_mul(2))
+        self.a.plus(slot_bytes(self.reserved).saturating_mul(2))
     }
 
     const fn slots(self) -> Slots {
@@ -269,6 +289,7 @@ impl<const N: usize> Record<N> {
             magic: self.magic,
             a: self.a,
             body: N,
+            reserved: self.reserved,
         }
     }
 
@@ -294,6 +315,41 @@ impl<const N: usize> Record<N> {
             Newest::Empty => Current::Empty,
             Newest::Corrupt => Current::Corrupt,
         })
+    }
+
+    /// Zero both complete reservations, including any previous credentials.
+    /// A refused write stops immediately; retrying may repeat the partial erase.
+    pub(crate) async fn erase<F: Fram>(self, fram: &mut F) -> Result<(), Refused<F::Error>> {
+        self.erase_slot(fram, Slot::A).await?;
+        self.erase_slot(fram, Slot::B).await
+    }
+
+    /// Scrub the non-current reservation without touching the committed record.
+    /// With no current record, scrub both reservations.
+    pub(crate) async fn erase_previous<F: Fram>(
+        self,
+        fram: &mut F,
+        position: Position,
+    ) -> Result<(), Refused<F::Error>> {
+        match position {
+            Position::At { slot, .. } => self.erase_slot(fram, slot.other()).await,
+            Position::Start => self.erase(fram).await,
+        }
+    }
+
+    async fn erase_slot<F: Fram>(self, fram: &mut F, slot: Slot) -> Result<(), Refused<F::Error>> {
+        // A fixed scratch buffer bounds stack use independently of reservation size.
+        const ERASE_CHUNK: usize = 32;
+        let zeros = [0; ERASE_CHUNK];
+        let bytes = slot_bytes(self.reserved);
+        let start = self.slots().address(slot);
+        for offset in (0..bytes).step_by(ERASE_CHUNK) {
+            let len = bytes.saturating_sub(offset).min(ERASE_CHUNK);
+            if let Some(chunk) = zeros.get(..len) {
+                fram.write(start.plus(offset), chunk).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Write `body` as the next record, into the slot that is not current:
@@ -322,6 +378,7 @@ impl<const N: usize> Record<N> {
 struct Slots {
     magic: u32,
     a: Address,
+    reserved: usize,
     /// The body's length in bytes: `N` of the record this came from.
     body: usize,
 }
@@ -330,7 +387,7 @@ impl Slots {
     const fn address(self, slot: Slot) -> Address {
         match slot {
             Slot::A => self.a,
-            Slot::B => self.a.plus(slot_bytes(self.body)),
+            Slot::B => self.a.plus(slot_bytes(self.reserved)),
         }
     }
 
@@ -546,6 +603,32 @@ mod tests {
     }
 
     const COUNTER: Record<4> = Record::at(0x4E54_5243, Address(16));
+
+    #[test]
+    fn p_102_prefix_keeps_reserved_slot_spacing_and_commits_last() {
+        let reserved = Record::<64>::at(0x1234, Address(16));
+        let record = reserved.prefix::<4>();
+        assert_eq!(record.end(), reserved.end());
+        let mut part = Part::fresh();
+        let first = block_on(record.write(&mut part, Position::Start, &[1; 4])).expect("first");
+        let second = block_on(record.write(&mut part, first.position, &[2; 4])).expect("second");
+        assert_eq!(
+            second.position,
+            Position::At {
+                seq: 2,
+                slot: Slot::B
+            }
+        );
+        assert_eq!(&part.bytes[92..96], &0x1234u32.to_le_bytes());
+        assert_eq!(
+            block_on(record.read(&mut part)).expect("read"),
+            Current::Valid {
+                seq: 2,
+                slot: Slot::B,
+                body: [2; 4]
+            }
+        );
+    }
 
     #[test]
     fn f_020_a_fresh_part_is_empty_and_the_first_write_lands_in_a_at_one() {

@@ -279,6 +279,10 @@ impl LinkEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Note {
+    /// The module holds a network but this controller has no country or hostname to clear it.
+    NetworkWithoutMaster,
+    /// The module refused the authoritative network update.
+    NetworkRefused(km43::NetConfig),
     /// A frame refused back to the peer with this code.
     Refused(LinkErrorCode),
     /// A request of ours unanswered after every attempt (L-015).
@@ -299,6 +303,11 @@ pub enum Note {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Outgoing {
+    /// Push the fixed network snapshot tracked under this request.
+    NetConfig {
+        /// The request id, unchanged on retry.
+        req_id: ReqId,
+    },
     /// Our statement.
     LinkUp {
         /// From our counter.
@@ -479,9 +488,21 @@ enum Phase {
     },
 }
 
+/// Why the network snapshot is owed; a local write must reach the module
+/// even if its previously reported version happens to equal the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkDue {
+    None,
+    Compare,
+    Changed,
+}
+
 /// The link, on the controller's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
+    network: Option<crate::Network>,
+    network_sent: Option<(ReqId, crate::Network)>,
+    network_due: NetworkDue,
     identity: Identity,
     boot: Tick,
     phase: Phase,
@@ -538,6 +559,9 @@ impl Link {
     #[must_use]
     pub fn new(identity: Identity, now: Tick) -> Self {
         Self {
+            network: None,
+            network_sent: None,
+            network_due: NetworkDue::None,
             identity,
             boot: now,
             phase: Phase::Down { next_linkup: None },
@@ -556,6 +580,85 @@ impl Link {
             closing: [None; CLOSING],
             resync: Resync::AGREED,
             pairing: PairingReports::new(),
+        }
+    }
+
+    /// Refresh the transport snapshot from the controller's persisted master.
+    pub fn set_network(&mut self, network: Option<crate::Network>) {
+        if self.network != network {
+            self.forget_network();
+            self.network_due = if self.is_up() {
+                NetworkDue::Changed
+            } else {
+                NetworkDue::Compare
+            };
+            self.network = network;
+        }
+    }
+
+    fn forget_network(&mut self) {
+        if let Some((req_id, _)) = self.network_sent.take() {
+            let _ = self.requests.answered(req_id, LinkMessageType::NetConfig);
+        }
+    }
+
+    fn report_network(&mut self, now: Tick, actions: &mut Actions) {
+        if self.network_due == NetworkDue::None || self.network_sent.is_some() {
+            return;
+        }
+        let Phase::Up {
+            peer,
+            compat: Compat::Agreed(_),
+            ..
+        } = self.phase
+        else {
+            return;
+        };
+        let Some(network) = self.network else {
+            if peer.net_version.is_some_and(|version| version != 0) {
+                actions.push(Action::Note(Note::NetworkWithoutMaster));
+            }
+            self.network_due = NetworkDue::None;
+            return;
+        };
+        if peer.net_version == Some(network.version()) && self.network_due != NetworkDue::Changed {
+            self.network_due = NetworkDue::None;
+            return;
+        }
+        if network.change().is_none() {
+            actions.push(Action::Note(Note::NetworkWithoutMaster));
+            self.network_due = NetworkDue::None;
+            return;
+        }
+        let Some(req_id) = self.request(LinkMessageType::NetConfig, now) else {
+            return;
+        };
+        self.network_sent = Some((req_id, network));
+        self.network_due = NetworkDue::None;
+        actions.push(Action::Send(Outgoing::NetConfig { req_id }));
+    }
+
+    fn network_answered(&mut self, envelope: LinkEnvelope<'_>, actions: &mut Actions) {
+        let req_id = envelope.req_id();
+        let Ok(verdict) = km43::NetVerdict::decode(envelope) else {
+            actions.push(Action::Note(Note::Malformed(LinkMessageType::NetConfigAck)));
+            return;
+        };
+        if self.network_sent.is_none_or(|(sent, _)| sent != req_id) {
+            actions.push(Action::Note(Note::UnexpectedAck(
+                LinkMessageType::NetConfigAck,
+            )));
+            return;
+        }
+        self.forget_network();
+        if let Phase::Up { peer, .. } = &mut self.phase {
+            peer.net_version = Some(verdict.version);
+        }
+        if let Some(peer) = &mut self.last_peer {
+            peer.net_version = Some(verdict.version);
+        }
+        if verdict.outcome != km43::NetConfig::Stored {
+            actions.push(Action::Note(Note::NetworkRefused(verdict.outcome)));
         }
     }
 
@@ -795,9 +898,8 @@ impl Link {
                 self.close_answered(envelope, rows, &mut actions);
             }
             LinkMessageType::PairingWindowAck => self.pairing_answered(envelope, &mut actions),
-            LinkMessageType::NetConfigAck
-            | LinkMessageType::CommsReleaseAck
-            | LinkMessageType::EnterDownloadAck => {
+            LinkMessageType::NetConfigAck => self.network_answered(envelope, &mut actions),
+            LinkMessageType::CommsReleaseAck | LinkMessageType::EnterDownloadAck => {
                 // Requests this firmware does not send yet, so nothing
                 // waits; the download request is the bench tool's, through
                 // its own path, and an acknowledgement nobody asked for is
@@ -818,6 +920,7 @@ impl Link {
                 Self::refuse(LinkErrorCode::WrongSide, &mut actions);
             }
         }
+        self.report_network(now, &mut actions);
         actions
     }
 
@@ -1245,6 +1348,7 @@ impl Link {
             }
         }
         self.report(now, rows, &mut actions);
+        self.report_network(now, &mut actions);
         actions
     }
 
@@ -1280,6 +1384,17 @@ impl Link {
     ) -> Result<usize, EncodeError> {
         let mut envelope = [0u8; LINK_ENVELOPE];
         let len = match outgoing {
+            Outgoing::NetConfig { req_id } => {
+                let (_, network) = self
+                    .network_sent
+                    .as_ref()
+                    .filter(|(sent, _)| *sent == req_id)
+                    .ok_or(EncodeError::Body)?;
+                network.change().ok_or(EncodeError::Body)?.write(
+                    link_header(LinkMessageType::NetConfig, req_id),
+                    &mut envelope,
+                )
+            }
             Outgoing::LinkUp { req_id } => {
                 self.link_up(LinkMessageType::LinkUp, req_id, &mut envelope)
             }
@@ -1459,6 +1574,8 @@ impl Link {
             self.beats.forget();
             self.drop_rows(DropReason::CommsRebooted, rows, actions);
         }
+        self.forget_network();
+        self.network_due = NetworkDue::Compare;
         self.close_attempt(actions);
         self.last_peer = Some(peer);
         self.heard(now);
@@ -1512,6 +1629,8 @@ impl Link {
     /// would name a handle the comms processor may have given to somebody
     /// else (L-041, L-080).
     fn drop_rows(&mut self, why: DropReason, rows: &mut impl Rows, actions: &mut Actions) {
+        self.forget_network();
+        self.network_due = NetworkDue::Compare;
         rows.drop_all();
         self.conns = rows.allocated();
         self.forget_resync();
@@ -1613,6 +1732,9 @@ impl Link {
                             self.resync = Resync::AGREED;
                         }
                     }
+                    if kind == LinkMessageType::NetConfig {
+                        self.network_sent = None;
+                    }
                     if kind == LinkMessageType::PairingWindow {
                         self.pairing.given_up(req_id);
                     }
@@ -1654,6 +1776,11 @@ impl Link {
                             let _ = self.requests.answered(req_id, kind);
                         }
                     },
+                    LinkMessageType::NetConfig => {
+                        if self.network_sent.is_some_and(|(sent, _)| sent == req_id) {
+                            actions.push(Action::Send(Outgoing::NetConfig { req_id }));
+                        }
+                    }
                     LinkMessageType::LinkUpAck
                     | LinkMessageType::Heartbeat
                     | LinkMessageType::HeartbeatAck
@@ -1662,7 +1789,6 @@ impl Link {
                     | LinkMessageType::ClientDisconnected
                     | LinkMessageType::ClientDisconnectedAck
                     | LinkMessageType::CloseConnectionAck
-                    | LinkMessageType::NetConfig
                     | LinkMessageType::NetConfigAck
                     | LinkMessageType::PairingWindowAck
                     | LinkMessageType::TimeOffer
@@ -1811,6 +1937,86 @@ mod tests {
         }
         assert!(found > 0, "a whole frame");
         (out, found)
+    }
+
+    fn network_fixture() -> crate::Network {
+        let mut network = crate::Network::NONE;
+        network
+            .set(crate::Credentials {
+                ssid: Text::new("cabin").expect("ssid"),
+                psk: crate::Psk::new("correct horse").expect("psk"),
+                country: crate::Country::new(*b"CA").expect("country"),
+                hostname: Text::new("origin89").expect("host"),
+            })
+            .expect("network");
+        network
+    }
+
+    #[test]
+    fn l_133_net_config_retries_the_same_snapshot_and_rejects_an_unmatched_ack() {
+        let mut link = up(at(0));
+        link.set_network(Some(network_fixture()));
+        let mut actions = Actions::NONE;
+        link.report_network(at(0), &mut actions);
+        let (req_id, _) = link.network_sent.expect("sent");
+        let (before, len) = envelope_of(&link, Outgoing::NetConfig { req_id }, at(0));
+        let mut body = [0; 64];
+        let ack_len = km43::NetVerdict {
+            outcome: km43::NetConfig::Stored,
+            version: 1,
+        }
+        .write(
+            link_header(LinkMessageType::NetConfigAck, ReqId(req_id.0 + 1)),
+            &mut body,
+        )
+        .expect("ack");
+        link.network_answered(
+            LinkEnvelope::decode(&body[..ack_len]).expect("envelope"),
+            &mut actions,
+        );
+        assert!(link.network_sent.is_some());
+        link.retry(at(2000), &mut actions);
+        assert!(actions.iter().filter(|action| matches!(action, Action::Send(Outgoing::NetConfig { req_id: sent }) if *sent == req_id)).count() >= 2);
+        let (after, after_len) = envelope_of(&link, Outgoing::NetConfig { req_id }, at(2000));
+        assert_eq!(&before[..len], &after[..after_len]);
+        let ack_len = km43::NetVerdict {
+            outcome: km43::NetConfig::Stored,
+            version: 1,
+        }
+        .write(
+            link_header(LinkMessageType::NetConfigAck, req_id),
+            &mut body,
+        )
+        .expect("ack");
+        link.network_answered(
+            LinkEnvelope::decode(&body[..ack_len]).expect("envelope"),
+            &mut actions,
+        );
+        assert!(link.network_sent.is_none());
+        assert_eq!(link.peer().expect("peer").net_version, Some(1));
+    }
+
+    #[test]
+    fn l_135_a_clear_supersedes_an_inflight_set_even_if_the_peer_claimed_its_version() {
+        let mut link = up(at(0));
+        let mut network = network_fixture();
+        link.set_network(Some(network));
+        let mut actions = Actions::NONE;
+        link.report_network(at(0), &mut actions);
+        let (old, _) = link.network_sent.expect("set");
+        if let Phase::Up { peer, .. } = &mut link.phase {
+            peer.net_version = Some(2);
+        }
+        network.clear().expect("clear");
+        link.set_network(Some(network));
+        link.report_network(at(1), &mut actions);
+        let (new, sent) = link.network_sent.expect("clear");
+        assert_ne!(old, new);
+        assert!(!link.requests.awaits(old, LinkMessageType::NetConfig));
+        assert!(matches!(
+            sent.change(),
+            Some(km43::NetChange::Clear { version: 2, .. })
+        ));
     }
 
     #[test]
