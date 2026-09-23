@@ -210,9 +210,14 @@ until then. Source: KM43 L-040, `esp-hal`'s RNG documentation. M3.
 slot that OTA never writes and that always carries the window, the credential
 record and the assets. Source: [#3][plan] §4.4, §9 item 5. M3.
 
-**F-037** — The comms firmware's heap serves the radio's blobs only; no code
-of ours allocates, and the gate refuses `alloc` in our modules. Source:
-[#3][plan] §3. M3.
+**F-037** — The comms firmware's heap serves the vendor radio stack only,
+from a fixed budget reserved in static RAM and initialized after the recovery
+download window. Our application and transport code does not allocate; heap
+initialization and the required allocator adapter are the only exception in our
+code. The gate must refuse allocation outside that scope. Qualify memory
+margins, exhaustion and recovery as defined in
+[the comms architecture](ARCHITECTURE.md#the-comms-processor). Source:
+[#3][plan] §3; [#96](https://github.com/origin89hq/firmware/issues/96). M3, M4.
 
 **F-038** — The bench flashing path through the STM32 speaks the ROM's baud on
 USART1 and switches back to the link's afterwards. It enters the ROM by one
