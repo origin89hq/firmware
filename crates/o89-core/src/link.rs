@@ -17,11 +17,9 @@
 //!
 //! **Before the session layer exists**, a connection the comms processor
 //! announces is refused as a full table, which a table of no rows is, a
-//! handle it releases is unknown, and a time offer is refused as
-//! implausible, because a controller that cannot yet take a time cannot
-//! find one plausible; the policies those answers stand in for arrive with
-//! M4 and replace the arms below, which is what the exhaustive match on the
-//! message type is for.
+//! handle it releases is unknown. Time offers are decoded here and handed
+//! to the recorder, which owns the floor and RTC. Its verdict returns through
+//! `time_verdict`; a pending offer never stalls heartbeat processing.
 //!
 //! cites: F-031, F-039
 
@@ -273,6 +271,13 @@ pub enum Outgoing {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "an action nobody performs is a rule nothing did"]
 pub enum Action {
+    /// Submit a decoded offer to the recorder, which owns the RTC and floor.
+    OfferTime {
+        /// Request to acknowledge after processing.
+        req_id: ReqId,
+        /// Offered wall-clock value; peer provenance never crosses this seam.
+        unix_ms: u64,
+    },
     /// Put this frame on the wire.
     Send(Outgoing),
     /// Every connection and every session bound to one goes.
@@ -664,13 +669,22 @@ impl Link {
         actions
     }
 
+    /// A verdict from the recorder, sent only while the link remains up.
+    pub fn time_verdict(&self, req_id: ReqId, outcome: TimeOffer) -> Actions {
+        let mut actions = Actions::NONE;
+        if self.is_up() {
+            actions.push(Action::Send(Outgoing::TimeVerdict { req_id, outcome }));
+        }
+        actions
+    }
+
     /// The three requests the peer makes, each body read before it is
     /// answered: a frame that is not the message it claims gets no
     /// acknowledgement the peer could act on (P-031), and none of them is a
     /// heartbeat. Before the link is up only the handshake is admitted
     /// (L-033): `ClientConnected` has an outcome for that, the others are
-    /// refused with 258. Until the session layer and the clock exist every
-    /// answer is a refusal the peer can act on, never silence.
+    /// refused with 258. Connection requests await the session layer; time
+    /// offers go to the recorder so their floor and calendar share an owner.
     fn answer(&mut self, kind: LinkMessageType, envelope: LinkEnvelope<'_>, actions: &mut Actions) {
         if !self.is_up() && refused_before_link(Side::Controller, kind) {
             Self::refuse(LinkErrorCode::BeforeLinkUp, actions);
@@ -693,10 +707,14 @@ impl Link {
                 })
             }
             LinkMessageType::TimeOffer => {
-                ClockOffer::decode(envelope).map(|_| Outgoing::TimeVerdict {
-                    req_id,
-                    outcome: TimeOffer::RefusedImplausible,
-                })
+                match ClockOffer::decode(envelope) {
+                    Ok(offer) => actions.push(Action::OfferTime {
+                        req_id,
+                        unix_ms: offer.unix_ms,
+                    }),
+                    Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
+                }
+                return;
             }
             LinkMessageType::LinkUp
             | LinkMessageType::LinkUpAck

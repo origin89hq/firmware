@@ -662,13 +662,36 @@ count (F-039): the G0 has no RNG, and what L-040 needs is a number that
 is new at every boot and never read back from RAM, which a boot count kept
 on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
-Until the session layer and the clock exist, a connection the comms
-processor announces is refused as not yet linked before the `LinkUp`
-exchange and as a full table after it, which a table of no rows is; a
-handle it releases is unknown; a time offer is refused as implausible,
-because a controller that cannot take a time cannot find one plausible.
-Every answer is a real outcome the peer acts on and never silence, which
-L-015 would read as a dead link. M4 replaces each arm.
+Until the session layer exists, a connection the comms processor announces
+is refused as not yet linked before the `LinkUp` exchange and as a full table
+after it; a handle it releases is unknown. Time offers go through a bounded
+queue to the recorder, which owns the RTC and reads the newest timestamp from
+`Ring::floor` when the calendar is unknown. Each value retains its receipt tick
+and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
+set must lie within ten Julian years of the floor; later offers may correct
+at most five seconds in either direction. The fifteen-minute acceptance limit
+uses the monotonic tick and survives comms resets. Each accepted change writes
+KM43's `time set` body with the old value, new value and `ntp-via-comms` source.
+Records acquire timestamps once the calendar is known; earlier records stay
+untouched.
+
+The RTC adapter admits reads and writes only with a ready LSE source, for
+2000–2099. Its five TAMP backup words hold a format marker, the fractional
+millisecond offset (the HAL sets whole seconds), and an unfinished change's old
+and new values. The marker is invalidated before a calendar write and committed
+after it; interruption before commit leaves the calendar unknown. An applied
+change waits for its audit append, retried at most once a second. No later offer
+is applied until that audit lands. The pending audit survives link loss and
+controller reset. A reset between append and journal acknowledgement may repeat
+the original audit record, without applying the change again. Acceptance is
+returned only after both writes succeed and remains replayable for the protocol's
+three 500 ms attempts, keyed by request ID and original value. Link loss or
+expiry clears that bounded reply cache so IDs can be reused.
+
+Boot validity requires the backup-domain flag, ready LSE and a readable marked
+calendar. Signed client Time and its floor override remain dependent on #85,
+#86 and km43#73; the reset and backup-cell tests in #87 still require board
+evidence.
 
 On the controller the link task owns USART1's pins for the life of the
 part and builds the UART only for as long as the module is powered: the

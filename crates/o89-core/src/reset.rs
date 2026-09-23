@@ -159,6 +159,15 @@ pub enum RtcClock {
 }
 
 impl RtcClock {
+    /// Calendar reads and writes are permitted only on the ready crystal.
+    #[must_use]
+    pub const fn calendar_enabled(self) -> bool {
+        match self {
+            Self::Lse => true,
+            Self::Fault { .. } => false,
+        }
+    }
+
     /// Read the backup domain's answer: only a ready crystal that is also
     /// selected counts.
     #[must_use]

@@ -16,6 +16,20 @@ use std::path::PathBuf;
 mod link_version;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // SOURCE_DATE_EPOCH makes release builds reproducible. Ordinary builds
+    // use their actual build time; only an empty timestamp history uses it.
+    let seconds = match env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value.parse::<u64>()?,
+        Err(env::VarError::NotPresent) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        Err(error) => return Err(error.into()),
+    };
+    let millis = seconds
+        .checked_mul(1_000)
+        .ok_or("build timestamp overflow")?;
+    println!("cargo:rustc-env=BUILD_UNIX_MS={millis}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let out = PathBuf::from(env::var("OUT_DIR")?);
     let package_version = env::var("CARGO_PKG_VERSION")?;
     // A mode-specific prerelease arms only the matching bench sender.

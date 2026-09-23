@@ -43,6 +43,9 @@ fn identity() -> Identity {
 }
 
 struct Bench {
+    clock: o89_core::WallClock,
+    calendar: Option<(o89_core::UnixMillis, Tick)>,
+    clock_records: Vec<km43::ControllerRecord>,
     now: Tick,
     link: Link,
     comms: HostileComms,
@@ -83,6 +86,9 @@ impl Bench {
         let _ = sequencer.power_on(now);
         let rail = Rail::new(sequencer, None);
         let mut bench = Self {
+            clock: o89_core::WallClock::new(),
+            calendar: None,
+            clock_records: Vec::new(),
             now,
             link: Link::new(identity(), now),
             comms: HostileComms::new(caps),
@@ -204,6 +210,28 @@ impl Bench {
                             }
                             pending.push_back(self.link.rail(recovery, self.now));
                         }
+                        Action::OfferTime { req_id, unix_ms } => {
+                            let current = self.calendar.map(|(at, tick)| {
+                                o89_core::UnixMillis::new(
+                                    at.as_millis()
+                                        .checked_add(self.now.since(tick).unwrap().as_millis())
+                                        .unwrap(),
+                                )
+                                .unwrap()
+                            });
+                            let floor = o89_core::UnixMillis::new(1_700_000_000_000).unwrap();
+                            let outcome = match self.clock.offer(*unix_ms, current, floor, self.now)
+                            {
+                                Ok(change) => {
+                                    self.calendar = Some((change.new_value(), self.now));
+                                    self.clock_records.push(change.offer_record());
+                                    self.clock.offer_applied(self.now);
+                                    km43::TimeOffer::Accepted
+                                }
+                                Err(outcome) => outcome,
+                            };
+                            pending.push_back(self.link.time_verdict(*req_id, outcome));
+                        }
                         Action::DropConnections(_) | Action::Log(_) | Action::Note(_) => {}
                     }
                 }
@@ -258,7 +286,8 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::Log(event) => Some((*at, *event)),
-                Action::Send(_)
+                Action::OfferTime { .. }
+                | Action::Send(_)
                 | Action::DropConnections(_)
                 | Action::CutRail
                 | Action::Note(_) => None,
@@ -271,7 +300,11 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::DropConnections(why) => Some((*at, *why)),
-                Action::Send(_) | Action::Log(_) | Action::CutRail | Action::Note(_) => None,
+                Action::OfferTime { .. }
+                | Action::Send(_)
+                | Action::Log(_)
+                | Action::CutRail
+                | Action::Note(_) => None,
             })
             .collect()
     }
@@ -288,9 +321,11 @@ impl Bench {
             .iter()
             .filter_map(|(_, action)| match action {
                 Action::Note(note) => Some(*note),
-                Action::Send(_) | Action::Log(_) | Action::CutRail | Action::DropConnections(_) => {
-                    None
-                }
+                Action::OfferTime { .. }
+                | Action::Send(_)
+                | Action::Log(_)
+                | Action::CutRail
+                | Action::DropConnections(_) => None,
             })
             .collect()
     }
@@ -300,7 +335,8 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::Send(outgoing) if wanted(*outgoing) => Some((*at, *outgoing)),
-                Action::Send(_)
+                Action::OfferTime { .. }
+                | Action::Send(_)
                 | Action::Log(_)
                 | Action::CutRail
                 | Action::DropConnections(_)
@@ -1421,7 +1457,7 @@ fn a_connection_before_the_session_layer_is_refused_as_a_full_table() {
 }
 
 #[test]
-fn a_time_offer_before_the_clock_exists_is_refused_as_implausible() {
+fn l_140_l_162_first_offer_sets_clock_and_records_comms_provenance() {
     // Capabilities: none.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(1_000));
@@ -1434,10 +1470,35 @@ fn a_time_offer_before_the_clock_exists_is_refused_as_implausible() {
         h,
         Heard::Other {
             opcode: 0xE6,
-            outcome: Some(2),
+            outcome: Some(1),
             ..
         }
     )));
+    assert_eq!(
+        bench.clock_records,
+        [km43::ControllerRecord::TimeSet {
+            old: None,
+            new: 1_800_000_000_000,
+            source: km43::TimeSource::NtpViaComms,
+        }]
+    );
+    let bytes = bench
+        .comms
+        .offer_time(1_800_000_000_001, bench.now)
+        .unwrap();
+    bench.feed(&bytes);
+    assert_eq!(bench.clock.rate_refusals(), 1);
+    assert_eq!(bench.clock_records.len(), 1);
+    assert!(matches!(
+        bench.sent(is_time_verdict).last(),
+        Some((
+            _,
+            Outgoing::TimeVerdict {
+                outcome: km43::TimeOffer::RefusedRateLimited,
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]
