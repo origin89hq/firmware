@@ -24,11 +24,12 @@
 //!
 //! Each answer to a heartbeat of ours carries the comms processor's count
 //! of connections, which is compared with ours (L-101). Three answers in a
-//! row that disagree and the comms processor's count is taken as the
-//! truth: every connection is closed with one `CloseConnection` naming
-//! handle 0, and when its answer arrives every row goes with it, so a
-//! release lost on the wire leaks a row for six seconds rather than until
-//! the next reboot (L-102). The clients reconnect and are announced again.
+//! row that disagree under an agreed version (L-050) and the comms
+//! processor's count is taken as the truth: every connection is closed with
+//! one `CloseConnection` naming handle 0, and when its answer arrives every
+//! row goes with it, so a release lost on the wire leaks a row for six
+//! seconds rather than until the next reboot (L-102). The clients
+//! reconnect and are announced again.
 //!
 //! Time offers are decoded here and handed to the recorder, which owns the
 //! floor and RTC. Its verdict returns through `time_verdict`; a pending
@@ -564,6 +565,17 @@ impl Link {
         matches!(self.phase, Phase::Up { .. })
     }
 
+    /// Whether the link is up under an agreed version (L-050).
+    const fn agreed(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Up {
+                compat: Compat::Agreed(_),
+                ..
+            }
+        )
+    }
+
     /// The peer, while the link is up.
     #[must_use]
     pub const fn peer(&self) -> Option<&Peer> {
@@ -1015,9 +1027,13 @@ impl Link {
     /// The comms processor's `conns`, from an answer to a beat of ours,
     /// against the rows (L-101). Three disagreements in a row and every
     /// connection is closed (L-102); an agreement starts the count again.
-    /// Nothing is counted while that close is owed or in flight.
+    /// Nothing is counted while that close is owed or in flight, or under a
+    /// major mismatch, where the peer would refuse it (L-050).
     fn compare(&mut self, theirs: u8, rows: &impl Rows, now: Tick, actions: &mut Actions) {
         self.conns = rows.allocated();
+        if !self.agreed() {
+            return;
+        }
         let Resync::Watching { disagreed } = self.resync else {
             return;
         };
@@ -1035,9 +1051,12 @@ impl Link {
     }
 
     /// Send the close of every connection that is owed, while the link is
-    /// up and a request slot is free (L-014).
+    /// up under an agreed version and a request slot is free (L-014). Under
+    /// a major mismatch it stays owed, as the pairing report does (L-050);
+    /// one already in flight runs out its retries, and no answer after it
+    /// counts towards another.
     fn issue_resync(&mut self, now: Tick, actions: &mut Actions) {
-        if self.resync != Resync::Owed || !self.is_up() {
+        if self.resync != Resync::Owed || !self.agreed() {
             return;
         }
         if let Some(req_id) = self.request(LinkMessageType::CloseConnection, now) {
@@ -2311,6 +2330,27 @@ mod tests {
         link.received(envelope, now, rows)
     }
 
+    /// The comms processor stating itself again under the same boot,
+    /// speaking `version`.
+    fn restate(link: &mut Link, version: Version, req_id: u32, now: Tick) -> Actions {
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: 0x5EED,
+            hw: "comms",
+            net_version: Some(0),
+        }
+        .write(
+            link_header(LinkMessageType::LinkUp, ReqId(req_id)),
+            &mut buf,
+        )
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        link.received(envelope, now, &mut NoRows)
+    }
+
     #[test]
     fn l_102_three_disagreeing_answers_in_a_row_close_every_connection_once() {
         let mut link = up(at(1_000));
@@ -2339,6 +2379,44 @@ mod tests {
             assert_eq!(resync(&actions), None, "beat {n}");
         }
         assert!(resync(&answer_beat(&mut link, &mut rows, 6, 0)).is_some());
+    }
+
+    #[test]
+    fn l_102_no_resync_goes_under_a_major_mismatch_however_long_the_counts_disagree() {
+        let mut link = up_with(at(1_000), Version { major: 2, minor: 0 });
+        assert!(matches!(link.compat(), Some(Compat::MajorMismatch { .. })));
+        let mut rows = Held(2);
+        // The peer would refuse the close (L-050): sent, it would be given up
+        // and owed again three answers later, for as long as the link lasts.
+        for n in 1..=30 {
+            let actions = answer_beat(&mut link, &mut rows, n, 0);
+            assert_eq!(resync(&actions), None, "beat {n}");
+        }
+        assert_eq!(rows.0, 2, "no row goes without the peer's answer");
+        // Nor did those answers count: agreed again, nothing is owed.
+        let _ = restate(&mut link, OURS, 90, at(62_000));
+        assert!(matches!(link.compat(), Some(Compat::Agreed(_))));
+        assert_eq!(resync(&link.tick(at(62_100), false, &mut rows)), None);
+    }
+
+    #[test]
+    fn l_102_a_resync_owed_when_the_version_turns_mismatched_is_held_until_it_agrees() {
+        let mut link = up(at(1_000));
+        let mut rows = Held(2);
+        // Owed and held back: as four requests in flight would leave it.
+        link.resync = Resync::Owed;
+        // The same boot states another major: still up, and mismatched,
+        // for less than the silence that would fall the link (L-100).
+        let _ = restate(&mut link, Version { major: 2, minor: 0 }, 90, at(1_100));
+        assert!(matches!(link.compat(), Some(Compat::MajorMismatch { .. })));
+        for now in (1_200..5_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut rows);
+            assert_eq!(resync(&ticked), None, "sent at {now}");
+        }
+        // Agreed again, the close owed goes.
+        let _ = restate(&mut link, OURS, 91, at(5_000));
+        assert!(matches!(link.compat(), Some(Compat::Agreed(_))));
+        assert!(resync(&link.tick(at(5_100), false, &mut rows)).is_some());
     }
 
     #[test]

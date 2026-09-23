@@ -699,7 +699,9 @@ before the `LinkUp` exchange and otherwise goes to the session layer's rows
 processor's count of connections; three in a row that disagree with the
 rows close every connection with one `CloseConnection` naming handle 0, and
 its answer frees every row (L-102), so a release lost on the wire leaks a
-row for six seconds rather than until the next reboot. The comms firmware
+row for six seconds rather than until the next reboot. Under a major
+mismatch the peer would refuse that close (L-050), so nothing is counted
+and a close already owed waits for an agreed version. The comms firmware
 counts no connections until it has a table (#90). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
