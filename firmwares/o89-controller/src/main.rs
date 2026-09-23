@@ -284,7 +284,7 @@ async fn main(spawner: Spawner) {
     let identity = boot_count.map(|boot| Identity {
         fw: link_text(FW),
         hw: link_text(HW),
-        boot_id: BootId::derive(&embassy_stm32::uid::uid(), boot),
+        boot_id: BootId::derive(embassy_stm32::uid::uid(), boot),
     });
 
     // 7. Every output this image drives, to its declared fail state. Held

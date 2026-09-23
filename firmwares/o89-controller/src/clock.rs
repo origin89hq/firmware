@@ -27,18 +27,18 @@ pub fn config() -> Config {
         mode: HseMode::Oscillator,
     });
     config.pll = Some(Pll {
-        source: PllSource::HSE,
-        prediv: PllPreDiv::DIV1,
-        mul: PllMul::MUL16,
+        source: PllSource::Hse,
+        prediv: PllPreDiv::Div1,
+        mul: PllMul::Mul16,
         divp: None,
-        divq: Some(PllQDiv::DIV4),
-        divr: Some(PllRDiv::DIV3),
+        divq: Some(PllQDiv::Div4),
+        divr: Some(PllRDiv::Div3),
     });
-    config.sys = Sysclk::PLL1_R;
-    config.ahb_pre = AHBPrescaler::DIV1;
-    config.apb1_pre = APBPrescaler::DIV1;
+    config.sys = Sysclk::Pll1R;
+    config.ahb_pre = AHBPrescaler::Div1;
+    config.apb1_pre = APBPrescaler::Div1;
     config.ls = LsConfig::default_lse();
-    config.mux.fdcansel = Fdcansel::HSE;
-    config.mux.adcsel = Adcsel::HSI;
+    config.mux.fdcansel = Fdcansel::Hse;
+    config.mux.adcsel = Adcsel::Hsi;
     config
 }

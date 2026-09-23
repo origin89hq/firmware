@@ -32,10 +32,10 @@ pub fn take_flags() -> ResetFlags {
 pub fn rtc_clock() -> RtcClock {
     let bdcr = RCC.bdcr().read();
     let source = match bdcr.rtcsel() {
-        Rtcsel::DISABLE => RtcSource::None,
-        Rtcsel::LSE => RtcSource::Lse,
-        Rtcsel::LSI => RtcSource::Lsi,
-        Rtcsel::HSE_DIV_32 => RtcSource::Hse,
+        Rtcsel::Disable => RtcSource::None,
+        Rtcsel::Lse => RtcSource::Lse,
+        Rtcsel::Lsi => RtcSource::Lsi,
+        Rtcsel::HseDiv32 => RtcSource::Hse,
     };
     RtcClock::from_backup_domain(bdcr.lserdy(), source)
 }

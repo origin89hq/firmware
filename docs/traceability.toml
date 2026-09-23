@@ -48,6 +48,9 @@ uncovered = [
     # Needs the board: it is a measurement of the real UART at 921600.
     # It leaves this list for a `hardware` declaration when the bench runs.
     "F-087",
+    # The driver's own behaviour, on the part: the bench that shows the
+    # module held off by a late task is what takes it off this list.
+    "F-090",
 ]
 
 # Kinds: `hardware` — a dated bench log stands in for the test; `spec-check`

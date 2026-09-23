@@ -406,6 +406,17 @@ that does not hold byte for byte what the whole route would write there; the
 way forward is the whole route once, by the knock. Source: [#1][i1], F-084,
 `espflash`'s bootloader manifest, ESP-IDF's `Kconfig.app_rollback`. M3.
 
+**F-090** — When the controller's receive ring is full, the driver leaves
+the byte in the hardware and masks its receive interrupt until the task has
+made room, so `RTS` deasserts and the module is held off rather than the
+byte being dropped. A late task therefore costs throughput and never a
+frame. This is why the firmware workspace pins Embassy to a revision of its
+`main` and not to 0.6.0, whose handler empties the data register on every
+interrupt and drops what does not fit, which makes the flow control on the
+wire decorative. The hardware's own receive faults are still not reported
+by the driver, so F-087's no-overrun condition stays unmeasured ([#66][i66]).
+Source: [#66][i66], embassy-rs/embassy 844c4e7b. M3.
+
 **F-089** — `o89-comms` confirms the slot it runs from against the proof
 that its download window ran, a value only the window makes and only once it
 has passed, and against nothing else. An image whose window is omitted has
@@ -436,6 +447,7 @@ Source: [#1][i1], F-036, F-088. M3.
 [i4]: https://github.com/origin89hq/firmware/issues/4
 [i5]: https://github.com/origin89hq/firmware/issues/5
 [i49]: https://github.com/origin89hq/firmware/issues/49
+[i66]: https://github.com/origin89hq/firmware/issues/66
 [k30]: https://github.com/origin89hq/km43/issues/30
 [k32]: https://github.com/origin89hq/km43/issues/32
 [k34]: https://github.com/origin89hq/km43/issues/34
