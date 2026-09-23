@@ -297,3 +297,113 @@ fn p_101_unsupported_sections_and_exhausted_versions_refuse_without_writes() {
     assert_eq!(result.outcome, SetConfig::ExceedsCap);
     assert_eq!(part.bytes_written(), 0);
 }
+
+fn damaged_config(section: ConfigSection, malformed: bool) -> SimFram {
+    use o89_core::{Fram, Position};
+    let mut part = SimFram::fresh();
+    match section {
+        ConfigSection::Network => {
+            if malformed {
+                let _ = block_on(map::NETWORK.write(&mut part, Position::Start, &[0x42; 160]))
+                    .expect("malformed");
+            } else {
+                block_on(part.write(map::COMMS_RELEASE.end(), &[0x42; 344]))
+                    .expect("corrupt both slots");
+            }
+        }
+        ConfigSection::IdentityAndSite => {
+            if malformed {
+                let _ = block_on(map::SITE_CONFIG.prefix().write(
+                    &mut part,
+                    Position::Start,
+                    &[0x42; o89_core::IDENTITY_RECORD_BYTES],
+                ))
+                .expect("malformed");
+            } else {
+                block_on(part.write(map::RECENT_CUTS.end(), &[0x42; 64])).expect("corrupt A");
+                block_on(part.write(
+                    map::RECENT_CUTS.end().plus(o89_core::slot_bytes(2048)),
+                    &[0x42; 64],
+                ))
+                .expect("corrupt B");
+            }
+        }
+        ConfigSection::Channels
+        | ConfigSection::BusesAndDevices
+        | ConfigSection::GeneratorBehaviour
+        | ConfigSection::FrostBehaviour
+        | ConfigSection::ScheduleBehaviour
+        | ConfigSection::LoadShedBehaviour
+        | ConfigSection::Cloud => panic!("fixture only supports identity and network"),
+    }
+    part.reboot();
+    part
+}
+
+#[test]
+fn p_102_damaged_sections_accept_only_version_zero_and_keep_reads_refused_until_replaced() {
+    for section in [ConfigSection::Network, ConfigSection::IdentityAndSite] {
+        for malformed in [false, true] {
+            let mut part = damaged_config(section, malformed);
+            let mut config = block_on(Configuration::read(&mut part)).expect("read");
+            let mut network =
+                block_on(Kept::<Network, 160>::read(map::NETWORK, &mut part)).expect("read");
+            let mut encoded = [0; km43::MAX_NETWORK_WRITE_BYTES];
+            let len = km43::NetworkWrite {
+                join: None,
+                country: km43::Country::new("CA").expect("country"),
+                hostname: km43::Hostname::new("origin89").expect("host"),
+            }
+            .encode(&mut encoded)
+            .expect("body");
+            let body = if section == ConfigSection::Network {
+                &encoded[..len]
+            } else {
+                &[0xa1, 1, 0x61, b'a'][..]
+            };
+            let mut answer = [0; 160];
+            assert_eq!(
+                config.answer(section, &network, &mut answer),
+                Err(km43::ErrorCode::BusyRetry)
+            );
+            let operation = SetConfigOperation {
+                section,
+                expected_version: 7,
+                body,
+            };
+            assert_eq!(
+                block_on(config.set(operation, &mut network, &mut part))
+                    .expect("ack")
+                    .outcome,
+                SetConfig::StaleVersion
+            );
+            assert_eq!(part.bytes_written(), 0);
+            assert_eq!(
+                block_on(config.set(
+                    SetConfigOperation {
+                        expected_version: 0,
+                        ..operation
+                    },
+                    &mut network,
+                    &mut part
+                ))
+                .expect("replacement")
+                .outcome,
+                SetConfig::Accepted
+            );
+            part.reboot();
+            let config = block_on(Configuration::read(&mut part)).expect("read");
+            let network =
+                block_on(Kept::<Network, 160>::read(map::NETWORK, &mut part)).expect("read");
+            let len = config
+                .answer(section, &network, &mut answer)
+                .expect("read replacement");
+            assert_eq!(
+                ConfigAnswer::decode(&answer[..len])
+                    .expect("answer")
+                    .version(),
+                1
+            );
+        }
+    }
+}

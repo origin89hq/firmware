@@ -142,6 +142,14 @@ impl<T: Body<N>, const N: usize> Kept<T, N> {
         Ok(())
     }
 
+    /// Erase both slots before publishing absence. A failure retains the held state.
+    pub(crate) async fn erase<F: Fram>(&mut self, fram: &mut F) -> Result<(), Refused<F::Error>> {
+        self.record.erase(fram).await?;
+        self.position = Position::Start;
+        self.held = Held::Absent;
+        Ok(())
+    }
+
     /// Replace the value in RAM without writing: for a change every boot
     /// makes again from what the part holds, so the part need not hold it.
     /// Crate-private, because it is the one way the RAM copy may differ

@@ -534,9 +534,13 @@ impl Sessions {
                     .await
                     .map_err(ResetFailed::Network)?;
             }
-            crate::Held::Absent => {}
-            crate::Held::Corrupt | crate::Held::Malformed(_) => {
-                return Err(ResetFailed::NetworkUnavailable);
+            // An interrupted erase can read absent with residue in the other slot.
+            crate::Held::Absent | crate::Held::Corrupt | crate::Held::Malformed(_) => {
+                self.keys
+                    .network
+                    .erase(fram)
+                    .await
+                    .map_err(ResetFailed::Network)?;
             }
         }
         let reset = reset_clients(&mut self.keys.epoch_record, &mut self.keys.clients, fram).await;
@@ -3603,14 +3607,14 @@ mod tests {
     }
 
     #[test]
-    fn p_085_a_reset_whose_epoch_does_not_land_ends_every_session_and_derives_nothing_new() {
+    fn p_085_a_reset_whose_network_erase_is_refused_ends_every_session_and_derives_nothing_new() {
         let mut rig = Rig::new();
         let _ = rig.connect(1);
         let (_, _, _) = rig.hello(1);
         rig.part.falling = true;
         assert!(matches!(
             block_on(rig.sessions.factory_reset(&mut rig.part)),
-            Err(ResetFailed::Epoch(_))
+            Err(ResetFailed::Network(crate::Refused::SupplyFalling))
         ));
         assert_eq!(
             rig.sessions.bound(),

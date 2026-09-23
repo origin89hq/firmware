@@ -689,10 +689,15 @@ the next link-up compares again.
 Factory reset ends sessions and writes the network clear before advancing the
 epoch. The clear increments the network version and retains country and
 hostname, so it remains encodable after reboot (L-134, L-135). A failed clear
-stops the reset. A never-written section remains unwritten. If that unit meets
+stops the reset. A damaged network record is erased across both slots before
+the epoch advances; a failed erase also stops the reset. An absent record is
+erased too, so a retry finishes removing residue after a partial erase. No
+country or hostname is invented, and the section reads absent afterwards. A
+never-written section remains unwritten. If that unit meets
 a module reporting a nonzero network version, KM43 0.5.1 has no clear shape
 without country and hostname: the controller sends nothing and raises
-`NetworkWithoutMaster`. That protocol gap remains open; no regulatory country
+`NetworkWithoutMaster`. That protocol gap remains open in
+[KM43 #98](https://github.com/origin89hq/km43/issues/98); no regulatory country
 is guessed. The phone-to-Wi-Fi bench exit also remains open and depends on
 #90's comms side.
 
@@ -828,7 +833,10 @@ No existing record moves. The network body uses 138 of its reserved 160 bytes:
 33 SSID + 64 passphrase. A clear retains country and hostname and advances the
 version. Configuration is canonicalized after validation; unknown CBOR keys
 are not persisted. Never-written records answer version zero with no body;
-damaged records refuse rather than pretending to be unwritten.
+damaged reads refuse rather than pretending to be unwritten. An authenticated
+replacement of a damaged section requires expected version zero because its
+version is unknowable; the validated replacement starts at version one. A
+local network replacement owes a push even when the module reports version one.
 
 **One record is one transaction, and that decides what shares a record.**
 The per-client counters and the dedup table are fields of the client table's

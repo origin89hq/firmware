@@ -317,6 +317,22 @@ impl<const N: usize> Record<N> {
         })
     }
 
+    /// Zero both complete reservations, including any previous credentials.
+    /// A refused write stops immediately; retrying may repeat the partial erase.
+    pub(crate) async fn erase<F: Fram>(self, fram: &mut F) -> Result<(), Refused<F::Error>> {
+        // A fixed scratch buffer bounds stack use independently of reservation size.
+        const ERASE_CHUNK: usize = 32;
+        let zeros = [0; ERASE_CHUNK];
+        let bytes = slot_bytes(self.reserved).saturating_mul(2);
+        for offset in (0..bytes).step_by(ERASE_CHUNK) {
+            let len = bytes.saturating_sub(offset).min(ERASE_CHUNK);
+            if let Some(chunk) = zeros.get(..len) {
+                fram.write(self.a.plus(offset), chunk).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write `body` as the next record, into the slot that is not current:
     /// the magic cleared first, so whatever the slot held stops being a
     /// record; then the sequence, the body and the CRC; then the magic, in

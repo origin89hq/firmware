@@ -162,8 +162,7 @@ impl Configuration {
             ConfigSection::Network => {
                 let current = match network.held() {
                     Held::Present(value) => *value,
-                    Held::Absent => Network::NONE,
-                    Held::Corrupt | Held::Malformed(_) => return Err(ErrorCode::BusyRetry),
+                    Held::Absent | Held::Corrupt | Held::Malformed(_) => Network::NONE,
                 };
                 let version = current.version();
                 if let Err(outcome) = operation.check_version(version) {
@@ -238,7 +237,8 @@ async fn save<F: Fram, const N: usize, const M: usize>(
     fram: &mut F,
     encode: impl FnOnce(&[u8], &mut [u8]) -> Result<usize, km43::ConfigError>,
 ) -> Result<SetConfigAck, ErrorCode> {
-    let (version, _) = shown(record)?;
+    // A damaged section has no knowable version; only an explicit zero can replace it.
+    let version = record.present().map_or(0, |value| value.version);
     if let Err(outcome) = operation.check_version(version) {
         return Ok(ack(operation, version, outcome));
     }

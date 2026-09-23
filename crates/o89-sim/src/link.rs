@@ -1954,3 +1954,187 @@ fn l_135_factory_reset_cut_at_every_byte_never_advances_epoch_with_old_credentia
         }
     }
 }
+
+fn damaged_network_unit(malformed: bool) -> (SimFram, Sessions) {
+    use o89_core::{Fram, Kept, Position, map};
+    let (mut part, mut keys) = unit();
+    if malformed {
+        let first =
+            block_on(map::NETWORK.write(&mut part, Position::Start, &[0x42; 160])).expect("slot A");
+        let _ =
+            block_on(map::NETWORK.write(&mut part, first.position, &[0x43; 160])).expect("slot B");
+    } else {
+        block_on(part.write(map::COMMS_RELEASE.end(), &[0x42; 344])).expect("both slots corrupt");
+    }
+    keys.network = block_on(Kept::read(map::NETWORK, &mut part)).expect("network");
+    if malformed {
+        assert!(matches!(keys.network.held(), o89_core::Held::Malformed(_)));
+    } else {
+        assert!(matches!(keys.network.held(), o89_core::Held::Corrupt));
+    }
+    part.reboot();
+    (part, Sessions::new(keys))
+}
+
+#[test]
+fn p_085_damaged_network_reset_erases_both_slots_before_revoking_clients() {
+    for malformed in [false, true] {
+        let (mut part, mut sessions) = damaged_network_unit(malformed);
+        block_on(sessions.factory_reset(&mut part)).expect("damaged network must not block reset");
+        assert!(matches!(
+            sessions.keys().network.held(),
+            o89_core::Held::Absent
+        ));
+        assert_eq!(
+            sessions
+                .keys()
+                .clients
+                .present()
+                .expect("clients")
+                .enrolled(),
+            0
+        );
+        assert_eq!(sessions.keys().epoch, km43::Epoch::new(2));
+        let start = usize::from(o89_core::map::COMMS_RELEASE.end().0);
+        let end = usize::from(o89_core::map::NETWORK.end().0);
+        assert!(part.bytes()[start..end].iter().all(|byte| *byte == 0));
+        let (store, report) = block_on(Store::boot(&mut part, None)).expect("reboot");
+        assert!(matches!(store.network.held(), o89_core::Held::Absent));
+        assert_eq!(report.epoch.epoch(), km43::Epoch::new(2));
+        assert_eq!(store.clients.present().expect("clients").enrolled(), 0);
+    }
+}
+
+#[test]
+fn p_085_damaged_network_reset_cut_at_every_byte_can_be_retried_without_old_credentials() {
+    for malformed in [false, true] {
+        let (mut whole, mut sessions) = damaged_network_unit(malformed);
+        let seed = whole.clone();
+        block_on(sessions.factory_reset(&mut whole)).expect("reset");
+        let steps = whole.bytes_written();
+        assert!(steps > 344);
+        for cut in 0..=steps {
+            let mut part = seed.clone();
+            let (store, report) = block_on(Store::boot(&mut part, None)).expect("boot");
+            let mut sessions = Sessions::new(Keys {
+                configuration: store.configuration,
+                network: store.network,
+                secret: store.secret.present().copied(),
+                epoch: report.epoch.epoch(),
+                epoch_record: store.epoch,
+                clients: store.clients,
+                challenges: store.challenges,
+            });
+            part.reboot();
+            part.cut_after(cut);
+            let result = block_on(sessions.factory_reset(&mut part));
+            if cut < 344 {
+                assert!(result.is_err(), "erase failure must stop reset at {cut}");
+                assert_eq!(sessions.keys().epoch, Some(km43::Epoch::FIRST));
+                assert_eq!(
+                    sessions
+                        .keys()
+                        .clients
+                        .present()
+                        .expect("clients")
+                        .enrolled(),
+                    1
+                );
+            }
+            part.reboot();
+            let (store, report) = block_on(Store::boot(&mut part, None)).expect("recover");
+            if report.epoch.epoch() != Some(km43::Epoch::FIRST) {
+                assert!(
+                    matches!(store.network.held(), o89_core::Held::Absent),
+                    "cut {cut}"
+                );
+                assert_eq!(store.clients.present().expect("clients").enrolled(), 0);
+            }
+            let mut sessions = Sessions::new(Keys {
+                configuration: store.configuration,
+                network: store.network,
+                secret: store.secret.present().copied(),
+                epoch: report.epoch.epoch(),
+                epoch_record: store.epoch,
+                clients: store.clients,
+                challenges: store.challenges,
+            });
+            block_on(sessions.factory_reset(&mut part)).expect("retry reset");
+            assert!(
+                matches!(sessions.keys().network.held(), o89_core::Held::Absent),
+                "retry {cut}"
+            );
+            assert_eq!(
+                sessions
+                    .keys()
+                    .clients
+                    .present()
+                    .expect("clients")
+                    .enrolled(),
+                0
+            );
+            let start = usize::from(o89_core::map::COMMS_RELEASE.end().0);
+            let end = usize::from(o89_core::map::NETWORK.end().0);
+            assert!(
+                part.bytes()[start..end].iter().all(|byte| *byte == 0),
+                "retry {cut}"
+            );
+        }
+    }
+}
+
+#[test]
+fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_version() {
+    // Capabilities: claim a cached version equal to the replacement's version.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 1,
+        ..Capabilities::default()
+    });
+    let (part, sessions) = damaged_network_unit(false);
+    bench.fram = part;
+    bench.endpoint.sessions = sessions;
+    bench.run_for(Millis::from_millis(2000));
+    assert!(
+        bench
+            .asked
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Note(Note::NetworkWithoutMaster)))
+    );
+    let (mut store, _) = block_on(Store::boot(&mut bench.fram, None)).expect("store");
+    let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+    let len = km43::NetworkWrite {
+        join: None,
+        country: km43::Country::new("CA").expect("country"),
+        hostname: km43::Hostname::new("origin89").expect("host"),
+    }
+    .encode(&mut body)
+    .expect("body");
+    let ack = block_on(store.configuration.set(
+        km43::SetConfigOperation {
+            section: km43::ConfigSection::Network,
+            expected_version: 0,
+            body: &body[..len],
+        },
+        &mut store.network,
+        &mut bench.fram,
+    ))
+    .expect("replacement");
+    assert_eq!(ack.outcome, km43::SetConfig::Accepted);
+    bench.endpoint.sessions = Sessions::new(Keys {
+        configuration: store.configuration,
+        network: store.network,
+        secret: store.secret.present().copied(),
+        epoch: store.epoch.present().copied(),
+        epoch_record: store.epoch,
+        clients: store.clients,
+        challenges: store.challenges,
+    });
+    bench.run_for(Millis::from_millis(2000));
+    assert!(
+        bench
+            .comms
+            .heard
+            .iter()
+            .any(|heard| matches!(heard, Heard::NetConfig { version: 1, .. }))
+    );
+}
