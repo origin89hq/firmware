@@ -11,7 +11,7 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig, Interface, WifiController,
     sta::StationConfig,
 };
-use o89_comms_core::{Credential, NTP_BYTES, NtpRequest};
+use o89_comms_core::{Credential, NTP_BYTES, NtpRequest, NtpSchedule, Tick};
 use static_cell::StaticCell;
 
 static DESIRED: Mutex<CriticalSectionRawMutex, RefCell<Option<Credential>>> =
@@ -28,6 +28,14 @@ pub struct Sample {
     pub at: Instant,
 }
 pub const SERVER: &str = "pool.ntp.org";
+
+static NTP_SCHEDULE: Mutex<CriticalSectionRawMutex, RefCell<NtpSchedule>> =
+    Mutex::new(RefCell::new(NtpSchedule::READY));
+
+/// Pace the next query from the link's fresh offer, even if its UART write fails.
+pub fn time_offered(now: Tick) {
+    NTP_SCHEDULE.lock(|schedule| schedule.borrow_mut().offered(now));
+}
 
 /// Each task reports progress within bounded waits. Idle radio and network tasks
 /// still turn once a second; a hung task cannot borrow the link's watchdog feed.
@@ -182,16 +190,22 @@ async fn station(mut controller: WifiController<'static>, stack: Stack<'static>)
 
 #[embassy_executor::task]
 async fn ntp(stack: Stack<'static>) {
-    let mut due = Instant::now();
     loop {
         progress(2);
-        if stack.is_config_up() && Instant::now() >= due {
+        let due = NTP_SCHEDULE.lock(|schedule| {
+            schedule
+                .borrow()
+                .ready(Tick::from_millis(Instant::now().as_millis()))
+        });
+        if stack.is_config_up() && due {
             if let Ok(Some(sample)) = with_timeout(Duration::from_secs(4), query(stack)).await {
                 let _queued = SAMPLES.try_send(sample);
-                due = Instant::from_millis(Instant::now().as_millis().saturating_add(900_000));
-            } else {
-                due = Instant::from_millis(Instant::now().as_millis().saturating_add(30_000));
             }
+            NTP_SCHEDULE.lock(|schedule| {
+                schedule
+                    .borrow_mut()
+                    .queried(Tick::from_millis(Instant::now().as_millis()));
+            });
         }
         progress(2);
         Timer::after_secs(1).await;

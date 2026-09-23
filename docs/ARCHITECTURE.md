@@ -1265,6 +1265,8 @@ sample, refusing a new sample while full.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.
+Queries retry after thirty seconds unless the link attempts a fresh offer;
+only that attempt defers the next query by fifteen minutes.
 New `TimeOffer` requests are separated by at least fifteen monotonic minutes,
 including failed sends and controller refusals. An unanswered request retries
 the same sample and request ID at 500 ms, up to three attempts (L-015). The ESP32 never sets a clock

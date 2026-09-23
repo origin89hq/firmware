@@ -7,6 +7,45 @@ pub const NTP_BYTES: usize = 48;
 pub const OFFER_INTERVAL_MS: u64 = 900_000;
 const UNIX_OFFSET: u64 = 2_208_988_800;
 
+/// Retry failed queries and samples that never became offers after thirty seconds.
+const QUERY_RETRY_MS: u64 = 30_000;
+
+/// Query pacing follows actual offers, not successful NTP replies. The link's
+/// `OfferRate` remains authoritative for permission to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtpSchedule {
+    due: Tick,
+}
+
+impl NtpSchedule {
+    /// Query immediately once networking is available.
+    pub const READY: Self = Self { due: Tick::ZERO };
+
+    /// Whether another query may begin.
+    #[must_use]
+    pub fn ready(&self, now: Tick) -> bool {
+        now >= self.due
+    }
+
+    /// A query completed, including failure or a full sample channel. Unless
+    /// the link attempts an offer, retry soon even if it drops a stale sample.
+    pub fn queried(&mut self, now: Tick) {
+        self.defer(now, QUERY_RETRY_MS);
+    }
+
+    /// The link admitted a fresh offer. Failed UART sends and refused offers
+    /// still consume the interval; acknowledgment retries do not extend it.
+    pub fn offered(&mut self, now: Tick) {
+        self.defer(now, OFFER_INTERVAL_MS);
+    }
+
+    fn defer(&mut self, now: Tick, delay_ms: u64) {
+        self.due = self
+            .due
+            .max(Tick::from_millis(now.as_millis().saturating_add(delay_ms)));
+    }
+}
+
 /// One request's unpredictable transmit timestamp, echoed as the response origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NtpRequest([u8; 8]);
@@ -94,6 +133,46 @@ impl OfferRate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unused_samples_and_failed_queries_retry_after_thirty_seconds() {
+        let mut schedule = NtpSchedule::READY;
+        assert!(schedule.ready(Tick::ZERO));
+        for completed in [100, 30_200, 60_300] {
+            schedule.queried(Tick::from_millis(completed));
+            assert!(!schedule.ready(Tick::from_millis(completed + 29_999)));
+            assert!(schedule.ready(Tick::from_millis(completed + 30_000)));
+        }
+    }
+
+    #[test]
+    fn offered_sample_paces_queries_from_the_offer_not_the_query() {
+        let mut schedule = NtpSchedule::READY;
+        let mut rate = OfferRate::new();
+        schedule.queried(Tick::from_millis(100));
+        assert!(rate.take(Tick::from_millis(200)));
+        schedule.offered(Tick::from_millis(200));
+        assert!(!schedule.ready(Tick::from_millis(900_199)));
+        assert!(schedule.ready(Tick::from_millis(900_200)));
+        assert!(rate.take(Tick::from_millis(900_200)));
+    }
+
+    #[test]
+    fn query_completion_cannot_shorten_an_offer_interval() {
+        let mut schedule = NtpSchedule::READY;
+        schedule.offered(Tick::from_millis(200));
+        schedule.queried(Tick::from_millis(300));
+        assert!(!schedule.ready(Tick::from_millis(30_300)));
+        assert!(schedule.ready(Tick::from_millis(900_200)));
+    }
+
+    #[test]
+    fn query_deadlines_saturate_and_do_not_move_backwards() {
+        let mut schedule = NtpSchedule::READY;
+        schedule.offered(Tick::from_millis(u64::MAX - 1));
+        schedule.queried(Tick::ZERO);
+        assert!(!schedule.ready(Tick::from_millis(u64::MAX - 1)));
+        assert!(schedule.ready(Tick::from_millis(u64::MAX)));
+    }
     fn response() -> (NtpRequest, [u8; 48]) {
         let request = NtpRequest::new([1; 8]);
         let mut response = [0; 48];

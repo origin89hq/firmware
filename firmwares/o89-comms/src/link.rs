@@ -100,6 +100,7 @@ pub async fn run(
             };
             let mut bytes = [0; MAX_FRAME];
             if let Ok(Some(len)) = link.time_offer(offer, now(), &mut writer, &mut bytes) {
+                crate::radio::time_offered(now());
                 let _sent = with_timeout(
                     WRITE_DEADLINE,
                     write_all(&mut tx, bytes.get(..len).unwrap_or(&[])),
