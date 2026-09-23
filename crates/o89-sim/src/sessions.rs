@@ -480,6 +480,7 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
         fw_comms: "",
         log: LOG,
         time_known: false,
+        pairing_open: false,
         link_up: true,
     };
     // A fresh unit connects two clients and each discovers.

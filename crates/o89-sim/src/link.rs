@@ -326,6 +326,7 @@ impl Bench {
                         model: MODEL,
                         log: LOG,
                         time_known: false,
+                        pairing_open: false,
                     };
                     let step = block_on(self.endpoint.frame(
                         frame,

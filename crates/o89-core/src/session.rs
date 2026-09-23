@@ -40,28 +40,35 @@
 //! flight runs again for the same reason: no output can already be where
 //! a command asked.
 //!
-//! What this slice does not serve yet is refused with error 2, bare or
-//! under the key by the rule above: `Pair` (the pairing slice), the three
-//! other signed requests, whose handlers call [`admit`] when they land,
-//! and the wrapped reads (theirs). Each is an arm of the exhaustive match
-//! below, which is where those slices land.
+//! **A `Pair` enrols only inside the pairing window** the selector opens
+//! (P-066), read when the frame is handled. Every answer to one is MAC'd
+//! under the pair key, refusals included, so the comms processor cannot
+//! forge a `window_closed` that sends somebody back to the panel (P-064).
+//! A row lands on the part before the answer says so, and an enrolment or
+//! a reclaim closes the window behind it (L-195).
 //!
-//! cites: P-021, P-026, P-051, P-060, P-061, P-062, P-063, P-073, P-076,
-//! P-077, P-079, P-080, P-084, P-143, L-061, L-062, L-070, L-071, L-072,
-//! L-080, L-180, L-182
+//! What this slice does not serve yet is refused with error 2, bare or
+//! under the key by the rule above: the three other signed requests,
+//! whose handlers call [`admit`] when they land, and the wrapped reads
+//! (theirs). Each is an arm of the exhaustive match below, which is where
+//! those slices land.
+//!
+//! cites: P-021, P-026, P-051, P-058, P-060, P-061, P-062, P-063, P-064,
+//! P-066, P-067, P-073, P-076, P-077, P-078, P-079, P-080, P-084, P-086,
+//! P-143, L-061, L-062, L-070, L-071, L-072, L-080, L-180, L-182, L-195
 
 use km43::{
     Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, CommandAck, Conn, EmptyBody,
     Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake, HandshakeError, Header,
     HelloClaim, HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
-    MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MessageType, Refusal as Code, ReqId,
-    SessionId, SessionKey, SignedClaim, SignedError, StateSeq, Tagged, Topology, Version, Wrapper,
-    WrapperError, WrapperKey,
+    MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MessageType, Outcome, PairClaim,
+    PairRequest, PairResponse, Refusal as Code, ReqId, SessionId, SessionKey, SignedClaim,
+    SignedError, StateSeq, Tagged, Topology, Version, Wrapper, WrapperError, WrapperKey,
 };
 
 use crate::body::Kept;
 use crate::challenge::{CHALLENGE_BYTES, CHALLENGE_COUNTER_BYTES, ChallengeCounter};
-use crate::clients::{CLIENT_TABLE_BYTES, ClientTable};
+use crate::clients::{CLIENT_TABLE_BYTES, ClientTable, Label, Paired, TableFull};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::Rows;
@@ -125,6 +132,9 @@ pub struct Facts<'a> {
     pub log: LogSpan,
     /// `Hello` key 10.
     pub time_known: bool,
+    /// `Discover` key 6, and whether a `Pair` may enrol: the pairing window,
+    /// read as this frame is handled and never cached (P-066).
+    pub pairing_open: bool,
     /// Whether the link-local handshake is done: a client frame before it
     /// is refused with 258 (L-033, L-180).
     pub link_up: bool,
@@ -164,6 +174,9 @@ pub enum SessionNote {
     Refused(u16),
     /// A session was bound on this handle.
     Bound(Conn),
+    /// A `Pair` enrolled or reclaimed this client: the window that allowed it
+    /// closes now (L-195).
+    Paired(ClientId),
     /// The client said goodbye on this handle.
     Unbound(Conn),
     /// A challenge could not be minted: the counter did not land, is at its
@@ -516,8 +529,7 @@ impl Sessions {
         match envelope.header().kind {
             MessageType::Discover => self.discover(to, now, facts, fram, dst).await,
             MessageType::Hello => self.hello(to, envelope, now, facts, dst),
-            // The pairing slice answers this.
-            MessageType::Pair => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
+            MessageType::Pair => self.pair(to, envelope, now, facts, fram, dst).await,
             // Wrapped: verified before anything is read (P-051).
             MessageType::Goodbye
             | MessageType::Inventory
@@ -609,13 +621,145 @@ impl Sessions {
             device_id: secret.device_id_bytes(),
             model: facts.model,
             provisioned,
-            // The gesture opens it; until that slice lands it never is.
-            pairing_open: false,
+            pairing_open: facts.pairing_open,
             challenge,
             epoch,
         }
         .write(to.header(MessageType::DiscoverResponse), dst);
         answered(written.ok())
+    }
+
+    /// `Pair 0x0B`: the challenge consumed on presentation whatever the
+    /// answer (P-061), a new one minted to go back in `next_challenge`
+    /// (P-058), and every outcome MAC'd under the pair key so a refusal the
+    /// comms processor forges does not read (P-064, P-066). Enrolment needs
+    /// the window open when this frame is handled (P-066) and a proof that
+    /// checks out, and lands its row on the part before the answer says so:
+    /// reclaim by label first, then the lowest free slot, then `table_full`
+    /// (P-067, P-078, P-086). A proof that fails counts against the
+    /// connection like any other (P-051); a closed window or a full table,
+    /// which cost no proof, does not.
+    async fn pair<F: Fram>(
+        &mut self,
+        to: Addressed,
+        envelope: Envelope<'_>,
+        now: Tick,
+        facts: &Facts<'_>,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        let claim = match PairClaim::decode(envelope) {
+            Ok(claim) => claim,
+            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        };
+        let Some(challenge) = self
+            .row_mut(to.conn)
+            .and_then(|row| row.take_challenge(now))
+        else {
+            return bare(
+                to,
+                Incoming::Client(ErrorCode::StaleChallengeReconnectAndRetry),
+                dst,
+            );
+        };
+        // Nothing derives without both, so nothing can be MAC'd.
+        let (Some(secret), Some(epoch)) = (self.keys.secret, self.keys.epoch) else {
+            let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+            reply.note = Some(SessionNote::NoChallenge);
+            return reply;
+        };
+        let Some(next_challenge) = self.mint(fram).await else {
+            let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+            reply.note = Some(SessionNote::NoChallenge);
+            return reply;
+        };
+        if let Some(row) = self.row_mut(to.conn) {
+            row.challenge = Challenge::Live {
+                bytes: next_challenge,
+                minted: now,
+            };
+        }
+        let key = secret.device_secret().pair_key();
+        let attempt = claim.attempt(secret.device_id_bytes(), challenge);
+        let outcome = if facts.pairing_open {
+            match claim.verify(&key, &attempt) {
+                // A verified `Pair` that could not be recorded has no outcome
+                // to say so (origin89hq/km43#91), and a bare 7 needs a MAC a
+                // client will not find: it times out and tries again.
+                Ok(request) => match self.enrol(request, epoch, fram).await {
+                    Ok(outcome) => outcome,
+                    Err(Unenrolled::NotKept) => {
+                        let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+                        reply.note = Some(SessionNote::NotKept);
+                        return reply;
+                    }
+                    Err(Unenrolled::OtherEpoch) => {
+                        return bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+                    }
+                    Err(Unenrolled::Label) => {
+                        return bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst);
+                    }
+                },
+                Err(bad) => bad.outcome(),
+            }
+        } else {
+            Outcome::WindowClosed
+        };
+        let shed = outcome.failed_a_proof() && self.count_failure(to.conn, now);
+        let written = PairResponse {
+            outcome,
+            epoch,
+            next_challenge,
+        }
+        .write(&key, &attempt, to.header(MessageType::PairResponse), dst);
+        let mut reply = answered(written.ok());
+        if let Some(client) = outcome.slot() {
+            reply.note = Some(SessionNote::Paired(client));
+        }
+        if shed {
+            reply.close = Some(Close {
+                conn: to.conn,
+                reason: CloseReason::AuthenticationFailures,
+            });
+        }
+        reply
+    }
+
+    /// A verified `Pair` into the client table under `epoch`: the row on the
+    /// part, or why nothing was enrolled.
+    async fn enrol<F: Fram>(
+        &mut self,
+        request: PairRequest<'_>,
+        epoch: Epoch,
+        fram: &mut F,
+    ) -> Result<Outcome, Unenrolled> {
+        let label = Label::new(request.label).map_err(|_| Unenrolled::Label)?;
+        let Some(table) = self
+            .keys
+            .clients
+            .present()
+            .filter(|table| table.is_under(epoch))
+        else {
+            return Err(Unenrolled::OtherEpoch);
+        };
+        // A reclaim keeps the client's id and key and sets its counter to
+        // zero, so a session still bound to it would read a captured frame
+        // as fresh. Every one goes first, whether or not the row then lands
+        // (P-078).
+        if let Some(client) = table.holder(&label) {
+            self.unbind(client);
+        }
+        let paired = self
+            .keys
+            .clients
+            .update(fram, |table| table.pair(label, request.client_kind))
+            .await
+            .map_err(|_| Unenrolled::NotKept)?;
+        Ok(match paired {
+            Ok(Paired::Enrolled(client)) => Outcome::Enrolled(client),
+            Ok(Paired::Reclaimed(client)) => Outcome::Reclaimed(client),
+            Err(TableFull) => Outcome::TableFull,
+        })
     }
 
     /// `Hello 0x01`: the challenge consumed on presentation (P-061), the
@@ -914,13 +1058,7 @@ impl Sessions {
     /// failure against the connection; the one that reaches the threshold
     /// ends any session on it and closes it (P-051).
     fn failed(&mut self, to: Addressed, now: Tick, dst: &mut [u8]) -> Reply {
-        let shed = self.row_mut(to.conn).is_some_and(|row| {
-            let shed = row.failed(now);
-            if shed {
-                row.bound = Bound::Ended;
-            }
-            shed
-        });
+        let shed = self.count_failure(to.conn, now);
         let mut reply = bare(to, Incoming::Client(ErrorCode::BadMAC), dst);
         if shed {
             reply.close = Some(Close {
@@ -929,6 +1067,28 @@ impl Sessions {
             });
         }
         reply
+    }
+
+    /// End every session bound to `client`, leaving the rows to their
+    /// transports (P-076).
+    fn unbind(&mut self, client: ClientId) {
+        for row in self.rows.iter_mut().flatten() {
+            if matches!(&row.bound, Bound::Session(binding) if binding.client == client) {
+                row.bound = Bound::Ended;
+            }
+        }
+    }
+
+    /// One more failure against `conn`; whether it reached the threshold,
+    /// which ends any session on it (P-051).
+    fn count_failure(&mut self, conn: Conn, now: Tick) -> bool {
+        self.row_mut(conn).is_some_and(|row| {
+            let shed = row.failed(now);
+            if shed {
+                row.bound = Bound::Ended;
+            }
+            shed
+        })
     }
 
     /// The next challenge, its counter on the part before it exists. None
@@ -966,6 +1126,19 @@ impl Rows for Sessions {
     fn allocated(&self) -> u8 {
         Self::allocated(self)
     }
+}
+
+/// Why a verified `Pair` enrolled nothing. Each is answered differently and
+/// only one is a part that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unenrolled {
+    /// The row did not land: the FRAM refused the write.
+    NotKept,
+    /// The table is not one this epoch's keys derive for: a factory reset
+    /// the boot has not finished, and no write was tried.
+    OtherEpoch,
+    /// A label the table cannot hold, which km43's decoder refuses first.
+    Label,
 }
 
 /// Where an answer goes: the handle in `session_id`, the request echoed
@@ -1072,8 +1245,9 @@ mod tests {
 
     use embassy_futures::block_on;
     use km43::{
-        ClientKind, CommandKind, CommandOperation, Counter, DeviceId, DeviceSecret,
-        ErrorBody as Body, HelloInner, Hint, MAX_PAYLOAD, PrintedSecret, Session, Signed,
+        Attempt, ClientKind, CommandKind, CommandOperation, Counter, DeviceId, DeviceSecret,
+        ErrorBody as Body, HelloInner, Hint, MAX_PAYLOAD, PairAckClaim, PrintedSecret, Session,
+        Signed,
     };
 
     use super::*;
@@ -1092,7 +1266,13 @@ mod tests {
     struct Part {
         bytes: [u8; PART_BYTES],
         falling: bool,
+        /// Refuse writes to the client table's record only, as a part that
+        /// failed mid-way through an enrolment would.
+        table_refused: bool,
     }
+
+    /// Where the client table's record starts: its two slots end the part.
+    const TABLE_STARTS: usize = PART_BYTES - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
 
     impl Fram for Part {
         type Error = ();
@@ -1108,13 +1288,14 @@ mod tests {
             at: Address,
             bytes: &[u8],
         ) -> impl Future<Output = Result<(), Refused<()>>> {
-            let outcome = if self.falling {
-                Err(Refused::SupplyFalling)
-            } else {
-                let start = usize::from(at.0);
-                self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
-                Ok(())
-            };
+            let outcome =
+                if self.falling || (self.table_refused && usize::from(at.0) >= TABLE_STARTS) {
+                    Err(Refused::SupplyFalling)
+                } else {
+                    let start = usize::from(at.0);
+                    self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                };
             core::future::ready(outcome)
         }
     }
@@ -1168,6 +1349,7 @@ mod tests {
             newest: LogSeq(41),
         },
         time_known: false,
+        pairing_open: false,
         link_up: true,
     };
 
@@ -1189,6 +1371,7 @@ mod tests {
             let mut part = Part {
                 bytes: [0; PART_BYTES],
                 falling: false,
+                table_refused: false,
             };
             let mut table = ClientTable::cleared(&Clearing::found_at_boot(epoch(1)));
             let _ = table.pair(Label::new("phone").expect("fits"), ClientKind::App);
@@ -1710,6 +1893,310 @@ mod tests {
             assert_eq!(hint(&answer), Some(2), "{kind:?}");
         }
         assert_eq!(rig.accepted(), Some(Counter(0)));
+    }
+
+    const OPEN: Facts<'static> = Facts {
+        pairing_open: true,
+        ..FACTS
+    };
+
+    fn pair_key() -> km43::PairKey {
+        device().pair_key()
+    }
+
+    impl Rig {
+        /// A `Pair` from `label` of `kind` on `handle`, proved under `key`
+        /// over `challenge`, and the attempt its answer is MAC'd over.
+        fn pair_frame(
+            &mut self,
+            handle: u16,
+            (label, kind): (&str, ClientKind),
+            challenge: [u8; 16],
+            key: &km43::PairKey,
+        ) -> (Bytes, Attempt) {
+            let req_id = self.next_req();
+            let attempt = Attempt {
+                device_id: DEVICE,
+                challenge,
+                client_nonce: [handle.to_le_bytes()[0] ^ 0x5a; 16],
+            };
+            let mut dst = [0u8; 256];
+            let len = PairRequest {
+                client_kind: kind,
+                label,
+            }
+            .write(
+                key,
+                &attempt,
+                Header {
+                    kind: MessageType::Pair,
+                    session: SessionId::from(handle),
+                    req_id,
+                },
+                &mut dst,
+            )
+            .expect("fits");
+            (Bytes::of(&dst[..len]), attempt)
+        }
+
+        /// The labels enrolled, by slot.
+        fn enrolled(&self) -> usize {
+            self.sessions
+                .keys()
+                .clients
+                .present()
+                .map_or(0, ClientTable::enrolled)
+        }
+    }
+
+    /// The `Pair 0x8B` in `answer`, verified as the client verifies it.
+    fn pair_ack(answer: &[u8], attempt: &Attempt) -> PairResponse {
+        let envelope = Envelope::decode(answer).expect("an envelope");
+        assert_eq!(envelope.header().kind, MessageType::PairResponse);
+        PairAckClaim::decode(envelope)
+            .expect("a pair ack")
+            .verify(&pair_key(), attempt, epoch(1))
+            .expect("MAC'd under the pair key, refusals included (P-064)")
+    }
+
+    const LAPTOP: (&str, ClientKind) = ("laptop", ClientKind::Cli);
+
+    #[test]
+    fn p_066_a_pair_with_no_window_open_is_window_closed_under_the_mac_and_enrols_nothing() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        for _ in 0..=FAILURES {
+            let challenge = rig.discover(1);
+            let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::WindowClosed);
+            assert_eq!(reply.note, None);
+            // Refusing to look at a proof costs nothing and counts nothing.
+            assert_eq!(reply.close, None);
+        }
+        assert_eq!(rig.enrolled(), 1);
+    }
+
+    #[test]
+    fn p_086_inside_the_window_a_new_label_is_enrolled_at_the_lowest_free_slot_and_closes_it() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        let two = ClientId::new(2).expect("a slot");
+        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::Enrolled(two));
+        assert_eq!(reply.note, Some(SessionNote::Paired(two)), "L-195");
+        // On the part, at counter zero (P-065), before the answer said so.
+        let reread = block_on(Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(
+            CLIENT_TABLE,
+            &mut rig.part,
+        ))
+        .expect("reads");
+        let table = reread.present().expect("a table");
+        let row = table.row(two).expect("the laptop's row");
+        assert_eq!(row.label().as_bytes(), b"laptop");
+        assert_eq!(row.kind(), ClientKind::Cli);
+        assert_eq!(row.counter(), Counter(0));
+        // And it can say hello under the key its slot derives.
+        let challenge = rig.discover(1);
+        let frame = rig.hello_frame(1, 2, challenge, &device(), epoch(1), Version::V1_0, [3; 16]);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))));
+    }
+
+    #[test]
+    fn p_078_the_same_label_reclaims_its_row_with_the_counter_back_to_zero() {
+        let mut rig = Rig::new();
+        let one = ClientId::new(1).expect("a slot");
+        let moved = block_on(
+            rig.sessions
+                .keys
+                .clients
+                .update(&mut rig.part, |table| table.accept(one, Counter(340))),
+        );
+        assert!(matches!(moved, Ok(crate::clients::Check::Ahead)));
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let (frame, attempt) =
+            rig.pair_frame(1, ("phone", ClientKind::App), challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::Reclaimed(one));
+        assert_eq!(reply.note, Some(SessionNote::Paired(one)));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+        assert_eq!(rig.enrolled(), 1);
+    }
+
+    /// Without unbinding, the reset counter is a replay hole: a command the
+    /// comms processor captured on a live session verifies under that
+    /// session's key and is ahead of a counter just set to zero.
+    #[test]
+    fn p_078_a_reclaim_unbinds_every_session_of_that_client_before_the_row_is_rewritten() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let captured = rig.command(1, 1, 5, START, &key);
+        let (_, answer) = rig.send(&captured);
+        assert_eq!(header(&answer).kind, MessageType::CommandResponse);
+        assert_eq!(rig.accepted(), Some(Counter(5)));
+        // The phone is reinstalled and pairs again, on another connection.
+        let _ = rig.connect(2);
+        let challenge = rig.discover(2);
+        let (frame, attempt) =
+            rig.pair_frame(2, ("phone", ClientKind::App), challenge, &pair_key());
+        let (_, answer) = rig.send_with(&frame, &OPEN);
+        assert!(matches!(
+            pair_ack(&answer, &attempt).outcome,
+            Outcome::Reclaimed(_)
+        ));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+        assert!(
+            !rig.sessions.is_bound(conn(1)),
+            "unbound before the rewrite"
+        );
+        // The captured command, replayed on the old session: refused as a
+        // session that ended, and the counter stays where the reclaim put it.
+        let (_, answer) = rig.send(&captured);
+        assert_eq!(hint(&answer), Some(9));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+    }
+
+    #[test]
+    fn p_067_a_full_table_is_table_full_unless_the_label_reclaims() {
+        let mut rig = Rig::new();
+        for n in 2..=8u8 {
+            let label = [b'c', b'0' + n];
+            let label = Label::new(core::str::from_utf8(&label).expect("ascii")).expect("fits");
+            let paired = block_on(
+                rig.sessions
+                    .keys
+                    .clients
+                    .update(&mut rig.part, |table| table.pair(label, ClientKind::App)),
+            );
+            assert!(matches!(paired, Ok(Ok(Paired::Enrolled(_)))));
+        }
+        assert_eq!(rig.enrolled(), 8);
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::TableFull);
+        assert_eq!(reply.note, None);
+        assert_eq!(reply.close, None);
+        let challenge = rig.discover(1);
+        let (frame, attempt) =
+            rig.pair_frame(1, ("phone", ClientKind::App), challenge, &pair_key());
+        let (_, answer) = rig.send_with(&frame, &OPEN);
+        assert!(matches!(
+            pair_ack(&answer, &attempt).outcome,
+            Outcome::Reclaimed(_)
+        ));
+    }
+
+    #[test]
+    fn p_051_a_pair_proof_that_fails_is_bad_proof_under_the_mac_and_counts_against_the_connection()
+    {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let wrong =
+            DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32])).pair_key();
+        for n in 1..=FAILURES {
+            let challenge = rig.discover(1);
+            let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &wrong);
+            let (reply, answer) = rig.send_with(&frame, &OPEN);
+            assert_eq!(
+                pair_ack(&answer, &attempt).outcome,
+                Outcome::BadProof,
+                "{n}"
+            );
+            assert_eq!(reply.note, None);
+            let shed = n == FAILURES;
+            assert_eq!(reply.close.is_some(), shed, "failure {n}");
+        }
+        assert_eq!(rig.enrolled(), 1);
+    }
+
+    /// The challenge is spent on presentation, whatever the answer, and the
+    /// one handed back in `next_challenge` is the row's live one: a retry
+    /// proves over it without another `Discover` (P-058), and a proof over
+    /// the spent one fails against the live one (P-061).
+    #[test]
+    fn p_061_a_pair_spends_its_challenge_and_answers_with_the_next() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let first = rig.discover(1);
+        let (frame, attempt) = rig.pair_frame(1, LAPTOP, first, &pair_key());
+        let (_, answer) = rig.send(&frame);
+        let next = pair_ack(&answer, &attempt).next_challenge;
+        assert_ne!(next, first);
+        // Over the one handed back, with no Discover between: enrolled.
+        let (frame, attempt) = rig.pair_frame(1, LAPTOP, next, &pair_key());
+        let (_, answer) = rig.send_with(&frame, &OPEN);
+        let enrolled = pair_ack(&answer, &attempt);
+        assert!(matches!(enrolled.outcome, Outcome::Enrolled(_)));
+        // Over the first, long spent: the controller proves it against its
+        // live challenge, and the proof fails.
+        let (frame, attempt) = rig.pair_frame(1, ("tablet", ClientKind::App), first, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        let as_the_controller_saw_it = Attempt {
+            challenge: enrolled.next_challenge,
+            ..attempt
+        };
+        assert_eq!(
+            pair_ack(&answer, &as_the_controller_saw_it).outcome,
+            Outcome::BadProof
+        );
+        assert_eq!(reply.note, None);
+        assert_eq!(rig.enrolled(), 2);
+    }
+
+    /// A table under an earlier epoch is one a factory reset left behind and
+    /// the boot has not cleared: nothing is enrolled into it, and the refusal
+    /// does not read as a FRAM that failed, because none did.
+    #[test]
+    fn a_pair_into_a_table_under_another_epoch_enrols_nothing_and_blames_no_write() {
+        let mut rig = Rig::under(epoch(2));
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let (frame, _) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        assert_eq!(raw_code(&answer), Some(7));
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
+        assert_eq!(rig.enrolled(), 1);
+    }
+
+    #[test]
+    fn p_066_discover_says_whether_the_window_is_open() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        for facts in [FACTS, OPEN] {
+            let frame = rig.empty(1, MessageType::Discover);
+            let (_, answer) = rig.send_with(&frame, &facts);
+            let discovery =
+                km43::Discovery::decode(Envelope::decode(&answer).expect("an envelope"))
+                    .expect("a Discover answer");
+            assert_eq!(discovery.pairing_open, facts.pairing_open);
+        }
+    }
+
+    #[test]
+    fn a_pair_whose_row_does_not_land_enrols_nothing_and_is_busy() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        rig.part.table_refused = true;
+        let (frame, _) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        assert_eq!(raw_code(&answer), Some(7));
+        assert_eq!(reply.note, Some(SessionNote::NotKept));
+        assert_eq!(rig.enrolled(), 1, "RAM is where the part is");
+        // A falling supply stops the challenge's mint before anything else.
+        rig.part.table_refused = false;
+        rig.part.falling = true;
+        let (frame, _) = rig.pair_frame(1, LAPTOP, [0; 16], &pair_key());
+        let (_, answer) = rig.send_with(&frame, &OPEN);
+        assert!(raw_code(&answer).is_some());
+        assert_eq!(rig.enrolled(), 1);
     }
 
     #[test]

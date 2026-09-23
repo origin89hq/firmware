@@ -270,6 +270,17 @@ impl ClientTable {
             .filter_map(|(row, n)| ClientId::new(n).map(|id| (id, row)))
     }
 
+    /// The client whose row carries `label`, byte for byte: the row a `Pair`
+    /// with that label would reclaim (P-078).
+    #[must_use]
+    pub fn holder(&self, label: &Label) -> Option<ClientId> {
+        self.rows
+            .iter()
+            .zip(1u32..)
+            .find(|(row, _)| row.is_some_and(|row| row.label == *label))
+            .and_then(|(_, n)| ClientId::new(n))
+    }
+
     /// What `Hello 0x81` key 11 carries for this client: the way out of
     /// the livelock, and the only one (P-081).
     #[must_use]
@@ -540,6 +551,22 @@ mod tests {
             Ok(Paired::Enrolled(id)) => id,
             other => panic!("{text} was not enrolled: {other:?}"),
         }
+    }
+
+    #[test]
+    fn p_078_the_holder_of_a_label_is_found_byte_for_byte_and_only_then() {
+        let mut table = fresh();
+        assert_eq!(table.holder(&label("phone")), None, "an empty table");
+        let _ = enrol(&mut table, "phone", ClientKind::App);
+        let laptop = enrol(&mut table, "laptop", ClientKind::Cli);
+        assert_eq!(table.holder(&label("laptop")), Some(laptop));
+        assert_eq!(table.holder(&label("Laptop")), None, "no case folding");
+        assert_eq!(table.holder(&label("laptop ")), None, "no trimming");
+        // The row a Pair with that label would reclaim.
+        assert_eq!(
+            table.pair(label("laptop"), ClientKind::Cli),
+            Ok(Paired::Reclaimed(laptop))
+        );
     }
 
     #[test]

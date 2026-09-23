@@ -29,6 +29,8 @@ pub struct Local<'a> {
     pub log: LogSpan,
     /// Whether the controller holds a time.
     pub time_known: bool,
+    /// Whether the pairing window is open, read as this frame is handled.
+    pub pairing_open: bool,
 }
 
 /// What one frame asked for: the link's actions, and a client's answer,
@@ -78,6 +80,7 @@ impl Endpoint {
             fw_comms: self.link.peer().map_or("", |peer| peer.fw.as_str()),
             log: local.log,
             time_known: local.time_known,
+            pairing_open: local.pairing_open,
             link_up: self.link.is_up(),
         };
         let reply = self.sessions.frame(frame, now, &facts, fram, dst).await;
