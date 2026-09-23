@@ -683,6 +683,9 @@ impl Sessions {
         let attempt = claim.attempt(secret.device_id_bytes(), challenge);
         let outcome = if facts.pairing_open {
             match claim.verify(&key, &attempt) {
+                // A verified `Pair` that could not be recorded has no outcome
+                // to say so (origin89hq/km43#91), and a bare 7 needs a MAC a
+                // client will not find: it times out and tries again.
                 Ok(request) => match self.enrol(request, epoch, fram).await {
                     Ok(outcome) => outcome,
                     Err(Unenrolled::NotKept) => {
@@ -731,13 +734,20 @@ impl Sessions {
         fram: &mut F,
     ) -> Result<Outcome, Unenrolled> {
         let label = Label::new(request.label).map_err(|_| Unenrolled::Label)?;
-        if !self
+        let Some(table) = self
             .keys
             .clients
             .present()
-            .is_some_and(|table| table.is_under(epoch))
-        {
+            .filter(|table| table.is_under(epoch))
+        else {
             return Err(Unenrolled::OtherEpoch);
+        };
+        // A reclaim keeps the client's id and key and sets its counter to
+        // zero, so a session still bound to it would read a captured frame
+        // as fresh. Every one goes first, whether or not the row then lands
+        // (P-078).
+        if let Some(client) = table.holder(&label) {
+            self.unbind(client);
         }
         let paired = self
             .keys
@@ -1057,6 +1067,16 @@ impl Sessions {
             });
         }
         reply
+    }
+
+    /// End every session bound to `client`, leaving the rows to their
+    /// transports (P-076).
+    fn unbind(&mut self, client: ClientId) {
+        for row in self.rows.iter_mut().flatten() {
+            if matches!(&row.bound, Bound::Session(binding) if binding.client == client) {
+                row.bound = Bound::Ended;
+            }
+        }
     }
 
     /// One more failure against `conn`; whether it reached the threshold,
@@ -2005,6 +2025,40 @@ mod tests {
         assert_eq!(reply.note, Some(SessionNote::Paired(one)));
         assert_eq!(rig.accepted(), Some(Counter(0)));
         assert_eq!(rig.enrolled(), 1);
+    }
+
+    /// Without unbinding, the reset counter is a replay hole: a command the
+    /// comms processor captured on a live session verifies under that
+    /// session's key and is ahead of a counter just set to zero.
+    #[test]
+    fn p_078_a_reclaim_unbinds_every_session_of_that_client_before_the_row_is_rewritten() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, key) = rig.hello(1);
+        let captured = rig.command(1, 1, 5, START, &key);
+        let (_, answer) = rig.send(&captured);
+        assert_eq!(header(&answer).kind, MessageType::CommandResponse);
+        assert_eq!(rig.accepted(), Some(Counter(5)));
+        // The phone is reinstalled and pairs again, on another connection.
+        let _ = rig.connect(2);
+        let challenge = rig.discover(2);
+        let (frame, attempt) =
+            rig.pair_frame(2, ("phone", ClientKind::App), challenge, &pair_key());
+        let (_, answer) = rig.send_with(&frame, &OPEN);
+        assert!(matches!(
+            pair_ack(&answer, &attempt).outcome,
+            Outcome::Reclaimed(_)
+        ));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
+        assert!(
+            !rig.sessions.is_bound(conn(1)),
+            "unbound before the rewrite"
+        );
+        // The captured command, replayed on the old session: refused as a
+        // session that ended, and the counter stays where the reclaim put it.
+        let (_, answer) = rig.send(&captured);
+        assert_eq!(hint(&answer), Some(9));
+        assert_eq!(rig.accepted(), Some(Counter(0)));
     }
 
     #[test]
