@@ -641,8 +641,15 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         Ok(())
     }
 
-    /// The first sequence held: the first record after the erased block
-    /// ahead of the head, or, before the first wrap, the anchor's.
+    /// The first sequence held: the first record found walking forward
+    /// from two past the head, over erased and closed blocks alike.
+    ///
+    /// An erased block is not the end of the walk. Before the first wrap
+    /// the blocks after the head are erased and the walk comes round to
+    /// the first block of the part, which is the anchor's; but a dropped
+    /// oldest block (#78) leaves two erased blocks ahead of the head with
+    /// older records after them, and stopping at the first would answer
+    /// with a newer block's sequence and hide every record behind it.
     async fn find_the_oldest(
         &mut self,
         anchor: u64,
@@ -653,8 +660,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             yield_now().await;
             match self.probe(block, scratch).await? {
                 Probe::Records { first } => return Ok(Some(first)),
-                Probe::Erased => return Ok(Some(anchor)),
-                Probe::Closed => block = self.next_block(block),
+                Probe::Erased | Probe::Closed => block = self.next_block(block),
             }
         }
         Ok(Some(anchor))
@@ -1200,6 +1206,68 @@ mod tests {
             block_on(ring.drop_oldest(&mut scratch)),
             Ok(Dropped::Nothing)
         );
+    }
+
+    /// A drop takes one block's records and no more, wherever the head is:
+    /// with the head low and the ring wrapped, the two erased blocks ahead
+    /// of it are followed by older records, which have to stay readable.
+    /// The records a block holds, counted from its bytes.
+    fn records_in<const E: usize>(ring: &mut Ring<Part<E>>, block: u32) -> u64 {
+        let mut bytes = [0u8; ERASE];
+        let at = block
+            .checked_mul(u32::try_from(ERASE).expect("fits"))
+            .expect("inside the part");
+        block_on(ring.read_raw(at, &mut bytes)).expect("reads");
+        let mut count = 0u64;
+        let mut offset = 0usize;
+        while let Some(found) = bytes.get(offset..).and_then(record::verify) {
+            count = count.saturating_add(1);
+            offset = offset.saturating_add(record::framed_len(found.payload.len()));
+        }
+        count
+    }
+
+    #[test]
+    fn f_023_a_drop_loses_the_oldest_blocks_records_and_no_others_wherever_the_head_is() {
+        // About nineteen records a block: every fill from one that has
+        // wrapped to two turns of the ring later, so the head sits in every
+        // block with the drop taken there.
+        let wrapped = 7 * 19 + 1;
+        for fill in wrapped..wrapped + 16 * 19 {
+            let mut part: Part<ERASE> = fresh();
+            let mut ring = open_with(&mut part, 8);
+            for _ in 0..fill {
+                append(&mut ring, None);
+            }
+            let next = ring.next_seq();
+            let (_, before, _) = read(&mut ring, 1);
+            let before = before as u64;
+            let mut scratch = [0u8; SCRATCH];
+            let (oldest_block, _) = block_on(ring.run(&mut scratch)).expect("walks");
+            let in_it = records_in(&mut ring, oldest_block);
+            let Dropped::Block {
+                block,
+                oldest: Some(left),
+            } = block_on(ring.drop_oldest(&mut scratch)).expect("drops")
+            else {
+                panic!("fill {fill}: a wrapped ring holds more than one block");
+            };
+            assert_eq!(block, oldest_block, "fill {fill}: the oldest block went");
+            let (seqs, after, answered) = read(&mut ring, 1);
+            let after = after as u64;
+            assert_eq!(
+                before - after,
+                in_it,
+                "fill {fill}: that block's records and no others"
+            );
+            assert_eq!(seqs[0], left, "fill {fill}");
+            assert_eq!(left, next - after, "fill {fill}: the rest reads to the end");
+            assert_eq!(answered, next, "fill {fill}");
+            let head = ring.head();
+            close(&mut part, ring);
+            let again = open_with(&mut part, 8);
+            assert_eq!(again.head(), head, "fill {fill}: a boot agrees");
+        }
     }
 
     #[test]

@@ -39,8 +39,12 @@ pub const MAILBOX_BYTES: usize = 8192;
 /// The word at offset zero when a mailbox is there: `O89M`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"O89M");
 
-/// The protocol's version, at offset four.
-pub const VERSION: u32 = 2;
+/// The protocol's version, at offset four. A host that reads another
+/// refuses the part, because an operation's meaning can change under the
+/// same number: 3 is where `EraseNorBlock` stopped erasing the ring's own
+/// blocks (#78), and a newer host that took a version 2 part's erase for
+/// a refusing one would recreate the hole it exists to prevent.
+pub const VERSION: u32 = 3;
 
 /// Bytes of data a request or an answer carries: enough for the client
 /// table's record in one write.
