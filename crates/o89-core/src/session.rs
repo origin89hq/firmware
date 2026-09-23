@@ -683,14 +683,20 @@ impl Sessions {
         let attempt = claim.attempt(secret.device_id_bytes(), challenge);
         let outcome = if facts.pairing_open {
             match claim.verify(&key, &attempt) {
-                Ok(request) => {
-                    let Some(outcome) = self.enrol(request, epoch, fram).await else {
+                Ok(request) => match self.enrol(request, epoch, fram).await {
+                    Ok(outcome) => outcome,
+                    Err(Unenrolled::NotKept) => {
                         let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
                         reply.note = Some(SessionNote::NotKept);
                         return reply;
-                    };
-                    outcome
-                }
+                    }
+                    Err(Unenrolled::OtherEpoch) => {
+                        return bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+                    }
+                    Err(Unenrolled::Label) => {
+                        return bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst);
+                    }
+                },
                 Err(bad) => bad.outcome(),
             }
         } else {
@@ -717,30 +723,29 @@ impl Sessions {
     }
 
     /// A verified `Pair` into the client table under `epoch`: the row on the
-    /// part, or `None` when it would not land, or when the table is not one
-    /// this epoch's keys derive for, and nothing was enrolled.
+    /// part, or why nothing was enrolled.
     async fn enrol<F: Fram>(
         &mut self,
         request: PairRequest<'_>,
         epoch: Epoch,
         fram: &mut F,
-    ) -> Option<Outcome> {
-        let label = Label::new(request.label).ok()?;
+    ) -> Result<Outcome, Unenrolled> {
+        let label = Label::new(request.label).map_err(|_| Unenrolled::Label)?;
         if !self
             .keys
             .clients
             .present()
             .is_some_and(|table| table.is_under(epoch))
         {
-            return None;
+            return Err(Unenrolled::OtherEpoch);
         }
         let paired = self
             .keys
             .clients
             .update(fram, |table| table.pair(label, request.client_kind))
             .await
-            .ok()?;
-        Some(match paired {
+            .map_err(|_| Unenrolled::NotKept)?;
+        Ok(match paired {
             Ok(Paired::Enrolled(client)) => Outcome::Enrolled(client),
             Ok(Paired::Reclaimed(client)) => Outcome::Reclaimed(client),
             Err(TableFull) => Outcome::TableFull,
@@ -1101,6 +1106,19 @@ impl Rows for Sessions {
     fn allocated(&self) -> u8 {
         Self::allocated(self)
     }
+}
+
+/// Why a verified `Pair` enrolled nothing. Each is answered differently and
+/// only one is a part that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unenrolled {
+    /// The row did not land: the FRAM refused the write.
+    NotKept,
+    /// The table is not one this epoch's keys derive for: a factory reset
+    /// the boot has not finished, and no write was tried.
+    OtherEpoch,
+    /// A label the table cannot hold, which km43's decoder refuses first.
+    Label,
 }
 
 /// Where an answer goes: the handle in `session_id`, the request echoed
@@ -2076,6 +2094,21 @@ mod tests {
         );
         assert_eq!(reply.note, None);
         assert_eq!(rig.enrolled(), 2);
+    }
+
+    /// A table under an earlier epoch is one a factory reset left behind and
+    /// the boot has not cleared: nothing is enrolled into it, and the refusal
+    /// does not read as a FRAM that failed, because none did.
+    #[test]
+    fn a_pair_into_a_table_under_another_epoch_enrols_nothing_and_blames_no_write() {
+        let mut rig = Rig::under(epoch(2));
+        let _ = rig.connect(1);
+        let challenge = rig.discover(1);
+        let (frame, _) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
+        let (reply, answer) = rig.send_with(&frame, &OPEN);
+        assert_eq!(raw_code(&answer), Some(7));
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
+        assert_eq!(rig.enrolled(), 1);
     }
 
     #[test]

@@ -606,9 +606,12 @@ mod tests {
         panel.enrolled();
         assert!(!panel.pairing_open(Tick::from_millis(now)));
         assert!(!panel.pairing_open(Tick::from_millis(now + 1_000)));
-        // Leave the spent gesture before beginning another.
-        panel.sample(Some(Auto), Tick::from_millis(now));
-        now += 110;
+        // Leave the spent gesture through the debounce, sampled every 10 ms
+        // so no gap past the sample limit resets the recognizer instead.
+        for _ in 0..10 {
+            panel.sample(Some(Auto), Tick::from_millis(now));
+            now += 10;
+        }
         gesture(&mut panel, [Auto; 3], &mut now);
         assert!(panel.pairing_open(Tick::from_millis(now)));
     }
