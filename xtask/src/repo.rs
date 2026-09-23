@@ -64,14 +64,7 @@ impl Repo {
 /// the toolchain was installed.
 pub fn llvm_tool(name: &str) -> Result<PathBuf> {
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let sysroot = Command::new(&rustc)
-        .args(["--print", "sysroot"])
-        .output()
-        .context("running rustc --print sysroot")?;
-    if !sysroot.status.success() {
-        bail!("rustc --print sysroot failed");
-    }
-    let sysroot = String::from_utf8(sysroot.stdout).context("sysroot path is not UTF-8")?;
+    let sysroot = sysroot()?;
     let version = Command::new(&rustc)
         .arg("-vV")
         .output()
@@ -81,7 +74,7 @@ pub fn llvm_tool(name: &str) -> Result<PathBuf> {
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .context("rustc -vV names no host")?;
-    let tool = Path::new(sysroot.trim())
+    let tool = sysroot
         .join("lib")
         .join("rustlib")
         .join(host.trim())
@@ -95,6 +88,20 @@ pub fn llvm_tool(name: &str) -> Result<PathBuf> {
         );
     }
     Ok(tool)
+}
+
+/// The toolchain's sysroot, as the `rustc` this repository pins reports it.
+pub fn sysroot() -> Result<PathBuf> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot = Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .context("running rustc --print sysroot")?;
+    if !sysroot.status.success() {
+        bail!("rustc --print sysroot failed");
+    }
+    let sysroot = String::from_utf8(sysroot.stdout).context("sysroot path is not UTF-8")?;
+    Ok(PathBuf::from(sysroot.trim()))
 }
 
 /// Run a command and fail with its name when it does not succeed.
