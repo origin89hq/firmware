@@ -7,6 +7,7 @@
 //! that fits the part and not the slot builds, flashes, ships, and fails its
 //! first update in a cabin.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,9 +126,20 @@ pub fn compile(repo: &Repo) -> Result<Vec<Artifact>> {
 /// panic handler's hash of the file names the machine as well as the file.
 /// Every image is measured and flashed from this build, so this is the one
 /// place the flags are set; each prefix maps to a fixed one.
-fn remapped(root: &Path, cargo_home: &Path, sysroot: &Path) -> Result<String> {
-    let pairs = [(root, "/o89"), (cargo_home, "/cargo"), (sysroot, "/rustc")];
-    let mut flags = Vec::with_capacity(pairs.len());
+///
+/// `inherited` are the flags the environment already asked for, kept in
+/// front. rustc applies the last prefix that matches, so the prefixes go
+/// from the shortest to the longest: a checkout inside cargo's home is
+/// still mapped to `/o89` and not to `/cargo/...` with its own path after.
+fn remapped(
+    inherited: &[String],
+    root: &Path,
+    cargo_home: &Path,
+    sysroot: &Path,
+) -> Result<String> {
+    let mut pairs = [(root, "/o89"), (cargo_home, "/cargo"), (sysroot, "/rustc")];
+    pairs.sort_by_key(|(from, _)| from.as_os_str().len());
+    let mut flags = inherited.to_vec();
     for (from, to) in pairs {
         let from = from
             .to_str()
@@ -137,6 +149,76 @@ fn remapped(root: &Path, cargo_home: &Path, sysroot: &Path) -> Result<String> {
     // `CARGO_ENCODED_RUSTFLAGS` separates by 0x1f, so a path with a space
     // survives; with `--target` it reaches the image and not build scripts.
     Ok(flags.join("\u{1f}"))
+}
+
+/// The flags cargo would have taken from the environment: the encoded
+/// form when it is set, as cargo reads it first, else `RUSTFLAGS` split on
+/// whitespace.
+fn inherited(encoded: Option<&OsStr>, plain: Option<&OsStr>) -> Result<Vec<String>> {
+    let text = |value: &OsStr| {
+        value
+            .to_str()
+            .map(str::to_owned)
+            .context("the rustflags in the environment are not UTF-8")
+    };
+    if let Some(encoded) = encoded {
+        let encoded = text(encoded)?;
+        return Ok(encoded
+            .split('\u{1f}')
+            .filter(|flag| !flag.is_empty())
+            .map(str::to_owned)
+            .collect());
+    }
+    if let Some(plain) = plain {
+        return Ok(text(plain)?.split_whitespace().map(str::to_owned).collect());
+    }
+    Ok(Vec::new())
+}
+
+/// Refuse a cargo config that sets `rustflags` for a build run from `root`.
+///
+/// Cargo takes rustflags from one source, and the environment variable this
+/// build sets outranks every config file, so flags written in one would be
+/// dropped without a word. None of this repository's configs sets any; one
+/// that does is a flag to carry here instead.
+fn no_config_rustflags(root: &Path, cargo_home: &Path) -> Result<()> {
+    let mut files: Vec<PathBuf> = root
+        .ancestors()
+        .flat_map(|dir| [dir.join(".cargo/config.toml"), dir.join(".cargo/config")])
+        .collect();
+    files.push(cargo_home.join("config.toml"));
+    files.push(cargo_home.join("config"));
+    for file in files.iter().filter(|file| file.is_file()) {
+        let text =
+            fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        if sets_rustflags(&text).with_context(|| format!("parsing {}", file.display()))? {
+            bail!(
+                "{} sets rustflags, which the images' remapped build would drop (#74): carry them in xtask/src/images.rs",
+                file.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether a cargo config sets `build.rustflags` or any `target.*.rustflags`.
+fn sets_rustflags(config: &str) -> Result<bool> {
+    let table: toml::Table = config.parse()?;
+    let in_build = table
+        .get("build")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|build| build.contains_key("rustflags"));
+    let in_target = table
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|targets| {
+            targets.values().any(|target| {
+                target
+                    .as_table()
+                    .is_some_and(|target| target.contains_key("rustflags"))
+            })
+        });
+    Ok(in_build || in_target)
 }
 
 /// Cargo's home, where the registry's sources are unpacked.
@@ -151,9 +233,15 @@ fn cargo_home() -> Result<PathBuf> {
 fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
     let manifest = repo.firmware_manifest();
     let mut command = repo.cargo();
+    let cargo_home = cargo_home()?;
+    no_config_rustflags(repo.root(), &cargo_home)?;
+    let inherited = inherited(
+        std::env::var_os("CARGO_ENCODED_RUSTFLAGS").as_deref(),
+        std::env::var_os("RUSTFLAGS").as_deref(),
+    )?;
     command.env(
         "CARGO_ENCODED_RUSTFLAGS",
-        remapped(repo.root(), &cargo_home()?, &sysroot()?)?,
+        remapped(&inherited, repo.root(), &cargo_home, &sysroot()?)?,
     );
     command.args(["build", "--locked", "--release", "--manifest-path"]);
     command.arg(&manifest);
@@ -289,6 +377,7 @@ mod tests {
     #[test]
     fn each_build_path_maps_to_a_fixed_prefix_in_one_flag_each() {
         let flags = remapped(
+            &[],
             Path::new("/home/a/firmware"),
             Path::new("/home/a/.cargo"),
             Path::new("/home/a/.rustup/toolchains/1.98.1"),
@@ -298,31 +387,154 @@ mod tests {
         assert_eq!(
             flags,
             [
-                "--remap-path-prefix=/home/a/firmware=/o89",
                 "--remap-path-prefix=/home/a/.cargo=/cargo",
+                "--remap-path-prefix=/home/a/firmware=/o89",
                 "--remap-path-prefix=/home/a/.rustup/toolchains/1.98.1=/rustc",
             ]
         );
     }
 
+    /// rustc takes the last prefix that matches, so a checkout inside cargo's
+    /// home or the sysroot has to come after it, or its own path survives
+    /// under `/cargo`.
+    #[test]
+    fn a_checkout_inside_cargos_home_still_maps_to_its_own_prefix() {
+        let flags = remapped(
+            &[],
+            Path::new("/c/checkouts/firmware"),
+            Path::new("/c"),
+            Path::new("/c/checkouts/firmware/toolchain"),
+        )
+        .expect("UTF-8 paths");
+        let flags: Vec<&str> = flags.split('\u{1f}').collect();
+        assert_eq!(
+            flags,
+            [
+                "--remap-path-prefix=/c=/cargo",
+                "--remap-path-prefix=/c/checkouts/firmware=/o89",
+                "--remap-path-prefix=/c/checkouts/firmware/toolchain=/rustc",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_flags_the_environment_asked_for_are_kept_in_front() {
+        let asked = ["-Cforce-frame-pointers=yes".to_owned()];
+        let flags = remapped(&asked, Path::new("/r"), Path::new("/c"), Path::new("/s"))
+            .expect("UTF-8 paths");
+        assert_eq!(
+            flags.split('\u{1f}').next(),
+            Some("-Cforce-frame-pointers=yes")
+        );
+        assert_eq!(flags.split('\u{1f}').count(), 4);
+    }
+
+    #[test]
+    fn the_environments_flags_are_read_as_cargo_reads_them() {
+        // The encoded form wins over `RUSTFLAGS`, as it does in cargo, and an
+        // empty piece is no flag.
+        let encoded = OsStr::new("-Ca\u{1f}\u{1f}--cfg x y");
+        assert_eq!(
+            inherited(Some(encoded), Some(OsStr::new("-Cignored"))).expect("UTF-8"),
+            ["-Ca", "--cfg x y"]
+        );
+        assert_eq!(
+            inherited(None, Some(OsStr::new("  -Ca   -Cb "))).expect("UTF-8"),
+            ["-Ca", "-Cb"]
+        );
+        assert!(inherited(None, None).expect("nothing set").is_empty());
+        assert!(
+            inherited(Some(OsStr::new("")), None)
+                .expect("set empty")
+                .is_empty()
+        );
+        let bad = OsStr::from_bytes(b"-C\xff");
+        assert!(inherited(None, Some(bad)).is_err());
+    }
+
+    #[test]
+    fn a_config_that_sets_rustflags_anywhere_is_found() {
+        assert!(sets_rustflags("[build]\nrustflags = [\"-Ca\"]\n").expect("parses"));
+        assert!(
+            sets_rustflags("[target.thumbv6m-none-eabi]\nrustflags = [\"-Ca\"]\n").expect("parses")
+        );
+        // What the repository's own configs hold: a target, a runner, an alias.
+        assert!(
+            !sets_rustflags(
+                "[build]\ntarget = \"thumbv6m-none-eabi\"\n[target.thumbv6m-none-eabi]\nrunner = \"probe-rs run\"\n[alias]\nxtask = \"run\"\n"
+            )
+            .expect("parses")
+        );
+        assert!(
+            sets_rustflags("[build\n").is_err(),
+            "a config cargo cannot read either"
+        );
+    }
+
+    /// The configs cargo reads for this repository's builds, from the root
+    /// or from a crate's directory, none of which may set flags the remap
+    /// would drop. The machine's own are the build's refusal to make, not a
+    /// test's.
+    #[test]
+    fn the_repositorys_own_configs_set_no_rustflags() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits in the repository");
+        let configs = [
+            ".cargo/config.toml",
+            "firmwares/o89-boot/.cargo/config.toml",
+            "firmwares/o89-comms/.cargo/config.toml",
+            "firmwares/o89-controller/.cargo/config.toml",
+        ];
+        for config in configs {
+            let text = fs::read_to_string(root.join(config)).expect("the config is there");
+            assert!(
+                !sets_rustflags(&text).expect("parses"),
+                "{config} sets rustflags"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_setting_rustflags_refuses_the_build_and_names_the_file() {
+        let dir = std::env::temp_dir().join(format!("o89-xtask-{}", std::process::id()));
+        let checkout = dir.join("checkout");
+        fs::create_dir_all(checkout.join(".cargo")).expect("a scratch checkout");
+        fs::write(
+            checkout.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"-Ca\"]\n",
+        )
+        .expect("written");
+        let refused = no_config_rustflags(&checkout, &dir.join("home"));
+        let clean = no_config_rustflags(&dir.join("home"), &dir.join("home"));
+        fs::remove_dir_all(&dir).expect("cleaned up");
+        let error = format!("{:#}", refused.expect_err("refused"));
+        assert!(error.contains("checkout/.cargo/config.toml"), "{error}");
+        assert!(error.contains("#74"), "{error}");
+        clean.expect("nothing to refuse where no config exists");
+    }
+
     #[test]
     fn a_checkout_path_with_a_space_stays_one_flag() {
         let flags = remapped(
+            &[],
             Path::new("/Users/a b/firmware"),
             Path::new("/c"),
             Path::new("/s"),
         )
         .expect("UTF-8 paths");
-        assert_eq!(
-            flags.split('\u{1f}').next(),
-            Some("--remap-path-prefix=/Users/a b/firmware=/o89")
+        assert!(
+            flags
+                .split('\u{1f}')
+                .any(|flag| flag == "--remap-path-prefix=/Users/a b/firmware=/o89"),
+            "{flags:?}"
         );
     }
 
     #[test]
     fn a_path_that_is_not_utf_8_is_refused_rather_than_mangled() {
         let bad = Path::new(OsStr::from_bytes(b"/home/\xff/firmware"));
-        let error = remapped(bad, Path::new("/c"), Path::new("/s")).expect_err("refused");
+        let error = remapped(&[], bad, Path::new("/c"), Path::new("/s")).expect_err("refused");
         assert!(format!("{error:#}").contains("is not UTF-8"), "{error:#}");
     }
 }
