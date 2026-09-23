@@ -81,16 +81,40 @@ pub enum Frame {
         /// What happened.
         outcome: CloseConnection,
     },
-    /// A network configuration that could not be stored (L-137).
-    NetFailed {
+    /// The result of a credential update (L-136, L-137).
+    NetReport {
         /// The controller's request.
         req_id: ReqId,
+        /// Persistence or validation outcome.
+        outcome: NetConfig,
+        /// Version held in RAM, including after a failed write.
+        version: u32,
+    },
+    /// A retry of the same NTP offer (L-015), never a fresh sample.
+    TimeOffer {
+        /// Unchanged correlation id.
+        req_id: ReqId,
+        /// Unchanged sample, retained only until acknowledgment or retry expiry.
+        offer: km43::ClockOffer<'static>,
     },
     /// A link-local refusal, on session 0 with request 0 (L-181).
     Refuse {
         /// Why.
         code: LinkErrorCode,
     },
+}
+
+/// Result of the most recent NTP offer, for its producer to inspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferDelivery {
+    /// No offer this boot.
+    None,
+    /// Waiting for an answer within the three-attempt budget.
+    Pending,
+    /// The controller's verdict, never used to set a local clock.
+    Answered(km43::TimeOffer),
+    /// Link loss or the final response deadline ended delivery.
+    Failed,
 }
 
 /// What the controller last said about itself.
@@ -107,6 +131,11 @@ struct Controller {
 pub struct Link {
     #[cfg(any(test, feature = "frames"))]
     controller_bench_mode: Option<bool>,
+    network: crate::Network,
+    offer_rate: crate::OfferRate,
+    offer_requests: Requests<1>,
+    offer_sample: Option<km43::ClockOffer<'static>>,
+    offer_delivery: OfferDelivery,
     boot: Tick,
     /// The controller's last statement, from its `LinkUp` or its answer to
     /// ours.
@@ -133,6 +162,11 @@ impl Link {
         Self {
             #[cfg(any(test, feature = "frames"))]
             controller_bench_mode: None,
+            network: crate::Network::new(None),
+            offer_rate: crate::OfferRate::new(),
+            offer_requests: Requests::NONE,
+            offer_sample: None,
+            offer_delivery: OfferDelivery::None,
             boot: now,
             controller: None,
             linked: false,
@@ -143,6 +177,79 @@ impl Link {
             statement: Requests::NONE,
             beats: Beats::NONE,
         }
+    }
+
+    /// Restore durable credentials before the first handshake.
+    pub fn restore_network(&mut self, credential: Option<crate::Credential>) {
+        self.network = crate::Network::new(credential);
+    }
+
+    /// The active RAM credential, including a clear.
+    #[must_use]
+    pub const fn credential(&self) -> Option<&crate::Credential> {
+        self.network.credential()
+    }
+
+    /// Frame a fresh NTP sample only on a compatible link and outside the rate
+    /// window. Failed writes consume the interval. Only the same request can be
+    /// retried within it, at most three transmissions (L-015).
+    pub fn time_offer(
+        &mut self,
+        offer: km43::ClockOffer<'static>,
+        now: Tick,
+        writer: &mut FrameWriter,
+        dst: &mut [u8; MAX_FRAME],
+    ) -> Result<Option<usize>, EncodeError> {
+        if !self.linked || !self.controller.is_some_and(|controller| controller.agreed) {
+            return Ok(None);
+        }
+        let mut bytes = [0; LINK_ENVELOPE];
+        let req_id = self.take_req();
+        let len = offer
+            .write(link_header(LinkMessageType::TimeOffer, req_id), &mut bytes)
+            .map_err(|_| EncodeError::Body)?;
+        if self.offer_requests.is_full() || !self.offer_rate.take(now) {
+            return Ok(None);
+        }
+        let len = writer
+            .write(bytes.get(..len).ok_or(EncodeError::Body)?, dst)
+            .map_err(EncodeError::Frame)?;
+        if !self
+            .offer_requests
+            .issue(LinkMessageType::TimeOffer, req_id, now)
+        {
+            return Ok(None);
+        }
+        self.offer_sample = Some(offer);
+        self.offer_delivery = OfferDelivery::Pending;
+        Ok(Some(len))
+    }
+
+    /// Delivery status; refusals are diagnostics, not authority over a clock.
+    #[must_use]
+    pub const fn offer_delivery(&self) -> OfferDelivery {
+        self.offer_delivery
+    }
+
+    fn retry_offer(&mut self, now: Tick) -> Option<Frame> {
+        match self.offer_requests.overdue(now) {
+            Some(Overdue::Resend { req_id, .. }) => self
+                .offer_sample
+                .map(|offer| Frame::TimeOffer { req_id, offer }),
+            Some(Overdue::GivenUp { .. }) => {
+                self.offer_sample = None;
+                self.offer_delivery = OfferDelivery::Failed;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn forget_offer(&mut self) {
+        if self.offer_sample.take().is_some() {
+            self.offer_delivery = OfferDelivery::Failed;
+        }
+        self.offer_requests = Requests::NONE;
     }
 
     /// Whether this side is linked (L-033).
@@ -186,7 +293,7 @@ impl Link {
         }
         if self.linked {
             if now < self.next_beat {
-                return None;
+                return self.retry_offer(now);
             }
             self.next_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
             let req_id = self.take_req();
@@ -215,6 +322,18 @@ impl Link {
     /// A frame from the controller, and what it is answered with, if
     /// anything.
     pub fn received(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Option<Frame> {
+        self.received_with_store(envelope, now, |_| false)
+    }
+
+    /// Handle the link-local frame with a durable credential writer. The writer
+    /// is never called before the handshake, for a wrong-side frame, or for
+    /// client payloads. A write failure retains the new RAM credential.
+    pub fn received_with_store(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        now: Tick,
+        store: impl FnMut(&crate::Credential) -> bool,
+    ) -> Option<Frame> {
         if is_peer_refusal(&envelope) {
             // The controller refused something of ours: never answered with
             // another error (L-181), and nothing waits on it.
@@ -224,7 +343,6 @@ impl Link {
             Intake::Act(kind) => kind,
             Intake::Refuse(code) => return Some(Frame::Refuse { code }),
         };
-        let req_id = envelope.req_id();
         if let Some(Controller { agreed: false, .. }) = self.controller
             && !crosses_mismatch(Side::Comms, kind)
         {
@@ -240,6 +358,17 @@ impl Link {
                 code: LinkErrorCode::BeforeLinkUp,
             });
         }
+        self.received_valid(kind, envelope, now, store)
+    }
+
+    fn received_valid(
+        &mut self,
+        kind: LinkMessageType,
+        envelope: LinkEnvelope<'_>,
+        now: Tick,
+        store: impl FnMut(&crate::Credential) -> bool,
+    ) -> Option<Frame> {
+        let req_id = envelope.req_id();
         match kind {
             LinkMessageType::LinkUp => {
                 let theirs = LinkUp::decode(envelope).ok()?;
@@ -301,13 +430,7 @@ impl Link {
                 };
                 Some(Frame::CloseReport { req_id, outcome })
             }
-            LinkMessageType::NetConfig => {
-                // No credential store before M4: the write fails, which
-                // L-137 says to report as such, and the controller pushes
-                // again after the next `LinkUp` (L-133).
-                NetChange::decode(envelope).ok()?;
-                Some(Frame::NetFailed { req_id })
-            }
+            LinkMessageType::NetConfig => Some(self.configure_network(envelope, store)),
             LinkMessageType::CommsRelease => {
                 // No installer before M7: refused with the one code that
                 // says nothing was authorised to land here.
@@ -315,9 +438,19 @@ impl Link {
                     code: LinkErrorCode::NoAuthorisation,
                 })
             }
-            LinkMessageType::ClientConnectedAck
-            | LinkMessageType::ClientDisconnectedAck
-            | LinkMessageType::TimeOfferAck => {
+            LinkMessageType::TimeOfferAck => {
+                let verdict = km43::TimeVerdict::decode(envelope).ok()?;
+                if self
+                    .offer_requests
+                    .answered(req_id, LinkMessageType::TimeOffer)
+                {
+                    self.offer_sample = None;
+                    self.offer_delivery = OfferDelivery::Answered(verdict.outcome);
+                    self.last_heard = Some(now);
+                }
+                None
+            }
+            LinkMessageType::ClientConnectedAck | LinkMessageType::ClientDisconnectedAck => {
                 // Answers to requests this side does not make yet: nothing
                 // waits, and an answer to nothing is not heard.
                 None
@@ -335,6 +468,29 @@ impl Link {
                     code: LinkErrorCode::WrongSide,
                 })
             }
+        }
+    }
+
+    fn configure_network(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        store: impl FnMut(&crate::Credential) -> bool,
+    ) -> Frame {
+        let req_id = envelope.req_id();
+        let verdict = match NetChange::decode(envelope) {
+            Ok(change) => self.network.apply(change, store),
+            Err(_) => NetVerdict {
+                outcome: NetConfig::RejectedInvalid,
+                version: self
+                    .network
+                    .credential()
+                    .map_or(0, crate::Credential::version),
+            },
+        };
+        Frame::NetReport {
+            req_id,
+            outcome: verdict.outcome,
+            version: verdict.version,
         }
     }
 
@@ -356,7 +512,7 @@ impl Link {
                 fw: me.fw,
                 boot_id: me.boot_id,
                 hw: me.hw,
-                net_version: Some(0),
+                net_version: Some(self.network.stored_version()),
             }
             .write(link_header(kind, req_id), envelope)
         };
@@ -387,12 +543,16 @@ impl Link {
                 link_header(LinkMessageType::CloseConnectionAck, req_id),
                 &mut envelope,
             ),
-            Frame::NetFailed { req_id } => NetVerdict {
-                outcome: NetConfig::NvsWriteFailed,
-                version: 0,
-            }
-            .write(
+            Frame::NetReport {
+                req_id,
+                outcome,
+                version,
+            } => NetVerdict { outcome, version }.write(
                 link_header(LinkMessageType::NetConfigAck, req_id),
+                &mut envelope,
+            ),
+            Frame::TimeOffer { req_id, offer } => offer.write(
+                link_header(LinkMessageType::TimeOffer, req_id),
                 &mut envelope,
             ),
             Frame::Refuse { code } => return frame_refusal(code, writer, dst),
@@ -414,8 +574,12 @@ impl Link {
         {
             self.linked = false;
             self.beats.forget();
+            self.forget_offer();
         }
         let agreed = OURS.agreed(version).is_ok();
+        if !agreed {
+            self.forget_offer();
+        }
         self.controller = Some(Controller { boot_id, agreed });
     }
 
@@ -443,6 +607,7 @@ impl Link {
     fn unlink(&mut self, now: Tick) {
         self.linked = false;
         self.beats.forget();
+        self.forget_offer();
         self.next_statement = now;
     }
 
@@ -1063,7 +1228,11 @@ mod tests {
                 ReqId(5),
             ),
             (
-                Frame::NetFailed { req_id: ReqId(6) },
+                Frame::NetReport {
+                    req_id: ReqId(6),
+                    outcome: NetConfig::NvsWriteFailed,
+                    version: 0,
+                },
                 LinkMessageType::NetConfigAck,
                 ReqId(6),
             ),
@@ -1122,5 +1291,289 @@ mod tests {
         let len = read_back(wire.get(..len).expect("fits"), &mut out);
         let beat = Heartbeat::decode(envelope_in(&out, len)).expect("a heartbeat");
         assert_eq!(beat.uptime_s, 3);
+    }
+    fn net_change(buf: &mut [u8; 256], ssid: &str) -> usize {
+        NetChange::Set {
+            version: 7,
+            ssid,
+            psk: "password",
+            country: "CA",
+            hostname: "origin89",
+        }
+        .write(link_header(LinkMessageType::NetConfig, ReqId(55)), buf)
+        .unwrap()
+    }
+
+    #[test]
+    fn l_136_netconfig_is_guarded_and_reports_durable_success_on_the_wire() {
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "site");
+        let envelope = || LinkEnvelope::decode(&buf[..len]).unwrap();
+        let mut early = Link::new(Tick::ZERO);
+        assert_eq!(
+            early.received_with_store(envelope(), at(1), |_| panic!("before link")),
+            Some(Frame::Refuse {
+                code: LinkErrorCode::BeforeLinkUp
+            })
+        );
+        let mut link = linked_at_boot();
+        let frame = link
+            .received_with_store(envelope(), at(10), |_| true)
+            .unwrap();
+        assert_eq!(
+            frame,
+            Frame::NetReport {
+                req_id: ReqId(55),
+                outcome: NetConfig::Stored,
+                version: 7
+            }
+        );
+        // A duplicate after a lost acknowledgment must not erase flash again.
+        assert_eq!(
+            link.received_with_store(envelope(), at(11), |_| panic!("duplicate write")),
+            Some(frame)
+        );
+        let mut wire = [0; MAX_FRAME];
+        let len = link
+            .build(frame, &ME, at(12), &mut FrameWriter::new(), &mut wire)
+            .unwrap();
+        let mut decoded = [0; 256];
+        let len = read_back(&wire[..len], &mut decoded);
+        let verdict = NetVerdict::decode(envelope_in(&decoded, len)).unwrap();
+        assert_eq!(verdict.outcome, NetConfig::Stored);
+        assert_eq!(verdict.version, 7);
+    }
+
+    #[test]
+    fn l_137_netconfig_reports_failure_and_retries_persistence() {
+        let mut link = linked_at_boot();
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "site");
+        let envelope = || LinkEnvelope::decode(&buf[..len]).unwrap();
+        assert_eq!(
+            link.received_with_store(envelope(), at(10), |_| false),
+            Some(Frame::NetReport {
+                req_id: ReqId(55),
+                outcome: NetConfig::NvsWriteFailed,
+                version: 7
+            })
+        );
+        assert_eq!(link.credential().unwrap().version(), 7);
+        assert_eq!(link.network.stored_version(), 0);
+        assert_eq!(
+            link.received_with_store(envelope(), at(11), |_| true),
+            Some(Frame::NetReport {
+                req_id: ReqId(55),
+                outcome: NetConfig::Stored,
+                version: 7
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_netconfig_is_answered_without_a_write() {
+        let mut link = linked_at_boot();
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "");
+        assert_eq!(
+            link.received_with_store(
+                LinkEnvelope::decode(&buf[..len]).unwrap(),
+                at(10),
+                |_| panic!("invalid")
+            ),
+            Some(Frame::NetReport {
+                req_id: ReqId(55),
+                outcome: NetConfig::RejectedInvalid,
+                version: 0
+            })
+        );
+        // A valid envelope with a malformed NetConfig body also gets a verdict.
+        let len = Heartbeat {
+            uptime_s: 1,
+            conns: 0,
+        }
+        .write(link_header(LinkMessageType::NetConfig, ReqId(56)), &mut buf)
+        .unwrap();
+        assert_eq!(
+            link.received_with_store(
+                LinkEnvelope::decode(&buf[..len]).unwrap(),
+                at(11),
+                |_| panic!("malformed")
+            ),
+            Some(Frame::NetReport {
+                req_id: ReqId(56),
+                outcome: NetConfig::RejectedInvalid,
+                version: 0
+            })
+        );
+        assert!(link.credential().is_none());
+    }
+
+    #[test]
+    fn time_offer_requires_a_link_and_rate_limits_even_without_an_ack() {
+        let offer = km43::ClockOffer {
+            unix_ms: 1_700_000_000_000,
+            source: 1,
+            accuracy_ms: 20,
+            server: "pool.ntp.org",
+        };
+        let mut wire = [0; MAX_FRAME];
+        let mut writer = FrameWriter::new();
+        let mut early = Link::new(Tick::ZERO);
+        assert_eq!(
+            early.time_offer(offer, at(10), &mut writer, &mut wire),
+            Ok(None)
+        );
+        let mut link = linked_at_boot();
+        let len = link
+            .time_offer(offer, at(10), &mut writer, &mut wire)
+            .unwrap()
+            .unwrap();
+        let mut body = [0; 256];
+        let len = read_back(&wire[..len], &mut body);
+        let envelope = envelope_in(&body, len);
+        assert_eq!(envelope.opcode(), LinkMessageType::TimeOffer as u8);
+        assert_eq!(km43::ClockOffer::decode(envelope).unwrap(), offer);
+        assert!(matches!(
+            link.retry_offer(at(510)),
+            Some(Frame::TimeOffer { .. })
+        ));
+        assert!(matches!(
+            link.retry_offer(at(1010)),
+            Some(Frame::TimeOffer { .. })
+        ));
+        assert_eq!(link.retry_offer(at(1510)), None);
+        assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
+        assert_eq!(
+            link.time_offer(offer, at(900_009), &mut writer, &mut wire),
+            Ok(None)
+        );
+        assert!(
+            link.time_offer(offer, at(900_010), &mut writer, &mut wire)
+                .unwrap()
+                .is_some()
+        );
+    }
+    fn pending_offer(link: &mut Link) -> (ReqId, km43::ClockOffer<'static>) {
+        let offer = km43::ClockOffer {
+            unix_ms: 1_700_000_000_000,
+            source: 1,
+            accuracy_ms: 20,
+            server: "pool.ntp.org",
+        };
+        let mut wire = [0; MAX_FRAME];
+        let len = link
+            .time_offer(offer, at(10), &mut FrameWriter::new(), &mut wire)
+            .unwrap()
+            .unwrap();
+        let mut body = [0; 256];
+        let len = read_back(&wire[..len], &mut body);
+        (envelope_in(&body, len).req_id(), offer)
+    }
+
+    #[test]
+    fn l_015_time_retries_keep_the_same_sample_and_request_then_report_failure() {
+        let mut link = linked_at_boot();
+        let (req_id, offer) = pending_offer(&mut link);
+        assert_eq!(link.tick(at(509)), None);
+        let retry = Frame::TimeOffer { req_id, offer };
+        assert_eq!(link.tick(at(510)), Some(retry));
+        assert_eq!(link.tick(at(1_009)), None);
+        assert_eq!(link.tick(at(1_010)), Some(retry));
+        assert_eq!(link.tick(at(1_510)), None);
+        assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
+        assert!(link.offer_sample.is_none());
+    }
+
+    #[test]
+    fn time_ack_counts_once_and_stops_retries_for_every_controller_verdict() {
+        for outcome in [
+            km43::TimeOffer::Accepted,
+            km43::TimeOffer::RefusedImplausible,
+            km43::TimeOffer::RefusedStepTooLarge,
+            km43::TimeOffer::RefusedRateLimited,
+        ] {
+            let mut link = linked_at_boot();
+            let (req_id, _) = pending_offer(&mut link);
+            let mut bytes = [0; 256];
+            let len = km43::TimeVerdict { outcome }
+                .write(
+                    link_header(LinkMessageType::TimeOfferAck, req_id),
+                    &mut bytes,
+                )
+                .unwrap();
+            assert_eq!(
+                link.received(LinkEnvelope::decode(&bytes[..len]).unwrap(), at(20)),
+                None
+            );
+            assert_eq!(link.last_heard(), Some(at(20)));
+            assert_eq!(link.offer_delivery(), OfferDelivery::Answered(outcome));
+            link.received(LinkEnvelope::decode(&bytes[..len]).unwrap(), at(30));
+            assert_eq!(link.last_heard(), Some(at(20)));
+            assert_eq!(link.tick(at(510)), None);
+            assert!(link.offer_sample.is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_or_malformed_time_acks_and_old_link_acks_are_not_heard() {
+        let mut link = linked_at_boot();
+        let (req_id, _) = pending_offer(&mut link);
+        let heard = link.last_heard();
+        let mut bytes = [0; 256];
+        let len = km43::TimeVerdict {
+            outcome: km43::TimeOffer::Accepted,
+        }
+        .write(
+            link_header(LinkMessageType::TimeOfferAck, ReqId(99)),
+            &mut bytes,
+        )
+        .unwrap();
+        link.received(LinkEnvelope::decode(&bytes[..len]).unwrap(), at(20));
+        assert_eq!(link.last_heard(), heard);
+        let len = NetVerdict {
+            outcome: NetConfig::NvsWriteFailed,
+            version: 7,
+        }
+        .write(
+            link_header(LinkMessageType::TimeOfferAck, req_id),
+            &mut bytes,
+        )
+        .unwrap();
+        link.received(LinkEnvelope::decode(&bytes[..len]).unwrap(), at(30));
+        assert_eq!(link.last_heard(), heard);
+        link.unlink(at(40));
+        assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
+        let len = km43::TimeVerdict {
+            outcome: km43::TimeOffer::Accepted,
+        }
+        .write(
+            link_header(LinkMessageType::TimeOfferAck, req_id),
+            &mut bytes,
+        )
+        .unwrap();
+        link.received(LinkEnvelope::decode(&bytes[..len]).unwrap(), at(50));
+        assert_eq!(link.last_heard(), heard);
+        assert!(!link.offer_rate.take(at(900_009)));
+    }
+    #[test]
+    fn changed_major_or_controller_boot_discards_pending_time_offer() {
+        for (boot_id, version) in [
+            (
+                CONTROLLER_BOOT,
+                Version {
+                    major: 99,
+                    minor: 0,
+                },
+            ),
+            (CONTROLLER_BOOT.wrapping_add(1), OURS),
+        ] {
+            let mut link = linked_at_boot();
+            pending_offer(&mut link);
+            link.record(boot_id, version);
+            assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
+            assert_eq!(link.retry_offer(at(510)), None);
+            assert!(!link.offer_rate.take(at(900_009)));
+        }
     }
 }

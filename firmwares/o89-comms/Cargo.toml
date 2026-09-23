@@ -45,7 +45,7 @@ devkit = []
 # true random source and the register block the download window writes.
 esp-hal = { version = "=1.2.2", features = ["esp32c6", "unstable"] }
 # The scheduler the radio will need and the executor the link runs on.
-esp-rtos = { version = "=0.4.0", features = ["esp32c6", "embassy"] }
+esp-rtos = { version = "=0.4.0", features = ["esp32c6", "embassy", "esp-radio", "esp-alloc"] }
 # The application descriptor the ROM bootloader reads before it runs anything,
 # the partition table, and the OTA state the window's completion confirms.
 esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c6"] }
@@ -65,6 +65,14 @@ o89-comms-core = { path = "../../crates/o89-comms-core" }
 # The worst-case payload, written once so a test and a bench mean the same
 # thing by it. Only the frames bench needs it.
 o89-link = { path = "../../crates/o89-link", optional = true }
+
+# Radio-only heap; all application buffers remain static.
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c6", "wifi", "unstable"] }
+esp-alloc = "=0.11.0"
+# Country-code lookup in the same blob as esp-radio; no guessed channel table.
+esp-wifi-sys-esp32c6 = "=0.3.0"
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "medium-ethernet"] }
+embassy-sync.workspace = true
 
 [lints]
 workspace = true

@@ -38,7 +38,8 @@ impl FrameBenchStart {
             Frame::Heartbeat { .. }
             | Frame::DownloadRefused { .. }
             | Frame::CloseReport { .. }
-            | Frame::NetFailed { .. }
+            | Frame::NetReport { .. }
+            | Frame::TimeOffer { .. }
             | Frame::Refuse { .. } => {}
         }
     }

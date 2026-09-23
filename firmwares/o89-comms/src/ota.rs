@@ -15,7 +15,6 @@ use esp_bootloader_esp_idf::ota::{Ota, OtaImageState};
 use esp_bootloader_esp_idf::partitions::{
     DataPartitionSubType, Error, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
 };
-use esp_hal::peripherals::FLASH;
 use esp_storage::FlashStorage;
 use o89_comms_core::WindowRan;
 
@@ -41,11 +40,10 @@ struct Unconfirmed;
 /// without it boots this image again, window first, to try again.
 ///
 /// `ran` is the proof the window ran, which only the window makes (F-089).
-pub fn confirm_if_pending(flash: FLASH<'static>, _ran: WindowRan) {
-    let mut storage = FlashStorage::new(flash);
+pub fn confirm_if_pending(storage: &mut FlashStorage<'_>, _ran: WindowRan) {
     // Bounded: `ATTEMPTS` turns.
     for _ in 0..ATTEMPTS {
-        if confirm(&mut storage).is_ok() {
+        if confirm(storage).is_ok() {
             return;
         }
     }

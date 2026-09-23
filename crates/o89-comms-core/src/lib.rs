@@ -20,10 +20,17 @@
 #[cfg(any(test, feature = "frames"))]
 mod frame_bench;
 mod link;
+mod network;
+mod ntp;
 mod window;
 
 #[cfg(any(test, feature = "frames"))]
 pub use frame_bench::FrameBenchStart;
 pub use link::*;
+pub use network::*;
+pub use ntp::*;
 pub use o89_link::{EncodeError, Millis, Tick};
 pub use window::*;
+
+mod credential_store;
+pub use credential_store::*;

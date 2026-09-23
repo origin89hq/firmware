@@ -8,8 +8,8 @@
 //! in, and writes what comes back.
 //!
 //! Every await has a deadline: a read waits one tick, a write two hundred
-//! milliseconds. The watchdog is fed once per turn of the loop, which is
-//! the whole of this side's liveness.
+//! milliseconds. The watchdog is fed only when this loop and the radio,
+//! network runner and NTP tasks have all made progress.
 
 use embassy_futures::yield_now;
 use embassy_time::{Duration, Instant, with_timeout};
@@ -50,6 +50,8 @@ pub async fn run(
     mut writer: FrameWriter,
     mut rwdt: Rwdt,
     boot_id: u32,
+    mut store: crate::credentials::Store,
+    credential: Option<o89_comms_core::Credential>,
 ) {
     let (mut rx, mut tx) = uart.split();
     let me = Identity {
@@ -58,18 +60,24 @@ pub async fn run(
         boot_id,
     };
     let mut link = Link::new(now());
+    link.restore_network(credential);
     let mut chunk = [0u8; 64];
     #[cfg(feature = "frames")]
     let mut frames = frames::Blast::new();
     // Bounded per turn: a read waits `TICK` at most, and the tick follows.
     loop {
-        rwdt.feed();
+        if crate::radio::healthy() {
+            rwdt.feed();
+        }
         if let Ok(Ok(count)) = with_timeout(TICK, rx.read_async(&mut chunk)).await {
             for byte in chunk.get(..count).unwrap_or(&[]) {
                 if let Received::Frame(frame) = reader.push(*byte)
                     && let Ok(envelope) = LinkEnvelope::decode(frame)
-                    && let Some(answer) = link.received(envelope, now())
+                    && let Some(answer) = link.received_with_store(envelope, now(), |record| {
+                        o89_comms_core::store_credential(&mut store, record).is_ok()
+                    })
                 {
+                    crate::radio::configure(link.credential().copied());
                     #[cfg(feature = "frames")]
                     frames.start.observe(answer);
                     send(&link, &me, answer, &mut tx, &mut writer).await;
@@ -80,6 +88,24 @@ pub async fn run(
             #[cfg(feature = "frames")]
             frames.start.observe(frame);
             send(&link, &me, frame, &mut tx, &mut writer).await;
+        }
+        if let Ok(sample) = crate::radio::SAMPLES.try_receive()
+            && sample.at.elapsed() < Duration::from_secs(1)
+        {
+            let offer = km43::ClockOffer {
+                unix_ms: sample.unix_ms,
+                source: 1,
+                accuracy_ms: sample.accuracy_ms,
+                server: crate::radio::SERVER,
+            };
+            let mut bytes = [0; MAX_FRAME];
+            if let Ok(Some(len)) = link.time_offer(offer, now(), &mut writer, &mut bytes) {
+                let _sent = with_timeout(
+                    WRITE_DEADLINE,
+                    write_all(&mut tx, bytes.get(..len).unwrap_or(&[])),
+                )
+                .await;
+            }
         }
         // Between turns, not inside one: the link's own frames go first,
         // so the controller's heartbeats are answered through the run and
