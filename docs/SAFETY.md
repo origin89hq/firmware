@@ -45,5 +45,5 @@ promise about coverage; the tests are named in the milestones.
 | Boot, reset, brownout, watchdog or power loss | H1, H2, H3, H4, H5; the boot order (M1); persistence (M2) |
 | Disconnect, malformed frame, duplicate or delayed command | H7, H9; the resynchroniser and CRC (M3); the dedup table and counters (M4) |
 | Stuck actuator, or command and feedback disagreeing | `FEEDBACK` against the commanded state; *stop not honoured* and *running, not ours* as states (M8) |
-| Timer wrap, full queue, exhausted retries, memory pressure | The 64-bit tick (H9); every table with a named capacity that refuses (M4, M5); no allocator (F-081) |
+| Timer wrap, full queue, exhausted retries, memory pressure | The 64-bit tick (H9); every table with a named capacity that refuses (M4, M5); allocator-free domain crates (F-081); the fixed-budget ESP32 radio heap and exhaustion/recovery qualification in [the comms architecture](ARCHITECTURE.md#the-comms-processor) (F-037, #89, #96) |
 | Interrupted update or corrupt persisted state | H1, H4, H8; the bootloader's trial and flip-back (M7); the ring's torn-write rule (M2) |

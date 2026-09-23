@@ -1145,9 +1145,41 @@ a hang the watchdog ends the same way, and either shows on the controller
 as a new `boot_id` and the ROM's text counted once. A console on UART1's
 unconnected pins is a bench addition when the radio work needs one.
 
-**A heap only for the radio.** The radio blobs cannot run without one; our
-own code there is written as if it had none, and `o89-comms` never depends
-on `o89-core`, which the gate refuses.
+**A heap only for the radio (F-037).** The ESP32 vendor Wi-Fi/BLE stack may
+allocate from a fixed-budget heap backed by statically reserved RAM. Initialize
+it only after the recovery download window has completed. This exception does
+not extend to the STM32, domain crates or their tests, or our ESP32 application
+and transport code. Connection tables, fragment assemblies and queues retain
+named static capacities and refuse at capacity without eviction. `o89-comms`
+never depends on `o89-core`, which the gate refuses.
+
+The pinned radio stack's required allocator and scheduler integration must be
+identified during qualification; the exception is not permission for a BLE host
+or an unrelated dependency to allocate. Disabling `esp-alloc` alone does not
+remove allocation: [Espressif's radio documentation][radio-allocation] requires
+replacement allocation functions. Heap initialization and the stack's allocator
+adapter are the only allocation plumbing our firmware may supply.
+
+[#89](https://github.com/origin89hq/firmware/issues/89) owns the shared radio
+initialization; [#96](https://github.com/origin89hq/firmware/issues/96) qualifies
+BLE and coexistence against that same memory budget. Before accepting a stack,
+record its exact pins, allocating components, reserved heap bytes, static RAM,
+task stacks, transport buffers and linked release size, with remaining margins.
+Choose the heap size from measured Wi-Fi/BLE operation; no heap size or stack
+is qualified by this exception alone.
+
+Qualification must measure peak heap use and fragmentation through repeated
+connect/disconnect cycles, full connections and queues, and BLE traffic while
+Wi-Fi associates, reconnects or fails. Exercise allocation failure during both
+initialization and operation. Where the stack returns an error, refuse the
+affected work and clean up its resources; where it cannot recover, reset the
+ESP32 through the existing reset/watchdog path. Verify that the controller keeps
+operating, stale client sessions cannot be reused, and no failure grants KM43
+permission. Revalidate the early download window with the radio stack present,
+including recovery after exhaustion. These are board acceptance obligations,
+not claims established by a host test or a fixed heap size.
+
+[radio-allocation]: https://docs.espressif.com/projects/rust/esp-radio/0.18.0/esp32c6/esp_radio/index.html#feature-flags
 
 **Partitions and recovery.** `otadata`, two OTA slots, a **factory** slot
 that OTA never writes and that always carries the window, a single-network

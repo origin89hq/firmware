@@ -48,9 +48,13 @@ and the plan with its milestones is
   needs a board to test, the seam is in the wrong place.
 - Missing, stale or implausible measurements carry their quality. Never a
   default that could be mistaken for a reading.
-- No allocator on the target, and none in the domain tests either. Every
-  collection has a named capacity and a documented behaviour when full; refuse
-  rather than evict.
+- No allocator on the STM32, in domain crates or their tests, or in our ESP32
+  application and transport code. The sole exception is a fixed-budget heap
+  for the ESP32 vendor radio stack, initialized after the recovery download
+  window. Its scope and qualification are defined in
+  [the comms architecture](docs/ARCHITECTURE.md#the-comms-processor) and F-037.
+  Every collection has a named capacity and a documented behaviour when full;
+  refuse rather than evict.
 - No `unwrap`, `expect`, `panic!`, `[]` indexing or unchecked arithmetic
   outside `#[cfg(test)]`. Match our own enums exhaustively, without `_` arms.
   Never `#[allow]`; an exceptional `#[expect(..., reason = "...")]` says what
