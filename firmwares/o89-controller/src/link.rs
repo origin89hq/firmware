@@ -1058,14 +1058,30 @@ fn log(event: o89_core::LinkEvent) {
 
 fn note_line(note: Note) {
     match note {
-        Note::UnexpectedAck(_) => defmt::info!("link: {}", note),
+        // These notes carry no SSID, passphrase, country or hostname values.
+        Note::NetworkSent {
+            req_id,
+            version,
+            operation,
+        } => {
+            defmt::info!(
+                "NetConfig queued: req={} version={} operation={}",
+                req_id.0,
+                version,
+                operation
+            );
+        }
+        Note::UnexpectedAck(_) | Note::NetworkAnswered { .. } | Note::NetworkRetry { .. } => {
+            defmt::info!("link: {}", note);
+        }
         Note::Refused(_)
         | Note::RequestFailed(_)
         | Note::Malformed(_)
         | Note::PeerRefused(_)
         | Note::WrongRole
         | Note::NetworkWithoutMaster
-        | Note::NetworkRefused(_) => {
+        | Note::NetworkRefused(_)
+        | Note::NetworkGaveUp { .. } => {
             defmt::warn!("link: {}", note);
         }
     }
@@ -1363,7 +1379,19 @@ async fn send_outgoing(
     };
     let bytes = frame.get(..len).unwrap_or(&[]);
     match with_timeout(WRITE_DEADLINE, send(tx, bytes)).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            if let o89_core::Outgoing::NetConfig { req_id } = outgoing
+                && let Some(push) = link.network_push(req_id)
+            {
+                // Only safe metadata; never format a Network or NetChange value.
+                defmt::info!(
+                    "NetConfig sent: req={} version={} operation={}",
+                    push.req_id.0,
+                    push.version,
+                    push.operation
+                );
+            }
+        }
         Ok(Err(error)) => defmt::warn!("link: {} not sent: {}", outgoing, error),
         Err(_) => {
             defmt::warn!(
