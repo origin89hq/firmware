@@ -688,6 +688,10 @@ impl HostileComms {
             Frame::PairingWindowAck { .. } => {
                 (Some(LinkMessageType::PairingWindowAck), false, false)
             }
+            Frame::ClientConnected { .. } => (Some(LinkMessageType::ClientConnected), false, false),
+            Frame::ClientDisconnected { .. } => {
+                (Some(LinkMessageType::ClientDisconnected), false, false)
+            }
             Frame::Refuse { .. } => (None, false, false),
         };
         let silent = match self.caps.answers {
@@ -775,6 +779,8 @@ impl HostileComms {
             | Frame::TimeOffer { .. }
             | Frame::NetReport { .. }
             | Frame::PairingWindowAck { .. }
+            | Frame::ClientConnected { .. }
+            | Frame::ClientDisconnected { .. }
             | Frame::Refuse { .. } => return None,
         };
         let Ok(len) = written else {

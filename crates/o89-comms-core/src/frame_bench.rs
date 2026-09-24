@@ -41,6 +41,8 @@ impl FrameBenchStart {
             | Frame::NetReport { .. }
             | Frame::PairingWindowAck { .. }
             | Frame::TimeOffer { .. }
+            | Frame::ClientConnected { .. }
+            | Frame::ClientDisconnected { .. }
             | Frame::Refuse { .. } => {}
         }
     }

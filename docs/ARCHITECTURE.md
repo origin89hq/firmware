@@ -1334,7 +1334,21 @@ a valid `LinkUp`.
 BLE and WebSocket share the bounded connection table, with eight rows and
 handles from a counter never 0 and never reused before the controller acknowledges the disconnect (L-060, L-080);
 every inbound client frame has its handle stamped into `session_id` (P-021);
-a link-local type on a client transport is dropped and answered (L-002). A
+a link-local type on a client transport is dropped and answered (L-002). The
+table lives in `o89-comms-core`'s link. A transport gets a row only while
+linked, and a ninth is refused with nothing evicted; a row still waiting on
+the answer to its release holds its place. Announcements and releases share
+L-014's four requests with the time offer, three at a time, and wait for a
+slot when all three are out. A refused `ClientConnected` drops the row and
+closes the transport with its reason (L-061); one unanswered three times
+closes the transport and is released, since the controller may hold the
+row; an unanswered release goes again under a new id until answered or the
+link falls. A `CloseConnection` closes the transports it names. A frame
+that is not an envelope is answered `Error 1` at `0, 0` on its own connection
+(P-025, P-028), since only this side knows where it came from. The
+controller's frames go to the open row their `session_id` names, and a
+refusal carrying one of the six link codes no client may see goes nowhere
+(L-180). A
 controller that goes quiet closes every client, stops advertising and retries
 `LinkUp` every two seconds (L-120); it never answers a `Discover` from memory
 (L-121).

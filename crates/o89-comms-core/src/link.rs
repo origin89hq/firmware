@@ -5,11 +5,15 @@
 //! attempts (L-015), and linked only by that answer (L-033). The
 //! controller's own statement is recorded and answered, never a link; a
 //! changed controller `boot_id` unlinks this side and closes every client
-//! connection, of which there are none yet (L-042). A heartbeat every two
+//! connection (L-042). A heartbeat every two
 //! seconds while linked, the controller's answered at once (L-100); six
 //! seconds since the controller last answered a request of ours and the
 //! link is down, clients closed, nothing served from memory, `LinkUp`
-//! retried (L-120, L-121). What the controller says of its own accord keeps
+//! retried (L-120, L-121). The connection table is the link's
+//! ([`Connections`]): its rows are announced and released here, counted in
+//! every heartbeat and every answer to one (L-101), closed when the
+//! controller asks and reported by how many (L-090), and closed with the
+//! link. What the controller says of its own accord keeps
 //! no link alive, and neither does an answer to a request this side never
 //! made or has already heard answered: only the first answer to one of its
 //! own proves the controller hears. A refusal from the controller is never
@@ -35,16 +39,20 @@
 use core::num::NonZeroU64;
 
 use km43::{
-    CloseConnection, CloseConnections, CloseReport, DownloadRequest, DownloadVerdict,
-    EnterDownload, FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkErrorCode, LinkMessageType,
-    LinkUp, MAX_FRAME, NetChange, NetConfig, NetVerdict, PairingWindowAck, PairingWindowNotice,
-    ReqId, Side, Version, arriving,
+    ClientDown, ClientDownAck, ClientUp, ClientUpAck, CloseConnection, CloseConnections,
+    CloseReport, Conn, DisconnectReason, DownloadRequest, DownloadVerdict, EnterDownload,
+    FrameWriter, Heartbeat, Intake, LinkEnvelope, LinkErrorCode, LinkMessageType, LinkTransport,
+    LinkUp, MAX_FRAME, MAX_PAYLOAD, NetChange, NetConfig, NetVerdict, PairingWindowAck,
+    PairingWindowNotice, ReqId, Side, Version, arriving,
 };
 use o89_link::{
     Beats, DEAD_AFTER, EncodeError, HEARTBEAT_PERIOD, LINK_ENVELOPE, LINKUP_PERIOD, Millis, OURS,
     Overdue, Requests, Tick, crosses_mismatch, frame_refusal, is_peer_refusal, link_header,
     refused_before_link,
 };
+
+use crate::connections::{Connections, Peer, Refused, Request, Status};
+use crate::relay::{self, Inbound, Route};
 
 /// What this side says of itself in every `LinkUp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +100,27 @@ pub enum Frame {
         req_id: ReqId,
         /// What happened.
         outcome: CloseConnection,
+    },
+    /// A transport exists and has a row (L-060).
+    ClientConnected {
+        /// The request, in flight until answered or given up.
+        req_id: ReqId,
+        /// Its handle.
+        conn: Conn,
+        /// What carries it.
+        transport: LinkTransport,
+        /// Where the client says it is (L-072).
+        peer: Peer,
+    },
+    /// A transport has gone; its handle is held until this is answered
+    /// (L-080).
+    ClientDisconnected {
+        /// The request, in flight until answered or given up.
+        req_id: ReqId,
+        /// Its handle.
+        conn: Conn,
+        /// Why it went.
+        reason: DisconnectReason,
     },
     /// The result of a credential update (L-136, L-137).
     NetReport {
@@ -185,6 +214,8 @@ pub struct Link {
     /// The controller's pairing window as its reports left it; `None`
     /// before any report from its current boot.
     pairing: Option<Reach>,
+    /// Every client transport's row.
+    connections: Connections,
 }
 
 impl Link {
@@ -209,7 +240,65 @@ impl Link {
             statement: Requests::NONE,
             beats: Beats::NONE,
             pairing: None,
+            connections: Connections::new(),
         }
+    }
+
+    /// A row for a client transport that exists now, announced to the
+    /// controller at the next turn. Refused while the link is down or the
+    /// versions disagree (L-120, L-050), and when all eight rows are taken;
+    /// the transport is then closed, and nothing is evicted.
+    pub fn connect(&mut self, transport: LinkTransport, peer: Peer) -> Result<Conn, Refused> {
+        if !self.linked || !self.controller.is_some_and(|controller| controller.agreed) {
+            return Err(Refused::NotLinked);
+        }
+        self.connections.allocate(transport, peer)
+    }
+
+    /// What the transport holding `conn` is to do; `None` once the handle
+    /// holds no transport.
+    #[must_use]
+    pub fn status(&self, conn: Conn) -> Option<Status> {
+        self.connections.status(conn)
+    }
+
+    /// The transport holding `conn` has gone, closed by its client, by an
+    /// error, or because its row said so.
+    pub fn gone(&mut self, conn: Conn, reason: DisconnectReason) {
+        self.connections.gone(conn, reason);
+    }
+
+    /// The client on `conn` could not take a frame the controller sent it:
+    /// its transport is to close, and the frame is not dropped silently.
+    pub fn overrun(&mut self, conn: Conn) {
+        self.connections.overrun(conn);
+    }
+
+    /// The table, for what a transport or a test reads of it.
+    #[must_use]
+    pub const fn connections(&self) -> &Connections {
+        &self.connections
+    }
+
+    /// A frame a client sent on `conn`, stamped with its handle into `dst`
+    /// (P-021), or the refusal its client is owed (P-025, L-002). `None`
+    /// while `conn` is not open: nothing crosses for a row the controller
+    /// has not accepted.
+    pub fn from_client(
+        &self,
+        conn: Conn,
+        frame: &[u8],
+        dst: &mut [u8; MAX_PAYLOAD],
+    ) -> Option<Result<Inbound, EncodeError>> {
+        self.connections
+            .is_open(conn)
+            .then(|| relay::stamp(conn, frame, dst))
+    }
+
+    /// Where a frame the controller sent goes: to [`Link::received`], to
+    /// an open connection, or nowhere.
+    pub fn route(&self, frame: &[u8]) -> Route {
+        relay::route(frame, |session| self.connections.open_row(session))
     }
 
     /// How long the controller's pairing window stays open as this side
@@ -333,13 +422,16 @@ impl Link {
                 .and_then(|heard| now.since(heard))
                 .is_some_and(|silent| silent >= DEAD_AFTER)
         {
-            // L-120: close every client, stop advertising, refuse new ones:
-            // none exist before M4, and the statement below is what remains.
+            // L-120: close every client, stop advertising, refuse new ones,
+            // and state this side again below.
             self.unlink(now);
         }
         if self.linked {
             if now < self.next_beat {
-                return self.retry_offer(now);
+                if let Some(offer) = self.retry_offer(now) {
+                    return Some(offer);
+                }
+                return self.connection_request(now);
             }
             self.next_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
             let req_id = self.take_req();
@@ -465,7 +557,7 @@ impl Link {
                 DownloadRequest::decode(envelope).ok()?;
                 Some(Frame::DownloadRefused { req_id })
             }
-            LinkMessageType::CloseConnection => Self::close_report(envelope, req_id),
+            LinkMessageType::CloseConnection => self.close_report(envelope, req_id),
             LinkMessageType::NetConfig => Some(self.configure_network(envelope, store)),
             LinkMessageType::CommsRelease => {
                 // No installer before M7: refused with the one code that
@@ -495,8 +587,22 @@ impl Link {
                 let notice = PairingWindowNotice::decode(envelope).ok()?;
                 self.pairing_report(notice, req_id, now)
             }
-            LinkMessageType::ClientConnectedAck | LinkMessageType::ClientDisconnectedAck => {
-                // Answers to requests not made yet.
+            LinkMessageType::ClientConnectedAck => {
+                // An answer to an announcement in flight decides its row,
+                // and like any answer proves the controller hears (L-100).
+                let ack = ClientUpAck::decode(envelope).ok()?;
+                if self.connections.connected(req_id, ack.outcome) {
+                    self.last_heard = Some(now);
+                }
+                None
+            }
+            LinkMessageType::ClientDisconnectedAck => {
+                // Either outcome frees the handle: the controller holds no
+                // row under it now (L-080).
+                ClientDownAck::decode(envelope).ok()?;
+                if self.connections.disconnected(req_id) {
+                    self.last_heard = Some(now);
+                }
                 None
             }
             LinkMessageType::ClientConnected
@@ -558,16 +664,47 @@ impl Link {
         }
     }
 
-    /// The answer to a `CloseConnection`. No connection rows before M4:
-    /// nothing to close, which is a real report and not silence.
-    fn close_report(envelope: LinkEnvelope<'_>, req_id: ReqId) -> Option<Frame> {
+    /// The answer to a `CloseConnection`: what it closed, handle 0 being
+    /// every connection.
+    fn close_report(&mut self, envelope: LinkEnvelope<'_>, req_id: ReqId) -> Option<Frame> {
         let close = CloseConnections::decode(envelope).ok()?;
-        let outcome = if close.is_every_connection() {
-            CloseConnection::Closed
-        } else {
-            CloseConnection::UnknownHandle
-        };
-        Some(Frame::CloseReport { req_id, outcome })
+        let done = self.connections.close(close.conn, close.reason);
+        Some(Frame::CloseReport {
+            req_id,
+            outcome: done.outcome,
+        })
+    }
+
+    /// The table's next announcement or release, or a retry of one.
+    fn connection_request(&mut self, now: Tick) -> Option<Frame> {
+        let next_req = &mut self.next_req;
+        let request = self.connections.due(now, || {
+            let req = ReqId(*next_req);
+            *next_req = next_req.wrapping_add(1);
+            req
+        })?;
+        Some(match request {
+            Request::Connected {
+                req_id,
+                conn,
+                transport,
+                peer,
+            } => Frame::ClientConnected {
+                req_id,
+                conn,
+                transport,
+                peer,
+            },
+            Request::Disconnected {
+                req_id,
+                conn,
+                reason,
+            } => Frame::ClientDisconnected {
+                req_id,
+                conn,
+                reason,
+            },
+        })
     }
 
     /// Build `frame` as this side sends it at `now`, framed into `dst`, and
@@ -619,6 +756,32 @@ impl Link {
                 link_header(LinkMessageType::CloseConnectionAck, req_id),
                 &mut envelope,
             ),
+            Frame::ClientConnected {
+                req_id,
+                conn,
+                transport,
+                peer,
+            } => ClientUp {
+                conn: conn.get(),
+                transport,
+                peer: peer.text().as_str(),
+            }
+            .write(
+                link_header(LinkMessageType::ClientConnected, req_id),
+                &mut envelope,
+            ),
+            Frame::ClientDisconnected {
+                req_id,
+                conn,
+                reason,
+            } => ClientDown {
+                conn: conn.get(),
+                reason,
+            }
+            .write(
+                link_header(LinkMessageType::ClientDisconnected, req_id),
+                &mut envelope,
+            ),
             Frame::NetReport {
                 req_id,
                 outcome,
@@ -644,7 +807,7 @@ impl Link {
 
     /// Record a statement of the controller's. A changed `boot_id` is a
     /// controller that rebooted: every client connection closes (L-042),
-    /// none before M4, and this side is unlinked, because the new boot has
+    /// and this side is unlinked, because the new boot has
     /// answered nothing of ours (L-033); a beat sent to the old boot is
     /// forgotten with it.
     fn record(&mut self, boot_id: u32, version: Version) {
@@ -655,6 +818,7 @@ impl Link {
             self.linked = false;
             self.beats.forget();
             self.forget_offer();
+            self.connections.drop_all();
             // Another boot's revisions start again from 1.
             self.pairing = None;
         }
@@ -684,12 +848,13 @@ impl Link {
         self.next_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
     }
 
-    /// The link is down (L-120): every beat still waiting is forgotten, and
-    /// this side states itself at once.
+    /// The link is down (L-120): every client transport closes, every beat
+    /// still waiting is forgotten, and this side states itself at once.
     fn unlink(&mut self, now: Tick) {
         self.linked = false;
         self.beats.forget();
         self.forget_offer();
+        self.connections.drop_all();
         // The lifetime ends with the link; the revision stays, and the
         // controller's resynchronisation brings a newer one.
         if let Some(reach) = &mut self.pairing {
@@ -1192,7 +1357,7 @@ mod tests {
             link.received(later, at(20)),
             Some(Frame::CloseReport {
                 req_id: ReqId(6),
-                outcome: CloseConnection::Closed
+                outcome: CloseConnection::Closed,
             })
         );
     }
@@ -1214,7 +1379,7 @@ mod tests {
             link.received(close, at(20)),
             Some(Frame::CloseReport {
                 req_id: ReqId(5),
-                outcome: CloseConnection::Closed
+                outcome: CloseConnection::Closed,
             })
         );
         let len = CloseConnections {
@@ -1230,7 +1395,7 @@ mod tests {
             link.received(close, at(30)),
             Some(Frame::CloseReport {
                 req_id: ReqId(6),
-                outcome: CloseConnection::UnknownHandle
+                outcome: CloseConnection::UnknownHandle,
             })
         );
     }
@@ -1891,6 +2056,290 @@ mod tests {
             assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
             assert_eq!(link.retry_offer(at(510)), None);
             assert!(!link.offer_rate.take(at(900_009)));
+        }
+    }
+
+    const PEER: Peer = Peer::Ipv4 {
+        addr: [192, 168, 4, 2],
+        port: 50_123,
+    };
+
+    fn acked(
+        buf: &mut [u8; 256],
+        kind: LinkMessageType,
+        req_id: ReqId,
+        outcome: u8,
+    ) -> LinkEnvelope<'_> {
+        let mut cbor = link_header(kind, req_id).write(1, buf).expect("fits");
+        cbor.key(1).expect("fits");
+        cbor.u64(u64::from(outcome)).expect("fits");
+        let len = cbor.finish().map_err(LinkError::from);
+        decoded(buf, len)
+    }
+
+    /// A transport connected on a linked link and accepted at `now`.
+    fn accepted(link: &mut Link, now: Tick) -> Conn {
+        let conn = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
+        let Some(Frame::ClientConnected {
+            req_id,
+            conn: announced,
+            ..
+        }) = link.tick(now)
+        else {
+            panic!("its announcement goes out at the next turn");
+        };
+        assert_eq!(announced, conn);
+        let mut buf = [0u8; 256];
+        let ack = acked(&mut buf, LinkMessageType::ClientConnectedAck, req_id, 1);
+        assert_eq!(link.received(ack, now), None);
+        assert_eq!(link.status(conn), Some(Status::Open));
+        conn
+    }
+
+    /// The `conns` of the frame `link` builds.
+    fn conns_in(link: &Link, frame: Frame) -> u8 {
+        let mut wire = [0u8; MAX_FRAME];
+        let len = link
+            .build(frame, &ME, at(100), &mut FrameWriter::new(), &mut wire)
+            .expect("builds");
+        let mut out = [0u8; 256];
+        let len = read_back(wire.get(..len).expect("fits"), &mut out);
+        Heartbeat::decode(envelope_in(&out, len))
+            .expect("a heartbeat")
+            .conns
+    }
+
+    #[test]
+    fn l_060_no_transport_gets_a_row_before_the_link_or_under_a_major_mismatch() {
+        let mut link = Link::new(Tick::ZERO);
+        assert_eq!(
+            link.connect(LinkTransport::WifiLocal, PEER),
+            Err(Refused::NotLinked)
+        );
+        let mut link = linked_at_boot();
+        link.record(CONTROLLER_BOOT, Version { major: 2, minor: 0 });
+        link.linked = true;
+        assert_eq!(
+            link.connect(LinkTransport::WifiLocal, PEER),
+            Err(Refused::NotLinked)
+        );
+    }
+
+    #[test]
+    fn l_060_a_ninth_client_is_refused_by_the_table_before_any_frame() {
+        let mut link = linked_at_boot();
+        for _ in 0..crate::ROWS {
+            let _ = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
+        }
+        assert_eq!(
+            link.connect(LinkTransport::Ble, PEER),
+            Err(Refused::TableFull)
+        );
+    }
+
+    #[test]
+    fn l_080_an_answered_release_is_heard_and_frees_the_handle() {
+        let mut link = linked_at_boot();
+        let conn = accepted(&mut link, at(10));
+        link.gone(conn, DisconnectReason::ClosedByClient);
+        let Some(Frame::ClientDisconnected {
+            req_id,
+            conn: released,
+            reason,
+        }) = link.tick(at(20))
+        else {
+            panic!("its release goes out");
+        };
+        assert_eq!((released, reason), (conn, DisconnectReason::ClosedByClient));
+        let mut buf = [0u8; 256];
+        let ack = acked(&mut buf, LinkMessageType::ClientDisconnectedAck, req_id, 1);
+        assert_eq!(link.received(ack, at(1_900)), None);
+        assert_eq!(
+            link.last_heard(),
+            Some(at(1_900)),
+            "an answer is heard (L-100)"
+        );
+        // A second answer to the same request is heard as nothing.
+        let ack = acked(&mut buf, LinkMessageType::ClientDisconnectedAck, req_id, 2);
+        assert_eq!(link.received(ack, at(1_950)), None);
+        assert_eq!(link.last_heard(), Some(at(1_900)));
+    }
+
+    #[test]
+    fn l_061_an_announcement_refused_for_a_full_table_drops_the_row() {
+        let mut link = linked_at_boot();
+        let conn = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
+        let Some(Frame::ClientConnected { req_id, .. }) = link.tick(at(10)) else {
+            panic!("announced");
+        };
+        let mut buf = [0u8; 256];
+        let refused = acked(
+            &mut buf,
+            LinkMessageType::ClientConnectedAck,
+            req_id,
+            km43::ClientConnected::RefusedTableFull as u8,
+        );
+        assert_eq!(link.received(refused, at(20)), None);
+        assert_eq!(
+            link.status(conn),
+            Some(Status::Close(crate::Closed::TableFull))
+        );
+        assert_eq!(conns_in(&link, Frame::Heartbeat { req_id: ReqId(1) }), 0);
+        link.gone(conn, DisconnectReason::ClosedByComms);
+        assert_eq!(link.status(conn), None);
+        assert_eq!(link.tick(at(30)), None, "nothing to release");
+    }
+
+    #[test]
+    fn l_120_a_dropped_link_closes_every_transport_and_refuses_new_ones() {
+        let mut link = linked_at_boot();
+        let conn = accepted(&mut link, at(10));
+        assert!(matches!(
+            link.tick(at(2_000)),
+            Some(Frame::Heartbeat { .. })
+        ));
+        // Six seconds after the controller last answered: its ack at 10 ms.
+        let _ = link.tick(at(6_009));
+        assert!(link.is_linked());
+        let _ = link.tick(at(6_010));
+        assert!(!link.is_linked());
+        assert_eq!(
+            link.status(conn),
+            Some(Status::Close(crate::Closed::LinkLost))
+        );
+        assert_eq!(
+            link.connect(LinkTransport::WifiLocal, PEER),
+            Err(Refused::NotLinked)
+        );
+        link.gone(conn, DisconnectReason::ClosedByComms);
+        assert_eq!(link.status(conn), None);
+    }
+
+    #[test]
+    fn l_042_a_controller_reboot_closes_every_transport() {
+        let mut link = linked_at_boot();
+        let conn = accepted(&mut link, at(10));
+        let mut buf = [0u8; 256];
+        let rebooted = statement(
+            &mut buf,
+            LinkMessageType::LinkUp,
+            ReqId(1),
+            Side::Controller,
+            CONTROLLER_BOOT.wrapping_add(1),
+            OURS,
+        );
+        let _ = link.received(rebooted, at(20));
+        assert_eq!(
+            link.status(conn),
+            Some(Status::Close(crate::Closed::LinkLost))
+        );
+        assert_eq!(conns_in(&link, Frame::Heartbeat { req_id: ReqId(1) }), 0);
+    }
+
+    #[test]
+    fn p_021_a_client_frame_crosses_only_on_an_open_row() {
+        let mut link = linked_at_boot();
+        let discover = [0x84, 0x00, 0x00, 0x01, 0xA0];
+        let mut dst = [0u8; MAX_PAYLOAD];
+        let open = accepted(&mut link, at(10));
+        let waiting = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
+        assert_eq!(link.from_client(waiting, &discover, &mut dst), None);
+        assert!(matches!(
+            link.from_client(open, &discover, &mut dst),
+            Some(Ok(Inbound::Forward(_)))
+        ));
+        link.gone(open, DisconnectReason::ClosedByClient);
+        assert_eq!(link.from_client(open, &discover, &mut dst), None);
+    }
+
+    #[test]
+    fn l_194_a_client_frame_shaped_like_a_link_request_never_reaches_the_link() {
+        // A `PairingWindow` and an `EnterDownload`, as a client would send
+        // them: answered 257 on the client's connection, and the link's
+        // state is unchanged.
+        let mut link = linked_at_boot();
+        let open = accepted(&mut link, at(10));
+        let before = link.clone();
+        for (bytes, len) in [
+            {
+                let mut buf = [0u8; 256];
+                let len = PairingWindowNotice::new(NonZeroU64::new(1).expect("non-zero"), 60_000)
+                    .expect("in range")
+                    .write(
+                        link_header(LinkMessageType::PairingWindow, ReqId(3)),
+                        &mut buf,
+                    )
+                    .expect("fits");
+                (buf, len)
+            },
+            {
+                let mut buf = [0u8; 256];
+                let len = DownloadRequest {
+                    reason: km43::DownloadReason::Recovery,
+                }
+                .write(
+                    link_header(LinkMessageType::EnterDownload, ReqId(4)),
+                    &mut buf,
+                )
+                .expect("fits");
+                (buf, len)
+            },
+        ] {
+            let mut dst = [0u8; MAX_PAYLOAD];
+            assert!(matches!(
+                link.from_client(open, bytes.get(..len).expect("fits"), &mut dst),
+                Some(Ok(Inbound::Answer(_)))
+            ));
+        }
+        assert_eq!(link, before);
+        assert_eq!(link.pairing_window(at(20)), None);
+    }
+
+    #[test]
+    fn client_requests_build_and_read_back() {
+        let link = linked_at_boot();
+        let conn = Conn::new(0x0102).expect("a handle");
+        let frames = [
+            Frame::ClientConnected {
+                req_id: ReqId(8),
+                conn,
+                transport: LinkTransport::WifiLocal,
+                peer: PEER,
+            },
+            Frame::ClientDisconnected {
+                req_id: ReqId(9),
+                conn,
+                reason: DisconnectReason::IdleTimeout,
+            },
+        ];
+        for frame in frames {
+            let mut wire = [0u8; MAX_FRAME];
+            let len = link
+                .build(frame, &ME, at(3), &mut FrameWriter::new(), &mut wire)
+                .expect("builds");
+            let mut out = [0u8; 256];
+            let len = read_back(wire.get(..len).expect("fits"), &mut out);
+            let envelope = envelope_in(&out, len);
+            assert_eq!(envelope.session(), SessionId::None);
+            match frame {
+                Frame::ClientConnected { req_id, .. } => {
+                    assert_eq!(envelope.req_id(), req_id);
+                    let up = ClientUp::decode(envelope).expect("a ClientConnected");
+                    assert_eq!(
+                        (up.conn, up.transport, up.peer),
+                        (0x0102, LinkTransport::WifiLocal, "192.168.4.2:50123")
+                    );
+                }
+                Frame::ClientDisconnected { req_id, .. } => {
+                    assert_eq!(envelope.req_id(), req_id);
+                    let down = ClientDown::decode(envelope).expect("a ClientDisconnected");
+                    assert_eq!(
+                        (down.conn, down.reason),
+                        (0x0102, DisconnectReason::IdleTimeout)
+                    );
+                }
+                _ => panic!("not built here"),
+            }
         }
     }
 }
