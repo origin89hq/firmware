@@ -1,6 +1,7 @@
 //! Radio ownership is independent of the controller handshake and association.
 //! One desired configuration replaces the previous value; there is no queue.
 use core::cell::RefCell;
+use embassy_futures::join::join3;
 use embassy_futures::select::{select, select4};
 use embassy_net::{Config, DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
@@ -11,9 +12,11 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig, Interface, WifiController,
     sta::StationConfig,
 };
-use o89_comms_core::{Credential, NTP_BYTES, NtpRequest, NtpSchedule, Tick};
+use o89_comms_core::{Country, Credential, NTP_BYTES, NtpRequest, NtpSchedule, Plan, Tick};
 
+use crate::access_point;
 use crate::clients::{Buffers, STATION_WORKERS};
+use crate::link::LINK;
 use static_cell::{ConstStaticCell, StaticCell};
 
 static DESIRED: Mutex<CriticalSectionRawMutex, RefCell<Option<Credential>>> =
@@ -24,6 +27,13 @@ static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 /// The station's WebSocket workers' buffers, lent to each session.
 static CLIENTS: ConstStaticCell<[Buffers; STATION_WORKERS]> =
     ConstStaticCell::new([const { Buffers::EMPTY }; STATION_WORKERS]);
+/// The access point's sockets: its DHCP server, and one TCP socket per
+/// WebSocket worker.
+const AP_SOCKETS: usize = 1 + access_point::WORKERS;
+static AP_RESOURCES: StaticCell<StackResources<AP_SOCKETS>> = StaticCell::new();
+/// The access point's WebSocket workers' buffers.
+static AP_CLIENTS: ConstStaticCell<[Buffers; access_point::WORKERS]> =
+    ConstStaticCell::new([const { Buffers::EMPTY }; access_point::WORKERS]);
 /// One sample in flight; full means drop the fresh sample, never evict a queued one.
 pub static SAMPLES: Channel<CriticalSectionRawMutex, Sample, 1> = Channel::new();
 /// A sample is used only during the next link turn and never adjusts a local clock.
@@ -69,33 +79,43 @@ fn desired() -> Option<Credential> {
 }
 
 pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<(), ()> {
-    let resources = RESOURCES.try_init(StackResources::new()).ok_or(())?;
-    let clients = CLIENTS.try_take().ok_or(())?;
-    spawner.spawn(radio(wifi, resources, clients).map_err(|_| ())?);
+    let held = Held {
+        resources: RESOURCES.try_init(StackResources::new()).ok_or(())?,
+        clients: CLIENTS.try_take().ok_or(())?,
+        ap_resources: AP_RESOURCES.try_init(StackResources::new()).ok_or(())?,
+        ap_clients: AP_CLIENTS.try_take().ok_or(())?,
+    };
+    spawner.spawn(radio(wifi, held).map_err(|_| ())?);
     Ok(())
 }
 
-#[embassy_executor::task]
-async fn radio(
-    mut wifi: WIFI<'static>,
+/// What every session borrows: each network's stack resources and its
+/// WebSocket workers' buffers.
+struct Held {
     resources: &'static mut StackResources<SOCKETS>,
     clients: &'static mut [Buffers; STATION_WORKERS],
-) {
+    ap_resources: &'static mut StackResources<AP_SOCKETS>,
+    ap_clients: &'static mut [Buffers; access_point::WORKERS],
+}
+
+#[embassy_executor::task]
+async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     loop {
         for task in 0..3 {
             progress(task);
         }
-        if let Some(record) = desired() {
-            match record.change() {
-                Ok(km43::NetChange::Set { .. }) => {
-                    // The session owns every Wi-Fi resource. Returning drops the
-                    // runner/interface before the controller, whose guard stops
-                    // and deinitializes the driver. Reborrow keeps WIFI here for
-                    // the next configured network without duplicating ownership.
-                    session(wifi.reborrow(), resources, clients, record).await;
-                }
-                Ok(km43::NetChange::Clear { .. } | km43::NetChange::ClearUnwritten) => {}
-                Err(_) => esp_hal::system::software_reset(),
+        if desired().is_some_and(|record| record.change().is_err()) {
+            esp_hal::system::software_reset();
+        }
+        let plan = plan().await;
+        match plan {
+            Plan::Off => {}
+            // The session owns every Wi-Fi resource. Returning drops the
+            // runner/interface before the controller, whose guard stops and
+            // deinitializes the driver. Reborrow keeps WIFI here for the
+            // next plan without duplicating ownership.
+            Plan::Station | Plan::AccessPoint { .. } | Plan::Both { .. } => {
+                session(wifi.reborrow(), &mut held, plan).await;
             }
         }
         // Idle and failed setup both yield, keeping watchdog progress bounded.
@@ -103,12 +123,16 @@ async fn radio(
     }
 }
 
-async fn session(
-    wifi: WIFI<'_>,
-    resources: &mut StackResources<SOCKETS>,
-    clients: &mut [Buffers; STATION_WORKERS],
-    record: Credential,
-) {
+/// What the radio should run now: the record held, and the controller's
+/// pairing window as the link measures it (L-196).
+async fn plan() -> Plan {
+    let now = Tick::from_millis(Instant::now().as_millis());
+    let pairing_open = LINK.lock().await.pairing_window(now).is_some();
+    Plan::of(desired().as_ref(), pairing_open)
+}
+
+/// The station's configuration, hostname and country from a `set` record.
+fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &str)> {
     let Ok(km43::NetChange::Set {
         ssid,
         psk,
@@ -117,19 +141,45 @@ async fn session(
         ..
     }) = record.change()
     else {
-        return;
+        return None;
     };
     let (Ok(ssid), Ok(password), Ok(hostname)) =
         (ssid.try_into(), psk.try_into(), hostname.try_into())
     else {
+        return None;
+    };
+    let config = StationConfig::default()
+        .with_ssid(ssid)
+        .with_authentication(AuthenticationMethodConfig::Wpa2Personal(password));
+    let mut dhcp = DhcpConfig::default();
+    dhcp.hostname = Some(hostname);
+    Some((config, dhcp, country))
+}
+
+fn seed() -> u64 {
+    (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random())
+}
+
+async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) {
+    let Some(record) = desired() else {
         return;
     };
     let Ok(mut controller) = WifiController::new(wifi, ControllerConfig::default()) else {
         return;
     };
-    let config = StationConfig::default()
-        .with_ssid(ssid)
-        .with_authentication(AuthenticationMethodConfig::Wpa2Personal(password));
+    match plan {
+        Plan::Off => {}
+        Plan::Station => station_session(&mut controller, held, record).await,
+        Plan::AccessPoint { country } => access_point_session(&mut controller, held, country).await,
+        Plan::Both { country } => both_session(&mut controller, held, record, country).await,
+    }
+}
+
+/// The cached network alone.
+async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, record: Credential) {
+    let Some((config, dhcp, country)) = station_config(&record) else {
+        return;
+    };
     if country_code(country).is_err()
         || controller.set_config(&WifiConfig::Station(config)).is_err()
     {
@@ -138,21 +188,134 @@ async fn session(
     let Some(interface) = Interface::try_station() else {
         return;
     };
-    let mut dhcp = DhcpConfig::default();
-    dhcp.hostname = Some(hostname);
-    let seed = (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random());
-    let (stack, runner) = embassy_net::new(interface, Config::dhcpv4(dhcp), resources, seed);
+    let (stack, runner) = embassy_net::new(
+        interface,
+        Config::dhcpv4(dhcp),
+        &mut *held.resources,
+        seed(),
+    );
     // All four futures are polled concurrently. Station returns when the
-    // desired record changes; cancellation drops the client connections,
+    // record or the plan changes; cancellation drops the client connections,
     // releasing their rows, then NTP sockets and the runner, before
     // controller teardown. The first three report watchdog progress.
     let _finished = select4(
         network(runner),
         ntp(stack),
-        station(&mut controller, record),
-        crate::clients::serve(stack, 0, clients),
+        station(controller, record, Plan::Station),
+        crate::clients::serve(stack, 0, held.clients),
     )
     .await;
+}
+
+/// The access point alone: no network cached, a country known.
+async fn access_point_session(
+    controller: &mut WifiController<'_>,
+    held: &mut Held,
+    country: Country,
+) {
+    let Some(interface) = Interface::try_access_point() else {
+        return;
+    };
+    let Some(config) = access_point::config(interface.mac_address()) else {
+        return;
+    };
+    if country_code_of(country).is_err()
+        || controller
+            .set_config(&WifiConfig::AccessPoint(config))
+            .is_err()
+    {
+        return;
+    }
+    crate::clients::open_access_point();
+    let (stack, runner) = embassy_net::new(
+        interface,
+        access_point::network(),
+        &mut *held.ap_resources,
+        seed(),
+    );
+    let _finished = select4(
+        network(runner),
+        access_point::dhcp(stack),
+        crate::clients::serve(stack, STATION_WORKERS, held.ap_clients),
+        hold(Plan::AccessPoint { country }),
+    )
+    .await;
+}
+
+/// The cached network, and the access point while the pairing window is
+/// open.
+async fn both_session(
+    controller: &mut WifiController<'_>,
+    held: &mut Held,
+    record: Credential,
+    country: Country,
+) {
+    let Some((station_config, dhcp, _)) = station_config(&record) else {
+        return;
+    };
+    let (Some(station_interface), Some(ap_interface)) =
+        (Interface::try_station(), Interface::try_access_point())
+    else {
+        return;
+    };
+    let Some(ap_config) = access_point::config(ap_interface.mac_address()) else {
+        return;
+    };
+    if country_code_of(country).is_err()
+        || controller
+            .set_config(&WifiConfig::AccessPointStation(station_config, ap_config))
+            .is_err()
+    {
+        return;
+    }
+    crate::clients::open_access_point();
+    let Held {
+        resources,
+        clients,
+        ap_resources,
+        ap_clients,
+    } = held;
+    let (stack, runner) = embassy_net::new(
+        station_interface,
+        Config::dhcpv4(dhcp),
+        &mut **resources,
+        seed(),
+    );
+    let (ap_stack, ap_runner) = embassy_net::new(
+        ap_interface,
+        access_point::network(),
+        &mut **ap_resources,
+        seed(),
+    );
+    // Station returns when the record or the plan changes, after draining
+    // the access point if the window closed (L-196).
+    let _finished = select(
+        select4(
+            network(runner),
+            ntp(stack),
+            station(controller, record, Plan::Both { country }),
+            crate::clients::serve(stack, 0, clients),
+        ),
+        join3(
+            network(ap_runner),
+            access_point::dhcp(ap_stack),
+            crate::clients::serve(ap_stack, STATION_WORKERS, ap_clients),
+        ),
+    )
+    .await;
+}
+
+/// The access point alone: report progress for the station and NTP it does
+/// not run, and return when the plan changes.
+async fn hold(plan: Plan) {
+    loop {
+        progress(1);
+        progress(2);
+        if self::plan().await != plan {
+            return;
+        }
+        Timer::after_secs(1).await;
+    }
 }
 
 async fn network(mut runner: Runner<'_, Interface>) {
@@ -162,6 +325,13 @@ async fn network(mut runner: Runner<'_, Interface>) {
         let _result = select(runner.run(), Timer::after_secs(1)).await;
         progress(0);
     }
+}
+
+/// The regulatory country the plan carries, applied as a record's is.
+fn country_code_of(country: Country) -> Result<(), ()> {
+    let [first, second] = country.as_bytes();
+    let code = [first, second];
+    country_code(core::str::from_utf8(&code).map_err(|_| ())?)
 }
 
 /// Use the blob's regulatory lookup, not esp-radio's fixed 13-channel `CountryInfo`.
@@ -194,10 +364,19 @@ async fn disconnect(controller: &mut WifiController<'_>) {
     }
 }
 
-async fn station(controller: &mut WifiController<'_>, applied: Credential) {
+async fn station(controller: &mut WifiController<'_>, applied: Credential, plan: Plan) {
     loop {
         progress(1);
         if desired() != Some(applied) {
+            return;
+        }
+        let next = self::plan().await;
+        if next != plan {
+            if plan.window_closes(next) {
+                // The phone on the access point takes what is already on its
+                // way before the access point goes (L-196).
+                crate::clients::drain_access_point().await;
+            }
             return;
         }
         if !controller.is_connected() {

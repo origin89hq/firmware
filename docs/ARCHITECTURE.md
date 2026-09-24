@@ -1326,13 +1326,28 @@ Every close carries a code and a reason a client can show (L-061). A ninth
 client finds no listening socket. The link, with the table, is shared with
 the workers through an async mutex no task holds across an await. The comms
 processor's own access point remains the browser provisioning fallback,
-raised only while no network is cached or the pairing window is open. The
+raised only while no network is cached or the pairing window is open, and
+only under a regulatory country from the controller's network record: a
+pairing report carries none, and an unwritten clear keeps every radio off
+(L-133). A unit never given a network therefore has no access point; its
+first pairing is BLE's. The
 controller reports its window over the link with KM43's `PairingWindow`
 after every link-up, on the opening and on every closure, an enrolment's
 `Pair` answer ahead of the closed report (L-195); the comms processor acts
 on it only from the controller UART once its own link is up (L-194) and
-keeps the lifetime on its own clock from receipt. Raising the access point
-on that lifetime is [#90](https://github.com/origin89hq/firmware/issues/90).
+keeps the lifetime on its own clock from receipt. The radio reads that
+lifetime once a second (`o89_comms_core::Plan`): a `clear` record raises
+the access point alone, a `set` record raises it beside the station while
+the window is open, and a change of plan restarts the Wi-Fi session. When
+the window's end takes the access point down, its workers take no new
+client and their clients get 500 ms to take what is already queued (L-196).
+The access point is open, named `origin89-` and the last two bytes of its
+address, on the country's channel plan through the same country lookup the
+station uses, at 192.168.4.1/24 with no gateway. It admits eight phones.
+`edge-dhcp` answers their DHCP over a UDP socket of ours, eight leases of
+five minutes over a range of eight addresses, so an expired lease is reused
+and a ninth phone waits for one; it allocates nothing. Two WebSocket
+workers serve it, their rows from the same table.
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
 
@@ -1393,8 +1408,9 @@ Wi-Fi off. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack has
 eleven socket slots (DHCP, DNS, NTP and one TCP socket per WebSocket
-worker), and the time-offer channel holds one sample, refusing a new sample
-while full.
+worker), the access point's stack three (its DHCP server and two workers),
+and the time-offer channel holds one sample, refusing a new sample while
+full.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.

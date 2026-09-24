@@ -74,6 +74,9 @@ esp-wifi-sys-esp32c6 = "=0.3.0"
 embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
 # The TCP socket's reads and writes, the release embassy-net implements.
 embedded-io-async = "=0.7.0"
+# The access point's DHCP server: packets and leases only, with no I/O of
+# its own and no allocation; a UDP socket of ours carries it.
+edge-dhcp = { version = "=0.8.0", default-features = false }
 embassy-sync.workspace = true
 
 [lints]
