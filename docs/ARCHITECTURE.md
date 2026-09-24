@@ -1565,7 +1565,7 @@ release and features and holds every socket open at once, and `cargo xtask
 check` refuses the two feature lists differing. The time-offer channel
 holds one sample, refusing a new sample while full.
 
-Wi-Fi diagnostics on KM43 0.6.2 live in `o89-core::Wifi`. Both wrapped
+Wi-Fi diagnostics on KM43 0.6.3 live in `o89-core::Wifi`. Both wrapped
 reads are answered before capability bit 8 is advertised. A refresh checks
 mask bit 1, written network metadata, the link, and the 10-second interval;
 a refresh during a running scan joins it. One numbered scan waits for its
