@@ -5,6 +5,14 @@
 # enrolment closure/reboot, factory reset, bad proof, and link-up reporting.
 # Host and simulation evidence only; no lamp/radio/phone bench qualification.
 # P-222 (km43 0.6.3) binds client enrolment storage; this firmware is not a client.
+# F-092: host tests cover DHCP timeout, loss and cancelled-scan completion;
+# the four-second vendor timeout and dormant-station AP mode require bench runs.
+# Comms Wi-Fi (#138): L-200–L-206 tests assert no-country/busy refusal,
+# deduplication/truncation/omitted counts, one result and bounded retries,
+# RAM-version reports, first-outcome state, and newest-only report delivery.
+# Published scan vectors pass through the same reducer and wire codecs.
+# The scan Vec remains vendor-radio-only allocation under F-037; target
+# compilation measures each AP at 47 bytes, not a qualified heap margin.
 # Wi-Fi diagnostics (#138): controller P-216–P-221, L-200/L-203/L-207
 # have wrapped-read, state-machine, published-vector and HostileComms tests.
 # F-093's deadline decisions are host tested; the adapter queues their record.

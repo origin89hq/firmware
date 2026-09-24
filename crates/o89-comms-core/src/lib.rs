@@ -47,3 +47,6 @@ pub use window::*;
 
 mod credential_store;
 pub use credential_store::*;
+
+mod wifi;
+pub use wifi::*;

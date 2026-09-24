@@ -2094,6 +2094,43 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn l_015_l_203_scan_without_ack_is_failed_after_three_transmissions() {
+        let mut link = Link::new(identity(), Tick::ZERO);
+        assert_eq!(link.wifi.refresh(true, true, true, Tick::ZERO), None);
+        let req_id = ReqId(123);
+        assert!(
+            link.requests
+                .issue(LinkMessageType::WifiScan, req_id, Tick::ZERO)
+        );
+        link.wifi_request = Some(req_id);
+        for millis in [500, 1000] {
+            let mut actions = Actions::NONE;
+            link.retry(Tick::from_millis(millis), &mut actions);
+            assert!(link.wifi.order().is_some());
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                Action::Send(Outgoing::WifiScan {
+                    req_id: ReqId(123),
+                    ..
+                })
+            )));
+        }
+        let mut actions = Actions::NONE;
+        link.retry(Tick::from_millis(1500), &mut actions);
+        assert_eq!(link.wifi.order(), None);
+        assert_eq!(link.wifi_request, None);
+        let mut body = [0; km43::MAX_PAYLOAD];
+        let len = link
+            .wifi
+            .answer(None, Tick::from_millis(1500), &mut body)
+            .expect("answer");
+        assert_eq!(
+            km43::ScanAnswer::decode(&body[..len]).expect("body").scan(),
+            km43::ScanState::Failed
+        );
+    }
+
     /// Every event goes to the ring as the body KM43 defines for its kind,
     /// and reads back the same.
     #[test]

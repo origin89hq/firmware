@@ -275,10 +275,8 @@ pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
 }
 
 /// Queue the core's P-220 decision through the same bounded recorder queue.
-pub fn post_wifi(event: km43::WifiStatusChanged) {
-    if EVENTS.try_send(Diagnostic::Wifi(event)).is_err() {
-        defmt::error!("recorder: Wi-Fi event queue full");
-    }
+pub fn post_wifi(event: km43::WifiStatusChanged) -> bool {
+    EVENTS.try_send(Diagnostic::Wifi(event)).is_ok()
 }
 
 /// The recorder task: the only owner of the NOR, and so the one that serves

@@ -200,7 +200,7 @@ impl Wifi {
 
     /// P-220: announce the state held now, suppress joining and address-only changes.
     #[must_use]
-    pub fn record(&mut self, section: u32, now: Tick) -> Option<WifiStatusChanged> {
+    pub fn record(&self, section: u32, now: Tick) -> Option<WifiStatusChanged> {
         let report = self.report?;
         if matches!(report.radio, Radio::Joining) {
             return None;
@@ -213,8 +213,11 @@ impl Wifi {
                 return None;
             }
         }
-        self.announced = Some((report, now));
         Some(WifiStatusChanged { section, report })
+    }
+    /// Advance the record rate only after the recorder queue accepted the decision.
+    pub fn recorded(&mut self, record: WifiStatusChanged, now: Tick) {
+        self.announced = Some((record.report, now));
     }
 }
 
@@ -234,6 +237,29 @@ fn elapsed(now: Tick, at: Tick) -> u64 {
 mod tests {
     use super::*;
     use km43::{ScanList, WifiFailure};
+    fn record(wifi: &mut Wifi, section: u32, now: Tick) -> Option<WifiStatusChanged> {
+        let record = wifi.record(section, now);
+        if let Some(record) = record {
+            wifi.recorded(record, now);
+        }
+        record
+    }
+    #[test]
+    fn f_093_p_220_full_recorder_queue_keeps_the_record_due_without_spending_the_interval() {
+        let mut wifi = Wifi::EMPTY;
+        wifi.reported(RadioReport {
+            version: 1,
+            radio: Radio::Off,
+        });
+        let due = wifi.record(1, at(0)).expect("due");
+        assert_eq!(
+            wifi.record(1, at(1)),
+            Some(due),
+            "queue refused: remains due"
+        );
+        wifi.recorded(due, at(1));
+        assert_eq!(wifi.record(1, at(2)), None);
+    }
     fn at(ms: u64) -> Tick {
         Tick::from_millis(ms)
     }
@@ -341,16 +367,16 @@ mod tests {
             version: 1,
             radio: Radio::Joining,
         });
-        assert_eq!(wifi.record(1, at(0)), None);
+        assert_eq!(record(&mut wifi, 1, at(0)), None);
         wifi.reported(joined);
-        assert_eq!(wifi.record(1, at(1)).expect("first").report, joined);
+        assert_eq!(record(&mut wifi, 1, at(1)).expect("first").report, joined);
         wifi.reported(RadioReport {
             version: 1,
             radio: Radio::Failed {
                 reason: WifiFailure::Lost,
             },
         });
-        assert_eq!(wifi.record(1, at(600_000)), None);
+        assert_eq!(record(&mut wifi, 1, at(600_000)), None);
         let latest = RadioReport {
             version: 1,
             radio: Radio::Failed {
@@ -359,7 +385,7 @@ mod tests {
         };
         wifi.reported(latest);
         assert_eq!(
-            wifi.record(1, at(600_001)).expect("boundary").report,
+            record(&mut wifi, 1, at(600_001)).expect("boundary").report,
             latest
         );
         wifi.reported(RadioReport {
@@ -367,13 +393,13 @@ mod tests {
             radio: Radio::Off,
         });
         assert_eq!(
-            wifi.record(2, at(600_002))
+            record(&mut wifi, 2, at(600_002))
                 .expect("new version")
                 .report
                 .version,
             2
         );
-        assert_eq!(wifi.record(2, at(1_200_002)), None);
+        assert_eq!(record(&mut wifi, 2, at(1_200_002)), None);
     }
     #[test]
     fn p_220_recovered_state_cancels_deferred_record_and_ip_alone_is_not_a_change() {
@@ -383,18 +409,18 @@ mod tests {
             radio: Radio::Joined { ipv4: [1, 2, 3, 4] },
         };
         wifi.reported(joined);
-        assert!(wifi.record(1, at(0)).is_some());
+        assert!(record(&mut wifi, 1, at(0)).is_some());
         wifi.reported(RadioReport {
             version: 1,
             radio: Radio::Failed {
                 reason: WifiFailure::Lost,
             },
         });
-        assert!(wifi.record(1, at(1)).is_none());
+        assert!(record(&mut wifi, 1, at(1)).is_none());
         wifi.reported(RadioReport {
             version: 1,
             radio: Radio::Joined { ipv4: [1, 2, 3, 5] },
         });
-        assert!(wifi.record(1, at(600_000)).is_none());
+        assert!(record(&mut wifi, 1, at(600_000)).is_none());
     }
 }

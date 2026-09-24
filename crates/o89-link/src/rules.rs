@@ -128,11 +128,15 @@ pub const fn crosses_mismatch(side: Side, kind: LinkMessageType) -> bool {
 #[must_use]
 pub const fn refused_before_link(side: Side, kind: LinkMessageType) -> bool {
     match kind {
-        LinkMessageType::ClientDisconnected | LinkMessageType::TimeOffer => {
+        LinkMessageType::ClientDisconnected
+        | LinkMessageType::TimeOffer
+        | LinkMessageType::WifiScanResult
+        | LinkMessageType::WifiState => {
             matches!(side, Side::Controller)
         }
         LinkMessageType::CloseConnection
         | LinkMessageType::NetConfig
+        | LinkMessageType::WifiScan
         | LinkMessageType::CommsRelease => matches!(side, Side::Comms),
         LinkMessageType::LinkUp
         | LinkMessageType::LinkUpAck
@@ -149,11 +153,8 @@ pub const fn refused_before_link(side: Side, kind: LinkMessageType) -> bool {
         | LinkMessageType::EnterDownloadAck
         | LinkMessageType::PairingWindow
         | LinkMessageType::PairingWindowAck
-        | LinkMessageType::WifiScan
         | LinkMessageType::WifiScanAck
-        | LinkMessageType::WifiScanResult
         | LinkMessageType::WifiScanResultAck
-        | LinkMessageType::WifiState
         | LinkMessageType::WifiStateAck => false,
     }
 }

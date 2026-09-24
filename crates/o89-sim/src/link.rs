@@ -347,10 +347,10 @@ impl Bench {
                             };
                             pending.push_back(self.endpoint.link.time_verdict(*req_id, outcome));
                         }
-                        Action::RecordWifi(_)
-                        | Action::DropConnections(_)
-                        | Action::Log(_)
-                        | Action::Note(_) => {}
+                        Action::RecordWifi(record) => {
+                            self.endpoint.link.wifi.recorded(*record, self.now);
+                        }
+                        Action::DropConnections(_) | Action::Log(_) | Action::Note(_) => {}
                     }
                 }
                 continue;
@@ -1592,6 +1592,7 @@ fn l_001_a_frame_from_the_wrong_side_is_refused_with_256_on_session_zero_and_req
     // Capabilities: none.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(1_000));
+    let before = bench.comms.heard.len();
     let bytes = bench
         .comms
         .send_from_the_wrong_side(bench.now)
@@ -1601,6 +1602,7 @@ fn l_001_a_frame_from_the_wrong_side_is_refused_with_256_on_session_zero_and_req
         .comms
         .heard
         .iter()
+        .skip(before)
         .find_map(|h| match h {
             Heard::Refusal {
                 code,
@@ -2438,7 +2440,7 @@ fn wifi_state(bench: &mut Bench) -> km43::ScanState {
 }
 
 #[test]
-fn l_200_l_203_p_218_hostile_comms_refuses_then_delivers_another_scan_number() {
+fn l_203_l_200_p_218_hostile_comms_refuses_then_delivers_another_scan_number() {
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(2000));
     let start = bench.now;
@@ -2540,6 +2542,58 @@ fn p_221_l_207_hostile_radio_report_cannot_trigger_a_network_push() {
     bench.feed(&frame);
     bench.run_for(Millis::from_millis(2000));
     assert_eq!(bench.endpoint.link.wifi.status(0).report, Some(report));
+    assert_eq!(
+        bench
+            .comms
+            .heard
+            .iter()
+            .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+            .count(),
+        before
+    );
+}
+
+#[test]
+fn l_207_hostile_scan_list_is_held_without_pushing_network_credentials() {
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(2000));
+    let before = bench
+        .comms
+        .heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+        .count();
+    let now = bench.now;
+    wifi_started(&mut bench, now, km43::WifiScan::Started);
+    let aps = [km43::AccessPoint {
+        ssid: "invented by comms",
+        rssi: -10,
+        security: km43::WifiSecurity::Open,
+        band: km43::WifiBand::Ghz24,
+        channel: 1,
+    }];
+    let mut bytes = [0; MAX_PAYLOAD];
+    let len = km43::ScanResult {
+        scan: core::num::NonZeroU32::MIN,
+        list: Some(km43::ScanList::new(&aps, 0).expect("list")),
+    }
+    .write(
+        wifi_header(LinkMessageType::WifiScanResult, ReqId(92)),
+        &mut bytes,
+    )
+    .expect("result");
+    let frame = bench
+        .comms
+        .wifi_body(
+            LinkMessageType::WifiScanResult,
+            ReqId(92),
+            &bytes[..len],
+            now,
+        )
+        .expect("peer result");
+    bench.feed(&frame);
+    bench.run_for(Millis::from_millis(2000));
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Complete);
     assert_eq!(
         bench
             .comms

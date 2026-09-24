@@ -43,6 +43,9 @@ impl FrameBenchStart {
             | Frame::TimeOffer { .. }
             | Frame::ClientConnected { .. }
             | Frame::ClientDisconnected { .. }
+            | Frame::WifiScanAck { .. }
+            | Frame::WifiScanResult { .. }
+            | Frame::WifiState { .. }
             | Frame::Refuse { .. } => {}
         }
     }

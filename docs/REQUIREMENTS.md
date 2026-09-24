@@ -501,3 +501,14 @@ P-218, L-203 and P-220 deadlines on the monotonic tick.
 
 Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
 KM43 P-216 to P-221 and L-200 to L-207.
+
+**F-092** — The comms radio adapter runs a requested scan with a four-second
+deadline. Cancellation ends the Wi-Fi session, allowing the driver to stop
+and deinitialize before another scan or join, and the core completes an
+unfinished accepted scan as failed. The core reports `no_ip` after four seconds
+associated without IPv4, continues trying, and reports `lost` on association
+loss. A country-only configuration enables a dormant station beside the
+provisioning AP so scanning works without attempting a station association.
+
+Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
+KM43 L-200 to L-206; pinned esp-radio's AP-only scan restriction.

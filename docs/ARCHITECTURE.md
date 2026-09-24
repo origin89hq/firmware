@@ -1322,6 +1322,26 @@ permission. Revalidate the early download window with the radio stack present,
 including recovery after exhaustion. These are board acceptance obligations,
 not claims established by a host test or a fixed heap size.
 
+Wi-Fi scan results add a temporary vendor allocation: pinned esp-radio's
+`scan_async` collects its `ScanResults` into a `Vec<AccessPointInfo>`. Each
+AP occupies **47 bytes** on this ESP32-C6 build, plus the Vec's spare capacity
+and allocator overhead; the blob's own scan list also occupies the radio heap.
+The public API reports a `u16` AP count. No smaller AP-count limit was found
+in the pinned radio configuration or blob API; APs in range and the remaining
+72 KiB heap bound it in practice, not a qualified density limit. Allocation
+failure reaches the existing reset panic handler and the next recovery window.
+This remains part of F-037 exhaustion/coexistence qualification and the vendor
+allocation concern tracked in [#134](https://github.com/origin89hq/firmware/issues/134).
+
+The adapter passes no `max` option: truncating before SSID deduplication would
+lose choices and the exact omitted count. It sorts the vendor-owned slice in
+place without allocation, then the core consumes it in one bounded pass into
+16 fixed rows and a saturating unlisted count. The Vec is dropped before the
+next await. Hidden and invalid UTF-8 names are omitted; invalid UTF-8 is detected
+by comparing the vendor's text-prefix length with its original SSID length.
+Duplicates of listed SSIDs do not add to unlisted. No application container
+allocates, and no reference into the vendor result survives the reduction.
+
 The radio-only allocation inventory includes the vendor Wi-Fi and BLE blobs,
 `esp-rtos` task/queue integration, `esp-alloc`, and esp-radio's HCI/NPL adapter.
 On the C6 the latter boxes incoming packets and queues them in a growable
@@ -1559,8 +1579,31 @@ push or grant authority (P-221, L-207).
 The core schedules `0x0806` through the recorder's existing bounded class A
 queue: never for joining, immediately for a new reported version, otherwise
 at the 10-minute boundary with the state then held. Address-only changes do
-not generate records. A full recorder queue refuses the diagnostic and emits
-a probe error; no diagnostic changes persistence outside the recorder.
+not generate records. A full recorder queue leaves the diagnostic due for the next turn and does
+not spend its interval; no diagnostic changes persistence outside the recorder.
+
+The comms core holds one accepted scan until its single result is acknowledged
+or given up. A duplicate request retains the started verdict; another scan is
+busy. Scan results, radio reports and NTP share one reserved link request slot,
+leaving three for connection lifecycle requests. Retries carry their original
+body; only the newest radio state waits behind an outstanding report. RAM
+credential versions are reported even after persistence fails, and observations
+from a superseded radio session are discarded. The first DHCP outcome waits at
+most four seconds after association; missing IPv4 is `no_ip`, and a dropped
+association is `lost`. Once an installation has an outcome, retries never report joining. L-204 is
+read as the current credential installation: any change of installed RAM
+version, including a lower L-133 push, starts with no outcome. Old numeric
+versions are not a history; an earlier configuration says nothing about the
+credentials now installed under that number.
+
+For a written country-only configuration, the provisioning AP runs in AP+station
+mode with a dormant station: no SSID and no call to connect. The pinned radio
+cannot scan in AP-only mode. This permits an explicitly requested scan before
+there is a station session while retaining the AP's sockets and BLE's separate
+progress checks. Each scan has a four-second deadline; timeout produces a failed
+result and ends the session so driver teardown stops an uncertain scan before
+another join or scan. An unwritten configuration never starts either active or
+passive scans. The recovery download window remains ahead of radio initialization.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.

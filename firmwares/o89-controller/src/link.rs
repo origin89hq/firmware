@@ -262,12 +262,11 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) 
         // same way, and one for the normal state answers at once.
         match REQUEST.try_take() {
             Some((seq, Request::Download { reason, entry })) => {
-                perform_quiet(
-                    &machine
-                        .endpoint
-                        .link
-                        .module_taken(&mut machine.endpoint.sessions),
-                );
+                let actions = machine
+                    .endpoint
+                    .link
+                    .module_taken(&mut machine.endpoint.sessions);
+                perform_quiet(&mut machine.endpoint.link, &actions);
                 download(
                     &mut pins,
                     &mut rings,
@@ -318,12 +317,11 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) 
                     rail::request_recovery();
                 }
                 Ended::Download(asked) => {
-                    perform_quiet(
-                        &machine
-                            .endpoint
-                            .link
-                            .module_taken(&mut machine.endpoint.sessions),
-                    );
+                    let actions = machine
+                        .endpoint
+                        .link
+                        .module_taken(&mut machine.endpoint.sessions);
+                    perform_quiet(&mut machine.endpoint.link, &actions);
                     download(&mut pins, &mut rings, &mut reader, &mut writer, asked).await;
                 }
             }
@@ -344,7 +342,7 @@ async fn unpowered(endpoint: &mut Endpoint) -> Option<Actions> {
         Ok(RailWord::Reset(_)) => None,
         Ok(RailWord::Recovered(recovery)) => {
             let actions = endpoint.link.rail(recovery, Uptime.now());
-            perform_quiet(&actions);
+            perform_quiet(&mut endpoint.link, &actions);
             match recovery {
                 Recovery::Cycling { .. } => None,
                 Recovery::LeftOnAndRaised | Recovery::Busy | Recovery::Deferred => {
@@ -361,7 +359,7 @@ async fn unpowered(endpoint: &mut Endpoint) -> Option<Actions> {
                 install_in_flight(),
                 selector::pairing_deadline(),
             );
-            perform_quiet(&actions);
+            perform_quiet(&mut endpoint.link, &actions);
             None
         }
     }
@@ -434,7 +432,7 @@ async fn episode(
         Err(ended) => return ended,
     };
     let (mut tx, mut rx) = uart.split();
-    if let Some(ended) = perform(&endpoint.link, &mut tx, writer, first).await {
+    if let Some(ended) = perform(&mut endpoint.link, &mut tx, writer, first).await {
         return ended;
     }
     // A client's answer, built before it is framed.
@@ -517,21 +515,8 @@ async fn episode(
         if let Some(asked) = bench_download() {
             break 'episode Ended::Download(asked);
         }
-        while let Ok(word) = rail::words().try_receive() {
-            match word {
-                RailWord::Reset(_) => {}
-                RailWord::Settled => {
-                    // Cannot happen while the UART is up: the rail only
-                    // settles after a cut this task asked for.
-                    defmt::warn!("link: the rail settled while the link was up");
-                }
-                RailWord::Recovered(recovery) => {
-                    let actions = endpoint.link.rail(recovery, Uptime.now());
-                    if let Some(ended) = perform(&endpoint.link, &mut tx, writer, &actions).await {
-                        break 'episode ended;
-                    }
-                }
-            }
+        if let Some(ended) = serve_rail(endpoint, &mut tx, writer).await {
+            break 'episode ended;
         }
         serve_reset(&mut endpoint.sessions, fram).await;
         if let Some(ended) = service_tick(endpoint, &mut tx, writer, &mut answer).await {
@@ -546,6 +531,30 @@ async fn episode(
     // counted now, before the caller can close the attempt (F-031).
     endpoint.link.noise(run);
     ended
+}
+
+async fn serve_rail(
+    endpoint: &mut Endpoint,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+) -> Option<Ended> {
+    while let Ok(word) = rail::words().try_receive() {
+        match word {
+            RailWord::Reset(_) => {}
+            RailWord::Settled => {
+                // Cannot happen while the UART is up: the rail only
+                // settles after a cut this task asked for.
+                defmt::warn!("link: the rail settled while the link was up");
+            }
+            RailWord::Recovered(recovery) => {
+                let actions = endpoint.link.rail(recovery, Uptime.now());
+                if let Some(ended) = perform(&mut endpoint.link, tx, writer, &actions).await {
+                    return Some(ended);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One whole frame from the module, through the link or the sessions, and
@@ -587,7 +596,7 @@ async fn on_frame(
     if let Some(ended) = reply(tx, writer, answer, step.reply).await {
         return Some(ended);
     }
-    perform(&endpoint.link, tx, writer, &step.actions).await
+    perform(&mut endpoint.link, tx, writer, &step.actions).await
 }
 
 /// A client's answer onto the wire, under the write deadline every frame
@@ -969,7 +978,7 @@ async fn bridge(pins: &mut Pins, rings: &mut Rings, seq: u32) -> Closed {
 /// A cut outranks a stall, and after a stall nothing more is sent: the
 /// ring is full of a frame that is not leaving.
 async fn perform(
-    link: &Link,
+    link: &mut Link,
     tx: &mut BufferedUartTx<'_>,
     writer: &mut FrameWriter,
     actions: &Actions,
@@ -1006,7 +1015,11 @@ async fn perform(
                     stalled = send_outgoing(link, tx, writer, outgoing).await;
                 }
             }
-            Action::RecordWifi(event) => recorder::post_wifi(*event),
+            Action::RecordWifi(event) => {
+                if recorder::post_wifi(*event) {
+                    link.wifi.recorded(*event, Uptime.now());
+                }
+            }
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
         }
@@ -1032,7 +1045,7 @@ async fn send(tx: &mut BufferedUartTx<'_>, bytes: &[u8]) -> Result<(), Error> {
 /// Perform what can be performed with no UART: records and notes. A frame
 /// asked for while the module is off is a bug in the state machine, and is
 /// said so.
-fn perform_quiet(actions: &Actions) {
+fn perform_quiet(link: &mut Link, actions: &Actions) {
     for action in actions {
         match action {
             Action::Send(outgoing) => {
@@ -1044,7 +1057,11 @@ fn perform_quiet(actions: &Actions) {
                 defmt::info!("link: every connection dropped: {}", why);
             }
             Action::OfferTime { .. } => defmt::error!("clock: offer while UART is off"),
-            Action::RecordWifi(event) => recorder::post_wifi(*event),
+            Action::RecordWifi(event) => {
+                if recorder::post_wifi(*event) {
+                    link.wifi.recorded(*event, Uptime.now());
+                }
+            }
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
         }
@@ -1342,16 +1359,11 @@ async fn service_tick(
             return Some(ended);
         }
     }
-    if let Some((req_id, outcome)) = recorder::time_answer()
-        && let Some(ended) = perform(
-            &endpoint.link,
-            tx,
-            writer,
-            &endpoint.link.time_verdict(req_id, outcome),
-        )
-        .await
-    {
-        return Some(ended);
+    if let Some((req_id, outcome)) = recorder::time_answer() {
+        let actions = endpoint.link.time_verdict(req_id, outcome);
+        if let Some(ended) = perform(&mut endpoint.link, tx, writer, &actions).await {
+            return Some(ended);
+        }
     }
     // The panel's window as it stands now, after any `Pair` this turn
     // answered: that answer is already on the wire, so the closed report
@@ -1361,7 +1373,7 @@ async fn service_tick(
         install_in_flight(),
         selector::pairing_deadline(),
     );
-    perform(&endpoint.link, tx, writer, &actions).await
+    perform(&mut endpoint.link, tx, writer, &actions).await
 }
 
 /// Encode and send one answer. True means CTS held the transmitter past its deadline.

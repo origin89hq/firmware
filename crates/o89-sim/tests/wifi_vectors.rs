@@ -14,6 +14,36 @@ mod vectors {
             })
             .collect()
     }
+    fn reduce(
+        list: ScanList<'_>,
+        scan: core::num::NonZeroU32,
+        req_id: ReqId,
+        body: &[u8],
+        output: &mut [u8],
+    ) {
+        let mut heard: Vec<_> = list
+            .iter()
+            .map(|ap| ap.expect("valid published AP"))
+            .map(|ap| o89_comms_core::HeardAp {
+                ssid: Some(ap.ssid),
+                rssi: ap.rssi,
+                security: ap.security,
+                channel: ap.channel,
+            })
+            .collect();
+        for _ in 0..list.unlisted() {
+            heard.push(o89_comms_core::HeardAp {
+                ssid: None,
+                rssi: i8::MIN,
+                security: WifiSecurity::Other,
+                channel: 1,
+            });
+        }
+        let reduced = o89_comms_core::ScanRows::collect(&heard, |ap| *ap).expect("radio reduction");
+        let len = reduced.write(scan, req_id, output).expect("comms result");
+        assert_eq!(&output[..len], body, "published comms bytes");
+    }
+
     #[test]
     fn p_217_p_219_p_220_l_200_l_201_l_202_l_204_published_wifi_bodies_round_trip_and_relay() {
         let vectors: Value = serde_json::from_str(VECTORS_JSON).expect("published JSON");
@@ -68,6 +98,7 @@ mod vectors {
                     let result = ScanResult::decode(envelope).expect("result");
                     // Relay the decoded rows unchanged through the same client codec.
                     if let Some(list) = result.list {
+                        reduce(list, result.scan, header.req_id, &body, &mut output);
                         let len = ScanAnswer::new(
                             ScanState::Complete,
                             None,

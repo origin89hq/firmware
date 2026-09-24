@@ -764,6 +764,9 @@ impl HostileComms {
             Frame::ClientDisconnected { .. } => {
                 (Some(LinkMessageType::ClientDisconnected), false, false)
             }
+            Frame::WifiScanAck { .. } => (Some(LinkMessageType::WifiScanAck), false, false),
+            Frame::WifiScanResult { .. } => (Some(LinkMessageType::WifiScanResult), false, false),
+            Frame::WifiState { .. } => (Some(LinkMessageType::WifiState), false, false),
             Frame::Refuse { .. } => (None, false, false),
         };
         let silent = match self.caps.answers {
@@ -874,6 +877,9 @@ impl HostileComms {
             | Frame::PairingWindowAck { .. }
             | Frame::ClientConnected { .. }
             | Frame::ClientDisconnected { .. }
+            | Frame::WifiScanAck { .. }
+            | Frame::WifiScanResult { .. }
+            | Frame::WifiState { .. }
             | Frame::Refuse { .. } => return None,
         };
         let Ok(len) = written else {
