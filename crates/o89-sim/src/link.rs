@@ -145,14 +145,29 @@ impl Bench {
         Self::stating(identity(), revision, caps, now)
     }
 
-    /// A unit whose device secret did not read this boot: no key 8 to state
-    /// (L-035).
+    /// A unit whose device secret was never written: its store read at
+    /// boot holds none, so its identity has no key 8 to state (L-035) and
+    /// its sessions derive nothing, as `main` hands both over.
     fn without_device_id(caps: Capabilities) -> Self {
+        let mut part = SimFram::fresh();
+        let (store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
+        assert!(store.secret.present().is_none(), "no secret written");
         let identity = Identity {
-            device_id: None,
+            device_id: store.secret.present().map(Secret::device_id_bytes),
             ..identity()
         };
-        Self::stating(identity, Revision::A, caps, Tick::from_millis(1_000))
+        let mut bench = Self::stating(identity, Revision::A, caps, Tick::from_millis(1_000));
+        bench.endpoint.sessions = Sessions::new(Keys {
+            configuration: store.configuration,
+            network: store.network,
+            secret: store.secret.present().copied(),
+            epoch: report.epoch.epoch(),
+            epoch_record: store.epoch,
+            clients: store.clients,
+            challenges: store.challenges,
+        });
+        bench.fram = part;
+        bench
     }
 
     fn stating(identity: Identity, revision: Revision, caps: Capabilities, now: Tick) -> Self {

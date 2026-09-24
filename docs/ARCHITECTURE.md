@@ -780,9 +780,10 @@ Every controller `LinkUp` carries the device secret's `device_id` as key 8
 (KM43 L-035), the one fact about the controller the comms processor keeps:
 it names the controller in the mDNS advertisement and nothing reads it
 otherwise. A boot without a secret has nothing to state, so its link stays
-down on purpose, as it does once L-195's revisions are spent: no `LinkUp`
-goes out, the module's is left unanswered, and the ladder does not cut
-(F-039).
+down on purpose: no `LinkUp` goes out, the module's is left unanswered, and
+the ladder does not cut (F-039). A boot whose L-195 revisions are spent is
+down on purpose too, and differs in one thing: it still answers the
+module's `LinkUp`, because it has a statement to answer with.
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
 (above). A frame from the comms processor that is not four elements is
