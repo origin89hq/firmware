@@ -239,3 +239,49 @@ fn p_080_a_signed_command_under_another_session_key_spends_no_counter() {
         Some(Counter(0))
     );
 }
+
+#[test]
+fn f_091_p_066_wrong_proof_inside_boot_window_is_bad_proof_and_keeps_it_open() {
+    // Capabilities: invent_connection, forge proof; attacker A lacks the printed secret.
+    let mut bench = Bench::first_enrolment(Capabilities::default());
+    bench.run_for(Millis::from_millis(1_000));
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let challenge = client.discover(&mut bench);
+    let attempt = Attempt {
+        device_id: DEVICE,
+        challenge,
+        client_nonce: [1; 16],
+    };
+    let wrong = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
+    let mut dst = [0; 256];
+    let len = PairRequest {
+        client_kind: ClientKind::Cli,
+        label: "forged",
+    }
+    .write(
+        &wrong.pair_key(),
+        &attempt,
+        client.header(MessageType::Pair),
+        &mut dst,
+    )
+    .unwrap();
+    let answers = client.send(&mut bench, &dst[..len]);
+    let reply = PairAckClaim::decode(Envelope::decode(answers.last().unwrap()).unwrap())
+        .unwrap()
+        .verify(&device().pair_key(), &attempt, epoch())
+        .unwrap();
+    assert_eq!(reply.outcome, km43::Outcome::BadProof);
+    assert!(
+        bench
+            .endpoint
+            .sessions
+            .keys()
+            .clients
+            .present()
+            .unwrap()
+            .row(ClientId::new(1).unwrap())
+            .is_none()
+    );
+    assert!(bench.window.is_open(bench.now));
+}

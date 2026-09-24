@@ -39,6 +39,19 @@ impl Selector {
     }
 }
 
+/// Initialize only after the store read. An absent or unreadable table is
+/// not empty: boot recovery cannot prove that no client has ever enrolled.
+/// The deadline starts at boot tick zero, never at store completion or link-up.
+pub fn at_power_on(enrolment: o89_core::EnrolmentAtBoot) {
+    PANEL.lock(|cell| {
+        cell.set(Panel::at_power_on(
+            crate::board::REVISION,
+            enrolment,
+            o89_core::Tick::ZERO,
+        ));
+    });
+}
+
 /// Read at render time; the supervisor does not cache an open-window flag.
 pub fn pairing_open() -> bool {
     PANEL.lock(|cell| cell.get().pairing_open(Uptime.now()))

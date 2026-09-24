@@ -589,17 +589,37 @@ is an operator override. An operator taking control must not find the
 generator still running because the last decision left it there: taking
 authority back puts the output at its fail state.
 
-**The selector is also the physical act the protocol needs.** Opening a
-pairing window, un-pairing and factory reset must be acts nobody can perform
-over the wire, and board A revision A carries no pushbutton. So a deliberate
-gesture on the selector is the act, and there are three distinct gestures
-because P-117 forbids one press meaning two things: the pairing window, the
-time-floor override and the factory reset (P-066). Every transition passes
+**The selector is also the physical act the protocol needs.** Un-pairing and
+factory reset must be acts nobody can perform over the wire. A deliberate
+gesture on the selector opens pairing, with the first-enrolment boot exception
+below for board A revision A, which carries no pushbutton. There are three
+distinct gestures because P-117 forbids one press meaning two things: the
+pairing window, the time-floor override and the factory reset (P-066). Every
+transition passes
 through *Off*, the position in which the controller never commands the
 generator, and the person making it is standing at the panel. Revision B's
 button ([origin89hq/hardware#11](https://github.com/origin89hq/hardware/issues/11),
 A-42) takes over with at least the same three gestures; the selector gestures
 stay defined so a unit with either board reads the same.
+
+Until [firmware#60](https://github.com/origin89hq/firmware/issues/60) adds the
+button, revision A also opens the same 120-second window at power-on when the
+client table read from storage is valid and empty (P-066, F-091; owner decision
+2026-09-24). `Revision::first_enrolment_at_power_on` owns the revision policy;
+revision B disables it. Absent, corrupt or unreadable storage opens nothing,
+even if boot repairs the table. F-026 still repairs a lost table durably:
+that repair boot stays closed, but the next boot reads a valid empty table
+and opens the window. The cost is explicit: client-table corruption restores
+power-on eligibility from the next boot, after recovery has already lost all
+enrolled clients; no separate "enrolled once" marker is kept.
+
+The deadline starts at boot, never link-up, and expiry does not reopen it. A power cut at an unattended, unpaired site
+opens it with nobody there. This exposure ends at the first enrolment: that
+Pair closes the window, and subsequent boots open nothing. Factory reset
+restores eligibility on the next boot under the new epoch. Proof verification
+is unchanged; a bad proof neither enrols nor closes the window. The window
+uses the same steady lamp and L-193 to L-195 reports, and grants no time-floor
+override. The selector gesture still works during and after it.
 
 On revision A, hold **Off for two seconds**, then make three excursions,
 returning to Off after each. Hold each outer position for at least 300 ms;
@@ -623,7 +643,8 @@ floor-crossing write; rate-limit refusal does not consume it.
 During the pairing window the status lamp is steady. A watchdog fault
 retains priority over that indication. Reset closes the window before
 requesting persistence. A failed reset keeps enrolment blocked; after a
-successful reset, a new pairing gesture is still required.
+successful reset, a new pairing gesture is required in that boot; the next
+boot may open F-091's first-enrolment window.
 
 **One lamp, meaning by pattern.** Two LEDs share one light pipe, so what a
 person sees is one lamp: a slow heartbeat is a controller that is alive,

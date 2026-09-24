@@ -342,3 +342,68 @@ fn l_194_a_relayed_client_frame_shaped_like_the_report_changes_nothing() {
         }
     )));
 }
+
+#[test]
+fn f_091_p_066_l_195_boot_window_is_reported_after_link_up_and_expires() {
+    // HostileComms capabilities: none.
+    let mut bench = Bench::first_enrolment(Capabilities::default());
+    assert!(bench.window.is_open(bench.now));
+    assert!(reports(&bench).is_empty());
+    bench.run_for(Millis::from_millis(1_000));
+    assert!(bench.endpoint.link.is_up());
+    let heard = reports(&bench);
+    assert_eq!(heard.len(), 1);
+    assert_eq!(heard[0].0, 1);
+    assert!((119_000..120_000).contains(&heard[0].1));
+    assert!(bench.comms.pairing_window(bench.now).is_some());
+    bench.run_for(Millis::from_millis(119_020));
+    assert!(!bench.window.is_open(bench.now));
+    assert_eq!(reports(&bench).last(), Some(&(2, 0)));
+    assert_eq!(bench.comms.pairing_window(bench.now), None);
+}
+
+#[test]
+fn f_091_p_066_enrolment_closes_boot_window_and_next_boot_stays_closed() {
+    // HostileComms capabilities: invent a connection, relay an honest Pair.
+    let mut bench = Bench::first_enrolment(Capabilities::default());
+    bench.run_for(Millis::from_millis(1_000));
+    announce(&mut bench, 3);
+    let answer = Client::on(3).pair(&mut bench, "first phone");
+    assert!(matches!(answer.outcome, Outcome::Enrolled(_)));
+    assert!(!bench.window.is_open(bench.now));
+    bench.run_for(Millis::from_millis(20));
+    assert_eq!(bench.comms.pairing_window(bench.now), None);
+    bench.boot_clients(o89_core::Revision::A);
+    assert_eq!(
+        bench
+            .endpoint
+            .sessions
+            .keys()
+            .clients
+            .present()
+            .unwrap()
+            .enrolled(),
+        1
+    );
+    assert!(!bench.window.is_open(bench.now));
+}
+
+#[test]
+fn f_091_p_066_factory_reset_new_epoch_reopens_on_next_boot() {
+    // HostileComms capabilities: none; factory reset is local to the controller.
+    let mut bench = Bench::new(Capabilities::default());
+    let (mut store, report) =
+        embassy_futures::block_on(o89_core::Store::boot(&mut bench.fram, None)).unwrap();
+    let previous = report.epoch.epoch().unwrap();
+    embassy_futures::block_on(o89_core::reset_clients(
+        &mut store.epoch,
+        &mut store.clients,
+        &mut bench.fram,
+    ))
+    .unwrap();
+    bench.boot_clients(o89_core::Revision::A);
+    let table = bench.endpoint.sessions.keys().clients.present().unwrap();
+    assert!(table.epoch() > previous);
+    assert_eq!(table.enrolled(), 0);
+    assert!(bench.window.is_open(bench.now));
+}

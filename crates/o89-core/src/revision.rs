@@ -88,6 +88,16 @@ const REVISION_A_LONGEST_OFF: Millis = Millis::from_millis(5_000);
 const THIRD_RUNG_CUT: Millis = Millis::from_millis(15 * 60 * 1_000);
 
 impl Revision {
+    /// Temporary first-enrolment access on revision A, which has no pushbutton
+    /// (P-066, F-091). The button in firmware#60 retires this workaround.
+    #[must_use]
+    pub const fn first_enrolment_at_power_on(self) -> bool {
+        match self {
+            Self::A => true,
+            Self::B => false,
+        }
+    }
+
     /// What the board does to the module rail through a reset.
     #[must_use]
     pub const fn rail_through_reset(self) -> RailThroughReset {

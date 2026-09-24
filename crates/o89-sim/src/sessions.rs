@@ -82,7 +82,18 @@ impl Client {
         );
         let discovery = Discovery::decode(envelope).expect("a Discover answer");
         assert_eq!(discovery.model, MODEL);
-        assert!(discovery.provisioned);
+        assert_eq!(
+            discovery.provisioned,
+            bench
+                .endpoint
+                .sessions
+                .keys()
+                .clients
+                .present()
+                .unwrap()
+                .enrolled()
+                > 0
+        );
         discovery.challenge
     }
 

@@ -269,9 +269,10 @@ ends. Source: [#3][plan] §9 item 3. M4.
 
 **F-043** — V1 initial pairing is available over BLE GATT from the native
 phone app without cached Wi-Fi credentials, a working site network, or
-internet. The STM32 alone gates `Pair` on the physical 120-second window
-and verifies the proof; Bluetooth connection or bonding grants no KM43
-permission. BLE shares the bounded client table with WebSocket, starts
+internet. The STM32 alone gates `Pair` on the 120-second window opened
+by a physical gesture or F-091's first-enrolment boot policy, and verifies
+the proof; Bluetooth connection or bonding grants no KM43 permission. BLE
+shares the bounded client table with WebSocket, starts
 only after the recovery download window and valid `LinkUp`, and closes
 clients and stops advertising on controller loss. Source: [#3][plan] §9
 item 3, [#96](https://github.com/origin89hq/firmware/issues/96), P-066,
@@ -448,6 +449,22 @@ these are #1's acceptance test: a crashing image and a windowless image,
 each delivered as an update, each rolled back to an image that honours the
 window, and the module reached again through the controller with no wire.
 Source: [#1][i1], F-036, F-088. M3.
+
+**F-091** — On a revision without a pushbutton, power-on opens P-066's
+120-second pairing window only when the client table read at boot is valid
+and empty. Revision A enables this temporary policy; revision B does not. An absent, corrupt, undecodable or unreadable
+table is not empty, even if boot recovery subsequently repairs it. That
+repair boot stays closed; a later boot reading the repaired, valid empty
+table is eligible. Thus client-table corruption restores power-on eligibility
+from the next boot, after F-026 recovery has already lost the client rows. The
+deadline starts at boot, not link-up, and expiry never reopens it in the same
+boot. It uses the selector window's lamp, PairingWindow reports (L-193 to
+L-195), proof checks and close on enrolment, without arming the floor override
+(P-117). Any enrolled client disables it on subsequent boots; factory reset
+restores eligibility on the next boot under the new epoch. The selector
+gesture remains available during and after the boot window.
+Source: owner decision 2026-09-24, temporary until
+[firmware#60](https://github.com/origin89hq/firmware/issues/60). M4.
 
 [h5]: https://github.com/origin89hq/hardware/issues/5
 [h6]: https://github.com/origin89hq/hardware/issues/6

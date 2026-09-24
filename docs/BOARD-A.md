@@ -84,6 +84,7 @@ is the one the gate traces.
 | `EN` has only an RC delay (hardware#14) | PC2 low across every rail cycle | A supervisor on `V3V3_ESP` (`A-39`); the rule stays | F-004 |
 | The rail switched on after minutes off corrupts the STM32 (hardware#5) | No cycle longer than 5 s off; the rail back on before any bus after a reset; L-112's rung replaced; USART1 configured after the rail settles | A slew-limited switch (`A-23`); the full ladder once the rework passes ten-minute off-times | F-005, F-006 |
 | The rail defaults off through every reset (hardware#48) | Every STM32 reset reboots the module; the boot record says so | The switch defaults on with `PC5` high-impedance; the controller takes ownership after boot | F-014 |
+| No pushbutton on revision A (firmware#60) | A valid empty client table opens the first-enrolment window at boot, until the first client enrols | No automatic boot window | F-091, P-066 |
 | No `NRST` on the debug header (hardware#29) | No stop mode; PA13 and PA14 untouched | `NRST` on the six-pin header (`A-40`); low power becomes possible | F-012 |
 | Any controller reset opens the contact (hardware#18) | The run reason in FRAM; the boot record explains the stop | A ride-through window on board B; automatic starts resume, manual starts stop by kicking with `RUN` low | F-022, F-061, F-015 |
 | `FEEDBACK` has no pull-up on either board (`B-09b`) | The internal pull-up; low is both closed | The same, through a series resistor | F-013 |
