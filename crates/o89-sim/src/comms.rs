@@ -319,6 +319,13 @@ impl HostileComms {
         self.link.as_ref().is_some_and(CommsLink::is_linked)
     }
 
+    /// The controller's `device_id` its link kept from the last statement
+    /// it accepted (L-035), for the advertisement.
+    #[must_use]
+    pub fn controller_device_id(&self) -> Option<[u8; o89_core::DEVICE_ID_BYTES]> {
+        self.link.as_ref().and_then(CommsLink::controller_device_id)
+    }
+
     /// What it may do, to change mid-test.
     pub fn capabilities(&mut self) -> &mut Capabilities {
         &mut self.caps
@@ -957,9 +964,11 @@ impl HostileComms {
             Claims::Comms => Side::Comms,
             Claims::Controller => Side::Controller,
         };
-        let net_version = match self.caps.claims {
-            Claims::Comms => Some(self.caps.net_version),
-            Claims::Controller => None,
+        // A statement claiming the controller carries the key only the
+        // controller sends (L-035), or it could not be written at all.
+        let (net_version, device_id) = match self.caps.claims {
+            Claims::Comms => (Some(self.caps.net_version), None),
+            Claims::Controller => (None, Some([0x11; o89_core::DEVICE_ID_BYTES])),
         };
         let len = LinkUp {
             version: self.caps.version,
@@ -968,6 +977,7 @@ impl HostileComms {
             boot_id: self.boot_id,
             hw: IDENTITY_HW,
             net_version,
+            device_id,
         }
         .write(header(kind, req_id), &mut envelope)
         .map_err(|_| Broken::Body)?;

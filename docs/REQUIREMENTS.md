@@ -237,8 +237,7 @@ the window is reached by the strap or not at all. Source: [#4][i4],
 and the boot count, truncated to the field's width. The boot count is kept
 on the FRAM and advanced from the stored value when the boot record is
 written, saturating at `u32::MAX`, so before saturation it is a new input at
-every boot; with no RNG and no secret in it, a unit without a provisioned
-secret still states itself. Two boots share a
+every boot; there is no RNG and no secret in it. Two boots share a
 value with the chance two random draws would, one in 2^32, which is the
 bound the field's width gives any scheme; what L-040 forbids is a value
 that rests on RAM and comes back the same by construction, not one that
@@ -247,8 +246,14 @@ written count, which is a FRAM that did not answer or a new count that
 did not land on it, has no `boot_id`: the link stays down, because an id over the unique id
 alone would come back the same after the reboot L-040 exists to make
 visible. The module is powered as on every boot: on revision A a rail kept
-off and switched on at a later boot is what F-005 forbids.
-Source: KM43 L-040, [#3][plan] §4.2. M3.
+off and switched on at a later boot is what F-005 forbids. A boot without a
+device secret has a `boot_id` and still no statement, because every
+controller `LinkUp` carries the secret's `device_id` (KM43 L-035): the link
+stays down for the boot, a `LinkUp` from the module is left unanswered, and
+the ladder does not cut a module whose silence a cycle would not cure
+([origin89hq/km43#127](https://github.com/origin89hq/km43/issues/127)).
+Download requests are still served.
+Source: KM43 L-040, L-035, [#3][plan] §4.2. M3.
 
 ## Sessions and provisioning
 

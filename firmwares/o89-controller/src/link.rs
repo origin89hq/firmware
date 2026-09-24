@@ -1093,6 +1093,9 @@ fn note_line(note: Note) {
         Note::UnexpectedAck(_) | Note::NetworkAnswered { .. } | Note::NetworkRetry { .. } => {
             defmt::info!("link: {}", note);
         }
+        // Every statement the module repeats while unlinked: the boot said
+        // why once, and this would say it every two seconds.
+        Note::NoDeviceId => defmt::debug!("link: {}", note),
         Note::Refused(_)
         | Note::RequestFailed(_)
         | Note::Malformed(_)

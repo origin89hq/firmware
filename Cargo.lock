@@ -1010,9 +1010,9 @@ dependencies = [
 
 [[package]]
 name = "km43"
-version = "0.6.3"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c920c5254db1f4d45fa5ad39ce54cef9e0a164875045d5b9f811d723b944bcca"
+checksum = "94dcda050c47b93bf00cef7dc3326b4efefd1f112a6730094508c5b95e261f64"
 dependencies = [
  "defmt",
  "hkdf",

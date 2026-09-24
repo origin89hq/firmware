@@ -202,6 +202,10 @@ struct Reach {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Controller {
     boot_id: u32,
+    /// Key 8 (L-035): what the advertisement names in TXT `id`, and
+    /// nothing else here reads it. The decoder refuses a controller
+    /// `LinkUp` without it, so a recorded statement always has one.
+    device_id: Option<[u8; o89_link::DEVICE_ID_BYTES]>,
     /// Whether the majors agree: under a mismatch only `LinkUp`,
     /// `Heartbeat` and `CommsRelease` cross (L-050).
     agreed: bool,
@@ -512,6 +516,17 @@ impl Link {
         self.linked
     }
 
+    /// The `device_id` of the latest controller statement accepted, for the
+    /// advertisement's TXT `id` and nothing else (L-035). Kept through a
+    /// drop, and replaced by the next statement; `None` before the first.
+    #[must_use]
+    pub const fn controller_device_id(&self) -> Option<[u8; o89_link::DEVICE_ID_BYTES]> {
+        match self.controller {
+            Some(controller) => controller.device_id,
+            None => None,
+        }
+    }
+
     /// Bench mode advertised by a validated controller handshake, if any.
     #[cfg(any(test, feature = "frames"))]
     #[must_use]
@@ -657,7 +672,7 @@ impl Link {
                         code: LinkErrorCode::WrongSide,
                     });
                 }
-                self.stated(theirs.boot_id, theirs.version, now);
+                self.stated(&theirs, now);
                 #[cfg(any(test, feature = "frames"))]
                 self.record_bench(theirs.fw);
                 Some(Frame::LinkUpAck { req_id })
@@ -676,7 +691,7 @@ impl Link {
                     });
                 }
                 let _ = self.statement.answered(req_id, LinkMessageType::LinkUp);
-                self.linked(theirs.boot_id, theirs.version, now);
+                self.linked(theirs.boot_id, theirs.version, theirs.device_id, now);
                 #[cfg(any(test, feature = "frames"))]
                 self.record_bench(theirs.fw);
                 None
@@ -897,6 +912,7 @@ impl Link {
             boot_id: me.boot_id,
             hw: me.hw,
             net_version: Some(self.network.stored_version()),
+            device_id: None,
         }
         .write(link_header(kind, req_id), dst)
     }
@@ -1011,7 +1027,12 @@ impl Link {
     /// and this side is unlinked, because the new boot has
     /// answered nothing of ours (L-033); a beat sent to the old boot is
     /// forgotten with it.
-    fn record(&mut self, boot_id: u32, version: Version) {
+    fn record(
+        &mut self,
+        boot_id: u32,
+        version: Version,
+        device_id: Option<[u8; o89_link::DEVICE_ID_BYTES]>,
+    ) {
         if self
             .controller
             .is_some_and(|known| known.boot_id != boot_id)
@@ -1027,14 +1048,18 @@ impl Link {
         if !agreed {
             self.forget_offer();
         }
-        self.controller = Some(Controller { boot_id, agreed });
+        self.controller = Some(Controller {
+            boot_id,
+            device_id,
+            agreed,
+        });
     }
 
     /// The controller stated itself of its own accord: recorded and
     /// answered, never a link (L-033). Unlinked, this side states itself at
     /// once, or as soon as the statement in flight is answered or given up.
-    fn stated(&mut self, boot_id: u32, version: Version, now: Tick) {
-        self.record(boot_id, version);
+    fn stated(&mut self, theirs: &LinkUp<'_>, now: Tick) {
+        self.record(theirs.boot_id, theirs.version, theirs.device_id);
         if !self.linked {
             self.next_statement = now;
         }
@@ -1042,8 +1067,14 @@ impl Link {
 
     /// The controller answered our statement: that is the link (L-033), and
     /// a round trip, so it is heard (L-100).
-    fn linked(&mut self, boot_id: u32, version: Version, now: Tick) {
-        self.record(boot_id, version);
+    fn linked(
+        &mut self,
+        boot_id: u32,
+        version: Version,
+        device_id: Option<[u8; o89_link::DEVICE_ID_BYTES]>,
+        now: Tick,
+    ) {
+        self.record(boot_id, version, device_id);
         self.wifi.linked();
         self.linked = true;
         self.last_heard = Some(now);
@@ -1091,6 +1122,8 @@ mod tests {
     use super::*;
 
     const CONTROLLER_BOOT: u32 = 0x00C0_FFEE;
+    /// What the controller states in key 8 (L-035).
+    const CONTROLLER_DEVICE: [u8; o89_link::DEVICE_ID_BYTES] = [0x4f; o89_link::DEVICE_ID_BYTES];
     const ME: Identity<'static> = Identity {
         fw: "0.0.0+g0123abcd",
         hw: "controller-a rev A",
@@ -1356,6 +1389,7 @@ mod tests {
             boot_id,
             hw: "controller-a rev A",
             net_version: None,
+            device_id: (role == Side::Controller).then_some(CONTROLLER_DEVICE),
         }
         .write(link_header(kind, req_id), buf);
         decoded(buf, len)
@@ -1399,6 +1433,7 @@ mod tests {
                     boot_id: CONTROLLER_BOOT,
                     hw: "controller-a rev A",
                     net_version: None,
+                    device_id: (role == Side::Controller).then_some(CONTROLLER_DEVICE),
                 }
                 .write(link_header(kind, req_id), &mut buf);
                 let _ = link.received(decoded(&buf, len), at(1));
@@ -1898,6 +1933,64 @@ mod tests {
         assert_eq!(ours.hw, ME.hw);
         assert_eq!(ours.boot_id, ME.boot_id);
         assert_eq!(ours.version, OURS);
+        assert_eq!(ours.device_id, None, "only the controller sends key 8");
+    }
+
+    #[test]
+    fn l_035_the_device_id_is_the_controllers_latest_accepted_statement() {
+        let mut link = Link::new(Tick::ZERO);
+        assert_eq!(link.controller_device_id(), None, "nothing stated yet");
+        // Stated of its own accord, and in the answer to ours.
+        let mut buf = [0u8; 256];
+        let _ = link.received(
+            from_controller(&mut buf, LinkMessageType::LinkUp, ReqId(7)),
+            at(1),
+        );
+        assert_eq!(link.controller_device_id(), Some(CONTROLLER_DEVICE));
+        // A later boot of a controller with another secret replaces it.
+        let other = [0x22; o89_link::DEVICE_ID_BYTES];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Controller,
+            fw: "0.0.0+g0123abcd",
+            boot_id: CONTROLLER_BOOT.wrapping_add(1),
+            hw: "controller-a rev A",
+            net_version: None,
+            device_id: Some(other),
+        }
+        .write(link_header(LinkMessageType::LinkUp, ReqId(8)), &mut buf);
+        let _ = link.received(decoded(&buf, len), at(2));
+        assert_eq!(link.controller_device_id(), Some(other));
+    }
+
+    #[test]
+    fn l_035_a_refused_statement_leaves_the_kept_device_id() {
+        let mut link = Link::new(Tick::ZERO);
+        let mut buf = [0u8; 256];
+        let _ = link.received(
+            from_controller(&mut buf, LinkMessageType::LinkUp, ReqId(7)),
+            at(1),
+        );
+        // One claiming the comms processor's side is refused, and teaches
+        // nothing about the controller.
+        let refused = link.received(
+            statement(
+                &mut buf,
+                LinkMessageType::LinkUp,
+                ReqId(8),
+                Side::Comms,
+                CONTROLLER_BOOT,
+                OURS,
+            ),
+            at(2),
+        );
+        assert!(matches!(
+            refused,
+            Some(Frame::Refuse {
+                code: LinkErrorCode::WrongSide
+            })
+        ));
+        assert_eq!(link.controller_device_id(), Some(CONTROLLER_DEVICE));
     }
 
     #[test]
@@ -2348,7 +2441,11 @@ mod tests {
     #[test]
     fn l_194_under_a_major_mismatch_a_report_is_refused_with_261() {
         let mut link = linked_at_boot();
-        link.record(CONTROLLER_BOOT, Version { major: 2, minor: 0 });
+        link.record(
+            CONTROLLER_BOOT,
+            Version { major: 2, minor: 0 },
+            Some(CONTROLLER_DEVICE),
+        );
         let mut buf = [0u8; 256];
         assert_eq!(
             link.received(report(&mut buf, ReqId(1), 1, 120_000, 0), at(10)),
@@ -2466,8 +2563,17 @@ mod tests {
         let _ = link.received(report(&mut buf, ReqId(1), 5, 120_000, 0), at(6_200));
         assert_eq!(link.pairing_window(at(6_200)), None);
         // A controller that rebooted starts again from 1.
-        link.record(CONTROLLER_BOOT.wrapping_add(1), OURS);
-        link.linked(CONTROLLER_BOOT.wrapping_add(1), OURS, at(7_000));
+        link.record(
+            CONTROLLER_BOOT.wrapping_add(1),
+            OURS,
+            Some(CONTROLLER_DEVICE),
+        );
+        link.linked(
+            CONTROLLER_BOOT.wrapping_add(1),
+            OURS,
+            Some(CONTROLLER_DEVICE),
+            at(7_000),
+        );
         let _ = link.received(report(&mut buf, ReqId(1), 1, 30_000, 0), at(7_000));
         assert_eq!(
             link.pairing_window(at(7_000)),
@@ -2506,7 +2612,7 @@ mod tests {
         ] {
             let mut link = linked_at_boot();
             pending_offer(&mut link);
-            link.record(boot_id, version);
+            link.record(boot_id, version, Some(CONTROLLER_DEVICE));
             assert_eq!(link.offer_delivery(), OfferDelivery::Failed);
             assert_eq!(link.retry_offer(at(510)), None);
             assert!(!link.offer_rate.take(at(900_009)));
@@ -2597,7 +2703,11 @@ mod tests {
             Err(Refused::NotLinked)
         );
         let mut link = linked_at_boot();
-        link.record(CONTROLLER_BOOT, Version { major: 2, minor: 0 });
+        link.record(
+            CONTROLLER_BOOT,
+            Version { major: 2, minor: 0 },
+            Some(CONTROLLER_DEVICE),
+        );
         link.linked = true;
         assert_eq!(
             link.connect(LinkTransport::WifiLocal, PEER),

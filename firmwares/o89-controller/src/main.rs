@@ -61,7 +61,7 @@ use embassy_time::{Duration, Ticker, Timer};
 use o89_core::{
     Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, Contact, CutsOnPart, CutsRecord, FailState,
     Feedback, Identity, Keys, LastWords, Line, LinkText, Millis, Pull as DeclaredPull, Rail,
-    RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Store, Task,
+    RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Secret, Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -295,10 +295,22 @@ async fn main(spawner: Spawner) {
     // identity and no link. Its module is powered all the same: on revision
     // A, a rail kept off and switched on at a later boot is what F-005
     // forbids.
+    // Key 8 is the secret's id (L-035). Without a secret the link task runs
+    // and serves the bench, but the link stays down for the boot and the
+    // ladder leaves the module alone: a new cycle would not write a secret
+    // (origin89hq/km43#127).
+    let device_id = store
+        .as_ref()
+        .and_then(|store| store.secret.present())
+        .map(Secret::device_id_bytes);
+    if device_id.is_none() {
+        defmt::error!("link: no device secret, so no device_id (L-035); the link stays down");
+    }
     let identity = boot_count.map(|boot| Identity {
         fw: link_text(FW),
         hw: link_text(HW),
         boot_id: BootId::derive(embassy_stm32::uid::uid(), boot),
+        device_id,
     });
 
     // 7. Every output this image drives, to its declared fail state. Held
