@@ -208,6 +208,18 @@ pub enum Compat {
     },
 }
 
+impl Compat {
+    /// Whether the two versions agree, so that more than the handshake and
+    /// heartbeats may cross (L-050).
+    #[must_use]
+    pub const fn is_agreed(self) -> bool {
+        match self {
+            Self::Agreed(_) => true,
+            Self::MajorMismatch { .. } => false,
+        }
+    }
+}
+
 /// Why every connection is being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -795,13 +807,10 @@ impl Link {
 
     /// Whether the link is up under an agreed version (L-050).
     const fn agreed(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Up {
-                compat: Compat::Agreed(_),
-                ..
-            }
-        )
+        match self.compat() {
+            Some(compat) => compat.is_agreed(),
+            None => false,
+        }
     }
 
     /// The peer, while the link is up.
@@ -2009,7 +2018,8 @@ impl Link {
 
     fn wifi_tick(&mut self, now: Tick, actions: &mut Actions) {
         self.wifi.tick(now);
-        if !self.is_up() {
+        // The peer refuses a scan order under a major mismatch (L-050).
+        if !self.agreed() {
             self.wifi.lost();
             self.forget_wifi_request();
             return;

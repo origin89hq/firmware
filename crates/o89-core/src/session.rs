@@ -78,7 +78,7 @@ use crate::challenge::{CHALLENGE_BYTES, CHALLENGE_COUNTER_BYTES, ChallengeCounte
 use crate::clients::{CLIENT_TABLE_BYTES, ClientTable, Label, Paired, TableFull};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
-use crate::link::Rows;
+use crate::link::{Compat, Rows};
 use crate::req_window::{OutOfWindow, ReqWindow};
 use crate::request::{Admission, Executed, Permit, Refusal, admit};
 use crate::secret::Secret;
@@ -147,9 +147,10 @@ pub struct Facts<'a> {
     /// `Discover` key 6, and whether a `Pair` may enrol: the pairing window,
     /// read as this frame is handled and never cached (P-066).
     pub pairing_open: bool,
-    /// Whether the link-local handshake is done: a client frame before it
-    /// is refused with 258 (L-033, L-180).
-    pub link_up: bool,
+    /// The link as the handshake left it: `None` before it is done, when a
+    /// client frame is refused with 258 (L-033, L-180); up under a major
+    /// mismatch, a refresh is refused as the link down (L-050, P-218).
+    pub link: Option<Compat>,
 }
 
 /// The oldest and newest sequence the log holds.
@@ -622,7 +623,7 @@ impl Sessions {
             return Reply::noted(SessionNote::NoHandle);
         };
         let to = Addressed { conn, req_id };
-        if !facts.link_up {
+        if facts.link.is_none() {
             return bare(to, Incoming::LinkLocal(LinkErrorCode::BeforeLinkUp), dst);
         }
         if self.row(conn).is_none() {
@@ -660,7 +661,10 @@ impl Sessions {
             | MessageType::ReadLog
             | MessageType::WifiScan
             | MessageType::WifiStatus
-            | MessageType::GetConfig => self.wrapped_request(to, envelope, now, wifi, dst),
+            | MessageType::GetConfig => {
+                let agreed = facts.link.is_some_and(Compat::is_agreed);
+                self.wrapped_request(to, envelope, now, (wifi, agreed), dst)
+            }
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
             MessageType::Time => self.time(to, envelope, now, fram, dst).await,
@@ -1017,7 +1021,7 @@ impl Sessions {
         to: Addressed,
         envelope: Envelope<'_>,
         now: Tick,
-        wifi: &mut crate::Wifi,
+        link: (&mut crate::Wifi, bool),
         dst: &mut [u8],
     ) -> Reply {
         if let Err(refused) = self.bound_on(to, dst) {
@@ -1061,7 +1065,7 @@ impl Sessions {
             let Bound::Session(binding) = bound else {
                 return Reply::NOTHING;
             };
-            return wifi_answer(to, binding, keys, wifi, (kind, payload, now), dst);
+            return wifi_answer(to, binding, keys, link, (kind, payload, now), dst);
         }
         if kind == MessageType::GetConfig {
             let Bound::Session(binding) = bound else {
@@ -1688,10 +1692,11 @@ fn wifi_answer(
     to: Addressed,
     binding: &Binding,
     keys: &Keys,
-    wifi: &mut crate::Wifi,
+    link: (&mut crate::Wifi, bool),
     request: (MessageType, &[u8], Tick),
     dst: &mut [u8],
 ) -> Reply {
+    let (wifi, agreed) = link;
     let (kind, payload, now) = request;
     let section = match keys.network.held() {
         crate::Held::Present(network) => network.version(),
@@ -1709,7 +1714,7 @@ fn wifi_answer(
             .and_then(|table| table.row(binding.client))
             .is_some_and(|row| row.mask().0 & 2 != 0);
         let refused = if asked.refresh {
-            wifi.refresh(authorised, section != 0, true, now)
+            wifi.refresh(authorised, section != 0, agreed, now)
         } else {
             None
         };
@@ -1849,7 +1854,7 @@ mod tests {
         },
         time_known: false,
         pairing_open: false,
-        link_up: true,
+        link: Some(Compat::Agreed(Version::V1_0)),
     };
 
     /// A unit under epoch `under` with one client enrolled at slot 1 under
@@ -3967,7 +3972,7 @@ mod tests {
         let _ = rig.connect(1);
         let frame = rig.empty(1, MessageType::Discover);
         let facts = Facts {
-            link_up: false,
+            link: None,
             ..FACTS
         };
         let (_, answer) = rig.send_with(&frame, &facts);
@@ -4029,7 +4034,7 @@ mod tests {
     fn p_028_an_unreadable_frame_is_refused_before_the_link_or_any_row_is_asked() {
         let mut rig = Rig::new();
         let facts = Facts {
-            link_up: false,
+            link: None,
             ..FACTS
         };
         let (reply, answer) = rig.send_with(&[0x85, 0x00, 0x01, 0x01, 0xa0, 0x00], &facts);

@@ -92,7 +92,7 @@ impl Endpoint {
             log: local.log,
             time_known: local.time_known,
             pairing_open: local.pairing_open,
-            link_up: self.link.is_up(),
+            link: self.link.compat(),
         };
         let reply = self
             .sessions

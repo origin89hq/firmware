@@ -1568,7 +1568,9 @@ holds one sample, refusing a new sample while full.
 Wi-Fi diagnostics on KM43 0.6.3 live in `o89-core::Wifi`. Both wrapped
 reads are answered before capability bit 8 is advertised. A refresh checks
 mask bit 1, written network metadata, the link, and the 10-second interval;
-a refresh during a running scan joins it. One numbered scan waits for its
+a refresh during a running scan joins it. A link up under a major mismatch
+counts as down: the refresh is answered `link_down` and no order is sent,
+since the peer refuses one with 261 (L-050). One numbered scan waits for its
 acknowledgement and then at most 15 seconds for a result. Refusal, request
 retry exhaustion, timeout, link loss or a changed comms boot fails it while
 retaining the last completed list. Late results are acknowledged and discarded.

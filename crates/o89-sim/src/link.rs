@@ -2440,6 +2440,30 @@ fn wifi_state(bench: &mut Bench) -> km43::ScanState {
 }
 
 #[test]
+fn l_200_l_050_a_scan_owed_under_a_major_mismatch_is_never_ordered() {
+    // Capabilities: version 2.0 against the agreed run's 1.0. The order is
+    // made owed behind the session's gate, as one left from before a
+    // restatement would be.
+    for (version, orders) in [(Version { major: 2, minor: 0 }, 0), (Version::V1_0, 1)] {
+        let mut bench = Bench::new(Capabilities {
+            version,
+            ..Capabilities::default()
+        });
+        bench.run_for(Millis::from_millis(5_000));
+        assert!(bench.endpoint.link.is_up());
+        let at = bench.now;
+        assert_eq!(bench.endpoint.link.wifi.refresh(true, true, true, at), None);
+        bench.run_for(Millis::from_millis(2_000));
+        let sent = bench
+            .asked
+            .iter()
+            .filter(|(_, action)| matches!(action, Action::Send(Outgoing::WifiScan { .. })))
+            .count();
+        assert_eq!(sent, orders, "{version:?}");
+    }
+}
+
+#[test]
 fn l_203_l_200_p_218_hostile_comms_refuses_then_delivers_another_scan_number() {
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(2000));
