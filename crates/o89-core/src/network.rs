@@ -238,6 +238,12 @@ impl Network {
     /// The radio's copy, including credentials only on the private link.
     #[must_use]
     pub fn change(&self) -> Option<km43::NetChange<'_>> {
+        if *self == Self::NONE {
+            return Some(km43::NetChange::ClearUnwritten);
+        }
+        if self.version == 0 {
+            return None;
+        }
         let country = core::str::from_utf8(self.country.as_ref()?).ok()?;
         let hostname = self.hostname.as_str();
         Some(match self.credentials.as_ref() {

@@ -20,8 +20,10 @@
 
 # Configuration section storage: P-100 to P-103, P-106 to P-108 have host
 # checks. L-133 to L-135 cover controller pushes and factory clear on HostileComms.
-# An unwritten master cannot clear a foreign cache without radio metadata in
-# km43 0.5.1; the probe note is tested, and the protocol gap remains open.
+# L-133 and L-137 cover unwritten clears, damaged-record reset, no push at zero,
+# unanswered retries, and retry after a failed erase at the next LinkUp.
+# Comms storage tests cover durable absence and erase failure; radio shutdown
+# and reconfiguration still need bench evidence.
 # The phone-to-Wi-Fi bench exit remains open and requires comms #90.
 
 # The list somebody defends at each audit round: the F rules that have

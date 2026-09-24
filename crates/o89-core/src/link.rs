@@ -279,7 +279,7 @@ impl LinkEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Note {
-    /// The module holds a network but this controller has no country or hostname to clear it.
+    /// The module holds a network but the controller master is damaged or unencodable.
     NetworkWithoutMaster,
     /// The module refused the authoritative network update.
     NetworkRefused(km43::NetConfig),
@@ -621,7 +621,9 @@ impl Link {
             self.network_due = NetworkDue::None;
             return;
         };
-        if peer.net_version == Some(network.version()) && self.network_due != NetworkDue::Changed {
+        if peer.net_version == Some(network.version())
+            && (network.version() == 0 || self.network_due != NetworkDue::Changed)
+        {
             self.network_due = NetworkDue::None;
             return;
         }
@@ -1548,7 +1550,11 @@ impl Link {
             ..
         } = &mut self.phase
         {
-            // The same boot again changes nothing (L-030).
+            // The same boot preserves sessions (L-030), but compares the cache
+            // again so a failed network write is retried (L-133, L-137).
+            if self.network_due == NetworkDue::None {
+                self.network_due = NetworkDue::Compare;
+            }
             *known = peer;
             *agreed = compat;
         }
@@ -1950,6 +1956,28 @@ mod tests {
             })
             .expect("network");
         network
+    }
+
+    #[test]
+    fn l_133_repeated_link_up_preserves_an_owed_local_network_write() {
+        let mut link = up(at(0));
+        let mut peer = *link.peer().expect("peer");
+        peer.net_version = Some(1);
+        link.set_network(Some(network_fixture()));
+        let mut actions = Actions::NONE;
+        link.stated(
+            peer,
+            link.compat().expect("compat"),
+            at(1),
+            &mut NoRows,
+            &mut actions,
+        );
+        link.report_network(at(1), &mut actions);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Send(Outgoing::NetConfig { .. })))
+        );
     }
 
     #[test]

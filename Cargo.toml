@@ -23,12 +23,13 @@ publish = false
 [workspace.dependencies]
 # The one wire format. Pinned exactly and written here once for both
 # workspaces; a member takes it with `.workspace = true` when it first needs it.
-# 0.5.1 carries `EnterDownload`, L-034's link texts, the rules as data
+# 0.6.0 carries `EnterDownload`, L-034's link texts, the rules as data
 # (`km43::REQUIREMENTS`), which the gate reads, the boot record's body, body
 # decoders that refuse a repeated key, the controller records' bodies, the
 # pairing-window report, and the identity and network configuration sections
 # with their codecs; the same pin in both workspaces.
-km43 = "=0.5.1"
+# Adds the metadata-free unwritten clear and rejects written version zero.
+km43 = "=0.6.0"
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }
