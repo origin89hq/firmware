@@ -13,7 +13,8 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use o89_comms_core::{
-    Country, Credential, NTP_BYTES, NtpRequest, NtpSchedule, Plan, Tick, sockets,
+    Country, Credential, NTP_BYTES, NtpRequest, NtpSchedule, Plan, Task, Tick, WifiProgress,
+    sockets,
 };
 
 use crate::access_point;
@@ -59,65 +60,19 @@ pub fn time_offered(now: Tick) {
 
 /// Each concurrent operation reports progress within bounded waits. The idle
 /// radio still turns once a second; a hang cannot borrow the link's watchdog feed.
-static PROGRESS: Mutex<CriticalSectionRawMutex, RefCell<Progress>> =
-    Mutex::new(RefCell::new(Progress::at(0)));
-
-/// The operations the link's watchdog feed waits on.
-#[derive(Clone, Copy)]
-enum Task {
-    Network,
-    Station,
-    Ntp,
-    Ble,
-}
-
-/// When each [`Task`] last reported, in milliseconds since boot: a field
-/// per task, which `at` and `healthy` name without `..`, so a new task
-/// cannot go unwatched the way a slot past a hand-counted array would.
-struct Progress {
-    network: u64,
-    station: u64,
-    ntp: u64,
-    ble: u64,
-}
-
-impl Progress {
-    /// Every task reported at `ms`.
-    const fn at(ms: u64) -> Self {
-        Self {
-            network: ms,
-            station: ms,
-            ntp: ms,
-            ble: ms,
-        }
-    }
-}
+static PROGRESS: Mutex<CriticalSectionRawMutex, RefCell<WifiProgress>> =
+    Mutex::new(RefCell::new(WifiProgress::at(0)));
 
 fn progress(task: Task) {
     PROGRESS.lock(|state| {
-        let mut state = state.borrow_mut();
-        let last = match task {
-            Task::Network => &mut state.network,
-            Task::Station => &mut state.station,
-            Task::Ntp => &mut state.ntp,
-            Task::Ble => &mut state.ble,
-        };
-        *last = Instant::now().as_millis();
+        state
+            .borrow_mut()
+            .progress(task, Instant::now().as_millis());
     });
 }
 pub fn healthy() -> bool {
-    PROGRESS.lock(|state| {
-        let Progress {
-            network,
-            station,
-            ntp,
-            ble,
-        } = *state.borrow();
-        let now = Instant::now().as_millis();
-        [network, station, ntp, ble]
-            .iter()
-            .all(|last| now.saturating_sub(*last) < 6_000)
-    })
+    let now = Instant::now().as_millis();
+    PROGRESS.lock(|state| state.borrow().healthy(now)) && crate::ble::healthy(now)
 }
 pub fn configure(credential: Option<Credential>) {
     DESIRED.lock(|state| *state.borrow_mut() = credential);
@@ -150,7 +105,7 @@ struct Held {
 async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     loop {
         let now = Instant::now().as_millis();
-        PROGRESS.lock(|state| *state.borrow_mut() = Progress::at(now));
+        PROGRESS.lock(|state| state.borrow_mut().reset(now));
         if desired().is_some_and(|record| record.change().is_err()) {
             esp_hal::system::software_reset();
         }
@@ -494,9 +449,4 @@ async fn query(stack: Stack<'_>) -> Option<Sample> {
         accuracy_ms,
         at: Instant::now(),
     })
-}
-
-/// A successful bounded HCI command proves the BLE host/controller made progress.
-pub fn ble_progress() {
-    progress(Task::Ble);
 }

@@ -1288,7 +1288,10 @@ immediately. The vendor C allocator also returns null; the pinned NPL adapter
 and controller initialization assert several failure results. A host error,
 a failed two-second disconnect, or a missed two-second HCI health command
 resets the ESP32. A successful HCI command reports watchdog progress every
-second; the link cannot keep feeding on behalf of a stalled BLE host. If a
+second; the link cannot keep feeding on behalf of a stalled BLE host. BLE owns
+its progress cell, separately from Wi-Fi's network, station and NTP reports.
+Restarting or idling Wi-Fi resets only those three reports. Each report expires
+at 6,000 ms; `o89-comms-core` tests this rollcall with caller-supplied time (F-032). If a
 vendor fault prevents the executor or interrupts from running, the already
 armed hardware watchdog ends the hang. Every reset enters the recovery window
 before allocating or starting radios again. Null-return behavior inside the

@@ -23,7 +23,8 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_radio::ble::controller::BleConnector;
 use km43::{BleError, BleMtu, Conn, DisconnectReason, MAX_PAYLOAD};
 use o89_comms_core::{
-    BLE_ATT_MTU, BLE_CONNECTIONS, BLE_VALUE_BYTES, BleAdmission, BlePipe, Inbound, Peer, Status,
+    BLE_ATT_MTU, BLE_CONNECTIONS, BLE_VALUE_BYTES, BleAdmission, BlePipe, Inbound, Peer, Progress,
+    Status,
 };
 use trouble_host::prelude::*;
 
@@ -50,6 +51,14 @@ type Pool = DefaultPacketPool;
 type Server<'a> = AttributeServer<'a, NoopRawMutex, Pool, ATTRIBUTES, BLE_CONNECTIONS>;
 static ADMISSION: Blocking<CriticalSectionRawMutex, RefCell<BleAdmission>> =
     Blocking::new(RefCell::new(BleAdmission::new()));
+
+/// Only a successful HCI command can refresh BLE's independently owned report.
+static PROGRESS: Blocking<CriticalSectionRawMutex, RefCell<Progress>> =
+    Blocking::new(RefCell::new(Progress::at(0)));
+
+pub fn healthy(now_ms: u64) -> bool {
+    PROGRESS.lock(|state| state.borrow().healthy(now_ms))
+}
 
 fn reset() -> ! {
     esp_hal::system::software_reset()
@@ -154,7 +163,7 @@ async fn health(stack: &Stack<'_, Controller, Pool>) {
         ) {
             reset();
         }
-        crate::radio::ble_progress();
+        PROGRESS.lock(|state| state.borrow_mut().progress(Instant::now().as_millis()));
         Timer::after_secs(1).await;
     }
 }
