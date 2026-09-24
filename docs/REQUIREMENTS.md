@@ -283,6 +283,17 @@ clients and stops advertising on controller loss. Source: [#3][plan] §9
 item 3, [#96](https://github.com/origin89hq/firmware/issues/96), P-066,
 L-060, L-080, L-120. M4.
 
+**F-044** — The comms processor advertises over BLE while its station holds
+no address — no network cached, joining, failed or off — and while the
+pairing window is open; it withdraws the advertisement within 100 ms of the
+radio's once-a-second observation that the station holds an address with
+the window closed. A phone already connected
+keeps its connection, so the app can hand over to Wi-Fi. Once joined, a
+client finds the controller over mDNS (P-224); a changed router, passphrase
+or address leaves the station unjoined, and BLE is back for recovery.
+Source: [#147](https://github.com/origin89hq/firmware/issues/147), L-194,
+L-195. M4.
+
 ## The site
 
 **F-050** — A Modbus driver on this board discards the frame it just sent

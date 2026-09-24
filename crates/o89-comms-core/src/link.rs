@@ -3004,21 +3004,21 @@ mod tests {
     #[test]
     fn l_120_ble_advertising_requires_link_and_stops_at_two_connections() {
         let mut ble = crate::BleAdmission::new();
-        assert!(!ble.advertising(&Link::new(Tick::ZERO)));
+        assert!(!ble.advertising(&Link::new(Tick::ZERO), Tick::ZERO));
         let mut link = linked_at_boot();
-        assert!(ble.advertising(&link));
+        assert!(ble.advertising(&link, Tick::ZERO));
         let (_, first) = ble.connect(&mut link, PEER).expect("first");
         let (_, second) = ble.connect(&mut link, PEER).expect("second");
-        assert!(!ble.advertising(&link));
+        assert!(!ble.advertising(&link, Tick::ZERO));
         assert_eq!(ble.connect(&mut link, PEER), Err(Refused::TableFull));
         assert_ne!(first, second);
         ble.gone(&mut link, first, DisconnectReason::ClosedByClient);
-        assert!(ble.advertising(&link));
+        assert!(ble.advertising(&link, Tick::ZERO));
         let (_, again) = ble.connect(&mut link, PEER).expect("free BLE slot");
         assert_ne!(again, first, "the unacknowledged handle is reserved");
         ble.gone(&mut link, first, DisconnectReason::ClosedByClient);
         assert!(
-            !ble.advertising(&link),
+            !ble.advertising(&link, Tick::ZERO),
             "old cleanup cannot release the new owner"
         );
     }
@@ -3103,9 +3103,139 @@ mod tests {
             ble.gone(&mut link, conn, DisconnectReason::ClosedByComms);
             assert_eq!(link.status(conn), None);
             if !reboot {
-                assert!(!ble.advertising(&link));
+                assert!(!ble.advertising(&link, Tick::ZERO));
                 assert_eq!(ble.connect(&mut link, PEER), Err(Refused::NotLinked));
             }
         }
+    }
+
+    const STATION_IP: [u8; 4] = [192, 168, 1, 20];
+
+    /// A linked comms processor holding network version 3, not yet joined.
+    fn joining() -> Link {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Set {
+                version: 3,
+                ssid: "cabin",
+                psk: "password",
+                country: "CA",
+                hostname: "origin89",
+            })
+            .expect("valid"),
+        ));
+        link
+    }
+
+    #[test]
+    fn f_044_ble_advertises_while_the_station_joins_and_withdraws_once_it_holds_an_address() {
+        let mut link = joining();
+        let ble = crate::BleAdmission::new();
+        assert!(ble.advertising(&link, at(0)), "no association yet");
+        link.station_observed(3, true, None, None, at(100));
+        assert!(ble.advertising(&link, at(100)), "associated, no lease");
+        link.station_observed(3, true, Some(STATION_IP), None, at(200));
+        assert!(link.wifi.joined());
+        assert!(!ble.advertising(&link, at(200)));
+    }
+
+    #[test]
+    fn f_044_a_lost_lease_association_session_or_record_resumes_advertising_at_once() {
+        type Loss = fn(&mut Link);
+        let losses: [(&str, Loss); 4] = [
+            ("lease", |link| {
+                link.station_observed(3, true, None, None, at(300));
+            }),
+            ("association", |link| {
+                link.station_observed(3, false, None, None, at(300));
+            }),
+            ("session", |link| {
+                link.station_observed(3, false, None, Some(km43::WifiFailure::Other), at(300));
+            }),
+            ("record", |link| {
+                link.restore_network(Some(
+                    crate::Credential::new(NetChange::Clear {
+                        version: 4,
+                        country: "CA",
+                        hostname: "origin89",
+                    })
+                    .expect("valid"),
+                ));
+            }),
+        ];
+        for (name, lose) in losses {
+            let mut link = joining();
+            let ble = crate::BleAdmission::new();
+            link.station_observed(3, true, Some(STATION_IP), None, at(200));
+            assert!(!ble.advertising(&link, at(200)), "{name}");
+            lose(&mut link);
+            assert!(!link.wifi.joined(), "{name}");
+            assert!(ble.advertising(&link, at(300)), "{name}");
+        }
+        // The report keeps its first outcome through a rejoin (L-204); the
+        // advertising gate reads the observation, not the report.
+        let mut link = joining();
+        link.station_observed(3, true, Some(STATION_IP), None, at(200));
+        link.station_observed(3, true, None, None, at(300));
+        assert!(matches!(
+            link.wifi.due().expect("reported").radio,
+            km43::Radio::Joined { .. }
+        ));
+        assert!(crate::BleAdmission::new().advertising(&link, at(300)));
+    }
+
+    #[test]
+    fn f_044_the_pairing_window_resumes_advertising_while_joined_until_it_ends() {
+        let mut buf = [0u8; 256];
+        for closed_by_report in [false, true] {
+            let mut link = joining();
+            let ble = crate::BleAdmission::new();
+            link.station_observed(3, true, Some(STATION_IP), None, at(200));
+            assert_eq!(
+                link.received(report(&mut buf, ReqId(1), 1, 60_000, 0), at(1_000)),
+                Some(ack(1, 1))
+            );
+            assert!(ble.advertising(&link, at(1_000)));
+            assert!(ble.advertising(&link, at(60_999)));
+            if closed_by_report {
+                let _ = link.received(report(&mut buf, ReqId(2), 2, 0, 0), at(2_000));
+                assert!(!ble.advertising(&link, at(2_000)));
+            } else {
+                assert!(!ble.advertising(&link, at(61_000)), "expired locally");
+            }
+        }
+    }
+
+    #[test]
+    fn f_044_a_phone_connected_before_the_join_keeps_its_row_and_can_hand_over() {
+        let mut link = joining();
+        let mut ble = crate::BleAdmission::new();
+        let (_, conn) = ble.connect(&mut link, PEER).expect("row");
+        link.station_observed(3, true, Some(STATION_IP), None, at(200));
+        assert_eq!(link.status(conn), Some(Status::Announcing));
+        assert!(
+            !ble.advertising(&link, at(200)),
+            "a free slot is not enough"
+        );
+        ble.gone(&mut link, conn, DisconnectReason::ClosedByClient);
+        assert!(
+            !ble.advertising(&link, at(300)),
+            "leaving does not re-advertise"
+        );
+    }
+
+    #[test]
+    fn f_044_neither_a_superseded_session_nor_an_unlinked_controller_opens_the_gate_wrongly() {
+        let mut link = joining();
+        let ble = crate::BleAdmission::new();
+        // Version 2's session finishing late cannot mark version 3 joined.
+        link.station_observed(2, true, Some(STATION_IP), None, at(200));
+        assert!(!link.wifi.joined());
+        assert!(ble.advertising(&link, at(200)));
+        // Unjoined is not enough without a controller (L-120).
+        let mut unlinked = Link::new(Tick::ZERO);
+        unlinked.restore_network(link.credential().copied());
+        assert!(!unlinked.wifi.joined());
+        assert!(!ble.advertising(&unlinked, at(200)));
     }
 }

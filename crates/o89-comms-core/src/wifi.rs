@@ -164,6 +164,7 @@ pub struct WifiDiagnostics {
     outcome: bool,
     association_since: Option<u64>,
     announced: Option<RadioReport>,
+    joined: bool,
 }
 impl WifiDiagnostics {
     /// Empty NVS means version zero and off.
@@ -178,6 +179,7 @@ impl WifiDiagnostics {
         outcome: false,
         association_since: None,
         announced: None,
+        joined: false,
     };
     /// Duplicate retries retain their first verdict; another order is busy
     /// until the result is acknowledged or given up (L-200, L-201).
@@ -250,6 +252,7 @@ impl WifiDiagnostics {
     /// L-204 applies to this installation: any version change, including a lower
     /// L-133 push, resets its first outcome. Old numeric versions have no history.
     pub fn observe(&mut self, report: RadioReport) {
+        self.joined = matches!(report.radio, Radio::Joined { .. });
         if report.version != self.report.version {
             self.outcome = false;
             self.association_since = None;
@@ -303,6 +306,14 @@ impl WifiDiagnostics {
             Radio::Joining
         };
         self.observe(RadioReport { version, radio });
+    }
+
+    /// Whether the station holds an address as last observed. Unlike the
+    /// report, which keeps its first outcome through a rejoin (L-204), a
+    /// rejoin, a lost lease or a new record clears it at once (F-044).
+    #[must_use]
+    pub const fn joined(&self) -> bool {
+        self.joined
     }
 
     /// Latest state waits behind an immutable outstanding report (L-206).
