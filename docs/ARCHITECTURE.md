@@ -604,7 +604,8 @@ stay defined so a unit with either board reads the same.
 
 Until [firmware#60](https://github.com/origin89hq/firmware/issues/60) adds the
 button, revision A also opens the same 120-second window at power-on when the
-client table read from storage is valid and empty (P-066, F-091; owner decision
+client table read from storage is valid and empty and the boot has a usable
+epoch (P-066, F-091; owner decision
 2026-09-24). `Revision::first_enrolment_at_power_on` owns the revision policy;
 revision B disables it. Absent, corrupt or unreadable storage opens nothing,
 even if boot repairs the table. F-026 still repairs a lost table durably:

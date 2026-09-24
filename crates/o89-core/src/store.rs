@@ -206,7 +206,6 @@ impl Store {
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
         let mut clients =
             Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
-        let enrolment = crate::EnrolmentAtBoot::from_clients(clients.held());
         let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
         let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
         let mut panics =
@@ -249,18 +248,7 @@ impl Store {
                 }),
             };
         }
-        let clients_booted = if let Some(under) = at_boot.epoch() {
-            Some(clients.booted(fram, under).await)
-        } else {
-            // No epoch to take the table under, so nothing derives and
-            // nothing enrols; but the windows the table measures still
-            // restart at this boot's tick zero (P-121), in RAM only.
-            if let Some(held) = clients.present() {
-                let rebased = held.clone().rebased();
-                clients.rebase(rebased);
-            }
-            None
-        };
+        let (enrolment, clients_booted) = boot_clients(&mut clients, fram, at_boot.epoch()).await;
 
         let boot = match boots.held() {
             Held::Present(previous) => previous.next(),
@@ -313,6 +301,29 @@ impl Store {
             },
             report,
         ))
+    }
+}
+
+/// Capture enrolment evidence before repair, only under a usable epoch.
+async fn boot_clients<F: Fram>(
+    clients: &mut Kept<ClientTable, CLIENT_TABLE_BYTES>,
+    fram: &mut F,
+    epoch: Option<Epoch>,
+) -> (
+    crate::EnrolmentAtBoot,
+    Option<Result<Booted, Refused<F::Error>>>,
+) {
+    if let Some(under) = epoch {
+        let enrolment = crate::EnrolmentAtBoot::from_clients(clients.held());
+        (enrolment, Some(clients.booted(fram, under).await))
+    } else {
+        // No epoch means no enrolment; restart table windows at tick zero
+        // in RAM only (P-121), without advertising an unusable window.
+        if let Some(held) = clients.present() {
+            let rebased = held.clone().rebased();
+            clients.rebase(rebased);
+        }
+        (crate::EnrolmentAtBoot::Unavailable, None)
     }
 }
 
@@ -463,6 +474,51 @@ mod tests {
                     .pairing_open(Tick::ZERO)
             );
         }
+    }
+
+    #[test]
+    fn f_091_p_066_empty_table_requires_a_usable_epoch_to_open() {
+        for damaged in [false, true] {
+            let mut part = Part::fresh();
+            let _ = boot(&mut part, None);
+            if damaged {
+                let _second = block_on(map::EPOCH.write(
+                    &mut part,
+                    Position::At {
+                        seq: 1,
+                        slot: crate::fram::Slot::A,
+                    },
+                    &Epoch::FIRST.encode(),
+                ))
+                .unwrap();
+                part.bytes[8] ^= 1;
+                part.bytes[crate::fram::slot_bytes(EPOCH_BYTES) + 8] ^= 1;
+            }
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+            assert_eq!(report.epoch.epoch().is_some(), !damaged);
+            assert_eq!(
+                crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
+                    .pairing_open(Tick::ZERO),
+                !damaged
+            );
+        }
+    }
+
+    #[test]
+    fn f_091_p_066_empty_table_with_refused_epoch_initialisation_stays_closed() {
+        let mut part = Part::fresh();
+        let _ = boot(&mut part, None);
+        part.bytes[..usize::from(map::EPOCH.end().0)].fill(0);
+        part.falling = true;
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        assert_eq!(report.epoch.epoch(), None);
+        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert!(
+            !crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
+                .pairing_open(Tick::ZERO)
+        );
     }
 
     #[test]
