@@ -30,6 +30,20 @@ thaw() {
 
 probe-rs write --chip "$chip" b32 "$apb_fz1" "$iwdg_stop"
 trap 'status=$?; thaw || status=1; exit "$status"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-"$@"
+
+# The command runs as a child, not in the foreground: bash runs a trap only
+# once a foreground command has exited, and `probe-rs run` runs until it is
+# stopped. A signal is passed on as TERM, since a child started this way
+# ignores INT, and the thaw waits for the child so that it never meets a
+# probe still in use. `<&0` keeps the terminal on the child's input, which
+# would otherwise be /dev/null.
+"$@" <&0 &
+child=$!
+stop() {
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" || true
+    exit "$1"
+}
+trap 'stop 130' INT
+trap 'stop 143' TERM
+wait "$child"

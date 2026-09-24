@@ -20,11 +20,13 @@ impl Bench {
         let dir = std::env::temp_dir().join(format!("o89-frozen-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("a scratch directory");
-        // Fails when its arguments end in $FAKE_FAIL, sleeps when they end
-        // in $FAKE_SLEEP; logs every call first.
+        // Fails when its arguments end in $FAKE_FAIL; runs until stopped,
+        // as `probe-rs run` does, when they end in $FAKE_SLEEP, and logs
+        // `stopped` when a signal ends it. Logs every call first.
         let fake = "#!/bin/sh\n\
             echo \"$*\" >> \"$FAKE_LOG\"\n\
-            case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && sleep 2;; esac\n\
+            trap 'echo stopped >> \"$FAKE_LOG\"; exit 143' TERM\n\
+            case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && { sleep 60 & wait $!; };; esac\n\
             case \"$*\" in *\"$FAKE_FAIL\") [ -n \"$FAKE_FAIL\" ] && exit 3;; esac\n\
             exit 0\n";
         let path = dir.join("probe-rs");
@@ -108,27 +110,45 @@ fn a_thaw_that_fails_fails_a_flash_that_worked() {
     assert_eq!(bench.calls(), [FREEZE, "download image", THAW]);
 }
 
-#[test]
-fn an_interrupted_flash_still_thaws_the_watchdog() {
-    let bench = Bench::new("interrupted");
+/// Signals the script while its command runs, as `probe-rs run` does until
+/// it is stopped, and returns the exit status and how long the script took
+/// to end after the signal.
+fn interrupt(name: &str, signal: &str) -> (Option<i32>, Duration, Vec<String>) {
+    let bench = Bench::new(name);
     let mut child = bench
-        .command("", "image", &["probe-rs", "download", "image"])
+        .command("", "image", &["probe-rs", "run", "image"])
         .spawn()
         .expect("the script starts");
     let started = Instant::now();
-    while !bench.calls().iter().any(|call| call == "download image") {
+    while !bench.calls().iter().any(|call| call == "run image") {
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "the flash never started"
+            "the command never started"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    let signalled = Instant::now();
     let kill = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
+        .args([signal, &child.id().to_string()])
         .status()
         .expect("kill");
     assert!(kill.success());
     let status = child.wait().expect("the script ends");
-    assert_eq!(status.code(), Some(143));
-    assert_eq!(bench.calls(), [FREEZE, "download image", THAW]);
+    (status.code(), signalled.elapsed(), bench.calls())
+}
+
+#[test]
+fn a_terminated_run_is_stopped_before_the_watchdog_thaws() {
+    let (code, took, calls) = interrupt("terminated", "-TERM");
+    assert_eq!(code, Some(143));
+    assert!(took < Duration::from_secs(5), "the script waited {took:?}");
+    assert_eq!(calls, [FREEZE, "run image", "stopped", THAW]);
+}
+
+#[test]
+fn an_interrupted_run_is_stopped_before_the_watchdog_thaws() {
+    let (code, took, calls) = interrupt("interrupted", "-INT");
+    assert_eq!(code, Some(130));
+    assert!(took < Duration::from_secs(5), "the script waited {took:?}");
+    assert_eq!(calls, [FREEZE, "run image", "stopped", THAW]);
 }
