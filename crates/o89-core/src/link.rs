@@ -275,10 +275,70 @@ impl LinkEvent {
     }
 }
 
+/// The operation alone, with no credential or radio metadata values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum NetworkOperation {
+    /// Join the configured network.
+    Set,
+    /// Forget a written network's credentials.
+    Clear,
+    /// Forget a foreign cache for a never-written master.
+    ClearUnwritten,
+}
+
+/// Safe metadata for the adapter to log after a successful UART write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct NetworkPush {
+    /// The request, unchanged across retries.
+    pub req_id: ReqId,
+    /// The immutable snapshot's version.
+    pub version: u32,
+    /// Only the operation; never an SSID, passphrase, country or hostname value.
+    pub operation: NetworkOperation,
+}
+
 /// Something for the log on the probe, never for the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Note {
+    /// A network push handed to the adapter; not proof of a completed UART write.
+    NetworkSent {
+        /// The request, unchanged across retries.
+        req_id: ReqId,
+        /// The immutable snapshot's version.
+        version: u32,
+        /// Only the operation; no network field values.
+        operation: NetworkOperation,
+    },
+    /// An unanswered network push scheduled again under the same request.
+    NetworkRetry {
+        /// The request, unchanged across retries.
+        req_id: ReqId,
+        /// The immutable snapshot's version.
+        version: u32,
+        /// Only the operation; no network field values.
+        operation: NetworkOperation,
+    },
+    /// A network push exhausted its bounded attempts.
+    NetworkGaveUp {
+        /// The request, unchanged across retries.
+        req_id: ReqId,
+        /// The immutable snapshot's version.
+        version: u32,
+        /// Only the operation; no network field values.
+        operation: NetworkOperation,
+    },
+    /// A matching, decoded answer to the network push.
+    NetworkAnswered {
+        /// The request answered.
+        req_id: ReqId,
+        /// The module's verdict.
+        outcome: km43::NetConfig,
+        /// The version reported by the module, even on refusal.
+        version: u32,
+    },
     /// The module holds a network but the controller master is damaged or unencodable.
     NetworkWithoutMaster,
     /// The module refused the authoritative network update.
@@ -407,8 +467,10 @@ pub enum Action {
 /// slot given up and its note, resent or newly issued, four in all because
 /// four is every slot (L-014), each given-up slot then reissued as a close
 /// (four more), the link falling with its drop and its record, or a beat,
-/// and a pairing report. Sixteen is room for every combination and a
-/// dropped action is a bug, counted rather than hidden.
+/// and a pairing report. Network diagnostics add at most two notes: the one
+/// pending network request retried/given up, and a newly issued push. Sixteen
+/// still holds every combination; a dropped action is a bug, counted rather
+/// than hidden.
 pub const ACTIONS: usize = 16;
 
 /// The actions of one call, in order.
@@ -596,6 +658,26 @@ impl Link {
         }
     }
 
+    /// Metadata for a pending push, only while this exact request is current.
+    /// Never exposes an SSID, passphrase, country or hostname value.
+    #[must_use]
+    pub fn network_push(&self, req_id: ReqId) -> Option<NetworkPush> {
+        let (_, network) = self
+            .network_sent
+            .as_ref()
+            .filter(|(sent, _)| *sent == req_id)?;
+        let operation = match network.change()? {
+            km43::NetChange::Set { .. } => NetworkOperation::Set,
+            km43::NetChange::Clear { .. } => NetworkOperation::Clear,
+            km43::NetChange::ClearUnwritten => NetworkOperation::ClearUnwritten,
+        };
+        Some(NetworkPush {
+            req_id,
+            version: network.version(),
+            operation,
+        })
+    }
+
     fn forget_network(&mut self) {
         if let Some((req_id, _)) = self.network_sent.take() {
             let _ = self.requests.answered(req_id, LinkMessageType::NetConfig);
@@ -637,6 +719,16 @@ impl Link {
         };
         self.network_sent = Some((req_id, network));
         self.network_due = NetworkDue::None;
+        if let Some(NetworkPush {
+            version, operation, ..
+        }) = self.network_push(req_id)
+        {
+            actions.push(Action::Note(Note::NetworkSent {
+                req_id,
+                version,
+                operation,
+            }));
+        }
         actions.push(Action::Send(Outgoing::NetConfig { req_id }));
     }
 
@@ -652,6 +744,11 @@ impl Link {
             )));
             return;
         }
+        actions.push(Action::Note(Note::NetworkAnswered {
+            req_id,
+            outcome: verdict.outcome,
+            version: verdict.version,
+        }));
         self.forget_network();
         if let Phase::Up { peer, .. } = &mut self.phase {
             peer.net_version = Some(verdict.version);
@@ -1739,6 +1836,16 @@ impl Link {
                         }
                     }
                     if kind == LinkMessageType::NetConfig {
+                        if let Some(NetworkPush {
+                            version, operation, ..
+                        }) = self.network_push(req_id)
+                        {
+                            actions.push(Action::Note(Note::NetworkGaveUp {
+                                req_id,
+                                version,
+                                operation,
+                            }));
+                        }
                         self.network_sent = None;
                     }
                     if kind == LinkMessageType::PairingWindow {
@@ -1784,6 +1891,16 @@ impl Link {
                     },
                     LinkMessageType::NetConfig => {
                         if self.network_sent.is_some_and(|(sent, _)| sent == req_id) {
+                            if let Some(NetworkPush {
+                                version, operation, ..
+                            }) = self.network_push(req_id)
+                            {
+                                actions.push(Action::Note(Note::NetworkRetry {
+                                    req_id,
+                                    version,
+                                    operation,
+                                }));
+                            }
                             actions.push(Action::Send(Outgoing::NetConfig { req_id }));
                         }
                     }
@@ -1943,6 +2060,278 @@ mod tests {
         }
         assert!(found > 0, "a whole frame");
         (out, found)
+    }
+
+    fn push_after_link_up(network: crate::Network) -> (Link, Actions, NetworkPush) {
+        let mut link = up(at(0));
+        link.set_network(Some(network));
+        let mut body = [0; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: link.peer().expect("peer").boot_id,
+            hw: "comms",
+            net_version: Some(99),
+        }
+        .write(link_header(LinkMessageType::LinkUp, ReqId(100)), &mut body)
+        .expect("statement");
+        let actions = link.received(
+            LinkEnvelope::decode(&body[..len]).expect("envelope"),
+            at(0),
+            &mut NoRows,
+        );
+        let req_id = link.network_sent.expect("push").0;
+        let push = link.network_push(req_id).expect("metadata");
+        (link, actions, push)
+    }
+
+    fn network_ack(
+        link: &mut Link,
+        req_id: ReqId,
+        outcome: km43::NetConfig,
+        version: u32,
+    ) -> Actions {
+        let mut body = [0; 64];
+        let len = km43::NetVerdict { outcome, version }
+            .write(
+                link_header(LinkMessageType::NetConfigAck, req_id),
+                &mut body,
+            )
+            .expect("ack");
+        link.received(
+            LinkEnvelope::decode(&body[..len]).expect("envelope"),
+            at(1),
+            &mut NoRows,
+        )
+    }
+
+    fn network_cases() -> [(crate::Network, u32, NetworkOperation); 3] {
+        let set = network_fixture();
+        let mut clear = set;
+        clear.clear().expect("clear");
+        [
+            (set, 1, NetworkOperation::Set),
+            (clear, 2, NetworkOperation::Clear),
+            (crate::Network::NONE, 0, NetworkOperation::ClearUnwritten),
+        ]
+    }
+
+    #[test]
+    fn l_133_network_sent_note_follows_a_differing_link_up() {
+        for (network, version, operation) in network_cases() {
+            let (link, actions, push) = push_after_link_up(network);
+            let req_id = push.req_id;
+            assert_eq!(
+                push,
+                NetworkPush {
+                    req_id,
+                    version,
+                    operation
+                }
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| *action == Action::Send(Outgoing::NetConfig { req_id }))
+            );
+            assert!(actions.iter().any(|action| *action
+                == Action::Note(Note::NetworkSent {
+                    req_id,
+                    version,
+                    operation
+                })));
+            assert_eq!(link.network_push(ReqId(req_id.0 + 1)), None);
+            assert_eq!(actions.dropped(), 0);
+        }
+    }
+
+    #[test]
+    fn l_137_network_answered_note_preserves_the_verdict_and_reported_version() {
+        for outcome in [
+            km43::NetConfig::Stored,
+            km43::NetConfig::RejectedInvalid,
+            km43::NetConfig::NvsWriteFailed,
+        ] {
+            let (mut link, _, push) = push_after_link_up(network_fixture());
+            let req_id = push.req_id;
+            let unexpected = network_ack(&mut link, ReqId(req_id.0 + 1), outcome, 17);
+            assert!(
+                !unexpected
+                    .iter()
+                    .any(|action| matches!(action, Action::Note(Note::NetworkAnswered { .. })))
+            );
+            assert_eq!(link.network_push(req_id), Some(push));
+            let actions = network_ack(&mut link, req_id, outcome, 17);
+            assert!(actions.iter().any(|action| *action
+                == Action::Note(Note::NetworkAnswered {
+                    req_id,
+                    outcome,
+                    version: 17
+                })));
+            assert_eq!(link.network_push(req_id), None);
+            let duplicate = network_ack(&mut link, req_id, outcome, 17);
+            assert!(
+                !duplicate
+                    .iter()
+                    .any(|action| matches!(action, Action::Note(Note::NetworkAnswered { .. })))
+            );
+        }
+    }
+
+    #[test]
+    fn l_015_network_retry_note_keeps_the_snapshot_and_waits_for_the_deadline() {
+        for (network, version, operation) in network_cases() {
+            let (mut link, _, push) = push_after_link_up(network);
+            let req_id = push.req_id;
+            let early = link.tick(at(499), false, &mut NoRows);
+            assert!(
+                !early
+                    .iter()
+                    .any(|action| matches!(action, Action::Note(Note::NetworkRetry { .. })))
+            );
+            for now in [500, 1000] {
+                let actions = link.tick(at(now), false, &mut NoRows);
+                assert!(actions.iter().any(|action| *action
+                    == Action::Note(Note::NetworkRetry {
+                        req_id,
+                        version,
+                        operation
+                    })));
+                assert!(
+                    actions
+                        .iter()
+                        .any(|action| *action == Action::Send(Outgoing::NetConfig { req_id }))
+                );
+                assert_eq!(link.network_push(req_id), Some(push));
+                assert_eq!(actions.dropped(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn l_015_network_give_up_note_keeps_the_last_snapshot_without_resending() {
+        for (network, version, operation) in network_cases() {
+            let (mut link, _, push) = push_after_link_up(network);
+            let req_id = push.req_id;
+            for now in [500, 1000] {
+                let actions = link.tick(at(now), false, &mut NoRows);
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Note(Note::NetworkGaveUp { .. })))
+                );
+            }
+            let actions = link.tick(at(1500), false, &mut NoRows);
+            assert!(actions.iter().any(|action| *action
+                == Action::Note(Note::NetworkGaveUp {
+                    req_id,
+                    version,
+                    operation
+                })));
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Send(Outgoing::NetConfig { .. })))
+            );
+            assert_eq!(link.network_push(req_id), None);
+            assert_eq!(actions.dropped(), 0);
+            let later = link.tick(at(1501), false, &mut NoRows);
+            assert!(
+                !later
+                    .iter()
+                    .any(|action| matches!(action, Action::Note(Note::NetworkGaveUp { .. })))
+            );
+        }
+    }
+
+    // Fixed-capacity formatting for domain tests too: overflowing is a test failure.
+    struct DebugText {
+        bytes: [u8; 512],
+        len: usize,
+    }
+
+    impl core::fmt::Write for DebugText {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
+            self.bytes
+                .get_mut(self.len..end)
+                .ok_or(core::fmt::Error)?
+                .copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    fn debug_text(value: impl core::fmt::Debug) -> DebugText {
+        use core::fmt::Write as _;
+        let mut text = DebugText {
+            bytes: [0; 512],
+            len: 0,
+        };
+        write!(&mut text, "{value:?}").expect("bounded debug text");
+        text
+    }
+
+    #[test]
+    fn network_notes_debug_never_contains_network_values_as_text_or_decimal_bytes() {
+        for (network, version, operation) in network_cases() {
+            let (mut link, sent, push) = push_after_link_up(network);
+            let retried = link.tick(at(500), false, &mut NoRows);
+            let _ = link.tick(at(1000), false, &mut NoRows);
+            let gave_up = link.tick(at(1500), false, &mut NoRows);
+            let (mut other, _, other_push) = push_after_link_up(network);
+            let answered = network_ack(
+                &mut other,
+                other_push.req_id,
+                km43::NetConfig::Stored,
+                version,
+            );
+            let expected = [
+                Note::NetworkSent {
+                    req_id: push.req_id,
+                    version,
+                    operation,
+                },
+                Note::NetworkRetry {
+                    req_id: push.req_id,
+                    version,
+                    operation,
+                },
+                Note::NetworkGaveUp {
+                    req_id: push.req_id,
+                    version,
+                    operation,
+                },
+                Note::NetworkAnswered {
+                    req_id: other_push.req_id,
+                    outcome: km43::NetConfig::Stored,
+                    version,
+                },
+            ];
+            for (actions, expected) in [sent, retried, gave_up, answered].iter().zip(expected) {
+                let note = actions
+                    .iter()
+                    .find_map(|action| {
+                        if let Action::Note(note) = action {
+                            (*note == expected).then_some(*note)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("each new note was emitted");
+                let formatted = debug_text(note);
+                let text = core::str::from_utf8(&formatted.bytes[..formatted.len]).expect("UTF-8");
+                for value in ["cabin", "correct horse", "CA", "origin89"] {
+                    let decimal = debug_text(value.as_bytes());
+                    let decimal = core::str::from_utf8(&decimal.bytes[..decimal.len])
+                        .expect("UTF-8")
+                        .trim_matches(['[', ']']);
+                    assert!(!text.contains(value), "{note:?} contains {value}");
+                    assert!(!text.contains(decimal), "{note:?} contains {decimal}");
+                }
+            }
+        }
     }
 
     fn network_fixture() -> crate::Network {
