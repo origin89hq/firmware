@@ -492,3 +492,12 @@ Source: owner decision 2026-09-24, temporary until
 [k35]: https://github.com/origin89hq/km43/issues/35
 [k36]: https://github.com/origin89hq/km43/issues/36
 [p58]: https://github.com/origin89hq/firmware/pull/58
+
+**F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller
+core. The adapter submits each due KM43 `0x0806` to the existing bounded
+recorder queue; diagnostics do not write configuration or grant authority.
+The core retains one scan list and one current-boot radio report, with
+P-218, L-203 and P-220 deadlines on the monotonic tick.
+
+Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
+KM43 P-216 to P-221 and L-200 to L-207.

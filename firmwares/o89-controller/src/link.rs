@@ -1006,6 +1006,7 @@ async fn perform(
                     stalled = send_outgoing(link, tx, writer, outgoing).await;
                 }
             }
+            Action::RecordWifi(event) => recorder::post_wifi(*event),
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
         }
@@ -1043,6 +1044,7 @@ fn perform_quiet(actions: &Actions) {
                 defmt::info!("link: every connection dropped: {}", why);
             }
             Action::OfferTime { .. } => defmt::error!("clock: offer while UART is off"),
+            Action::RecordWifi(event) => recorder::post_wifi(*event),
             Action::Log(event) => log(*event),
             Action::Note(note) => note_line(*note),
         }

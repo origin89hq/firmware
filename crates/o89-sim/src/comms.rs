@@ -660,6 +660,37 @@ impl HostileComms {
         Ok(self.queue(frame, now))
     }
 
+    /// Inject a diagnostic body over the hostile peer's framing and delay path.
+    pub fn wifi_body(
+        &mut self,
+        kind: LinkMessageType,
+        req_id: ReqId,
+        body: &[u8],
+        now: Tick,
+    ) -> Result<Vec<u8>, Broken> {
+        let mut dst = [0; km43::MAX_PAYLOAD];
+        let len = if kind == LinkMessageType::WifiScanAck {
+            km43::ScanOrderVerdict::decode(
+                km43::LinkEnvelope::decode(body).map_err(|_| Broken::Body)?,
+            )
+            .map_err(|_| Broken::Body)?
+            .write(header(kind, req_id), &mut dst)
+        } else if kind == LinkMessageType::WifiScanResult {
+            km43::ScanResult::decode(km43::LinkEnvelope::decode(body).map_err(|_| Broken::Body)?)
+                .map_err(|_| Broken::Body)?
+                .write(header(kind, req_id), &mut dst)
+        } else if kind == LinkMessageType::WifiState {
+            km43::RadioReport::decode(km43::LinkEnvelope::decode(body).map_err(|_| Broken::Body)?)
+                .map_err(|_| Broken::Body)?
+                .write(header(kind, req_id), &mut dst)
+        } else {
+            return Err(Broken::Body);
+        }
+        .map_err(|_| Broken::Body)?;
+        let frame = self.frame(&dst, len, Some(kind))?;
+        Ok(self.queue(frame, now))
+    }
+
     /// A request of `kind` whose body is an empty map: a frame that is not
     /// the message it claims, where P-015 requires keys.
     pub fn request_with_no_body(

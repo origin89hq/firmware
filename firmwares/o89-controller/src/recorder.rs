@@ -19,7 +19,7 @@ use core::num::NonZeroU32;
 
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
-use embassy_sync::channel::{Channel, TrySendError};
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker};
 use km43::{
@@ -142,7 +142,12 @@ const PERIOD: Duration = Duration::from_millis(100);
 /// Events waiting for the ring, from the tasks that raise them. As deep
 /// as the protocol's event queue; a task whose event does not fit is told
 /// so and says so, and nothing is evicted.
-static EVENTS: Channel<CriticalSectionRawMutex, LinkEvent, MAX_EVENT_QUEUE> = Channel::new();
+#[derive(Clone, Copy)]
+enum Diagnostic {
+    Link(LinkEvent),
+    Wifi(km43::WifiStatusChanged),
+}
+static EVENTS: Channel<CriticalSectionRawMutex, Diagnostic, MAX_EVENT_QUEUE> = Channel::new();
 
 /// The recovery ladder's cuts, to be kept on the FRAM before the rail
 /// moves, under the request's number. One at a time: a request the
@@ -266,9 +271,14 @@ pub struct Cuts {
 
 /// Queue an event for the ring, or hand it back when the queue is full.
 pub fn post(event: LinkEvent) -> Result<(), LinkEvent> {
-    EVENTS.try_send(event).map_err(|refused| match refused {
-        TrySendError::Full(event) => event,
-    })
+    EVENTS.try_send(Diagnostic::Link(event)).map_err(|_| event)
+}
+
+/// Queue the core's P-220 decision through the same bounded recorder queue.
+pub fn post_wifi(event: km43::WifiStatusChanged) {
+    if EVENTS.try_send(Diagnostic::Wifi(event)).is_err() {
+        defmt::error!("recorder: Wi-Fi event queue full");
+    }
 }
 
 /// The recorder task: the only owner of the NOR, and so the one that serves
@@ -320,10 +330,32 @@ pub async fn run(
                         break;
                     };
                     if let Some(ring) = ring.as_mut() {
-                        let _ =
-                            append_record(ring, &mut scratch, event.record(), calendar.now()).await;
+                        match event {
+                            Diagnostic::Link(event) => {
+                                let _ = append_record(
+                                    ring,
+                                    &mut scratch,
+                                    event.record(),
+                                    calendar.now(),
+                                )
+                                .await;
+                            }
+                            Diagnostic::Wifi(event) => {
+                                let mut body = [0; 64];
+                                if let Ok(len) = event.encode(&mut body) {
+                                    let _ = append_body(
+                                        ring,
+                                        &mut scratch,
+                                        km43::WifiStatusChanged::KIND,
+                                        body.get(..len).unwrap_or(&[]),
+                                        calendar.now(),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     } else {
-                        defmt::error!("recorder: no ring; {} not recorded", event);
+                        defmt::error!("recorder: no ring; diagnostic not recorded");
                     }
                 }
                 mailbox::serve(mailbox::Parts {

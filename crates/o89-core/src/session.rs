@@ -606,10 +606,11 @@ impl Sessions {
         &mut self,
         frame: &[u8],
         now: Tick,
-        facts: &Facts<'_>,
+        context: (&Facts<'_>, &mut crate::Wifi),
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
+        let (facts, wifi) = context;
         let Ok(scalars) = LinkEnvelope::decode(frame) else {
             return unreadable(dst);
         };
@@ -659,7 +660,7 @@ impl Sessions {
             | MessageType::ReadLog
             | MessageType::WifiScan
             | MessageType::WifiStatus
-            | MessageType::GetConfig => self.wrapped_request(to, envelope, now, dst),
+            | MessageType::GetConfig => self.wrapped_request(to, envelope, now, wifi, dst),
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
             MessageType::Time => self.time(to, envelope, now, fram, dst).await,
@@ -949,7 +950,7 @@ impl Sessions {
             session,
             fw_controller: facts.fw_controller,
             fw_comms: facts.fw_comms,
-            capabilities: 0,
+            capabilities: 1 << 8,
             log_oldest_seq: facts.log.oldest,
             log_newest_seq: facts.log.newest,
             // The state store does not exist yet; its counter starts here.
@@ -1016,6 +1017,7 @@ impl Sessions {
         to: Addressed,
         envelope: Envelope<'_>,
         now: Tick,
+        wifi: &mut crate::Wifi,
         dst: &mut [u8],
     ) -> Reply {
         if let Err(refused) = self.bound_on(to, dst) {
@@ -1055,34 +1057,17 @@ impl Sessions {
             }
             binding.heard = now;
         }
+        if matches!(kind, MessageType::WifiScan | MessageType::WifiStatus) {
+            let Bound::Session(binding) = bound else {
+                return Reply::NOTHING;
+            };
+            return wifi_answer(to, binding, keys, wifi, (kind, payload, now), dst);
+        }
         if kind == MessageType::GetConfig {
             let Bound::Session(binding) = bound else {
                 return Reply::NOTHING;
             };
-            let request = match km43::GetConfigRequest::decode(payload) {
-                Ok(request) => request,
-                Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
-            };
-            let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
-            let len = match keys
-                .configuration
-                .answer(request.section, &keys.network, &mut body)
-            {
-                Ok(len) => len,
-                Err(code) => return wrapped(to, &binding.key, code, dst),
-            };
-            let written = body
-                .get(..len)
-                .and_then(|body| {
-                    Tagged::over(
-                        to.header(MessageType::GetConfigResponse),
-                        body,
-                        &binding.key,
-                    )
-                    .ok()
-                })
-                .and_then(|tagged| tagged.write(dst).ok());
-            return answered(written);
+            return config_answer(to, binding, keys, payload, dst);
         }
         if kind != MessageType::Goodbye || !goodbye {
             let code = if kind == MessageType::Goodbye {
@@ -1666,6 +1651,92 @@ const fn wire(code: Incoming) -> u16 {
     }
 }
 
+fn config_answer(
+    to: Addressed,
+    binding: &Binding,
+    keys: &Keys,
+    payload: &[u8],
+    dst: &mut [u8],
+) -> Reply {
+    let request = match km43::GetConfigRequest::decode(payload) {
+        Ok(request) => request,
+        Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+    };
+    let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
+    let len = match keys
+        .configuration
+        .answer(request.section, &keys.network, &mut body)
+    {
+        Ok(len) => len,
+        Err(code) => return wrapped(to, &binding.key, code, dst),
+    };
+    let written = body
+        .get(..len)
+        .and_then(|body| {
+            Tagged::over(
+                to.header(MessageType::GetConfigResponse),
+                body,
+                &binding.key,
+            )
+            .ok()
+        })
+        .and_then(|tagged| tagged.write(dst).ok());
+    answered(written)
+}
+
+fn wifi_answer(
+    to: Addressed,
+    binding: &Binding,
+    keys: &Keys,
+    wifi: &mut crate::Wifi,
+    request: (MessageType, &[u8], Tick),
+    dst: &mut [u8],
+) -> Reply {
+    let (kind, payload, now) = request;
+    let section = match keys.network.held() {
+        crate::Held::Present(network) => network.version(),
+        crate::Held::Absent | crate::Held::Corrupt | crate::Held::Malformed(_) => 0,
+    };
+    let mut body = [0; km43::MAX_PAYLOAD];
+    let (response, encoded) = if kind == MessageType::WifiScan {
+        let asked = match km43::ScanRequest::decode(payload) {
+            Ok(asked) => asked,
+            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+        };
+        let authorised = keys
+            .clients
+            .present()
+            .and_then(|table| table.row(binding.client))
+            .is_some_and(|row| row.mask().0 & 2 != 0);
+        let refused = if asked.refresh {
+            wifi.refresh(authorised, section != 0, true, now)
+        } else {
+            None
+        };
+        (
+            MessageType::WifiScanResponse,
+            wifi.answer(refused, now, &mut body),
+        )
+    } else {
+        if let Err(why) = EmptyBody::decode(MessageType::WifiStatus, payload) {
+            return refused_under(to, &binding.key, why.refusal(), dst);
+        }
+        (
+            MessageType::WifiStatusResponse,
+            wifi.status(section).encode(&mut body),
+        )
+    };
+    let len = match encoded {
+        Ok(len) => len,
+        Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+    };
+    answered(
+        body.get(..len)
+            .and_then(|body| Tagged::over(to.header(response), body, &binding.key).ok())
+            .and_then(|tagged| tagged.write(dst).ok()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use core::future::Future;
@@ -1857,11 +1928,14 @@ mod tests {
 
         fn send_with(&mut self, frame: &[u8], facts: &Facts<'_>) -> (Reply, Bytes) {
             let mut dst = [0u8; MAX_PAYLOAD];
-            let reply =
-                block_on(
-                    self.sessions
-                        .frame(frame, self.now, facts, &mut self.part, &mut dst),
-                );
+            let mut wifi = crate::Wifi::EMPTY;
+            let reply = block_on(self.sessions.frame(
+                frame,
+                self.now,
+                (facts, &mut wifi),
+                &mut self.part,
+                &mut dst,
+            ));
             let bytes = reply
                 .answer
                 .map_or(Bytes::EMPTY, |len| Bytes::of(&dst[..len]));
@@ -2025,6 +2099,62 @@ mod tests {
                 .present()
                 .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
         }
+    }
+
+    #[test]
+    fn p_216_p_218_p_219_both_wifi_reads_are_wrapped_and_spend_no_counter() {
+        let mut hello = Rig::new();
+        let _ = hello.connect(1);
+        let (_, answer, key) = hello.hello(1);
+        let (_, body) = under(&answer, &key);
+        let mut reader = km43::CborReader::new(&body);
+        let mut capabilities = None;
+        for _ in 0..reader.map().expect("map") {
+            if reader.u32().expect("key") == 6 {
+                capabilities = Some(reader.u32().expect("capabilities"));
+            } else {
+                reader.skip().expect("field");
+            }
+        }
+        assert_eq!(capabilities, Some(1 << 8));
+        let (mut rig, key) = config_client(ClientKind::App, None);
+        let before = rig.accepted();
+        let mut body = [0; 32];
+        let len = km43::ScanRequest { refresh: true }
+            .encode(&mut body)
+            .expect("request");
+        let mut bytes = [0; 128];
+        let len = Tagged::over(
+            Header {
+                kind: MessageType::WifiScan,
+                session: SessionId::from(1),
+                req_id: rig.next_req(),
+            },
+            &body[..len],
+            &key,
+        )
+        .expect("wrapped")
+        .write(&mut bytes)
+        .expect("frame");
+        let (_, answer) = rig.send(&bytes[..len]);
+        let (header, body) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::WifiScanResponse);
+        assert_eq!(
+            km43::ScanAnswer::decode(&body).expect("scan").refused(),
+            Some(km43::ScanRefusal::RadioOff)
+        );
+        let request = rig.wrapped(1, MessageType::WifiStatus, &key);
+        let (_, answer) = rig.send(&request);
+        let (header, body) = under(&answer, &key);
+        assert_eq!(header.kind, MessageType::WifiStatusResponse);
+        assert_eq!(
+            km43::WifiStatus::decode(&body).expect("status"),
+            km43::WifiStatus {
+                section: 0,
+                report: None
+            }
+        );
+        assert_eq!(rig.accepted(), before);
     }
 
     const START: (u32, CommandKind) = (42, CommandKind::StartGenerator);

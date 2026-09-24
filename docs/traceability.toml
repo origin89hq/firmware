@@ -5,6 +5,11 @@
 # enrolment closure/reboot, factory reset, bad proof, and link-up reporting.
 # Host and simulation evidence only; no lamp/radio/phone bench qualification.
 # P-222 (km43 0.6.3) binds client enrolment storage; this firmware is not a client.
+# Wi-Fi diagnostics (#138): controller P-216–P-221, L-200/L-203/L-207
+# have wrapped-read, state-machine, published-vector and HostileComms tests.
+# F-093's deadline decisions are host tested; the adapter queues their record.
+# No bench evidence is claimed: join failures, DHCP withheld, AP loss, scan
+# during BLE, and unwritten-network scans remain the issue's bench exit.
 
 # Requirements nothing can test, and a count of the ones nobody has tested yet.
 #

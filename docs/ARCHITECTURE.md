@@ -1530,8 +1530,8 @@ runner and NTP run concurrently within one Wi-Fi session, so a failed
 association does not hold up the UART or BLE tasks. Each reports
 progress before the link feeds the watchdog. A changed network record ends
 the session, dropping its sockets and interface before the controller; the
-radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep
-Wi-Fi off. A later network record creates a fresh session from a reborrow
+radio driver then stops and deinitializes Wi-Fi. An unwritten clear keeps
+Wi-Fi off; a written clear retains the country and provisioning access point. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. Each IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
@@ -1544,6 +1544,23 @@ workers. A host test builds both stacks with the firmware's embassy-net
 release and features and holds every socket open at once, and `cargo xtask
 check` refuses the two feature lists differing. The time-offer channel
 holds one sample, refusing a new sample while full.
+
+Wi-Fi diagnostics on KM43 0.6.2 live in `o89-core::Wifi`. Both wrapped
+reads are answered before capability bit 8 is advertised. A refresh checks
+mask bit 1, written network metadata, the link, and the 10-second interval;
+a refresh during a running scan joins it. One numbered scan waits for its
+acknowledgement and then at most 15 seconds for a result. Refusal, request
+retry exhaustion, timeout, link loss or a changed comms boot fails it while
+retaining the last completed list. Late results are acknowledged and discarded.
+One current-boot radio report is held separately from the controller's network
+version and is discarded with the link. Neither report can trigger a network
+push or grant authority (P-221, L-207).
+
+The core schedules `0x0806` through the recorder's existing bounded class A
+queue: never for joining, immediately for a new reported version, otherwise
+at the 10-minute boundary with the state then held. Address-only changes do
+not generate records. A full recorder queue refuses the diagnostic and emits
+a probe error; no diagnostic changes persistence outside the recorder.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.

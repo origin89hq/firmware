@@ -673,6 +673,7 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
     // A fresh unit connects two clients and each discovers.
     let path = |part: &mut SimFram, keys| -> Result<(), ()> {
         let mut sessions = Sessions::new(keys);
+        let mut wifi = o89_core::Wifi::EMPTY;
         let now = o89_core::Tick::from_millis(1_000);
         for handle in 1..=2u16 {
             let conn = Conn::new(handle).ok_or(())?;
@@ -688,7 +689,8 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
             .write(0, &mut frame)
             .map_err(|_| ())?;
             let len = cbor.finish().map_err(|_| ())?;
-            let reply = block_on(sessions.frame(&frame[..len], now, &facts, part, &mut dst));
+            let reply =
+                block_on(sessions.frame(&frame[..len], now, (&facts, &mut wifi), part, &mut dst));
             let len = reply.answer.ok_or(())?;
             let envelope = Envelope::decode(&dst[..len]).map_err(|_| ())?;
             let discovery = Discovery::decode(envelope).map_err(|_| ())?;
@@ -831,7 +833,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
         let _ = block_on(bench.endpoint.sessions.frame(
             &frame,
             bench.now,
-            &facts,
+            (&facts, &mut bench.endpoint.link.wifi),
             &mut bench.fram,
             &mut dst,
         ));
