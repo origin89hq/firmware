@@ -90,8 +90,11 @@ fn identity() -> Identity {
 
 pub(crate) struct Bench {
     clock: o89_core::WallClock,
-    calendar: Option<(o89_core::UnixMillis, Tick)>,
-    clock_records: Vec<km43::ControllerRecord>,
+    /// The selector's override at the instant the recorder processes the request.
+    floor_override: clock::FloorOverride,
+    clock_notes: Vec<clock::ClockNote>,
+    pub(crate) calendar: Option<(o89_core::UnixMillis, Tick)>,
+    pub(crate) clock_records: Vec<km43::ControllerRecord>,
     pub(crate) now: Tick,
     pub(crate) endpoint: Endpoint,
     pub(crate) comms: HostileComms,
@@ -141,6 +144,8 @@ impl Bench {
         let (fram, keys) = unit();
         let mut bench = Self {
             clock: o89_core::WallClock::new(),
+            floor_override: clock::FloorOverride::Unarmed,
+            clock_notes: Vec::new(),
             calendar: None,
             clock_records: Vec::new(),
             now,
@@ -345,19 +350,31 @@ impl Bench {
                     let local = Local {
                         model: MODEL,
                         log: LOG,
-                        time_known: false,
+                        time_known: self.calendar.is_some(),
                         pairing_open: self.window.is_open(self.now),
                     };
-                    let step = block_on(self.endpoint.frame(
+                    let mut step = block_on(self.endpoint.frame(
                         frame,
                         self.now,
                         &local,
                         &mut self.fram,
                         &mut dst,
                     ));
-                    let Some(step) = step else {
+                    let Some(ref mut step) = step else {
                         continue;
                     };
+                    if let Some(o89_core::Reply {
+                        note: Some(SessionNote::TimeAsked(asked)),
+                        ..
+                    }) = step.reply
+                    {
+                        let answer = self.client_time(asked);
+                        step.reply = Some(self.endpoint.sessions.time_answered(
+                            asked.ticket,
+                            answer,
+                            &mut dst,
+                        ));
+                    }
                     if let Some(o89_core::Reply {
                         note: Some(SessionNote::Paired(_)),
                         ..
@@ -2340,3 +2357,5 @@ fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_ver
             .any(|heard| matches!(heard, Heard::NetConfig { version: 1, .. }))
     );
 }
+
+mod clock;
