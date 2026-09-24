@@ -965,5 +965,5 @@ fn f_041_discover_after_secret_replacement_over_a_corrupt_counter_has_a_challeng
     let mut client = Client::on(1);
     let challenge = client.discover(&mut bench);
     assert_ne!(challenge, [0; 16]);
-    assert_ne!(challenge, device().challenge(1));
+    assert_eq!(challenge, fresh.device_secret().challenge(1));
 }
