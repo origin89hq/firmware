@@ -1,4 +1,5 @@
 //! Bounded scan reduction and diagnostic radio state (L-200–L-206).
+use crate::Millis;
 use core::num::NonZeroU32;
 use km43::{
     AccessPoint, LinkEnvelope, LinkMessageType, Radio, RadioReport, ReqId, ScanList, ScanOrder,
@@ -9,6 +10,13 @@ use km43::{
 pub const MAX_HEARD_APS: usize = u16::MAX as usize;
 /// One result envelope; encoding overflow reports a failed scan.
 pub const SCAN_RESULT_BYTES: usize = km43::MAX_PAYLOAD;
+/// Associated this long without IPv4, the station reports `no_ip` (F-092).
+pub const NO_IP: Millis = Millis::from_millis(4_000);
+/// The DHCP client's wait before it resends DISCOVER. smoltcp waits 10 s,
+/// so one lost DISCOVER read as `no_ip` for six seconds before the resend
+/// (firmware #143); at 2 s it is resent inside the `no_ip` bound.
+pub const DHCP_DISCOVER_RESEND: Millis = Millis::from_millis(2_000);
+const _: () = assert!(DHCP_DISCOVER_RESEND.as_millis() < NO_IP.as_millis());
 
 /// A borrowed observation at the adapter seam. Invalid UTF-8 has no SSID.
 #[derive(Debug, Clone, Copy)]
@@ -258,7 +266,7 @@ impl WifiDiagnostics {
         self.report = report;
     }
     /// Observe the station seam: DHCP absence and association loss are core
-    /// decisions. Four seconds bounds the first DHCP outcome; retries continue.
+    /// decisions. [`NO_IP`] bounds the first DHCP outcome; retries continue.
     pub fn station(
         &mut self,
         version: u32,
@@ -277,7 +285,7 @@ impl WifiDiagnostics {
             let since = *self.association_since.get_or_insert(now);
             if let Some(ipv4) = ipv4 {
                 Radio::Joined { ipv4 }
-            } else if now.saturating_sub(since) >= 4_000 {
+            } else if now.saturating_sub(since) >= NO_IP.as_millis() {
                 Radio::Failed {
                     reason: km43::WifiFailure::NoIp,
                 }

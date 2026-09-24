@@ -161,6 +161,8 @@ fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &st
         .with_authentication(AuthenticationMethodConfig::Wpa2Personal(password));
     let mut dhcp = DhcpConfig::default();
     dhcp.hostname = Some(hostname);
+    dhcp.retry_config.discover_timeout =
+        smoltcp::time::Duration::from_millis(o89_comms_core::DHCP_DISCOVER_RESEND.as_millis());
     Some((config, dhcp, country))
 }
 

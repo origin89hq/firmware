@@ -75,6 +75,10 @@ esp-wifi-sys-esp32c6 = "=0.3.0"
 # (`o89_comms_core::sockets`); `o89-sim`'s test of the budgets builds this
 # exact requirement, and `cargo xtask check` refuses the two differing.
 embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
+# The DHCP client's retry timings: embassy-net takes smoltcp's `Duration`
+# without re-exporting it. Pinned to the release embassy-net resolves, whose
+# features it sets.
+smoltcp = { version = "=0.13.1", default-features = false }
 # The TCP socket's reads and writes, the release embassy-net implements.
 embedded-io-async = "=0.7.0"
 # The access point's DHCP server: packets and leases only, with no I/O of

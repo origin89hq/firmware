@@ -1779,6 +1779,7 @@ dependencies = [
  "km43",
  "o89-comms-core",
  "o89-link",
+ "smoltcp",
  "static_cell",
  "trouble-host",
 ]

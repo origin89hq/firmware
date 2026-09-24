@@ -1592,7 +1592,9 @@ body; only the newest radio state waits behind an outstanding report. RAM
 credential versions are reported even after persistence fails, and observations
 from a superseded radio session are discarded. The first DHCP outcome waits at
 most four seconds after association; missing IPv4 is `no_ip`, and a dropped
-association is `lost`. Once an installation has an outcome, retries never report joining. L-204 is
+association is `lost`. The DHCP client resends DISCOVER after two seconds
+rather than smoltcp's ten, so a single lost DISCOVER is resent inside that
+bound instead of reading as `no_ip`. Once an installation has an outcome, retries never report joining. L-204 is
 read as the current credential installation: any change of installed RAM
 version, including a lower L-133 push, starts with no outcome. Old numeric
 versions are not a history; an earlier configuration says nothing about the
