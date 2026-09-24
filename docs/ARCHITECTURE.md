@@ -1415,9 +1415,13 @@ native phone app, before site Wi-Fi is configured and without internet.
 The person scans the controller's QR code, opens the 120-second window at
 the panel, and the app performs `Discover`, `Pair`, then `Hello` over BLE.
 An authenticated session can then write the network configuration. BLE
-availability does not depend on a successful Wi-Fi association, including
-when cached credentials name an unavailable network. The ESP32 carries
-bytes; the STM32 verifies proofs, owns enrolment and holds every key.
+advertises whenever the station holds no address, including when cached
+credentials name an unavailable network, and while the pairing window is
+open. Once the station holds an address with the window closed, a phone
+reaches the controller over the site network and finds it over mDNS, so
+advertising stops; a phone already connected over BLE keeps its connection
+and hands over (F-044). The ESP32 carries bytes; the STM32 verifies proofs,
+owns enrolment and holds every key.
 Bluetooth connection or bonding alone grants no KM43 permission.
 
 Local Wi-Fi uses one WebSocket connection per client (P-034), on TCP port
@@ -1468,8 +1472,14 @@ controller checks its window when it processes `Pair`. Cloud stays out of V1.
 KM43 0.6.0: RX is Write Without Response and TX is Notify with a CCCD.
 Advertising includes the service UUID only after valid `LinkUp`; controller
 loss requests advertising cancellation within 100 ms and closes existing
-clients. Neither connection nor subscription nor bonding grants KM43 permission.
-The controller still owns the physical window and proof checks.
+clients. The same 100 ms poll requests cancellation when the station holds
+an address and the window is closed, leaving connected clients alone; the
+host's disable command completes after that request, unmeasured.
+The gate reads the station's latest observation, taken once a second, not
+its report: the report keeps `joined` through a rejoin (L-204), while a lost
+lease or association restores advertising at the next observation (F-044).
+Neither connection nor subscription nor bonding grants KM43 permission. The
+controller still owns the physical window and proof checks.
 
 `BLE_CONNECTIONS = 2` bounds concurrent setup phones, the vendor controller,
 TrouBLE's connection resources and the KM43 codec pairs. Two is enough for

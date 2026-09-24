@@ -1,5 +1,5 @@
 //! BLE admission and KM43 codec use, independent of the radio and GATT host.
-use crate::{Link, Peer, Refused};
+use crate::{Link, Peer, Refused, Tick};
 use km43::{
     BleError, BleMtu, BleReceiver, BleSender, BleValueLimit, Conn, DisconnectReason, LinkTransport,
 };
@@ -25,10 +25,15 @@ impl BleAdmission {
         }
     }
 
-    /// Advertising grants no authorization; only a linked controller permits it.
+    /// Advertising grants no authorization; only a linked controller permits
+    /// it. Once the station holds an address, a phone reaches the controller
+    /// over the site network, so BLE advertises only while the pairing
+    /// window is open. Clients already connected are kept (F-044).
     #[must_use]
-    pub fn advertising(&self, link: &Link) -> bool {
-        link.is_linked() && self.slots.iter().any(Option::is_none)
+    pub fn advertising(&self, link: &Link, now: Tick) -> bool {
+        link.is_linked()
+            && self.slots.iter().any(Option::is_none)
+            && (!link.wifi.joined() || link.pairing_window(now).is_some())
     }
 
     /// Refuse at the BLE cap or shared table cap, without evicting a connection.

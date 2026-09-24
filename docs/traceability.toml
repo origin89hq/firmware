@@ -7,6 +7,9 @@
 # P-222 (km43 0.6.3) binds client enrolment storage; this firmware is not a client.
 # F-092: host tests cover DHCP timeout, loss and cancelled-scan completion;
 # the four-second vendor timeout and dormant-station AP mode require bench runs.
+# F-044: host tests cover join, lost lease, association, session and record,
+# the window resuming and ending, a connected phone kept, and a superseded
+# session. The transitions on board A with a phone are #147's bench exit.
 # Comms Wi-Fi (#138): L-200–L-206 tests assert no-country/busy refusal,
 # deduplication/truncation/omitted counts, one result and bounded retries,
 # RAM-version reports, first-outcome state, and newest-only report delivery.

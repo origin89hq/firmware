@@ -2,7 +2,9 @@
 //! The host and codecs use static buffers. Only the vendor radio/HCI adapter
 //! allocates, from the existing radio heap after the recovery window.
 //!
-//! Advertising cancellation is requested within 100 ms of controller loss. Each worker owns
+//! Advertising cancellation is requested within 100 ms of controller loss,
+//! and of the station holding an address while the pairing window is closed
+//! (F-044); connected clients stay. Each worker owns
 //! one GATT connection and one KM43 codec pair; Drop releases its shared row.
 //! Writes and disconnects have deadlines. Idle reads wait at most one status
 //! tick. A periodic HCI command must complete even while nobody is connected.
@@ -24,7 +26,7 @@ use esp_radio::ble::controller::BleConnector;
 use km43::{BleError, BleMtu, Conn, DisconnectReason, MAX_PAYLOAD};
 use o89_comms_core::{
     BLE_ATT_MTU, BLE_CONNECTIONS, BLE_VALUE_BYTES, BleAdmission, BlePipe, Inbound, Peer, Progress,
-    Status,
+    Status, Tick,
 };
 use trouble_host::prelude::*;
 
@@ -172,12 +174,16 @@ async fn health(stack: &Stack<'_, Controller, Pool>) {
 
 async fn advertising_allowed() -> bool {
     let link = LINK.lock().await;
-    ADMISSION.lock(|state| state.borrow().advertising(&link))
+    let now = Tick::from_millis(Instant::now().as_millis());
+    ADMISSION.lock(|state| state.borrow().advertising(&link, now))
 }
 
-async fn controller_lost() {
+/// Controller loss, a station that holds an address with the pairing window
+/// closed, or the window closing while joined: returning drops the advertiser,
+/// which requests cancellation; the host disables advertising after that.
+async fn advertising_withdrawn() {
     loop {
-        if !LINK.lock().await.is_linked() {
+        if !advertising_allowed().await {
             return;
         }
         Timer::after(STATUS).await;
@@ -231,7 +237,7 @@ async fn worker(
                     .map_err(|_| ())?;
                 acceptor.accept().await.map_err(|_| ())
             },
-            controller_lost(),
+            advertising_withdrawn(),
         )
         .await;
         drop(peripheral);
