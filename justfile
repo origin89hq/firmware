@@ -71,6 +71,12 @@ comms-bootloader:
 # Flashing, erasing and resetting: never run from `check`. Before any of these
 # against a board, name the exact target, the expected effect, the safe setup
 # and the recovery path. Board B is plugged and unplugged with 12 V off.
+#
+# Every controller flash, here and through the crates' `probe-rs run`
+# runners, goes through `firmwares/frozen-watchdog.sh`: the IWDG is frozen
+# while the probe holds the core halted and thawed when the command ends, so
+# a download longer than the watchdog's 8 s does not reset the part under the
+# probe and leave a watchdog boot record (#125).
 # ---------------------------------------------------------------------------
 
 chip := "STM32G0B1RETx"
@@ -90,9 +96,10 @@ boot_bin := "firmwares/target/thumbv6m-none-eabi/release/o89-boot.bin"
 #
 # Flash the bootloader into both banks of the controller, then reset it.
 flash-boot: sizes
-    probe-rs download --chip {{chip}} --verify {{boot_elf}}
-    probe-rs download --chip {{chip}} --verify --binary-format bin --base-address 0x08040000 {{boot_bin}}
-    probe-rs reset --chip {{chip}}
+    firmwares/frozen-watchdog.sh sh -c '\
+      probe-rs download --chip {{chip}} --verify {{boot_elf}} && \
+      probe-rs download --chip {{chip}} --verify --binary-format bin --base-address 0x08040000 {{boot_bin}} && \
+      probe-rs reset --chip {{chip}}'
 
 # Flash the production controller image at 0x08002000, then reset the part:
 # `probe-rs download` alone leaves it halted in its flash loader with every
@@ -105,8 +112,9 @@ flash-boot: sizes
 #
 # Flash the production controller image at 0x08002000 and reset the part.
 flash-controller: sizes
-    probe-rs download --chip {{chip}} --verify {{controller_elf}}
-    probe-rs reset --chip {{chip}}
+    firmwares/frozen-watchdog.sh sh -c '\
+      probe-rs download --chip {{chip}} --verify {{controller_elf}} && \
+      probe-rs reset --chip {{chip}}'
 
 # Flash and run the production controller image with the log on the probe.
 # The runner is `probe-rs run`, which flashes the ELF's own regions only, so
