@@ -9,7 +9,7 @@
 //! gesture. Debounce requires 50 ms of unchanged samples. No sequence is a
 //! prefix of another, and a completed sequence produces exactly one event.
 
-use crate::{Millis, Tick};
+use crate::{ClientTable, Held, Millis, Revision, Tick};
 
 /// Stable time required before accepting a selector position.
 pub const SELECTOR_DEBOUNCE: Millis = Millis::from_millis(50);
@@ -277,7 +277,7 @@ impl SelectorGestures {
     }
 }
 
-/// Expiring enrolment permission. Only a completed pairing gesture opens it.
+/// Expiring enrolment permission. Opened by a pairing gesture or first-enrolment boot policy.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PairingWindow {
     opened: Option<Tick>,
@@ -288,6 +288,16 @@ impl PairingWindow {
     #[must_use]
     pub const fn new() -> Self {
         Self { opened: None }
+    }
+
+    /// P-066 / F-091: the revision's boot exception uses the gesture's window.
+    #[must_use]
+    pub fn at_power_on(revision: Revision, enrolment: EnrolmentAtBoot, now: Tick) -> Self {
+        let mut window = Self::new();
+        if revision.first_enrolment_at_power_on() && enrolment == EnrolmentAtBoot::Empty {
+            window.gesture(Gesture::Pairing, now);
+        }
+        window
     }
 
     /// Apply one physical act; reset closes a previously open window.
@@ -327,6 +337,36 @@ impl PairingWindow {
     }
 }
 
+/// Client-table evidence captured before boot repairs any missing or damaged
+/// record. Missing data is not evidence that nobody has enrolled (F-091).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use]
+pub enum EnrolmentAtBoot {
+    /// A readable empty table, including one previously repaired by F-026.
+    Empty,
+    /// At least one enrolled client.
+    Enrolled,
+    /// The table was absent, corrupt or undecodable.
+    Unavailable,
+}
+
+impl EnrolmentAtBoot {
+    /// Capture the read, before the store's recovery can replace the table.
+    pub fn from_clients(clients: &Held<ClientTable>) -> Self {
+        match clients {
+            Held::Present(table) => {
+                if table.enrolled() == 0 {
+                    Self::Empty
+                } else {
+                    Self::Enrolled
+                }
+            }
+            Held::Absent | Held::Corrupt | Held::Malformed(_) => Self::Unavailable,
+        }
+    }
+}
+
 /// Permissions held by the physical panel. Reset failures block enrolment
 /// until a later reset succeeds; time permission is consumed only by an
 /// accepted floor-crossing write, never by a refused request.
@@ -353,6 +393,16 @@ impl Panel {
             window: PairingWindow::new(),
             floor: None,
             reset_blocked: false,
+        }
+    }
+
+    /// P-066 / F-091: open the ordinary 120-second window only on revisions
+    /// needing first-enrolment access, after reading a proven empty table.
+    #[must_use]
+    pub fn at_power_on(revision: Revision, enrolment: EnrolmentAtBoot, now: Tick) -> Self {
+        Self {
+            window: PairingWindow::at_power_on(revision, enrolment, now),
+            ..Self::new()
         }
     }
 
@@ -436,6 +486,82 @@ impl Panel {
 mod tests {
     use super::*;
     use SelectorPosition::{Auto, Manual, Off};
+
+    fn empty_table() -> ClientTable {
+        ClientTable::cleared(&crate::Clearing::found_at_boot(km43::Epoch::FIRST))
+    }
+
+    #[test]
+    fn f_091_p_066_revision_a_empty_boot_opens_for_120_seconds() {
+        let evidence = EnrolmentAtBoot::from_clients(&Held::Present(empty_table()));
+        let panel = Panel::at_power_on(Revision::A, evidence, Tick::from_millis(5_000));
+        assert!(panel.pairing_open(Tick::from_millis(5_000)));
+        assert!(panel.pairing_open(Tick::from_millis(124_999)));
+        assert!(!panel.pairing_open(Tick::from_millis(125_000)));
+        assert!(!panel.pairing_open(Tick::from_millis(300_000)));
+        assert_eq!(
+            panel.pairing_deadline(Tick::from_millis(5_000)),
+            Some(Tick::from_millis(125_000))
+        );
+        assert!(!panel.floor_override(Tick::from_millis(5_000)));
+    }
+
+    #[test]
+    fn f_091_p_066_one_enrolled_client_keeps_boot_closed() {
+        let mut table = empty_table();
+        let _ = table
+            .pair(crate::Label::new("phone").unwrap(), km43::ClientKind::App)
+            .unwrap();
+        let evidence = EnrolmentAtBoot::from_clients(&Held::Present(table));
+        let panel = Panel::at_power_on(Revision::A, evidence, Tick::ZERO);
+        assert!(!panel.pairing_open(Tick::ZERO));
+        assert_eq!(panel.pairing_deadline(Tick::ZERO), None);
+    }
+
+    #[test]
+    fn f_091_p_066_revision_b_empty_boot_stays_closed() {
+        let panel = Panel::at_power_on(Revision::B, EnrolmentAtBoot::Empty, Tick::ZERO);
+        assert!(!panel.pairing_open(Tick::ZERO));
+        assert_eq!(panel.pairing_deadline(Tick::ZERO), None);
+    }
+
+    #[test]
+    fn f_091_p_066_absent_corrupt_and_malformed_are_not_empty() {
+        for held in [
+            Held::Absent,
+            Held::Corrupt,
+            Held::Malformed(crate::Malformed { at: 0 }),
+        ] {
+            let evidence = EnrolmentAtBoot::from_clients(&held);
+            assert_eq!(evidence, EnrolmentAtBoot::Unavailable);
+            assert!(
+                !Panel::at_power_on(Revision::A, evidence, Tick::ZERO).pairing_open(Tick::ZERO)
+            );
+        }
+    }
+
+    #[test]
+    fn f_091_p_066_enrolled_closes_the_boot_window() {
+        let mut panel = Panel::at_power_on(Revision::A, EnrolmentAtBoot::Empty, Tick::ZERO);
+        assert!(panel.pairing_open(Tick::ZERO));
+        panel.enrolled();
+        assert!(!panel.pairing_open(Tick::ZERO));
+        assert_eq!(panel.pairing_deadline(Tick::ZERO), None);
+    }
+
+    #[test]
+    fn f_091_p_066_selector_reopens_during_and_after_the_boot_window() {
+        for start in [10_000, 130_000] {
+            let mut panel = Panel::at_power_on(Revision::A, EnrolmentAtBoot::Empty, Tick::ZERO);
+            let mut now = start;
+            gesture(&mut panel, [Auto; 3], &mut now);
+            assert!(panel.pairing_open(Tick::from_millis(now)));
+            assert!(
+                panel.pairing_deadline(Tick::from_millis(now)).unwrap()
+                    > Tick::from_millis(120_000)
+            );
+        }
+    }
 
     struct Hand {
         gestures: SelectorGestures,

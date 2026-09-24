@@ -137,7 +137,10 @@ impl Bench {
 
     /// As [`Bench::new`], on the board revision given.
     fn on(revision: Revision, caps: Capabilities) -> Self {
-        let now = Tick::from_millis(1_000);
+        Self::on_at(revision, caps, Tick::from_millis(1_000))
+    }
+
+    fn on_at(revision: Revision, caps: Capabilities, now: Tick) -> Self {
         let mut sequencer = RailSequencer::new(revision);
         let _ = sequencer.power_on(now);
         let rail = Rail::new(sequencer, None);
@@ -174,6 +177,36 @@ impl Bench {
         if let RailThroughReset::On = revision.rail_through_reset() {
             bench.settled();
         }
+        bench
+    }
+
+    /// The controller's boot wiring, with a real store read before permission.
+    pub(crate) fn boot_clients(&mut self, revision: Revision) {
+        let (store, report) = block_on(Store::boot(&mut self.fram, None)).expect("store read");
+        self.window = PairingWindow::at_power_on(revision, report.enrolment, self.now);
+        self.endpoint.sessions = Sessions::new(Keys {
+            configuration: store.configuration,
+            network: store.network,
+            secret: store.secret.present().copied(),
+            epoch: report.epoch.epoch(),
+            epoch_record: store.epoch,
+            clients: store.clients,
+            challenges: store.challenges,
+        });
+    }
+
+    /// A device secret and durably empty table, read on the next power-on.
+    pub(crate) fn first_enrolment(caps: Capabilities) -> Self {
+        let mut bench = Self::on_at(Revision::A, caps, Tick::ZERO);
+        bench.fram = SimFram::fresh();
+        let (mut store, _) = block_on(Store::boot(&mut bench.fram, None)).expect("store");
+        block_on(
+            store
+                .secret
+                .write(&mut bench.fram, Secret::new(DEVICE, PRINTED).unwrap()),
+        )
+        .unwrap();
+        bench.boot_clients(Revision::A);
         bench
     }
 

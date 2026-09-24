@@ -182,6 +182,8 @@ pub struct BootReport<E> {
     /// What became of the client table, or nothing because there was no
     /// epoch to take it under.
     pub clients: Option<Result<Booted, Refused<E>>>,
+    /// Pre-repair enrolment evidence, unavailable if boot repair fails (P-066, F-091).
+    pub enrolment: crate::EnrolmentAtBoot,
     /// The number of this boot.
     pub boot: BootCount,
     /// Whether that number landed on the part.
@@ -246,18 +248,7 @@ impl Store {
                 }),
             };
         }
-        let clients_booted = if let Some(under) = at_boot.epoch() {
-            Some(clients.booted(fram, under).await)
-        } else {
-            // No epoch to take the table under, so nothing derives and
-            // nothing enrols; but the windows the table measures still
-            // restart at this boot's tick zero (P-121), in RAM only.
-            if let Some(held) = clients.present() {
-                let rebased = held.clone().rebased();
-                clients.rebase(rebased);
-            }
-            None
-        };
+        let (enrolment, clients_booted) = boot_clients(&mut clients, fram, at_boot.epoch()).await;
 
         let boot = match boots.held() {
             Held::Present(previous) => previous.next(),
@@ -288,6 +279,7 @@ impl Store {
         let report = BootReport {
             epoch: at_boot,
             clients: clients_booted,
+            enrolment,
             boot,
             boot_recorded,
             panic_recorded,
@@ -309,6 +301,35 @@ impl Store {
             },
             report,
         ))
+    }
+}
+
+/// Capture pre-repair evidence, requiring a usable epoch and successful boot repair.
+async fn boot_clients<F: Fram>(
+    clients: &mut Kept<ClientTable, CLIENT_TABLE_BYTES>,
+    fram: &mut F,
+    epoch: Option<Epoch>,
+) -> (
+    crate::EnrolmentAtBoot,
+    Option<Result<Booted, Refused<F::Error>>>,
+) {
+    if let Some(under) = epoch {
+        let enrolment = crate::EnrolmentAtBoot::from_clients(clients.held());
+        let booted = clients.booted(fram, under).await;
+        let enrolment = if booted.is_ok() {
+            enrolment
+        } else {
+            crate::EnrolmentAtBoot::Unavailable
+        };
+        (enrolment, Some(booted))
+    } else {
+        // No epoch means no enrolment; restart table windows at tick zero
+        // in RAM only (P-121), without advertising an unusable window.
+        if let Some(held) = clients.present() {
+            let rebased = held.clone().rebased();
+            clients.rebase(rebased);
+        }
+        (crate::EnrolmentAtBoot::Unavailable, None)
     }
 }
 
@@ -410,6 +431,133 @@ mod tests {
 
     fn boot(part: &mut Part, words: Option<LastWords>) -> (Store, BootReport<()>) {
         block_on(Store::boot(part, words)).expect("the part answers")
+    }
+
+    #[test]
+    fn f_091_p_066_boot_repair_does_not_turn_absence_or_corruption_into_empty_evidence() {
+        let mut part = Part::fresh();
+        let (mut store, report) = boot(&mut part, None);
+        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        let table = store.clients.present().unwrap().clone();
+        block_on(store.clients.write(&mut part, table)).unwrap();
+        let start = usize::from(map::CLIENT_TABLE.end().0)
+            - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
+        let second = start + crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
+        part.bytes[start + 8] ^= 1;
+        part.bytes[second + 8] ^= 1;
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+    }
+
+    #[test]
+    fn f_091_p_066_repair_boot_stays_closed_and_next_valid_empty_boot_opens() {
+        for corrupt in [false, true] {
+            let mut part = Part::fresh();
+            if corrupt {
+                let (mut store, _) = boot(&mut part, None);
+                let mut table = store.clients.present().unwrap().clone();
+                let _ = table
+                    .pair(Label::new("lost phone").unwrap(), ClientKind::App)
+                    .unwrap();
+                block_on(store.clients.write(&mut part, table)).unwrap();
+                let start = usize::from(map::CLIENT_TABLE.end().0)
+                    - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
+                let second = start + crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
+                part.bytes[start + 8] ^= 1;
+                part.bytes[second + 8] ^= 1;
+            }
+            let (store, repair) = boot(&mut part, None);
+            assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+            assert!(
+                !crate::Panel::at_power_on(crate::Revision::A, repair.enrolment, Tick::ZERO)
+                    .pairing_open(Tick::ZERO)
+            );
+            let (_, next) = boot(&mut part, None);
+            assert!(
+                crate::Panel::at_power_on(crate::Revision::A, next.enrolment, Tick::ZERO)
+                    .pairing_open(Tick::ZERO)
+            );
+        }
+    }
+
+    #[test]
+    fn f_091_p_066_empty_table_requires_a_usable_epoch_to_open() {
+        for damaged in [false, true] {
+            let mut part = Part::fresh();
+            let _ = boot(&mut part, None);
+            if damaged {
+                let _second = block_on(map::EPOCH.write(
+                    &mut part,
+                    Position::At {
+                        seq: 1,
+                        slot: crate::fram::Slot::A,
+                    },
+                    &Epoch::FIRST.encode(),
+                ))
+                .unwrap();
+                part.bytes[8] ^= 1;
+                part.bytes[crate::fram::slot_bytes(EPOCH_BYTES) + 8] ^= 1;
+            }
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+            assert_eq!(report.epoch.epoch().is_some(), !damaged);
+            assert_eq!(
+                crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
+                    .pairing_open(Tick::ZERO),
+                !damaged
+            );
+        }
+    }
+
+    #[test]
+    fn f_091_p_066_stale_empty_table_opens_only_after_boot_write_succeeds() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        // A reset advanced the epoch but lost power before clearing the table.
+        let clearing = block_on(store.epoch.advance(&mut part)).unwrap();
+        assert_eq!(clearing.epoch(), epoch(2));
+        part.falling = true;
+        let (store, refused) = boot(&mut part, None);
+        assert_eq!(refused.epoch.epoch(), Some(epoch(2)));
+        assert_eq!(refused.clients, Some(Err(Refused::SupplyFalling)));
+        assert_eq!(store.clients.present().unwrap().epoch(), Epoch::FIRST);
+        assert!(
+            !crate::Panel::at_power_on(crate::Revision::A, refused.enrolment, Tick::ZERO)
+                .pairing_open(Tick::ZERO)
+        );
+        assert_eq!(refused.enrolment, crate::EnrolmentAtBoot::Unavailable);
+
+        part.falling = false;
+        let (store, repaired) = boot(&mut part, None);
+        assert_eq!(
+            repaired.clients,
+            Some(Ok(Booted::Cleared(Because::Earlier(Epoch::FIRST))))
+        );
+        assert_eq!(store.clients.present().unwrap().epoch(), epoch(2));
+        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        assert_eq!(repaired.enrolment, crate::EnrolmentAtBoot::Empty);
+        assert!(
+            crate::Panel::at_power_on(crate::Revision::A, repaired.enrolment, Tick::ZERO)
+                .pairing_open(Tick::ZERO)
+        );
+    }
+
+    #[test]
+    fn f_091_p_066_empty_table_with_refused_epoch_initialisation_stays_closed() {
+        let mut part = Part::fresh();
+        let _ = boot(&mut part, None);
+        part.bytes[..usize::from(map::EPOCH.end().0)].fill(0);
+        part.falling = true;
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        assert_eq!(report.epoch.epoch(), None);
+        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert!(
+            !crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
+                .pairing_open(Tick::ZERO)
+        );
     }
 
     #[test]

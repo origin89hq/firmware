@@ -1,3 +1,10 @@
+# F-091 / P-066 first-enrolment boot policy: f_091_p_066_* in
+# o89-core gesture/store and o89-sim pairing/sessions::adversarial cover
+# revision A/B, pre-repair storage evidence and next-boot recovery eligibility,
+# 120-second expiry, selector reuse,
+# enrolment closure/reboot, factory reset, bad proof, and link-up reporting.
+# Host and simulation evidence only; no lamp/radio/phone bench qualification.
+
 # Requirements nothing can test, and a count of the ones nobody has tested yet.
 #
 # `cargo xtask check` sorts every **F-nnn** in REQUIREMENTS.md into three

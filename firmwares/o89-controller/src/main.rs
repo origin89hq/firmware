@@ -231,6 +231,7 @@ async fn main(spawner: Spawner) {
     let mut store = match Store::boot(&mut fram, words).await {
         Ok((store, report)) => {
             defmt::info!("store: {}", report);
+            selector::at_power_on(report.enrolment);
             if let Some(reason) = store.run.present() {
                 defmt::info!("run reason: {}", reason);
             } else {
