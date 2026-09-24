@@ -1406,11 +1406,17 @@ the session, dropping its sockets and interface before the controller; the
 radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep
 Wi-Fi off. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
-The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack has
-eleven socket slots (DHCP, DNS, NTP and one TCP socket per WebSocket
-worker), the access point's stack three (its DHCP server and two workers),
-and the time-offer channel holds one sample, refusing a new sample while
-full.
+The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. Each IP stack's
+socket set is fixed, and smoltcp panics, resetting the module, when a
+socket arrives at a full one, so each budget is a sum of named slots in
+`o89_comms_core::sockets`, one per socket anything opens. The station's
+stack has eleven: embassy-net's own DNS and DHCP client, NTP, and one TCP
+socket per WebSocket worker. The access point's has four: embassy-net's
+DNS, which its `dns` feature adds to every stack, its DHCP server, and two
+workers. A host test builds both stacks with the firmware's embassy-net
+release and features and holds every socket open at once, and `cargo xtask
+check` refuses the two feature lists differing. The time-offer channel
+holds one sample, refusing a new sample while full.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.

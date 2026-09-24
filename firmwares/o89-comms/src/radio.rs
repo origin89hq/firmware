@@ -12,7 +12,9 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig, Interface, WifiController,
     sta::StationConfig,
 };
-use o89_comms_core::{Country, Credential, NTP_BYTES, NtpRequest, NtpSchedule, Plan, Tick};
+use o89_comms_core::{
+    Country, Credential, NTP_BYTES, NtpRequest, NtpSchedule, Plan, Tick, sockets,
+};
 
 use crate::access_point;
 use crate::clients::{Buffers, STATION_WORKERS};
@@ -21,15 +23,18 @@ use static_cell::{ConstStaticCell, StaticCell};
 
 static DESIRED: Mutex<CriticalSectionRawMutex, RefCell<Option<Credential>>> =
     Mutex::new(RefCell::new(None));
-/// DHCP, DNS and NTP, and one TCP socket per WebSocket worker.
-const SOCKETS: usize = 3 + crate::clients::STATION_WORKERS;
+/// The station's sockets, each slot named in `o89_comms_core::sockets`:
+/// embassy-net's DNS and DHCP client, NTP, and one TCP socket per WebSocket
+/// worker. A socket added past the budget panics in smoltcp.
+const SOCKETS: usize = sockets::STATION;
 static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 /// The station's WebSocket workers' buffers, lent to each session.
 static CLIENTS: ConstStaticCell<[Buffers; STATION_WORKERS]> =
     ConstStaticCell::new([const { Buffers::EMPTY }; STATION_WORKERS]);
-/// The access point's sockets: its DHCP server, and one TCP socket per
-/// WebSocket worker.
-const AP_SOCKETS: usize = 1 + access_point::WORKERS;
+/// The access point's sockets: embassy-net's DNS, which every stack of
+/// this build carries, its DHCP server, and one TCP socket per WebSocket
+/// worker.
+const AP_SOCKETS: usize = sockets::ACCESS_POINT;
 static AP_RESOURCES: StaticCell<StackResources<AP_SOCKETS>> = StaticCell::new();
 /// The access point's WebSocket workers' buffers.
 static AP_CLIENTS: ConstStaticCell<[Buffers; access_point::WORKERS]> =
@@ -54,21 +59,59 @@ pub fn time_offered(now: Tick) {
 
 /// Each concurrent operation reports progress within bounded waits. The idle
 /// radio still turns once a second; a hang cannot borrow the link's watchdog feed.
-static PROGRESS: Mutex<CriticalSectionRawMutex, RefCell<[u64; 3]>> =
-    Mutex::new(RefCell::new([0; 3]));
-fn progress(task: usize) {
-    PROGRESS.lock(|state| {
-        if let Some(tick) = state.borrow_mut().get_mut(task) {
-            *tick = Instant::now().as_millis();
+static PROGRESS: Mutex<CriticalSectionRawMutex, RefCell<Progress>> =
+    Mutex::new(RefCell::new(Progress::at(0)));
+
+/// The operations the link's watchdog feed waits on.
+#[derive(Clone, Copy)]
+enum Task {
+    Network,
+    Station,
+    Ntp,
+}
+
+/// When each [`Task`] last reported, in milliseconds since boot: a field
+/// per task, which `at` and `healthy` name without `..`, so a new task
+/// cannot go unwatched the way a slot past a hand-counted array would.
+struct Progress {
+    network: u64,
+    station: u64,
+    ntp: u64,
+}
+
+impl Progress {
+    /// Every task reported at `ms`.
+    const fn at(ms: u64) -> Self {
+        Self {
+            network: ms,
+            station: ms,
+            ntp: ms,
         }
+    }
+}
+
+fn progress(task: Task) {
+    PROGRESS.lock(|state| {
+        let mut state = state.borrow_mut();
+        let last = match task {
+            Task::Network => &mut state.network,
+            Task::Station => &mut state.station,
+            Task::Ntp => &mut state.ntp,
+        };
+        *last = Instant::now().as_millis();
     });
 }
 pub fn healthy() -> bool {
     PROGRESS.lock(|state| {
-        state
-            .borrow()
+        let Progress {
+            network,
+            station,
+            ntp,
+        } = *state.borrow();
+        let now = Instant::now().as_millis();
+        [network, station, ntp]
             .iter()
-            .all(|last| Instant::now().as_millis().saturating_sub(*last) < 6_000)
+            .all(|last| now.saturating_sub(*last) < 6_000)
     })
 }
 pub fn configure(credential: Option<Credential>) {
@@ -101,9 +144,8 @@ struct Held {
 #[embassy_executor::task]
 async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     loop {
-        for task in 0..3 {
-            progress(task);
-        }
+        let now = Instant::now().as_millis();
+        PROGRESS.lock(|state| *state.borrow_mut() = Progress::at(now));
         if desired().is_some_and(|record| record.change().is_err()) {
             esp_hal::system::software_reset();
         }
@@ -309,8 +351,8 @@ async fn both_session(
 /// not run, and return when the plan changes.
 async fn hold(plan: Plan) {
     loop {
-        progress(1);
-        progress(2);
+        progress(Task::Station);
+        progress(Task::Ntp);
         if self::plan().await != plan {
             return;
         }
@@ -323,7 +365,7 @@ async fn network(mut runner: Runner<'_, Interface>) {
         // Runner keeps its state in the stack. Cancellation only ends this poll
         // loop; packets already submitted to the driver remain its responsibility.
         let _result = select(runner.run(), Timer::after_secs(1)).await;
-        progress(0);
+        progress(Task::Network);
     }
 }
 
@@ -366,7 +408,7 @@ async fn disconnect(controller: &mut WifiController<'_>) {
 
 async fn station(controller: &mut WifiController<'_>, applied: Credential, plan: Plan) {
     loop {
-        progress(1);
+        progress(Task::Station);
         if desired() != Some(applied) {
             return;
         }
@@ -383,18 +425,18 @@ async fn station(controller: &mut WifiController<'_>, applied: Credential, plan:
             let result = with_timeout(Duration::from_secs(4), controller.connect_async()).await;
             if result.is_err() {
                 // Explicitly abort the blob operation after cancelling its waiter.
-                progress(1);
+                progress(Task::Station);
                 disconnect(controller).await;
             }
         }
-        progress(1);
+        progress(Task::Station);
         Timer::after_secs(1).await;
     }
 }
 
 async fn ntp(stack: Stack<'_>) {
     loop {
-        progress(2);
+        progress(Task::Ntp);
         let due = NTP_SCHEDULE.lock(|schedule| {
             schedule
                 .borrow()
@@ -410,7 +452,7 @@ async fn ntp(stack: Stack<'_>) {
                     .queried(Tick::from_millis(Instant::now().as_millis()));
             });
         }
-        progress(2);
+        progress(Task::Ntp);
         Timer::after_secs(1).await;
     }
 }

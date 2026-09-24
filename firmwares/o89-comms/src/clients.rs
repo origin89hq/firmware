@@ -44,8 +44,8 @@ use embedded_io_async::{Read, Write};
 use km43::{Conn, DisconnectReason, LinkTransport, MAX_PAYLOAD};
 use o89_comms_core::{
     CONTROL_PAYLOAD, Closed, Goodbye, HEAD_BYTES, Inbound, Incoming, Link, Outgoing, Peer,
-    REQUEST_BYTES, RESPONSE_BYTES, ROWS, Status, accept, close_payload, head_len, read_head,
-    request_end, unmask, write_head,
+    REQUEST_BYTES, RESPONSE_BYTES, Status, accept, close_payload, head_len, read_head, request_end,
+    unmask, write_head,
 };
 
 use crate::link::LINK;
@@ -53,7 +53,7 @@ use crate::link::LINK;
 /// The port a client connects to.
 const PORT: u16 = 80;
 /// Workers on the station's network: one per row.
-pub const STATION_WORKERS: usize = ROWS;
+pub const STATION_WORKERS: usize = o89_comms_core::sockets::STATION_WORKERS;
 /// Every worker, each with its mailbox: the station's, then the access
 /// point's.
 const WORKERS: usize = STATION_WORKERS + crate::access_point::WORKERS;

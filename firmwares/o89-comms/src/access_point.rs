@@ -29,7 +29,7 @@ use esp_radio::wifi::{AuthenticationMethodConfig, Ssid};
 /// Phones that may associate at once.
 pub const STATIONS: u16 = 8;
 /// WebSocket workers behind the access point.
-pub const WORKERS: usize = 2;
+pub const WORKERS: usize = o89_comms_core::sockets::ACCESS_POINT_WORKERS;
 /// Addresses leased at once: the whole range, so an expired lease is
 /// reused rather than a full table refusing forever.
 const LEASES: usize = 8;

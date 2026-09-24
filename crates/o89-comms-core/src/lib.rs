@@ -25,6 +25,7 @@ mod link;
 mod network;
 mod ntp;
 mod relay;
+pub mod sockets;
 mod websocket;
 mod window;
 

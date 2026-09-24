@@ -17,5 +17,16 @@ embassy-futures.workspace = true
 embedded-storage-async.workspace = true
 km43.workspace = true
 
+[dev-dependencies]
+# The comms processor's network stack, built on the laptop to show that
+# each socket budget in `o89_comms_core::sockets` holds every socket the
+# firmware and embassy-net open at once (`tests/comms_sockets.rs`). The same
+# release and features as `firmwares/o89-comms`: `cargo xtask check` refuses
+# the two drifting apart, because a feature is what adds embassy-net's own
+# sockets.
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
+# The clock `embassy_net::new` reads, from the host's.
+embassy-time = { version = "=0.5.1", features = ["std"] }
+
 [lints]
 workspace = true

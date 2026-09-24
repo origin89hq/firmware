@@ -37,7 +37,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{CargoOpt, DependencyKind, Metadata, MetadataCommand, PackageId, TargetKind};
+use cargo_metadata::{
+    CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId, TargetKind,
+};
 
 use crate::cross::no_std_crates;
 use crate::repo::{CORTEX_M0, RISCV, Repo};
@@ -58,6 +60,13 @@ const HAL_PREFIXES: &[&str] = &[
     "esp-riscv-rt",
     "riscv",
 ];
+
+/// The host crate whose tests build the comms processor's network stack.
+const SIM: &str = "o89-sim";
+/// The comms processor's network stack. Its features decide which sockets
+/// it opens for itself, so the host test of the socket budgets means
+/// nothing unless it builds the stack the firmware builds.
+const NET: &str = "embassy-net";
 
 /// The crate roots that bring an allocator with them.
 const ALLOC_ROOTS: &[&str] = &["alloc", "std"];
@@ -310,6 +319,42 @@ fn uses_alloc(dir: &Path) -> Result<Option<(String, &'static str)>> {
     Ok(None)
 }
 
+/// A dependency as its manifest asks for it: the version requirement, the
+/// default features and the features named.
+#[derive(Debug, PartialEq, Eq)]
+struct Asked {
+    req: String,
+    default_features: bool,
+    features: BTreeSet<String>,
+}
+
+impl Asked {
+    /// What `package` asks of `dep`, if it names it.
+    fn of(package: &Package, dep: &str) -> Option<Self> {
+        package
+            .dependencies
+            .iter()
+            .find(|asked| asked.name == dep)
+            .map(|asked| Self {
+                req: asked.req.to_string(),
+                default_features: asked.uses_default_features,
+                features: asked.features.iter().cloned().collect(),
+            })
+    }
+}
+
+/// Refuse the host test's network stack differing from the firmware's.
+fn same_stack(firmware: Option<Asked>, host: Option<Asked>) -> Result<()> {
+    let firmware = firmware.with_context(|| format!("{COMMS} no longer names {NET}"))?;
+    let host = host.with_context(|| format!("{SIM} no longer builds {NET} for its tests"))?;
+    if firmware != host {
+        bail!(
+            "{SIM} tests {NET} as {host:?} but {COMMS} builds it as {firmware:?}: a feature adds the stack's own sockets, so the socket budgets are tested against a stack the part does not run"
+        );
+    }
+    Ok(())
+}
+
 /// Apply both rules.
 pub fn check(repo: &Repo) -> Result<()> {
     let firmware = MetadataCommand::new()
@@ -336,6 +381,13 @@ pub fn check(repo: &Repo) -> Result<()> {
         .features(CargoOpt::AllFeatures)
         .exec()
         .context("reading the host workspace")?;
+    let sim = host
+        .workspace_packages()
+        .into_iter()
+        .find(|package| package.name.as_str() == SIM)
+        .with_context(|| format!("{SIM} is not a member of the host workspace"))?;
+    same_stack(Asked::of(comms, NET), Asked::of(sim, NET))?;
+
     let graph = Graph::from_metadata(&host)?;
     for name in no_std_crates(repo)? {
         let package = host
@@ -371,7 +423,7 @@ pub fn check(repo: &Repo) -> Result<()> {
         }
     }
     println!(
-        "dependency boundaries kept: {COMMS} never sees {CORE}; domain crates name no peripheral and no allocator"
+        "dependency boundaries kept: {COMMS} never sees {CORE}; domain crates name no peripheral and no allocator; {SIM} tests the {NET} {COMMS} builds"
     );
     Ok(())
 }
@@ -379,6 +431,42 @@ pub fn check(repo: &Repo) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asked(features: &[&str]) -> Asked {
+        Asked {
+            req: "=0.9.1".to_owned(),
+            default_features: true,
+            features: features.iter().map(|&feature| feature.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_host_test_may_build_the_stack_the_firmware_builds() {
+        same_stack(Some(asked(&["dns", "tcp"])), Some(asked(&["tcp", "dns"])))
+            .expect("the same stack");
+    }
+
+    #[test]
+    fn a_host_test_stack_without_a_feature_the_firmware_has_is_refused() {
+        let refused =
+            same_stack(Some(asked(&["dns", "tcp"])), Some(asked(&["tcp"]))).expect_err("differs");
+        assert!(refused.to_string().contains("socket budgets"), "{refused}");
+    }
+
+    #[test]
+    fn a_host_test_stack_on_another_release_is_refused() {
+        let other = Asked {
+            req: "=0.9.2".to_owned(),
+            ..asked(&["dns"])
+        };
+        same_stack(Some(asked(&["dns"])), Some(other)).expect_err("another release");
+    }
+
+    #[test]
+    fn a_stack_neither_side_names_is_refused() {
+        same_stack(None, Some(asked(&["dns"]))).expect_err("the firmware names none");
+        same_stack(Some(asked(&["dns"])), None).expect_err("the host names none");
+    }
 
     fn id(repr: &str) -> PackageId {
         PackageId {
