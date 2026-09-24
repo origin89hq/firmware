@@ -27,7 +27,7 @@ serde_json = "=1.0.151"
 # release and features as `firmwares/o89-comms`: `cargo xtask check` refuses
 # the two drifting apart, because a feature is what adds embassy-net's own
 # sockets.
-embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet", "multicast"] }
 # The clock `embassy_net::new` reads: the mock, which a test advances by
 # hand, so the DHCP client's resends are timed without waiting on them
 # (`tests/comms_dhcp.rs`).

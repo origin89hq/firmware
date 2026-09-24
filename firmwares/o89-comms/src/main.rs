@@ -34,6 +34,7 @@ mod ble;
 mod clients;
 mod credentials;
 mod link;
+mod mdns;
 #[cfg(not(feature = "no-window"))]
 mod ota;
 mod panic;
