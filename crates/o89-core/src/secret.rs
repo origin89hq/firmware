@@ -1,11 +1,12 @@
 //! The two things a unit is born with: the device id etched into it and
 //! the printed secret on its label, from which every key derives.
 //!
-//! Written once, at manufacture, by the tool that prints the label; read
+//! Provisioned at manufacture by the tool that prints the label; read
 //! at every boot; never exposed to the comms processor and never logged.
 //! The type has no `Debug` for the reason the keys in `km43` have none:
-//! the one secret on this device that can never be rotated should not be
-//! one `?secret` away from a bench log.
+//! printed secret should not be one `?secret` away from a bench log. Bench
+//! replacement uses `stage_secret` and boot recovery to reset its challenge
+//! counter together with fresh key material; existing client keys are orphaned.
 //!
 //! cites: P-038, P-044
 

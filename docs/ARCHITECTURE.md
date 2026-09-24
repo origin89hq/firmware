@@ -246,6 +246,29 @@ a peripheral, which is why it is not a seam. Physical entropy is not needed
 and not ruled out: the ADC's low bits are noisy, and stirring them in raises
 the cost of a stolen label without changing the argument.
 
+A corrupt challenge counter refuses to mint. On the bench, `o89-dev store
+write-secret` (or `--replace`) stages a fresh secret through a firmware mailbox
+operation, then reboots and reads back completion before printing the label.
+An applied transaction retains its secret until the host flushes the label and
+acknowledges it. After a failed reboot or read-back, `o89-dev store write-secret
+--resume` finishes the same transaction and verifies the active secret and counter
+before displaying the device id, printed secret, P-049 payload and QR. Pending or
+unacknowledged transactions refuse new writes, including `--replace`; an acknowledged
+transaction refuses resume. Output and FRAM acknowledgement cannot be atomic:
+a crash after output but before acknowledgement can repeat the same label on resume.
+No secret is saved on the host.
+The intent is a 49-byte body in two 61-byte slots appended after the existing
+FRAM map, leaving every existing record at its address. Before exposing a
+`Store`, boot writes the new secret, writes counter zero, commits the completed
+intent, and scrubs the previous intent slot. A cut before the intent lands keeps
+the old pair; a cut afterwards replays recovery before any session exists.
+Counter values under fresh secret material derive different challenges. Reusing
+the current secret is refused, and there is no counter-only reset operation.
+Unreadable intent is erased and reported at boot, keeping the current secret
+and counter unchanged; old-layout garbage in the appended region cannot stop
+setup. A refused recovery write yields no store or session keys, and a later
+boot retries valid pending intent or finishes discarding unreadable residue. Replacing the label orphans existing client keys.
+
 ### Embassy, and why the choice is cheap
 
 Embassy, confined to `o89-controller`. The drivers are already async state
@@ -821,7 +844,7 @@ event queue, which refuses when full.
 
 | | Part | Holds | Layout |
 |---|---|---|---|
-| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters and the dedup table beside them in one record, because P-080 lands a counter and an in-flight entry in one transaction (P-081, P-105, P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
+| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters and the dedup table beside them in one record, because P-080 lands a counter and an in-flight entry in one transaction (P-081, P-105, P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the bench secret replacement intent (122 bytes, appended after the configuration reservations) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
 | NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a
@@ -910,9 +933,10 @@ store and the ring use, and lands the same sequence as its answer. So a
 write from the bench meets the voltage detector's refusal as the firmware's
 own would, and the bytes it writes are framed by this crate's own records
 on the host: the epoch and the secret a unit leaves the bench with are
-records the boot reads exactly as it reads its own. The firmware moves
-bytes and decides nothing about them; what they mean is the host's, in the
-same `o89-core`. One request reads records rather than bytes: the ring's
+records the boot reads exactly as it reads its own. Secret replacement is
+the exception: mailbox version 4 stages it in the controller, then the tool
+requests a reset and verifies boot completed the secret and counter transaction.
+Other raw record writes retain their host-side encoding in `o89-core`. One request reads records rather than bytes: the ring's
 newest events are walked by the ring's own reader and handed back a page at
 a time, because the ring is the one thing that knows where it starts and
 ends, and a host finding the head a mailbox request at a time would probe

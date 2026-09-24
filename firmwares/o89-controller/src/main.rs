@@ -250,7 +250,7 @@ async fn main(spawner: Spawner) {
         }
         Err(error) => {
             defmt::error!(
-                "store: the FRAM did not answer: {}; booting without it",
+                "store: read or secret recovery failed: {}; booting without it",
                 error
             );
             None

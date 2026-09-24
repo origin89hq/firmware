@@ -33,6 +33,10 @@ pub const CHALLENGE_BYTES: usize = 16;
 pub struct ChallengeCounter(u64);
 
 impl ChallengeCounter {
+    pub(crate) const fn fresh() -> Self {
+        Self(0)
+    }
+
     /// The last counter a challenge was derived from.
     #[must_use]
     pub const fn last(&self) -> u64 {
@@ -82,8 +86,8 @@ impl Minted {
 pub enum MintFailed<E> {
     /// The record holds no counter this image can read: corrupt or
     /// malformed. Minting from any guess could repeat a challenge, so
-    /// nothing is minted until a person writes a counter past every one
-    /// that could have been used.
+    /// nothing is minted until the bench replaces the secret and its
+    /// counter together.
     Unknown,
     /// The counter is at the top of its `u64`, which no unit reaches.
     AtTheCeiling,
