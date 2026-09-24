@@ -448,10 +448,8 @@ fn l_062_a_transport_whose_release_was_dropped_is_reclaimed_by_the_reboot_that_f
     );
 }
 
-/// Proven against the simulated peer only. The comms firmware keeps no
-/// connection table yet and counts none in its heartbeats, so the real
-/// ESP32 cannot drive this resync until #90 gives it the table, the count
-/// and the re-announce.
+/// Against the peer's invented connections. The same resync driven by the
+/// comms processor's own table is in `connections.rs`.
 #[test]
 fn l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_without_a_reboot() {
     // Capabilities: lose a release.

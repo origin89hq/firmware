@@ -740,7 +740,8 @@ its answer frees every row (L-102), so a release lost on the wire leaks a
 row for six seconds rather than until the next reboot. Under a major
 mismatch the peer would refuse that close (L-050), so nothing is counted
 and a close already owed waits for an agreed version. The comms firmware
-counts no connections until it has a table (#90). Time offers go through a bounded
+counts the rows of its own table (below), and its answer to the close
+reports how many transports it closed (L-090). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
@@ -1343,7 +1344,11 @@ slot when all three are out. A refused `ClientConnected` drops the row and
 closes the transport with its reason (L-061); one unanswered three times
 closes the transport and is released, since the controller may hold the
 row; an unanswered release goes again under a new id until answered or the
-link falls. A `CloseConnection` closes the transports it names. A frame
+link falls. `conns` counts rows whose transport exists, announced or open
+(L-101). A `CloseConnection` closes the transports it names and reports how
+many (L-090); after a resync every transport is closed, and each client that
+reconnects is announced under a new handle, which is the re-announcement
+L-102 asks of a side that keeps no connection without its transport. A frame
 that is not an envelope is answered `Error 1` at `0, 0` on its own connection
 (P-025, P-028), since only this side knows where it came from. The
 controller's frames go to the open row their `session_id` names, and a

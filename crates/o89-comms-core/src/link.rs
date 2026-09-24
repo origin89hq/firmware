@@ -94,12 +94,14 @@ pub enum Frame {
         /// The controller's request.
         req_id: ReqId,
     },
-    /// The report on a close the controller asked for.
+    /// The report on a close the controller asked for (L-090).
     CloseReport {
         /// The controller's request.
         req_id: ReqId,
         /// What happened.
         outcome: CloseConnection,
+        /// How many transports it closed.
+        closed: u8,
     },
     /// A transport exists and has a row (L-060).
     ClientConnected {
@@ -665,13 +667,14 @@ impl Link {
     }
 
     /// The answer to a `CloseConnection`: what it closed, handle 0 being
-    /// every connection.
+    /// every connection, and how many transports that was (L-090).
     fn close_report(&mut self, envelope: LinkEnvelope<'_>, req_id: ReqId) -> Option<Frame> {
         let close = CloseConnections::decode(envelope).ok()?;
         let done = self.connections.close(close.conn, close.reason);
         Some(Frame::CloseReport {
             req_id,
             outcome: done.outcome,
+            closed: done.closed,
         })
     }
 
@@ -732,7 +735,7 @@ impl Link {
         let beat = |kind, req_id, envelope: &mut [u8]| {
             Heartbeat {
                 uptime_s: self.uptime_s(now),
-                conns: 0,
+                conns: self.connections.allocated(),
             }
             .write(link_header(kind, req_id), envelope)
         };
@@ -752,7 +755,11 @@ impl Link {
                 link_header(LinkMessageType::EnterDownloadAck, req_id),
                 &mut envelope,
             ),
-            Frame::CloseReport { req_id, outcome } => CloseReport { outcome, closed: 0 }.write(
+            Frame::CloseReport {
+                req_id,
+                outcome,
+                closed,
+            } => CloseReport { outcome, closed }.write(
                 link_header(LinkMessageType::CloseConnectionAck, req_id),
                 &mut envelope,
             ),
@@ -1358,6 +1365,7 @@ mod tests {
             Some(Frame::CloseReport {
                 req_id: ReqId(6),
                 outcome: CloseConnection::Closed,
+                closed: 0,
             })
         );
     }
@@ -1380,6 +1388,7 @@ mod tests {
             Some(Frame::CloseReport {
                 req_id: ReqId(5),
                 outcome: CloseConnection::Closed,
+                closed: 0,
             })
         );
         let len = CloseConnections {
@@ -1396,6 +1405,7 @@ mod tests {
             Some(Frame::CloseReport {
                 req_id: ReqId(6),
                 outcome: CloseConnection::UnknownHandle,
+                closed: 0,
             })
         );
     }
@@ -1475,6 +1485,7 @@ mod tests {
                 Frame::CloseReport {
                     req_id: ReqId(5),
                     outcome: CloseConnection::Closed,
+                    closed: 2,
                 },
                 LinkMessageType::CloseConnectionAck,
                 ReqId(5),
@@ -2077,6 +2088,15 @@ mod tests {
         decoded(buf, len)
     }
 
+    fn close_of(buf: &mut [u8; 256], conn: u16, req_id: ReqId) -> LinkEnvelope<'_> {
+        let len = CloseConnections {
+            conn,
+            reason: CloseReason::Resync,
+        }
+        .write(link_header(LinkMessageType::CloseConnection, req_id), buf);
+        decoded(buf, len)
+    }
+
     /// A transport connected on a linked link and accepted at `now`.
     fn accepted(link: &mut Link, now: Tick) -> Conn {
         let conn = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
@@ -2107,6 +2127,23 @@ mod tests {
         Heartbeat::decode(envelope_in(&out, len))
             .expect("a heartbeat")
             .conns
+    }
+
+    #[test]
+    fn l_101_every_heartbeat_and_every_answer_counts_the_rows_with_a_transport() {
+        let mut link = linked_at_boot();
+        let count = |link: &Link| {
+            (
+                conns_in(link, Frame::Heartbeat { req_id: ReqId(1) }),
+                conns_in(link, Frame::HeartbeatAck { req_id: ReqId(2) }),
+            )
+        };
+        assert_eq!(count(&link), (0, 0));
+        let open = accepted(&mut link, at(10));
+        let _announced = link.connect(LinkTransport::WifiLocal, PEER).expect("a row");
+        assert_eq!(count(&link), (2, 2), "announced counts, bound or not");
+        link.gone(open, DisconnectReason::ClosedByClient);
+        assert_eq!(count(&link), (1, 1), "a released row does not");
     }
 
     #[test]
@@ -2188,6 +2225,75 @@ mod tests {
         link.gone(conn, DisconnectReason::ClosedByComms);
         assert_eq!(link.status(conn), None);
         assert_eq!(link.tick(at(30)), None, "nothing to release");
+    }
+
+    #[test]
+    fn l_090_a_close_reports_how_many_transports_it_closed() {
+        let mut link = linked_at_boot();
+        let a = accepted(&mut link, at(10));
+        let b = accepted(&mut link, at(20));
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            link.received(close_of(&mut buf, b.get(), ReqId(40)), at(30)),
+            Some(Frame::CloseReport {
+                req_id: ReqId(40),
+                outcome: CloseConnection::Closed,
+                closed: 1,
+            })
+        );
+        assert_eq!(
+            link.received(close_of(&mut buf, 999, ReqId(41)), at(40)),
+            Some(Frame::CloseReport {
+                req_id: ReqId(41),
+                outcome: CloseConnection::UnknownHandle,
+                closed: 0,
+            })
+        );
+        assert_eq!(
+            link.received(close_of(&mut buf, 0, ReqId(42)), at(50)),
+            Some(Frame::CloseReport {
+                req_id: ReqId(42),
+                outcome: CloseConnection::Closed,
+                closed: 1,
+            }),
+            "every one that was left"
+        );
+        assert!(matches!(link.status(a), Some(Status::Close(_))));
+    }
+
+    #[test]
+    fn l_102_after_a_resync_every_transport_closes_and_a_reconnect_is_announced_anew() {
+        let mut link = linked_at_boot();
+        let a = accepted(&mut link, at(10));
+        let b = accepted(&mut link, at(20));
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            link.received(close_of(&mut buf, 0, ReqId(7)), at(30)),
+            Some(Frame::CloseReport {
+                req_id: ReqId(7),
+                outcome: CloseConnection::Closed,
+                closed: 2,
+            })
+        );
+        // The counts agree at once: the controller frees every row with
+        // this answer, and this side counts none.
+        assert_eq!(conns_in(&link, Frame::Heartbeat { req_id: ReqId(1) }), 0);
+        for conn in [a, b] {
+            assert_eq!(
+                link.status(conn),
+                Some(Status::Close(crate::Closed::ByController(
+                    CloseReason::Resync
+                )))
+            );
+            link.gone(conn, DisconnectReason::ClosedByComms);
+            assert_eq!(link.status(conn), None);
+        }
+        // Nothing is released: the controller holds none of them.
+        assert_eq!(link.tick(at(40)), None);
+        // Each client reconnects and is announced under a handle of its own.
+        let again = accepted(&mut link, at(50));
+        assert!(again != a && again != b);
+        assert_eq!(conns_in(&link, Frame::Heartbeat { req_id: ReqId(1) }), 1);
     }
 
     #[test]

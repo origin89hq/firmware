@@ -13,10 +13,10 @@
 # reported, not ratcheted.
 #
 # A KM43 rule binding both firmwares reads as covered once either side has
-# its test, so the halves still missing are named here:
-# - L-102: the controller's half is tested against the simulated peer; the
-#   comms processor's count, its close report and the re-announce wait on
-#   the comms connection table (#90).
+# its test. L-102's two halves both have theirs: the comms processor's
+# count, its close report and the re-announce by reconnection are tested in
+# `o89-comms-core` and against the controller's link in `o89-sim`; the
+# bench run of a resync with a phone waits on #90's bench exit.
 
 # Configuration section storage: P-100 to P-103, P-106 to P-108 have host
 # checks. L-133 to L-135 cover controller pushes and factory clear on HostileComms.
