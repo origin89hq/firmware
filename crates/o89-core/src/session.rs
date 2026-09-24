@@ -657,6 +657,8 @@ impl Sessions {
             | MessageType::History
             | MessageType::Subscribe
             | MessageType::ReadLog
+            | MessageType::WifiScan
+            | MessageType::WifiStatus
             | MessageType::GetConfig => self.wrapped_request(to, envelope, now, dst),
             // Signed: its own MAC and counter, in P-080's order.
             MessageType::Command => self.command(to, envelope, now, fram, dst).await,
@@ -685,6 +687,8 @@ impl Sessions {
             | MessageType::FirmwareResponse
             | MessageType::TimeResponse
             | MessageType::PairResponse
+            | MessageType::WifiScanResponse
+            | MessageType::WifiStatusResponse
             | MessageType::GoodbyeResponse => {
                 bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst)
             }

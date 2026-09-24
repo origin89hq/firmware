@@ -109,7 +109,13 @@ pub const fn crosses_mismatch(side: Side, kind: LinkMessageType) -> bool {
         | LinkMessageType::EnterDownload
         | LinkMessageType::EnterDownloadAck
         | LinkMessageType::PairingWindow
-        | LinkMessageType::PairingWindowAck => false,
+        | LinkMessageType::PairingWindowAck
+        | LinkMessageType::WifiScan
+        | LinkMessageType::WifiScanAck
+        | LinkMessageType::WifiScanResult
+        | LinkMessageType::WifiScanResultAck
+        | LinkMessageType::WifiState
+        | LinkMessageType::WifiStateAck => false,
     }
 }
 
@@ -142,7 +148,13 @@ pub const fn refused_before_link(side: Side, kind: LinkMessageType) -> bool {
         | LinkMessageType::CommsReleaseAck
         | LinkMessageType::EnterDownloadAck
         | LinkMessageType::PairingWindow
-        | LinkMessageType::PairingWindowAck => false,
+        | LinkMessageType::PairingWindowAck
+        | LinkMessageType::WifiScan
+        | LinkMessageType::WifiScanAck
+        | LinkMessageType::WifiScanResult
+        | LinkMessageType::WifiScanResultAck
+        | LinkMessageType::WifiState
+        | LinkMessageType::WifiStateAck => false,
     }
 }
 

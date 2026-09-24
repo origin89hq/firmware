@@ -1012,6 +1012,12 @@ impl Link {
             | LinkMessageType::PairingWindow
             | LinkMessageType::TimeOfferAck
             | LinkMessageType::CommsRelease
+            | LinkMessageType::WifiScan
+            | LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiScanResultAck
+            | LinkMessageType::WifiState
+            | LinkMessageType::WifiStateAck
             | LinkMessageType::EnterDownload => {
                 // `arriving` refuses these at this side; an arm so that a
                 // change to the direction table lands here and not in a
@@ -1101,6 +1107,12 @@ impl Link {
             | LinkMessageType::CommsRelease
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownload
+            | LinkMessageType::WifiScan
+            | LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiScanResultAck
+            | LinkMessageType::WifiState
+            | LinkMessageType::WifiStateAck
             | LinkMessageType::EnterDownloadAck => {
                 // Not a request of the peer's; `received` never sends these
                 // here, and an arm keeps a new opcode from landing in a
@@ -1816,6 +1828,38 @@ impl Link {
 
     /// Requests unanswered for the timeout go again with the same id, up to
     /// the attempts; past that they are given up (L-015).
+    fn request_given_up(&mut self, kind: LinkMessageType, req_id: ReqId, actions: &mut Actions) {
+        // Failed to whatever asked, and nothing more: whether
+        // the link is down is L-100's timer alone (L-015). A
+        // close given up leaves its row to the transport's own
+        // release, or to the link falling.
+        if kind == LinkMessageType::CloseConnection {
+            let _ = self.take_closing(req_id);
+            if self.resync == Resync::Sent(req_id) {
+                // Back to watching: the counts still disagree,
+                // and three more answers send it again.
+                self.resync = Resync::AGREED;
+            }
+        }
+        if kind == LinkMessageType::NetConfig {
+            if let Some(NetworkPush {
+                version, operation, ..
+            }) = self.network_push(req_id)
+            {
+                actions.push(Action::Note(Note::NetworkGaveUp {
+                    req_id,
+                    version,
+                    operation,
+                }));
+            }
+            self.network_sent = None;
+        }
+        if kind == LinkMessageType::PairingWindow {
+            self.pairing.given_up(req_id);
+        }
+        actions.push(Action::Note(Note::RequestFailed(kind)));
+    }
+
     fn retry(&mut self, now: Tick, actions: &mut Actions) {
         // Bounded: each call moves one request on, and no more than
         // `MAX_INFLIGHT` are in flight to move.
@@ -1823,35 +1867,7 @@ impl Link {
             match self.requests.overdue(now) {
                 None => return,
                 Some(Overdue::GivenUp { kind, req_id }) => {
-                    // Failed to whatever asked, and nothing more: whether
-                    // the link is down is L-100's timer alone (L-015). A
-                    // close given up leaves its row to the transport's own
-                    // release, or to the link falling.
-                    if kind == LinkMessageType::CloseConnection {
-                        let _ = self.take_closing(req_id);
-                        if self.resync == Resync::Sent(req_id) {
-                            // Back to watching: the counts still disagree,
-                            // and three more answers send it again.
-                            self.resync = Resync::AGREED;
-                        }
-                    }
-                    if kind == LinkMessageType::NetConfig {
-                        if let Some(NetworkPush {
-                            version, operation, ..
-                        }) = self.network_push(req_id)
-                        {
-                            actions.push(Action::Note(Note::NetworkGaveUp {
-                                req_id,
-                                version,
-                                operation,
-                            }));
-                        }
-                        self.network_sent = None;
-                    }
-                    if kind == LinkMessageType::PairingWindow {
-                        self.pairing.given_up(req_id);
-                    }
-                    actions.push(Action::Note(Note::RequestFailed(kind)));
+                    self.request_given_up(kind, req_id, actions);
                 }
                 Some(Overdue::Resend { kind, req_id }) => match kind {
                     LinkMessageType::LinkUp => {
@@ -1919,6 +1935,12 @@ impl Link {
                     | LinkMessageType::CommsRelease
                     | LinkMessageType::CommsReleaseAck
                     | LinkMessageType::EnterDownload
+                    | LinkMessageType::WifiScan
+                    | LinkMessageType::WifiScanAck
+                    | LinkMessageType::WifiScanResult
+                    | LinkMessageType::WifiScanResultAck
+                    | LinkMessageType::WifiState
+                    | LinkMessageType::WifiStateAck
                     | LinkMessageType::EnterDownloadAck => {
                         // Nothing else is issued as a request yet; the arm
                         // lands here when one is.

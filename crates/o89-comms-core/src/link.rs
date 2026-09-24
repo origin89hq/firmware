@@ -503,6 +503,20 @@ impl Link {
         self.received_valid(kind, envelope, now, store)
     }
 
+    fn time_offer_answered(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Option<Frame> {
+        let req_id = envelope.req_id();
+        let verdict = km43::TimeVerdict::decode(envelope).ok()?;
+        if self
+            .offer_requests
+            .answered(req_id, LinkMessageType::TimeOffer)
+        {
+            self.offer_sample = None;
+            self.offer_delivery = OfferDelivery::Answered(verdict.outcome);
+            self.last_heard = Some(now);
+        }
+        None
+    }
+
     fn received_valid(
         &mut self,
         kind: LinkMessageType,
@@ -570,18 +584,7 @@ impl Link {
                     code: LinkErrorCode::NoAuthorisation,
                 })
             }
-            LinkMessageType::TimeOfferAck => {
-                let verdict = km43::TimeVerdict::decode(envelope).ok()?;
-                if self
-                    .offer_requests
-                    .answered(req_id, LinkMessageType::TimeOffer)
-                {
-                    self.offer_sample = None;
-                    self.offer_delivery = OfferDelivery::Answered(verdict.outcome);
-                    self.last_heard = Some(now);
-                }
-                None
-            }
+            LinkMessageType::TimeOfferAck => self.time_offer_answered(envelope, now),
             LinkMessageType::PairingWindow => {
                 if !self.linked {
                     // Before this side's own statement is answered: discarded
@@ -616,6 +619,12 @@ impl Link {
             | LinkMessageType::PairingWindowAck
             | LinkMessageType::TimeOffer
             | LinkMessageType::CommsReleaseAck
+            | LinkMessageType::WifiScan
+            | LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiScanResultAck
+            | LinkMessageType::WifiState
+            | LinkMessageType::WifiStateAck
             | LinkMessageType::EnterDownloadAck => {
                 // Refused by `arriving` at this side; an arm so a change to
                 // the direction table lands here.

@@ -4,6 +4,7 @@
 # 120-second expiry, selector reuse,
 # enrolment closure/reboot, factory reset, bad proof, and link-up reporting.
 # Host and simulation evidence only; no lamp/radio/phone bench qualification.
+# P-222 (km43 0.6.3) binds client enrolment storage; this firmware is not a client.
 
 # Requirements nothing can test, and a count of the ones nobody has tested yet.
 #
