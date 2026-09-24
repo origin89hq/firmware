@@ -137,3 +137,52 @@ fn p_080_fresh_request_id_does_not_make_an_old_signed_counter_fresh() {
         Incoming::Client(km43::ErrorCode::CounterNotFresh)
     );
 }
+
+#[test]
+fn p_028_five_element_envelope_cannot_execute_its_goodbye() {
+    // Capabilities: inject malformed envelope.
+    let mut bench = linked();
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let key = client.key.take().unwrap();
+    let mut frame = client.wrapped(MessageType::Goodbye, &key);
+    assert_eq!(frame[0], 0x84);
+    frame[0] = 0x85;
+    frame.push(0);
+    // Refused before any element is read, so at 0, 0 (P-025): it names no
+    // connection and stays on the link, as a refusal of the comms
+    // processor's frame. An honest one answers its client itself.
+    assert!(client.send(&mut bench, &frame).is_empty());
+    let refusals: Vec<_> = bench
+        .comms
+        .heard
+        .iter()
+        .filter_map(|heard| match heard {
+            Heard::Refusal {
+                code,
+                session,
+                req_id,
+            } => Some((*code, *session, *req_id)),
+            Heard::Other { .. }
+            | Heard::ToClient { .. }
+            | Heard::Close { .. }
+            | Heard::LinkUp { .. }
+            | Heard::LinkUpAck { .. }
+            | Heard::Heartbeat { .. }
+            | Heard::HeartbeatAck { .. }
+            | Heard::PairingWindow { .. }
+            | Heard::NetConfig { .. } => None,
+        })
+        .collect();
+    assert_eq!(refusals, [(1, 0, ReqId(0))]);
+    assert!(bench.endpoint.sessions.is_bound(Conn::new(1).unwrap()));
+    assert!(bench.endpoint.link.is_up());
+    // The same goodbye in four elements still ends the session.
+    frame.pop();
+    frame[0] = 0x84;
+    let answers = client.send(&mut bench, &frame);
+    let envelope = Envelope::decode(answers.last().unwrap()).unwrap();
+    assert_eq!(envelope.header().kind, MessageType::GoodbyeResponse);
+    assert!(!bench.endpoint.sessions.is_bound(Conn::new(1).unwrap()));
+}

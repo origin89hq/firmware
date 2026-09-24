@@ -75,9 +75,11 @@
 #     checks the session-zero/req-zero diagnostic route; new conformance::p_080
 #     checks the echoed req_id on an authenticated request refusal.
 #     Client outstanding-request completion remains client-side evidence.
-# 12: HostileComms five-element Goodbye is silently dropped by Endpoint's
-#     initial decode, rather than answered with error 1: firmware #122.
-#     The failing reproduction is excluded from this suite pending that fix.
+# 12: new conformance::p_028_five_element_envelope_cannot_execute_its_goodbye
+#     and core session::p_028_a_five_element_goodbye_is_refused_with_error_1_at_zero_zero_and_unbinds_nothing:
+#     refused with error 1 at 0, 0 before any element is read (P-025), which
+#     stays on the link; the honest relay answers the client (o89-comms-core relay).
+#     Dropping the refusal in Endpoint fails the sim test.
 #     Refusing an excessive Hello max_channels is the client's responsibility.
 # 13: existing core request::p_120_a_retry_with_identical_operation_bytes_is_answered_duplicate_and_not_executed
 #     and p_124_the_same_cmd_id_with_different_bytes_is_rejected_and_not_executed;

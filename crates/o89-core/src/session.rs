@@ -176,8 +176,9 @@ pub struct Close {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SessionNote {
-    /// A client frame whose four elements did not read: no handle to answer
-    /// on.
+    /// A frame whose four elements did not read, refused with error 1 at
+    /// `0, 0` before any element was read (P-025, P-028): no handle to
+    /// answer on.
     Unreadable,
     /// A client frame carrying handle 0, which the comms processor stamps
     /// over on every frame it relays (P-021). Its bug; nothing to answer.
@@ -610,7 +611,7 @@ impl Sessions {
         dst: &mut [u8],
     ) -> Reply {
         let Ok(scalars) = LinkEnvelope::decode(frame) else {
-            return Reply::noted(SessionNote::Unreadable);
+            return unreadable(dst);
         };
         let req_id = scalars.req_id();
         let SessionId::Assigned(handle) = scalars.session() else {
@@ -1575,6 +1576,31 @@ fn bare(to: Addressed, code: Incoming, dst: &mut [u8]) -> Reply {
         .ok();
     let mut reply = answered(written);
     reply.note = Some(SessionNote::Refused(wire(code)));
+    reply
+}
+
+/// Error 1 at `0, 0` for a frame whose four elements did not read
+/// (P-025, P-028). It names no connection, so it stays on the UART as a
+/// refusal of the comms processor's frame (L-181); an honest one never
+/// relays such a frame, and answers its client itself.
+fn unreadable(dst: &mut [u8]) -> Reply {
+    let written = ErrorBody {
+        code: Incoming::Client(ErrorCode::MalformedFrame),
+        detail: "",
+    }
+    .write(
+        Header {
+            kind: MessageType::ErrorResponse,
+            session: SessionId::None,
+            req_id: ReqId(0),
+        },
+        dst,
+    )
+    .ok();
+    let mut reply = answered(written);
+    if reply.answer.is_some() {
+        reply.note = Some(SessionNote::Unreadable);
+    }
     reply
 }
 
@@ -3823,6 +3849,58 @@ mod tests {
         let (reply, answer) = rig.send(&frame);
         assert!(answer.is_empty());
         assert_eq!(reply.note, Some(SessionNote::NoHandle));
+    }
+
+    /// Error 1 at `0, 0`, noted as unreadable.
+    fn assert_unreadable(reply: &Reply, answer: &[u8]) {
+        assert_eq!(reply.note, Some(SessionNote::Unreadable));
+        assert_eq!(reply.close, None);
+        assert_eq!(hint(answer), Some(ErrorCode::MalformedFrame as u16));
+        let header = header(answer);
+        assert_eq!(header.kind, MessageType::ErrorResponse);
+        assert_eq!((header.session, header.req_id), (SessionId::None, ReqId(0)));
+    }
+
+    #[test]
+    fn p_028_a_five_element_goodbye_is_refused_with_error_1_at_zero_zero_and_unbinds_nothing() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let (_, _, _) = rig.hello(1);
+        let goodbye = rig.empty(1, MessageType::Goodbye);
+        let mut five = [0u8; 64];
+        five[..goodbye.len()].copy_from_slice(&goodbye);
+        assert_eq!(five[0], 0x84);
+        five[0] = 0x85;
+        let (reply, answer) = rig.send(&five[..=goodbye.len()]);
+        assert_unreadable(&reply, &answer);
+        assert!(rig.sessions.is_bound(conn(1)));
+        assert_eq!((rig.sessions.allocated(), rig.sessions.bound()), (1, 1));
+    }
+
+    #[test]
+    fn p_025_a_frame_that_is_no_envelope_is_refused_with_error_1_at_zero_zero() {
+        let mut rig = Rig::new();
+        let _ = rig.connect(1);
+        let counter = rig.counter();
+        // Three elements, an array of four cut short, a map, nothing.
+        for frame in [&[0x83, 0x00, 0x01, 0x01][..], &[0x84, 0x00], &[0xa0], &[]] {
+            let (reply, answer) = rig.send(frame);
+            assert_unreadable(&reply, &answer);
+        }
+        assert_eq!(rig.counter(), counter);
+        assert_eq!(rig.sessions.allocated(), 1);
+    }
+
+    #[test]
+    fn p_028_an_unreadable_frame_is_refused_before_the_link_or_any_row_is_asked() {
+        let mut rig = Rig::new();
+        let facts = Facts {
+            link_up: false,
+            ..FACTS
+        };
+        let (reply, answer) = rig.send_with(&[0x85, 0x00, 0x01, 0x01, 0xa0, 0x00], &facts);
+        assert_unreadable(&reply, &answer);
+        assert_eq!(rig.sessions.allocated(), 0);
     }
 
     #[test]
