@@ -10,14 +10,15 @@
 //! here: it goes to [`Link::from_client`](crate::Link::from_client) as it
 //! stands.
 //!
-//! The handshake is RFC 6455's, and nothing it carries is decided on beyond
-//! the upgrade itself: no path, no origin, no subprotocol. The client's
+//! The handshake is RFC 6455's on KM43's path, `km43::WS_PATH`, and any
+//! other request-target is answered 404 without an upgrade (P-223). Nothing
+//! else it carries is decided on: no origin, no subprotocol. The client's
 //! identity is proved end to end to the controller, never to this side.
 //! A request longer than [`REQUEST_BYTES`] is refused, never truncated.
 
 use core::fmt::{self, Write as _};
 
-use km43::MAX_PAYLOAD;
+use km43::{MAX_PAYLOAD, WS_PATH};
 use sha1::{Digest, Sha1};
 
 use crate::Closed;
@@ -48,6 +49,8 @@ pub enum Refusal {
     TooLong,
     /// Not `GET <target> HTTP/1.1`.
     NotGet,
+    /// A request-target other than `WS_PATH`, exactly (P-223).
+    NotFound,
     /// No `Upgrade: websocket` or no `Connection: upgrade`.
     NotUpgrade,
     /// A version other than 13.
@@ -57,11 +60,12 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The HTTP answer: 426 names the version this side speaks, 431 a
-    /// request too long, 400 anything else.
+    /// The HTTP answer: 404 a path other than KM43's, 426 names the version
+    /// this side speaks, 431 a request too long, 400 anything else.
     #[must_use]
     pub const fn response(self) -> &'static [u8] {
         match self {
+            Self::NotFound => b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n",
             Self::TooLong => {
                 b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"
             }
@@ -97,14 +101,17 @@ pub fn accept(request: &[u8], response: &mut [u8; RESPONSE_BYTES]) -> Result<usi
         .ok_or(Refusal::NotGet)?;
     let mut lines = text.split("\r\n");
     let mut start = lines.next().ok_or(Refusal::NotGet)?.split(' ');
-    if (
-        start.next(),
-        start.next().is_some(),
-        start.next(),
-        start.next(),
-    ) != (Some("GET"), true, Some("HTTP/1.1"), None)
-    {
+    let (Some("GET"), Some(target), Some("HTTP/1.1"), None) =
+        (start.next(), start.next(), start.next(), start.next())
+    else {
         return Err(Refusal::NotGet);
+    };
+    if target.is_empty() {
+        return Err(Refusal::NotGet);
+    }
+    // Exactly: a trailing slash or a query is another resource (P-223).
+    if target != WS_PATH {
+        return Err(Refusal::NotFound);
     }
     let mut upgrade = false;
     let mut connection = false;
@@ -444,7 +451,7 @@ pub fn close_payload(goodbye: Goodbye, payload: &mut [u8; CONTROL_PAYLOAD]) -> u
 mod tests {
     use super::*;
 
-    const RFC_REQUEST: &[u8] = b"GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://example.com\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const RFC_REQUEST: &[u8] = b"GET /km43 HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://example.com\r\nSec-WebSocket-Version: 13\r\n\r\n";
 
     fn accepted(request: &[u8]) -> Result<[u8; RESPONSE_BYTES], Refusal> {
         let mut response = [0u8; RESPONSE_BYTES];
@@ -469,34 +476,34 @@ mod tests {
 
     #[test]
     fn a_handshake_reads_its_headers_in_any_case_and_among_other_tokens() {
-        let request = b"GET / HTTP/1.1\r\nconnection: keep-alive, Upgrade\r\nUPGRADE: WebSocket\r\nsec-websocket-key:  dGhlIHNhbXBsZSBub25jZQ==\t\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let request = b"GET /km43 HTTP/1.1\r\nconnection: keep-alive, Upgrade\r\nUPGRADE: WebSocket\r\nsec-websocket-key:  dGhlIHNhbXBsZSBub25jZQ==\t\r\nSec-WebSocket-Version: 13\r\n\r\n";
         assert!(accepted(request).is_ok());
     }
 
     #[test]
     fn a_handshake_that_is_not_an_upgrade_is_refused_with_its_reason() {
         let cases: [(&[u8], Refusal); 8] = [
-            (b"POST / HTTP/1.1\r\n\r\n", Refusal::NotGet),
-            (b"GET / HTTP/1.0\r\nUpgrade: websocket\r\n\r\n", Refusal::NotGet),
-            (b"GET / HTTP/1.1 extra\r\n\r\n", Refusal::NotGet),
+            (b"POST /km43 HTTP/1.1\r\n\r\n", Refusal::NotGet),
+            (b"GET /km43 HTTP/1.0\r\nUpgrade: websocket\r\n\r\n", Refusal::NotGet),
+            (b"GET /km43 HTTP/1.1 extra\r\n\r\n", Refusal::NotGet),
             (
-                b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                b"GET /km43 HTTP/1.1\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                 Refusal::NotUpgrade,
             ),
             (
-                b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 8\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                b"GET /km43 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 8\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                 Refusal::Version,
             ),
             (
-                b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                b"GET /km43 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n",
                 Refusal::Key,
             ),
             (
-                b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: short==\r\n\r\n",
+                b"GET /km43 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: short==\r\n\r\n",
                 Refusal::Key,
             ),
             (
-                b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                b"GET /km43 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
                 Refusal::Key,
             ),
         ];
@@ -507,6 +514,51 @@ mod tests {
                 "{}",
                 core::str::from_utf8(request).unwrap_or("")
             );
+        }
+    }
+
+    /// RFC 6455's example request with its target replaced.
+    fn to(target: &str) -> ([u8; 256], usize) {
+        let mut out = [0u8; 256];
+        let rest = RFC_REQUEST.strip_prefix(b"GET /km43").expect("the example");
+        let bytes = b"GET ".iter().chain(target.as_bytes()).chain(rest);
+        let len = out
+            .iter_mut()
+            .zip(bytes)
+            .map(|(at, byte)| *at = *byte)
+            .count();
+        (out, len)
+    }
+
+    #[test]
+    fn p_223_the_upgrade_is_on_km43s_path_and_nowhere_else() {
+        assert_eq!(WS_PATH, "/km43");
+        let (request, len) = to(WS_PATH);
+        assert!(accepted(&request[..len]).is_ok());
+        for other in ["/", "/km43/", "/km43?x=1", "/KM43", "/km4", "/km43/x", "*"] {
+            let (request, len) = to(other);
+            assert_eq!(
+                accepted(&request[..len]).err(),
+                Some(Refusal::NotFound),
+                "{other}"
+            );
+        }
+        assert_eq!(
+            Refusal::NotFound.response(),
+            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn p_223_a_request_that_is_not_a_get_is_refused_before_its_path() {
+        // The 404 is for a GET to another resource; a malformed start line
+        // is a bad request wherever it points.
+        for request in [
+            b"POST /other HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET /other HTTP/1.0\r\n\r\n",
+            b"GET  HTTP/1.1\r\n\r\n",
+        ] {
+            assert_eq!(accepted(request).err(), Some(Refusal::NotGet));
         }
     }
 
