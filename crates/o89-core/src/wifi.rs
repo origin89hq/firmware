@@ -34,9 +34,9 @@ pub struct Wifi {
     list_at: Tick,
     report: Option<RadioReport>,
     announced: Option<(RadioReport, Tick)>,
-    /// The latest version whose `joined` this controller boot announced
+    /// The highest version whose `joined` this controller boot announced
     /// (P-220). Versions rise except when a damaged section is rewritten from
-    /// zero, and then the worst case is one join early or one held.
+    /// zero; a repeated version then waits the interval, never writing early.
     joined: Option<u32>,
 }
 
@@ -228,7 +228,7 @@ impl Wifi {
     pub fn recorded(&mut self, record: WifiStatusChanged, now: Tick) {
         self.announced = Some((record.report, now));
         if matches!(record.report.radio, Radio::Joined { .. }) {
-            self.joined = Some(record.report.version);
+            self.joined = self.joined.max(Some(record.report.version));
         }
     }
 
@@ -237,7 +237,7 @@ impl Wifi {
     fn first_join_after_failure(&self, previous: RadioReport, report: RadioReport) -> bool {
         matches!(previous.radio, Radio::Failed { .. })
             && matches!(report.radio, Radio::Joined { .. })
-            && self.joined != Some(report.version)
+            && self.joined.is_none_or(|joined| report.version > joined)
     }
 }
 
@@ -539,5 +539,26 @@ mod tests {
         );
         wifi.reported(failed(2));
         assert_eq!(record(&mut wifi, 2, at(4)), None);
+    }
+    #[test]
+    fn f_093_p_220_a_version_repeated_after_a_damaged_section_never_joins_early_again() {
+        let mut wifi = Wifi::EMPTY;
+        for (version, ms) in [(1, 0), (2, 2)] {
+            wifi.reported(failed(version));
+            assert!(record(&mut wifi, version, at(ms)).is_some());
+            wifi.reported(joined(version));
+            assert!(record(&mut wifi, version, at(ms + 1)).is_some());
+        }
+        wifi.reported(failed(1));
+        assert_eq!(
+            record(&mut wifi, 1, at(4)).expect("new version").report,
+            failed(1)
+        );
+        wifi.reported(joined(1));
+        assert_eq!(record(&mut wifi, 1, at(5)), None, "joined once this boot");
+        assert_eq!(
+            record(&mut wifi, 1, at(600_004)).expect("interval").report,
+            joined(1)
+        );
     }
 }
