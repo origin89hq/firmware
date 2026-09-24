@@ -1286,6 +1286,7 @@ dependencies = [
 name = "o89-sim"
 version = "0.0.0"
 dependencies = [
+ "critical-section",
  "embassy-futures",
  "embassy-net",
  "embassy-time",
@@ -1294,6 +1295,7 @@ dependencies = [
  "o89-comms-core",
  "o89-core",
  "serde_json",
+ "smoltcp",
 ]
 
 [[package]]
