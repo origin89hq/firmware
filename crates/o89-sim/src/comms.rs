@@ -14,23 +14,29 @@
 //! controller, reboot with a new `boot_id`, lose a release on the wire, and
 //! put on the wire the frames a real peer would not.
 //!
-//! The connections it announces are its own, outside that link, because the
-//! comms firmware has no connection table yet (#90): it keeps the handles it
-//! announced and has not released, counts them in its heartbeats (L-101),
-//! and closes them when asked, reporting how many (L-090). A connection the
-//! controller refused for a full table is not kept. It builds those with `km43`'s own writers, so what
-//! the controller reads is what a real peer would have sent, and a frame it
-//! cannot build is an error a test reads, never a panic in this crate.
+//! It connects clients honestly through its link's own connection table
+//! (#90): a row per transport, announced, counted in every heartbeat
+//! (L-101), closed and counted when the controller asks (L-090), dropped
+//! when the controller refuses it. On top of that it can invent
+//! connections outside the table, with handles of its choosing: it keeps
+//! the handles it announced that way and has not released, counts them in
+//! its heartbeats with the table's, and closes them when asked, reporting
+//! how many with the table's. One it invented that the controller refused
+//! for a full table is not kept. It builds those with `km43`'s own
+//! writers, so what the controller reads is what a real peer would have
+//! sent, and a frame it cannot build is an error a test reads, never a
+//! panic in this crate.
 
 use std::collections::VecDeque;
 
 use km43::{
     ClientConnected, ClientDown, ClientUp, ClockOffer, CloseConnection, CloseConnections,
-    CloseReason, CloseReport, DisconnectReason, Envelope, ErrorBody, FrameReader, FrameWriter,
-    Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader, LinkMessageType, LinkTransport, LinkUp,
-    MAX_FRAME, MessageType, PairingWindowNotice, Received, ReqId, SessionId, Side, Version,
+    CloseReason, CloseReport, Conn, DisconnectReason, Envelope, ErrorBody, FrameReader,
+    FrameWriter, Header, Heartbeat, Incoming, LinkEnvelope, LinkHeader, LinkMessageType,
+    LinkTransport, LinkUp, MAX_FRAME, MessageType, PairingWindowNotice, Received, ReqId, SessionId,
+    Side, Version,
 };
-use o89_comms_core::{Frame, Identity, Link as CommsLink};
+use o89_comms_core::{Frame, Identity, Link as CommsLink, Peer, Refused, Status};
 use o89_core::{HEARTBEAT_PERIOD, Millis, OURS, Tick};
 
 /// Whether the peer answers at all.
@@ -93,7 +99,8 @@ pub enum Releases {
     /// A transport that goes is released over the link.
     Sent,
     /// The transport goes and its `ClientDisconnected` is lost on the wire:
-    /// the peer stops counting it, and the controller is never told.
+    /// the peer stops counting it, and the controller is never told. A
+    /// release from its link's table is lost at every attempt.
     Lost,
 }
 
@@ -485,6 +492,40 @@ impl HostileComms {
         Ok(self.wire(&frame, Some(LinkMessageType::HeartbeatAck), now))
     }
 
+    /// A client connects honestly: its link's table gives it a row and a
+    /// handle, and announces it at its next turn (L-060).
+    pub fn connect(&mut self) -> Result<Conn, Refused> {
+        let peer = Peer::Ipv4 {
+            addr: [192, 168, 4, 2],
+            port: 50_000,
+        };
+        self.link
+            .as_mut()
+            .ok_or(Refused::NotLinked)?
+            .connect(LinkTransport::WifiLocal, peer)
+    }
+
+    /// What the table asks of the transport holding `conn`.
+    #[must_use]
+    pub fn status(&self, conn: Conn) -> Option<Status> {
+        self.link.as_ref().and_then(|link| link.status(conn))
+    }
+
+    /// The transport holding `conn` went.
+    pub fn transport_gone(&mut self, conn: Conn, reason: DisconnectReason) {
+        if let Some(link) = self.link.as_mut() {
+            link.gone(conn, reason);
+        }
+    }
+
+    /// Rows its table holds a transport for (L-101).
+    #[must_use]
+    pub fn table_conns(&self) -> u8 {
+        self.link
+            .as_ref()
+            .map_or(0, |link| link.connections().allocated())
+    }
+
     /// A connection announced with this handle, over local Wi-Fi.
     pub fn announce_connection(&mut self, conn: u16, now: Tick) -> Result<Vec<u8>, Broken> {
         self.announce_as(conn, LinkTransport::WifiLocal, "192.168.4.2", now)
@@ -688,14 +729,21 @@ impl HostileComms {
             Frame::PairingWindowAck { .. } => {
                 (Some(LinkMessageType::PairingWindowAck), false, false)
             }
+            Frame::ClientConnected { .. } => (Some(LinkMessageType::ClientConnected), false, false),
+            Frame::ClientDisconnected { .. } => {
+                (Some(LinkMessageType::ClientDisconnected), false, false)
+            }
             Frame::Refuse { .. } => (None, false, false),
         };
         let silent = match self.caps.answers {
             Answers::Nothing => true,
             Answers::Everything | Answers::TalksOnly => false,
         };
+        let lost = matches!(frame, Frame::ClientDisconnected { .. })
+            && self.caps.releases == Releases::Lost;
         if (kind == Some(LinkMessageType::NetConfigAck) && self.caps.withhold_network_ack)
             || silent
+            || lost
             || (statement && self.caps.statement == Statement::Withheld)
             || (beat && self.caps.beats == Beats::Withheld)
         {
@@ -751,9 +799,15 @@ impl HostileComms {
                 .since(self.booted_at)
                 .and_then(|up| up.as_millis().checked_div(1_000))
                 .map_or(0, |secs| u32::try_from(secs).unwrap_or(u32::MAX));
+            let table = self
+                .link
+                .as_ref()
+                .map_or(0, |link| link.connections().allocated());
             Heartbeat {
                 uptime_s,
-                conns: u8::try_from(self.live.len()).unwrap_or(u8::MAX),
+                conns: u8::try_from(self.live.len())
+                    .unwrap_or(u8::MAX)
+                    .saturating_add(table),
             }
             .write(header(kind, req_id), envelope)
         };
@@ -762,8 +816,20 @@ impl HostileComms {
             Frame::HeartbeatAck { req_id } => {
                 beat(LinkMessageType::HeartbeatAck, req_id, &mut envelope)
             }
-            Frame::CloseReport { req_id, .. } => {
+            Frame::CloseReport {
+                req_id,
+                outcome: table_outcome,
+                closed: table_closed,
+            } => {
+                // What the close did to the connections it invented, with
+                // what it did to its table's.
                 let (outcome, closed) = self.close_report.take()?;
+                let outcome = if table_outcome == CloseConnection::Closed {
+                    CloseConnection::Closed
+                } else {
+                    outcome
+                };
+                let closed = closed.saturating_add(table_closed);
                 CloseReport { outcome, closed }.write(
                     header(LinkMessageType::CloseConnectionAck, req_id),
                     &mut envelope,
@@ -775,6 +841,8 @@ impl HostileComms {
             | Frame::TimeOffer { .. }
             | Frame::NetReport { .. }
             | Frame::PairingWindowAck { .. }
+            | Frame::ClientConnected { .. }
+            | Frame::ClientDisconnected { .. }
             | Frame::Refuse { .. } => return None,
         };
         let Ok(len) = written else {

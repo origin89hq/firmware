@@ -17,19 +17,28 @@
 
 #![no_std]
 
+mod access_point;
+mod connections;
 #[cfg(any(test, feature = "frames"))]
 mod frame_bench;
 mod link;
 mod network;
 mod ntp;
+mod relay;
+pub mod sockets;
+mod websocket;
 mod window;
 
+pub use access_point::*;
+pub use connections::*;
 #[cfg(any(test, feature = "frames"))]
 pub use frame_bench::FrameBenchStart;
 pub use link::*;
 pub use network::*;
 pub use ntp::*;
-pub use o89_link::{EncodeError, Millis, Tick};
+pub use o89_link::{Country, EncodeError, Millis, Tick};
+pub use relay::*;
+pub use websocket::*;
 pub use window::*;
 
 mod credential_store;

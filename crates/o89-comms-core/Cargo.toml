@@ -18,6 +18,7 @@ frames = []
 [dependencies]
 km43.workspace = true
 o89-link = { path = "../o89-link" }
+sha1.workspace = true
 
 [lints]
 workspace = true

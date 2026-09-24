@@ -29,6 +29,8 @@
 #![no_std]
 #![no_main]
 
+mod access_point;
+mod clients;
 mod credentials;
 mod link;
 #[cfg(not(feature = "no-window"))]

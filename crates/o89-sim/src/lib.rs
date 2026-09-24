@@ -28,6 +28,8 @@
 //! itself.
 
 mod comms;
+#[cfg(test)]
+mod connections;
 mod fram;
 #[cfg(test)]
 mod link;

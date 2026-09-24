@@ -7,17 +7,32 @@
 //! (L-033, L-100, L-120). This file reads UART0 and the clock, hands both
 //! in, and writes what comes back.
 //!
+//! The link and its table are shared with the client transports
+//! (`clients.rs`) through [`LINK`], an async mutex no task holds across an
+//! await, so a lock is free whenever a task runs. A frame from the
+//! controller goes to the link, to the client its session names, or
+//! nowhere (`o89_comms_core::route`). A client's frame, already stamped,
+//! arrives on `clients::UPSTREAM` and goes out as it stands, one a turn
+//! after the UART has been read; it never reaches the link (L-194).
+//!
 //! Every await has a deadline: a read waits one tick, a write two hundred
 //! milliseconds. The watchdog is fed only when this loop and the radio,
 //! network runner and NTP tasks have all made progress.
 
+use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, with_timeout};
 use esp_hal::Async;
 use esp_hal::rtc_cntl::Rwdt;
 use esp_hal::uart::{Uart, UartTx};
 use km43::{FrameReader, FrameWriter, LinkEnvelope, MAX_FRAME, Received};
-use o89_comms_core::{Frame, Identity, Link, Tick};
+use o89_comms_core::{Frame, Identity, Link, Route, Tick};
+
+/// The link, with its connection table, shared with the client transports.
+/// Never held across an await.
+pub static LINK: Mutex<CriticalSectionRawMutex, Link> = Mutex::new(Link::new(Tick::ZERO));
 
 /// This firmware, as key 4 of every `LinkUp`: its version with the commit
 /// it was built from, which the build script reads from git (L-034). The
@@ -59,35 +74,74 @@ pub async fn run(
         hw: HW,
         boot_id,
     };
-    let mut link = Link::new(now());
-    link.restore_network(credential);
+    {
+        let mut link = LINK.lock().await;
+        *link = Link::new(now());
+        link.restore_network(credential);
+    }
     let mut chunk = [0u8; 64];
     #[cfg(feature = "frames")]
     let mut frames = frames::Blast::new();
-    // Bounded per turn: a read waits `TICK` at most, and the tick follows.
+    // Bounded per turn: a read waits `TICK` at most, a client's frame one
+    // write deadline, and the tick follows.
     loop {
         if crate::radio::healthy() {
             rwdt.feed();
         }
-        if let Ok(Ok(count)) = with_timeout(TICK, rx.read_async(&mut chunk)).await {
-            for byte in chunk.get(..count).unwrap_or(&[]) {
-                if let Received::Frame(frame) = reader.push(*byte)
-                    && let Ok(envelope) = LinkEnvelope::decode(frame)
-                    && let Some(answer) = link.received_with_store(envelope, now(), |record| {
-                        o89_comms_core::store_credential(&mut store, record).is_ok()
-                    })
-                {
-                    crate::radio::configure(link.credential().copied());
-                    #[cfg(feature = "frames")]
-                    frames.start.observe(answer);
-                    send(&link, &me, answer, &mut tx, &mut writer).await;
+        let turn = select(
+            with_timeout(TICK, rx.read_async(&mut chunk)),
+            crate::clients::UPSTREAM.receive(),
+        )
+        .await;
+        match turn {
+            Either::First(Ok(Ok(count))) => {
+                for byte in chunk.get(..count).unwrap_or(&[]) {
+                    let Received::Frame(frame) = reader.push(*byte) else {
+                        continue;
+                    };
+                    let (answer, credential) = {
+                        let mut link = LINK.lock().await;
+                        let answer = match link.route(frame) {
+                            Route::Link => LinkEnvelope::decode(frame).ok().and_then(|envelope| {
+                                link.received_with_store(envelope, now(), |record| {
+                                    o89_comms_core::store_credential(&mut store, record).is_ok()
+                                })
+                            }),
+                            Route::Client(conn) => {
+                                crate::clients::deliver(&mut link, conn, frame);
+                                None
+                            }
+                            Route::Nowhere => None,
+                        };
+                        (answer, link.credential().copied())
+                    };
+                    if let Some(answer) = answer {
+                        crate::radio::configure(credential);
+                        #[cfg(feature = "frames")]
+                        frames.start.observe(answer);
+                        send(&me, answer, &mut tx, &mut writer).await;
+                    }
+                }
+            }
+            Either::First(Ok(Err(_)) | Err(_)) => {}
+            Either::Second(stamped) => {
+                // A client's frame, stamped with its handle (P-021). One that
+                // does not leave is lost, and the client's retry recovers it.
+                let mut bytes = [0u8; MAX_FRAME];
+                if let Ok(len) = writer.write(stamped.bytes(), &mut bytes) {
+                    let _left = with_timeout(
+                        WRITE_DEADLINE,
+                        write_all(&mut tx, bytes.get(..len).unwrap_or(&[])),
+                    )
+                    .await;
                 }
             }
         }
-        if let Some(frame) = link.tick(now()) {
+        let frame = LINK.lock().await.tick(now());
+        if let Some(frame) = frame {
             #[cfg(feature = "frames")]
             frames.start.observe(frame);
-            send(&link, &me, frame, &mut tx, &mut writer).await;
+            send(&me, frame, &mut tx, &mut writer).await;
         }
         if let Ok(sample) = crate::radio::SAMPLES.try_receive()
             && sample.at.elapsed() < Duration::from_secs(1)
@@ -99,7 +153,11 @@ pub async fn run(
                 server: crate::radio::SERVER,
             };
             let mut bytes = [0; MAX_FRAME];
-            if let Ok(Some(len)) = link.time_offer(offer, now(), &mut writer, &mut bytes) {
+            let offered = LINK
+                .lock()
+                .await
+                .time_offer(offer, now(), &mut writer, &mut bytes);
+            if let Ok(Some(len)) = offered {
                 crate::radio::time_offered(now());
                 let _sent = with_timeout(
                     WRITE_DEADLINE,
@@ -112,7 +170,7 @@ pub async fn run(
         // so the controller's heartbeats are answered through the run and
         // its ladder never cuts the rail (F-087).
         #[cfg(feature = "frames")]
-        frames.batch(&link, &mut tx, &mut writer).await;
+        frames.batch(&mut tx, &mut writer).await;
         // A read that is ready at once does not yield: a controller that
         // floods the UART would otherwise hold the executor every turn.
         yield_now().await;
@@ -128,14 +186,17 @@ fn now() -> Tick {
 /// that does not build or does not leave is one the controller retries or
 /// the ladder counts.
 async fn send(
-    link: &Link,
     me: &Identity<'_>,
     frame: Frame,
     tx: &mut UartTx<'static, Async>,
     writer: &mut FrameWriter,
 ) {
     let mut bytes = [0u8; MAX_FRAME];
-    let Ok(len) = link.build(frame, me, now(), writer, &mut bytes) else {
+    let built = LINK
+        .lock()
+        .await
+        .build(frame, me, now(), writer, &mut bytes);
+    let Ok(len) = built else {
         return;
     };
     // A frame that does not leave is one the controller retries or the
@@ -165,10 +226,10 @@ async fn write_all(tx: &mut UartTx<'static, Async>, mut bytes: &[u8]) -> bool {
 /// controller (F-087).
 #[cfg(feature = "frames")]
 mod frames {
-    use super::{UartTx, WRITE_DEADLINE, write_all};
+    use super::{LINK, UartTx, WRITE_DEADLINE, write_all};
     use embassy_time::with_timeout;
     use km43::{FrameWriter, MAX_FRAME, MAX_PAYLOAD};
-    use o89_comms_core::{FrameBenchStart, Link};
+    use o89_comms_core::FrameBenchStart;
     use o89_link::{CUT_RUN, PER_CUT, cut_point, stamp, worst_case};
 
     /// How many the run sends: ten thousand worst-case frames (F-087), or
@@ -214,12 +275,15 @@ mod frames {
         /// being measured is the wire and not the protocol.
         pub async fn batch(
             &mut self,
-            link: &Link,
             tx: &mut UartTx<'static, esp_hal::Async>,
             writer: &mut FrameWriter,
         ) {
-            self.start.controller(link.controller_bench_mode());
-            if !self.start.ready(link.is_linked()) || self.sent >= TOTAL || self.failed {
+            let (mode, linked) = {
+                let link = LINK.lock().await;
+                (link.controller_bench_mode(), link.is_linked())
+            };
+            self.start.controller(mode);
+            if !self.start.ready(linked) || self.sent >= TOTAL || self.failed {
                 return;
             }
             let mut payload = [0u8; MAX_PAYLOAD];

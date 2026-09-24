@@ -740,7 +740,8 @@ its answer frees every row (L-102), so a release lost on the wire leaks a
 row for six seconds rather than until the next reboot. Under a major
 mismatch the peer would refuse that close (L-050), so nothing is counted
 and a close already owed waits for an agreed version. The comms firmware
-counts no connections until it has a table (#90). Time offers go through a bounded
+counts the rows of its own table (below), and its answer to the close
+reports how many transports it closed (L-090). Time offers go through a bounded
 queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
@@ -1308,15 +1309,45 @@ when cached credentials name an unavailable network. The ESP32 carries
 bytes; the STM32 verifies proofs, owns enrolment and holds every key.
 Bluetooth connection or bonding alone grants no KM43 permission.
 
-Local Wi-Fi uses one WebSocket connection per client (P-034). The comms
+Local Wi-Fi uses one WebSocket connection per client (P-034), on TCP port
+80 of the station's network, served by eight workers, one per row, inside
+the Wi-Fi session, so a changed network closes every connection and releases
+its row. Each worker owns fixed buffers for its socket, a client's envelope,
+its stamped copy and one frame for the client; each has a two-frame mailbox
+the link task fills from the UART, and a client whose mailbox is full when a
+frame arrives is closed rather than a frame dropped or evicted. Clients'
+stamped frames reach the UART through a two-envelope queue the link task
+drains one a turn after reading the UART; a frame that cannot enter it
+within a second is lost and its client retries. The opening handshake is
+RFC 6455's within 1 024 bytes and five seconds; no path, origin or
+subprotocol is decided on. A text frame, a fragmented message, an unmasked
+frame or one over one envelope closes the connection (1003, 1002, 1009).
+Every close carries a code and a reason a client can show (L-061). A ninth
+client finds no listening socket. The link, with the table, is shared with
+the workers through an async mutex no task holds across an await. The comms
 processor's own access point remains the browser provisioning fallback,
-raised only while no network is cached or the pairing window is open. The
+raised only while no network is cached or the pairing window is open, and
+only under a regulatory country from the controller's network record: a
+pairing report carries none, and an unwritten clear keeps every radio off
+(L-133). A unit never given a network therefore has no access point; its
+first pairing is BLE's. The
 controller reports its window over the link with KM43's `PairingWindow`
 after every link-up, on the opening and on every closure, an enrolment's
 `Pair` answer ahead of the closed report (L-195); the comms processor acts
 on it only from the controller UART once its own link is up (L-194) and
-keeps the lifetime on its own clock from receipt. Raising the access point
-on that lifetime is [#90](https://github.com/origin89hq/firmware/issues/90).
+keeps the lifetime on its own clock from receipt. The radio reads that
+lifetime once a second (`o89_comms_core::Plan`): a `clear` record raises
+the access point alone, a `set` record raises it beside the station while
+the window is open, and a change of plan restarts the Wi-Fi session. When
+the window's end takes the access point down, its workers take no new
+client and their clients get 500 ms to take what is already queued (L-196).
+The access point is open, named `origin89-` and the last two bytes of its
+address, on the country's channel plan through the same country lookup the
+station uses, at 192.168.4.1/24 with no gateway. It admits eight phones.
+`edge-dhcp` answers their DHCP over a UDP socket of ours, eight leases of
+five minutes over a range of eight addresses, so an expired lease is reused
+and a ninth phone waits for one; it allocates nothing. Two WebSocket
+workers serve it, their rows from the same table.
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
 
@@ -1334,7 +1365,25 @@ a valid `LinkUp`.
 BLE and WebSocket share the bounded connection table, with eight rows and
 handles from a counter never 0 and never reused before the controller acknowledges the disconnect (L-060, L-080);
 every inbound client frame has its handle stamped into `session_id` (P-021);
-a link-local type on a client transport is dropped and answered (L-002). A
+a link-local type on a client transport is dropped and answered (L-002). The
+table lives in `o89-comms-core`'s link. A transport gets a row only while
+linked, and a ninth is refused with nothing evicted; a row still waiting on
+the answer to its release holds its place. Announcements and releases share
+L-014's four requests with the time offer, three at a time, and wait for a
+slot when all three are out. A refused `ClientConnected` drops the row and
+closes the transport with its reason (L-061); one unanswered three times
+closes the transport and is released, since the controller may hold the
+row; an unanswered release goes again under a new id until answered or the
+link falls. `conns` counts rows whose transport exists, announced or open
+(L-101). A `CloseConnection` closes the transports it names and reports how
+many (L-090); after a resync every transport is closed, and each client that
+reconnects is announced under a new handle, which is the re-announcement
+L-102 asks of a side that keeps no connection without its transport. A frame
+that is not an envelope is answered `Error 1` at `0, 0` on its own connection
+(P-025, P-028), since only this side knows where it came from. The
+controller's frames go to the open row their `session_id` names, and a
+refusal carrying one of the six link codes no client may see goes nowhere
+(L-180). A
 controller that goes quiet closes every client, stops advertising and retries
 `LinkUp` every two seconds (L-120); it never answers a `Discover` from memory
 (L-121).
@@ -1357,9 +1406,17 @@ the session, dropping its sockets and interface before the controller; the
 radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep
 Wi-Fi off. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
-The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack has
-three socket slots (DHCP, DNS, NTP), and the time-offer channel holds one
-sample, refusing a new sample while full.
+The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. Each IP stack's
+socket set is fixed, and smoltcp panics, resetting the module, when a
+socket arrives at a full one, so each budget is a sum of named slots in
+`o89_comms_core::sockets`, one per socket anything opens. The station's
+stack has eleven: embassy-net's own DNS and DHCP client, NTP, and one TCP
+socket per WebSocket worker. The access point's has four: embassy-net's
+DNS, which its `dns` feature adds to every stack, its DHCP server, and two
+workers. A host test builds both stacks with the firmware's embassy-net
+release and features and holds every socket open at once, and `cargo xtask
+check` refuses the two feature lists differing. The time-offer channel
+holds one sample, refusing a new sample while full.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.
