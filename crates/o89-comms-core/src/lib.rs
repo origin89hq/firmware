@@ -23,6 +23,7 @@ mod connections;
 #[cfg(any(test, feature = "frames"))]
 mod frame_bench;
 mod link;
+pub mod mdns;
 mod network;
 mod ntp;
 mod progress;

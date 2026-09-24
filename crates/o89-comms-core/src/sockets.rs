@@ -22,6 +22,9 @@ pub const EMBASSY_DNS: usize = 1;
 pub const EMBASSY_DHCP_CLIENT: usize = 1;
 /// The station's NTP query: one UDP socket, open for one query at a time.
 pub const NTP: usize = 1;
+/// The station's mDNS responder (KM43 P-224): one UDP socket on 5353 for
+/// the session.
+pub const MDNS: usize = 1;
 /// The access point's DHCP server: one UDP socket for the session.
 pub const DHCP_SERVER: usize = 1;
 /// WebSocket workers on the station's network, each holding one TCP
@@ -31,9 +34,9 @@ pub const STATION_WORKERS: usize = ROWS;
 /// at a time.
 pub const ACCESS_POINT_WORKERS: usize = 2;
 
-/// The station's stack: `embassy-net`'s DNS and DHCP client, NTP, and its
-/// workers.
-pub const STATION: usize = EMBASSY_DNS + EMBASSY_DHCP_CLIENT + NTP + STATION_WORKERS;
+/// The station's stack: `embassy-net`'s DNS and DHCP client, NTP, the mDNS
+/// responder, and its workers.
+pub const STATION: usize = EMBASSY_DNS + EMBASSY_DHCP_CLIENT + NTP + MDNS + STATION_WORKERS;
 /// The access point's stack: `embassy-net`'s DNS, the DHCP server, and its
 /// workers.
 pub const ACCESS_POINT: usize = EMBASSY_DNS + DHCP_SERVER + ACCESS_POINT_WORKERS;
@@ -43,6 +46,6 @@ const _: () = assert!(
     "a phone on the access point needs a worker"
 );
 const _: () = assert!(
-    STATION == 11 && ACCESS_POINT == 4,
+    STATION == 12 && ACCESS_POINT == 4,
     "the architecture states both budgets"
 );

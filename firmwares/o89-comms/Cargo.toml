@@ -74,7 +74,7 @@ esp-wifi-sys-esp32c6 = "=0.3.0"
 # `dns` and `dhcpv4` add embassy-net's own sockets to a stack's budget
 # (`o89_comms_core::sockets`); `o89-sim`'s test of the budgets builds this
 # exact requirement, and `cargo xtask check` refuses the two differing.
-embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet", "multicast"] }
 # The DHCP client's retry timings: embassy-net takes smoltcp's `Duration`
 # without re-exporting it. Pinned to the release embassy-net resolves, whose
 # features it sets.

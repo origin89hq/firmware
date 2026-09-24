@@ -2,7 +2,7 @@
 //! One desired configuration replaces the previous value; there is no queue.
 use core::cell::RefCell;
 use embassy_futures::join::join3;
-use embassy_futures::select::{select, select4};
+use embassy_futures::select::{select, select3, select4};
 use embassy_net::{Config, DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
@@ -32,6 +32,9 @@ static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 /// The station's WebSocket workers' buffers, lent to each session.
 static CLIENTS: ConstStaticCell<[Buffers; STATION_WORKERS]> =
     ConstStaticCell::new([const { Buffers::EMPTY }; STATION_WORKERS]);
+/// The station's mDNS responder's buffers, lent to each session.
+static MDNS: ConstStaticCell<crate::mdns::Buffers> =
+    ConstStaticCell::new(crate::mdns::Buffers::EMPTY);
 /// The access point's sockets: embassy-net's DNS, which every stack of
 /// this build carries, its DHCP server, and one TCP socket per WebSocket
 /// worker.
@@ -85,6 +88,7 @@ pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<
     let held = Held {
         resources: RESOURCES.try_init(StackResources::new()).ok_or(())?,
         clients: CLIENTS.try_take().ok_or(())?,
+        mdns: MDNS.try_take().ok_or(())?,
         ap_resources: AP_RESOURCES.try_init(StackResources::new()).ok_or(())?,
         ap_clients: AP_CLIENTS.try_take().ok_or(())?,
     };
@@ -92,11 +96,12 @@ pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<
     Ok(())
 }
 
-/// What every session borrows: each network's stack resources and its
-/// WebSocket workers' buffers.
+/// What every session borrows: each network's stack resources, its
+/// WebSocket workers' buffers, and the station's mDNS buffers.
 struct Held {
     resources: &'static mut StackResources<SOCKETS>,
     clients: &'static mut [Buffers; STATION_WORKERS],
+    mdns: &'static mut crate::mdns::Buffers,
     ap_resources: &'static mut StackResources<AP_SOCKETS>,
     ap_clients: &'static mut [Buffers; access_point::WORKERS],
 }
@@ -139,8 +144,9 @@ async fn plan() -> Plan {
     Plan::of(desired().as_ref(), pairing_open)
 }
 
-/// The station's configuration, hostname and country from a `set` record.
-fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &str)> {
+/// The station's configuration, its DHCP configuration, the country and the
+/// hostname, which DHCP and mDNS both carry, from a `set` record.
+fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &str, &str)> {
     let Ok(km43::NetChange::Set {
         ssid,
         psk,
@@ -151,6 +157,7 @@ fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &st
     else {
         return None;
     };
+    let name = hostname;
     let (Ok(ssid), Ok(password), Ok(hostname)) =
         (ssid.try_into(), psk.try_into(), hostname.try_into())
     else {
@@ -163,7 +170,7 @@ fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &st
     dhcp.hostname = Some(hostname);
     dhcp.retry_config.discover_timeout =
         smoltcp::time::Duration::from_millis(o89_comms_core::DHCP_DISCOVER_RESEND.as_millis());
-    Some((config, dhcp, country))
+    Some((config, dhcp, country, name))
 }
 
 fn seed() -> u64 {
@@ -187,7 +194,7 @@ async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) {
 
 /// The cached network alone.
 async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, record: Credential) {
-    let Some((config, dhcp, country)) = station_config(&record) else {
+    let Some((config, dhcp, country, hostname)) = station_config(&record) else {
         return;
     };
     if country_code(country).is_err()
@@ -204,15 +211,19 @@ async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, r
         &mut *held.resources,
         seed(),
     );
-    // All four futures are polled concurrently. Station returns when the
-    // record or the plan changes; cancellation drops the client connections,
-    // releasing their rows, then NTP sockets and the runner, before
-    // controller teardown. The first three report watchdog progress.
-    let _finished = select4(
-        network(runner),
-        ntp(stack),
-        station(controller, stack, record, Plan::Station),
-        crate::clients::serve(stack, 0, held.clients),
+    // All five futures are polled concurrently. Station returns when the
+    // record or the plan changes, once the responder has said goodbye;
+    // cancellation drops the client connections, releasing their rows,
+    // then the mDNS and NTP sockets and the runner, before controller
+    // teardown. The first three report watchdog progress.
+    let _finished = select(
+        select4(
+            network(runner),
+            ntp(stack),
+            station(controller, stack, record, Plan::Station),
+            crate::clients::serve(stack, 0, held.clients),
+        ),
+        crate::mdns::respond(stack, hostname, held.mdns),
     )
     .await;
 }
@@ -263,7 +274,7 @@ async fn both_session(
     record: Credential,
     country: Country,
 ) {
-    let Some((station_config, dhcp, _)) = station_config(&record) else {
+    let Some((station_config, dhcp, _, hostname)) = station_config(&record) else {
         return;
     };
     let (Some(station_interface), Some(ap_interface)) =
@@ -285,6 +296,7 @@ async fn both_session(
     let Held {
         resources,
         clients,
+        mdns,
         ap_resources,
         ap_clients,
     } = held;
@@ -302,13 +314,14 @@ async fn both_session(
     );
     // Station returns when the record or the plan changes, after draining
     // the access point if the window closed (L-196).
-    let _finished = select(
+    let _finished = select3(
         select4(
             network(runner),
             ntp(stack),
             station(controller, stack, record, Plan::Both { country }),
             crate::clients::serve(stack, 0, clients),
         ),
+        crate::mdns::respond(stack, hostname, mdns),
         join3(
             network(ap_runner),
             access_point::dhcp(ap_stack),
@@ -390,6 +403,8 @@ async fn station(
     loop {
         progress(Task::Station);
         if desired() != Some(applied) {
+            // The goodbye goes out on the network being left (P-224).
+            crate::mdns::leave().await;
             return;
         }
         let next = self::plan().await;
@@ -399,9 +414,11 @@ async fn station(
                 // way before the access point goes (L-196).
                 crate::clients::drain_access_point().await;
             }
+            crate::mdns::leave().await;
             return;
         }
         if scan(controller).await {
+            crate::mdns::leave().await;
             return;
         }
         let connected = controller.is_connected();
@@ -503,7 +520,7 @@ async fn query(stack: Stack<'_>) -> Option<Sample> {
 
 /// Link ownership never waits on the radio; a stalled lock resets through the
 /// recovery window rather than stranding an accepted scan indefinitely.
-async fn diagnostics() -> embassy_sync::mutex::MutexGuard<
+pub(crate) async fn diagnostics() -> embassy_sync::mutex::MutexGuard<
     'static,
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
     o89_comms_core::Link,

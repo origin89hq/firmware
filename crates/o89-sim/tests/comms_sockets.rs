@@ -15,6 +15,7 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
     Config, DhcpConfig, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
 };
+use o89_comms_core::mdns::{MDNS_GROUP, MDNS_PORT};
 use o89_comms_core::sockets::{ACCESS_POINT, ACCESS_POINT_WORKERS, STATION, STATION_WORKERS};
 
 /// A link that never comes up: the stack is built and holds sockets, and
@@ -105,11 +106,20 @@ fn access_point_session<const SOCK: usize>() {
 }
 
 /// The station's session: embassy-net's DNS and DHCP client, an NTP query,
-/// and every worker.
+/// the mDNS responder, and every worker.
 fn station_session<const SOCK: usize>() {
     let mut resources = StackResources::<SOCK>::new();
     let (stack, _runner) = embassy_net::new(Unplugged, station_config(), &mut resources, 1);
-    with_udp(stack, 0, || workers::<STATION_WORKERS>(stack));
+    // The group the responder listens on, which smoltcp's table must hold.
+    let [a, b, c, d] = MDNS_GROUP;
+    assert!(
+        stack
+            .join_multicast_group(Ipv4Address::new(a, b, c, d))
+            .is_ok()
+    );
+    with_udp(stack, MDNS_PORT, || {
+        with_udp(stack, 0, || workers::<STATION_WORKERS>(stack));
+    });
 }
 
 const ACCESS_POINT_SHORT: usize = ACCESS_POINT.saturating_sub(1);
@@ -127,7 +137,7 @@ fn an_access_point_budget_one_slot_short_panics_on_its_last_worker() {
 }
 
 #[test]
-fn the_station_stack_holds_embassy_dns_and_dhcp_ntp_and_every_worker() {
+fn the_station_stack_holds_embassy_dns_and_dhcp_ntp_mdns_and_every_worker() {
     station_session::<STATION>();
 }
 

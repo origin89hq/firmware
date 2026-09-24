@@ -1570,13 +1570,33 @@ The radio and its RTOS use a fixed 72 KiB heap; credential storage and applicati
 socket set is fixed, and smoltcp panics, resetting the module, when a
 socket arrives at a full one, so each budget is a sum of named slots in
 `o89_comms_core::sockets`, one per socket anything opens. The station's
-stack has eleven: embassy-net's own DNS and DHCP client, NTP, and one TCP
-socket per WebSocket worker. The access point's has four: embassy-net's
+stack has twelve: embassy-net's own DNS and DHCP client, NTP, the mDNS
+responder, and one TCP socket per WebSocket worker. The access point's has four: embassy-net's
 DNS, which its `dns` feature adds to every stack, its DHCP server, and two
 workers. A host test builds both stacks with the firmware's embassy-net
 release and features and holds every socket open at once, and `cargo xtask
 check` refuses the two feature lists differing. The time-offer channel
 holds one sample, refusing a new sample while full.
+
+**Discovery on the site network (KM43 P-224).** While the station holds an
+address, the comms processor answers mDNS for `<hostname>.local` and
+advertises one `_km43._tcp` instance named after the hostname: SRV on
+`WS_PORT`, TXT `id` carrying the controller's `device_id` from its latest
+`LinkUp` (L-035). Until a controller has stated one it advertises nothing,
+and a client falls back to the address `WifiStatus` reported. The responder
+is `o89_comms_core::mdns`, sans I/O and host-tested: three probes 250 ms
+apart before claiming either name, RFC 6762 §8.2's comparison against a
+simultaneous probe, `-2` and ` (2)` on a conflict up to 32 names, two
+announcements a second apart and again when the address or the `device_id`
+changes, known-answer suppression, a record multicast at most once a
+second, unicast to a question that asks for it or to a resolver on another
+port. The firmware runs it on one UDP socket in the station session, with
+its 2.5 KB of buffers static, and `station()` asks it for a goodbye, every
+record at TTL 0, before it returns, waiting at most 500 ms. Losing the
+address stops the answers; there is nobody to send a goodbye from. Not
+done: the 20 to 120 ms delay before a shared answer, negative answers for
+types it lacks, and IPv6. mDNS says where to try, never who answers:
+`Discover` and `Hello` decide (P-225).
 
 Wi-Fi diagnostics on KM43 0.6.3 live in `o89-core::Wifi`. Both wrapped
 reads are answered before capability bit 8 is advertised. A refresh checks
