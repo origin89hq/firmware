@@ -67,7 +67,7 @@ o89-comms-core = { path = "../../crates/o89-comms-core" }
 o89-link = { path = "../../crates/o89-link", optional = true }
 
 # Radio-only heap; all application buffers remain static.
-esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c6", "wifi", "unstable"] }
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c6", "wifi", "ble", "coex", "unstable"] }
 esp-alloc = "=0.11.0"
 # Country-code lookup in the same blob as esp-radio; no guessed channel table.
 esp-wifi-sys-esp32c6 = "=0.3.0"
@@ -81,6 +81,11 @@ embedded-io-async = "=0.7.0"
 # its own and no allocation; a UDP socket of ours carries it.
 edge-dhcp = { version = "=0.8.0", default-features = false }
 embassy-sync.workspace = true
+
+# TrouBLE 0.7 uses bt-hci 0.9, matching the pinned radio Transport; 0.8 uses 0.10.
+# Static pools only: no central, security/bonding, log or global allocator.
+trouble-host = { version = "=0.7.0", default-features = false, features = ["peripheral", "gatt", "default-packet-pool"] }
+bt-hci = "=0.9.0"
 
 [lints]
 workspace = true

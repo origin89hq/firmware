@@ -68,6 +68,7 @@ enum Task {
     Network,
     Station,
     Ntp,
+    Ble,
 }
 
 /// When each [`Task`] last reported, in milliseconds since boot: a field
@@ -77,6 +78,7 @@ struct Progress {
     network: u64,
     station: u64,
     ntp: u64,
+    ble: u64,
 }
 
 impl Progress {
@@ -86,6 +88,7 @@ impl Progress {
             network: ms,
             station: ms,
             ntp: ms,
+            ble: ms,
         }
     }
 }
@@ -97,6 +100,7 @@ fn progress(task: Task) {
             Task::Network => &mut state.network,
             Task::Station => &mut state.station,
             Task::Ntp => &mut state.ntp,
+            Task::Ble => &mut state.ble,
         };
         *last = Instant::now().as_millis();
     });
@@ -107,9 +111,10 @@ pub fn healthy() -> bool {
             network,
             station,
             ntp,
+            ble,
         } = *state.borrow();
         let now = Instant::now().as_millis();
-        [network, station, ntp]
+        [network, station, ntp, ble]
             .iter()
             .all(|last| now.saturating_sub(*last) < 6_000)
     })
@@ -489,4 +494,9 @@ async fn query(stack: Stack<'_>) -> Option<Sample> {
         accuracy_ms,
         at: Instant::now(),
     })
+}
+
+/// A successful bounded HCI command proves the BLE host/controller made progress.
+pub fn ble_progress() {
+    progress(Task::Ble);
 }

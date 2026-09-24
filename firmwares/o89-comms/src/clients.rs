@@ -54,9 +54,9 @@ use crate::link::LINK;
 const PORT: u16 = 80;
 /// Workers on the station's network: one per row.
 pub const STATION_WORKERS: usize = o89_comms_core::sockets::STATION_WORKERS;
-/// Every worker, each with its mailbox: the station's, then the access
-/// point's.
-const WORKERS: usize = STATION_WORKERS + crate::access_point::WORKERS;
+/// BLE workers follow the station and access-point workers in the shared mailboxes.
+pub const BLE_FIRST: usize = STATION_WORKERS + crate::access_point::WORKERS;
+const WORKERS: usize = BLE_FIRST + o89_comms_core::BLE_CONNECTIONS;
 /// Frames the controller may send a client before it has taken one.
 const MAILBOX: usize = 2;
 /// The socket's receive buffer: an envelope and its frame head.
@@ -120,9 +120,9 @@ static MAILBOXES: [Channel<CriticalSectionRawMutex, Envelope, MAILBOX>; WORKERS]
     [const { Channel::new() }; WORKERS];
 
 /// Clients' stamped frames for the link task to put on the UART, which it
-/// alone owns. Full, a worker waits one write deadline and then drops its
-/// frame, whose client retries.
-pub static UPSTREAM: Channel<CriticalSectionRawMutex, Envelope, UPSTREAM_DEPTH> = Channel::new();
+/// alone owns. Full, a worker waits one write deadline: WebSocket relies on
+/// client retry; BLE closes and clears its codecs. Nothing is evicted.
+pub static UPSTREAM: Channel<CriticalSectionRawMutex, Upstream, UPSTREAM_DEPTH> = Channel::new();
 
 /// The handle each worker holds, if any.
 static OWNERS: Blocking<CriticalSectionRawMutex, RefCell<[Option<Conn>; WORKERS]>> =
@@ -141,7 +141,7 @@ pub fn open_access_point() {
 /// already queued for them before the access point goes (L-196).
 pub async fn drain_access_point() {
     DRAINING.store(true, Ordering::Relaxed);
-    let drained = MAILBOXES.get(STATION_WORKERS..).unwrap_or(&[]);
+    let drained = MAILBOXES.get(STATION_WORKERS..BLE_FIRST).unwrap_or(&[]);
     let _drained = with_timeout(DRAIN, async {
         // Bounded by the deadline.
         while drained.iter().any(|mailbox| !mailbox.is_empty()) {
@@ -270,14 +270,14 @@ fn peer(endpoint: Option<IpEndpoint>) -> Peer {
 /// A row held by a worker: registered for its mailbox, and released when
 /// the connection ends however it ends. The link is never locked across an
 /// await, so the release on drop finds it free.
-struct Row {
+pub struct Row {
     index: usize,
     conn: Conn,
     reason: Cell<DisconnectReason>,
 }
 
 impl Row {
-    fn hold(index: usize, conn: Conn) -> Self {
+    pub fn hold(index: usize, conn: Conn) -> Self {
         OWNERS.lock(|owners| {
             if let Some(owner) = owners.borrow_mut().get_mut(index) {
                 *owner = Some(conn);
@@ -459,7 +459,8 @@ async fn read_half(
                     .from_client(conn, payload, &mut envelopes.stamped);
                 match stamped {
                     Some(Ok(Inbound::Forward(len))) => {
-                        forward(envelopes.stamped.get(..len).unwrap_or(&[])).await;
+                        let _queued =
+                            forward(conn, envelopes.stamped.get(..len).unwrap_or(&[])).await;
                     }
                     Some(Ok(Inbound::Answer(len))) => {
                         let answer = envelopes.stamped.get(..len).unwrap_or(&[]);
@@ -486,22 +487,23 @@ async fn read_half(
 }
 
 /// A stamped frame to the controller. One that does not leave within the
-/// deadline is lost, and the client's own retry is what recovers it.
-async fn forward(stamped: &[u8]) {
-    let _queued = with_timeout(WRITE, async {
+/// deadline returns false; the transport decides whether to close or rely on retry.
+pub async fn forward(conn: Conn, stamped: &[u8]) -> bool {
+    let queued = with_timeout(WRITE, async {
         // Bounded by the deadline. The copy is made only when there is
         // room, so the wait holds none.
         loop {
             let Some(envelope) = Envelope::of(stamped) else {
-                return;
+                return false;
             };
-            if UPSTREAM.try_send(envelope).is_ok() {
-                return;
+            if UPSTREAM.try_send(Upstream { conn, envelope }).is_ok() {
+                return true;
             }
             poll_fn(|cx| UPSTREAM.poll_ready_to_send(cx)).await;
         }
     })
     .await;
+    matches!(queued, Ok(true))
 }
 
 /// The controller's frames for this client, and the table's word on it.
@@ -558,4 +560,20 @@ async fn frame(writer: &mut impl Write, kind: Outgoing, payload: &[u8]) -> bool 
     })
     .await;
     matches!(sent, Ok(Ok(())))
+}
+
+/// BLE shares the same bounded per-worker delivery mailboxes as WebSocket.
+pub async fn receive(index: usize) -> Option<Envelope> {
+    Some(MAILBOXES.get(index)?.receive().await)
+}
+
+/// A queued client frame retains its owner so teardown cancels it before UART transmission.
+pub struct Upstream {
+    pub conn: Conn,
+    envelope: Envelope,
+}
+impl Upstream {
+    pub fn bytes(&self) -> &[u8] {
+        self.envelope.bytes()
+    }
 }

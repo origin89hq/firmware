@@ -1270,6 +1270,31 @@ permission. Revalidate the early download window with the radio stack present,
 including recovery after exhaustion. These are board acceptance obligations,
 not claims established by a host test or a fixed heap size.
 
+The radio-only allocation inventory includes the vendor Wi-Fi and BLE blobs,
+`esp-rtos` task/queue integration, `esp-alloc`, and esp-radio's HCI/NPL adapter.
+On the C6 the latter boxes incoming packets and queues them in a growable
+`VecDeque` with **no independent length cap**. Two BLE connections, controller
+buffer counts and HCI/ACL flow control constrain traffic, but do not establish
+a byte bound for that queue; its absolute bound is the shared 72 KiB heap.
+The C6 controller defaults request a 4096-byte task stack, 30 high and eight
+low HCI event buffers of size 70, and 24 ACL buffers of size 255, plus
+controller and allocator overhead. These are runtime heap consumers, not
+additional application statics. Wi-Fi/BLE `coex` is enabled for the C6; the
+existing 72 KiB reservation is still provisional for combined operation.
+
+Allocation failure is not a sleep loop: `esp-alloc` returns null, Rust's
+infallible allocation handler panics, and this firmware's panic handler resets
+immediately. The vendor C allocator also returns null; the pinned NPL adapter
+and controller initialization assert several failure results. A host error,
+a failed two-second disconnect, or a missed two-second HCI health command
+resets the ESP32. A successful HCI command reports watchdog progress every
+second; the link cannot keep feeding on behalf of a stalled BLE host. If a
+vendor fault prevents the executor or interrupts from running, the already
+armed hardware watchdog ends the hang. Every reset enters the recovery window
+before allocating or starting radios again. Null-return behavior inside the
+closed blob and exhaustion during reconnect/coexistence still require fault
+injection on the board; source inspection is not that evidence.
+
 [radio-allocation]: https://docs.espressif.com/projects/rust/esp-radio/0.18.0/esp32c6/esp_radio/index.html#feature-flags
 
 **Partitions and recovery.** `otadata`, two OTA slots, a **factory** slot
@@ -1351,16 +1376,60 @@ workers serve it, their rows from the same table.
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
 
-The BLE implementation is tracked in [#96](https://github.com/origin89hq/firmware/issues/96).
-KM43's BLE section is still specified but unverified; service discovery,
-fragmentation vectors and conformance evidence are tracked in
-[origin89hq/km43#81](https://github.com/origin89hq/km43/issues/81). V1
-acceptance requires those protocol checks, a compatible pinned stack within
-the target's allocation and memory constraints, and native-app pairing on
-the supported phone platforms against board A. A transport plan is not a
-claim that BLE is implemented or qualified. The early recovery download
-window still runs before the radio stack, and advertising starts only after
-a valid `LinkUp`.
+**BLE setup transport (#96).** The GATT server uses the UUIDs in pinned
+KM43 0.6.0: RX is Write Without Response and TX is Notify with a CCCD.
+Advertising includes the service UUID only after valid `LinkUp`; controller
+loss requests advertising cancellation within 100 ms and closes existing
+clients. Neither connection nor subscription nor bonding grants KM43 permission.
+The controller still owns the physical window and proof checks.
+
+`BLE_CONNECTIONS = 2` bounds concurrent setup phones, the vendor controller,
+TrouBLE's connection resources and the KM43 codec pairs. Two is enough for
+setup without reserving eight radio connections and eight pairs of 1024-byte
+payload buffers. Raising it requires F-037 heap measurements first. Each phone
+also takes a row in the shared eight-row table; there is no second allowance.
+At the BLE cap no worker advertises; a shared-table refusal disconnects the
+new phone, never an existing client.
+
+The host is `trouble-host =0.7.0`, defaults disabled, with only `peripheral`,
+`gatt` and `default-packet-pool`. Its `bt-hci =0.9.0` matches the pinned
+`esp-radio =1.0.0-beta.1` connector; TrouBLE 0.8 uses the newer HCI API.
+Existing HAL, RTOS and Embassy pins remain unchanged. The host allocates no
+heap and uses 16 static 251-byte packets (4036 bytes including bookkeeping),
+eight-entry receive/transmit queues, two-entry connection-event queues, two
+channel records, four HCI command slots and 16 attribute records. Const
+assertions tie these upstream configuration values to the BLE cap and KM43
+limits. ATT MTU starts at 23 and negotiates up to 247; characteristic values
+are at most 244 bytes. No Bluetooth security/bond storage or central role is enabled.
+
+Each connection owns one `km43::BleReceiver` and `BleSender`. No fragment
+format or assembly algorithm is implemented here. A transmit slot refuses a
+second message, and the two-entry delivery mailbox closes an overrun client.
+TrouBLE's full receive queue or exhausted static packet pool rejects the new
+ACL PDU; its runner discards that PDU rather than evicting an older one or
+reporting a fatal runner error. KM43 sequence checking/expiry discards an
+incomplete message, and the client's request timeout drives retry. Saturation
+and recovery still need the board tests below.
+The shared two-entry upstream queue waits at most one second; a BLE timeout
+closes that connection. Queued upstream frames retain their connection handle
+and are canceled before UART transmission if the row is no longer open.
+Malformed fragments close the connection; incomplete assemblies expire after
+KM43's five seconds even without traffic. Disconnect, controller restart and
+subscription loss clear both codec directions. Notification admission advances
+the sender only with an enabled CCCD: TrouBLE's successful no-op for an
+unsubscribed peer must not consume a fragment. Every write has a one-second
+deadline, announcements three seconds and disconnect confirmation two seconds.
+
+The host tests consume all 2758 shared BLE trace steps from KM43's
+`docs/protocol/vectors/v1.json`, including selected value limits, maximum
+payloads, errors, expiry, disconnect, backpressure and message-ID wrap.
+`crates/o89-comms-core/tests/import_ble_vectors.py` imports the fixture into
+an allocation-free test representation and records the source hash. Re-import
+when updating the protocol pin. These are host checks, not BLE conformance.
+Native-app onboarding on each supported phone OS, coexistence, recovery and
+heap-exhaustion tests on board A remain open in
+[#96](https://github.com/origin89hq/firmware/issues/96) and
+[KM43 #81](https://github.com/origin89hq/km43/issues/81).
 
 BLE and WebSocket share the bounded connection table, with eight rows and
 handles from a counter never 0 and never reused before the controller acknowledges the disconnect (L-060, L-080);
@@ -1400,7 +1469,7 @@ country and hostname. Duplicate successful requests do not erase again.
 The Wi-Fi station starts after the recovery window and OTA confirmation,
 using that cache without waiting for the controller. Association, the network
 runner and NTP run concurrently within one Wi-Fi session, so a failed
-association does not hold up the UART or a future BLE task. Each reports
+association does not hold up the UART or BLE tasks. Each reports
 progress before the link feeds the watchdog. A changed network record ends
 the session, dropping its sockets and interface before the controller; the
 radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep

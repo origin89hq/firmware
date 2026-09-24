@@ -1,7 +1,7 @@
 //! The connection table: eight rows every client transport shares.
 //!
 //! One table for the comms processor, whatever carries the client:
-//! WebSocket now, BLE when #96 lands, each row a transport that exists. A
+//! WebSocket and BLE, each row a transport that exists. A
 //! transport asks for a row and is refused when all eight are taken or the
 //! link is down (L-120); there is no second allowance per transport. The
 //! handle comes from a counter from 1 to 0xFFFF that skips handles in use
@@ -56,6 +56,8 @@ const _: () = assert!(CLIENT_REQUESTS >= 1);
 /// person and decided on by nothing (L-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peer {
+    /// Bluetooth peer address, informational only and never a trust identity.
+    Ble([u8; 6]),
     /// An IPv4 address and port, for a WebSocket.
     Ipv4 {
         /// The address.
@@ -111,6 +113,12 @@ impl Peer {
                 addr: [a, b, c, d],
                 port,
             } => write!(text, "{a}.{b}.{c}.{d}:{port}"),
+            Self::Ble([first, second, third, fourth, fifth, sixth]) => {
+                write!(
+                    text,
+                    "{first:02x}:{second:02x}:{third:02x}:{fourth:02x}:{fifth:02x}:{sixth:02x}"
+                )
+            }
         };
         debug_assert!(written.is_ok(), "every address fits");
         text

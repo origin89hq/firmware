@@ -214,7 +214,11 @@ record and the assets. Source: [#3][plan] §4.4, §9 item 5. M3.
 from a fixed budget reserved in static RAM and initialized after the recovery
 download window. Our application and transport code does not allocate; heap
 initialization and the required allocator adapter are the only exception in our
-code. The gate must refuse allocation outside that scope. Qualify memory
+code. The allocation inventory includes vendor blobs, their RTOS integration,
+`esp-alloc`, and esp-radio's HCI packet boxes and growable receive queue;
+the latter has no independent length cap and shares the fixed radio heap.
+TrouBLE and application buffers are static, with two concurrent BLE clients.
+The gate must refuse allocation outside that scope. Qualify memory
 margins, exhaustion and recovery as defined in
 [the comms architecture](ARCHITECTURE.md#the-comms-processor). Source:
 [#3][plan] §3; [#96](https://github.com/origin89hq/firmware/issues/96). M3, M4.

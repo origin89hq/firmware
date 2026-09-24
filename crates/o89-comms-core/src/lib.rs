@@ -18,6 +18,7 @@
 #![no_std]
 
 mod access_point;
+mod ble;
 mod connections;
 #[cfg(any(test, feature = "frames"))]
 mod frame_bench;
@@ -30,6 +31,7 @@ mod websocket;
 mod window;
 
 pub use access_point::*;
+pub use ble::*;
 pub use connections::*;
 #[cfg(any(test, feature = "frames"))]
 pub use frame_bench::FrameBenchStart;
