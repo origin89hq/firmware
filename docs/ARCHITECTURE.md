@@ -733,7 +733,9 @@ on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
-(above). Each answer to a heartbeat of the controller's carries the comms
+(above). A frame from the comms processor that is not four elements is
+refused with `Error 1` at `0, 0` before any element is read (P-025, P-028);
+it names no connection, so it stays on the link. Each answer to a heartbeat of the controller's carries the comms
 processor's count of connections; three in a row that disagree with the
 rows close every connection with one `CloseConnection` naming handle 0, and
 its answer frees every row (L-102), so a release lost on the wire leaks a

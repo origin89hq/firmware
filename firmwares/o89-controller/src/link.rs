@@ -568,7 +568,7 @@ async fn on_frame(
     };
     let step = endpoint
         .frame(frame, Uptime.now(), &local, fram, answer)
-        .await?;
+        .await;
     if let Some(Reply {
         note: Some(SessionNote::Paired(_)),
         ..

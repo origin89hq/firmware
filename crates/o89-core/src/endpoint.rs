@@ -62,23 +62,26 @@ impl Endpoint {
         local: &Local<'_>,
         fram: &mut F,
         dst: &mut [u8],
-    ) -> Option<Step> {
+    ) -> Step {
         self.link
             .set_network(match self.sessions.keys().network.held() {
                 crate::Held::Present(network) => (network.version() != 0).then_some(*network),
                 crate::Held::Absent => Some(crate::Network::NONE),
                 crate::Held::Corrupt | crate::Held::Malformed(_) => None,
             });
-        let envelope = LinkEnvelope::decode(frame).ok()?;
-        if is_for_the_link(&envelope) {
+        // A frame that is not four elements is nobody's to route; the
+        // sessions refuse it with error 1 (P-028).
+        if let Ok(envelope) = LinkEnvelope::decode(frame)
+            && is_for_the_link(&envelope)
+        {
             let actions = self.link.received(envelope, now, &mut self.sessions);
             // A row admitted by that frame is given its challenge before the
             // next frame is read (L-070).
             self.sessions.settle(now, fram).await;
-            return Some(Step {
+            return Step {
                 reply: None,
                 actions,
-            });
+            };
         }
         let facts = Facts {
             model: local.model,
@@ -94,10 +97,10 @@ impl Endpoint {
             Some(close) => self.link.close(close.conn, close.reason, now),
             None => Actions::NONE,
         };
-        Some(Step {
+        Step {
             reply: Some(reply),
             actions,
-        })
+        }
     }
 
     /// Time passed: the link's own tick, then every session that has gone

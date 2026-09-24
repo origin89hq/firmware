@@ -360,9 +360,6 @@ impl Bench {
                         &mut self.fram,
                         &mut dst,
                     ));
-                    let Some(ref mut step) = step else {
-                        continue;
-                    };
                     if let Some(o89_core::Reply {
                         note: Some(SessionNote::TimeAsked(asked)),
                         ..
