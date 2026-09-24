@@ -298,13 +298,12 @@ fn p_101_unsupported_sections_and_exhausted_versions_refuse_without_writes() {
     assert_eq!(part.bytes_written(), 0);
 }
 
-fn damaged_config(section: ConfigSection, malformed: bool) -> SimFram {
+pub(crate) fn damage_config(part: &mut SimFram, section: ConfigSection, malformed: bool) {
     use o89_core::{Fram, Position};
-    let mut part = SimFram::fresh();
     match section {
         ConfigSection::Network => {
             if malformed {
-                let _ = block_on(map::NETWORK.write(&mut part, Position::Start, &[0x42; 160]))
+                let _ = block_on(map::NETWORK.write(part, Position::Start, &[0x42; 160]))
                     .expect("malformed");
             } else {
                 block_on(part.write(map::COMMS_RELEASE.end(), &[0x42; 344]))
@@ -314,7 +313,7 @@ fn damaged_config(section: ConfigSection, malformed: bool) -> SimFram {
         ConfigSection::IdentityAndSite => {
             if malformed {
                 let _ = block_on(map::SITE_CONFIG.prefix().write(
-                    &mut part,
+                    part,
                     Position::Start,
                     &[0x42; o89_core::IDENTITY_RECORD_BYTES],
                 ))
@@ -328,23 +327,58 @@ fn damaged_config(section: ConfigSection, malformed: bool) -> SimFram {
                 .expect("corrupt B");
             }
         }
-        ConfigSection::Channels
-        | ConfigSection::BusesAndDevices
-        | ConfigSection::GeneratorBehaviour
+        ConfigSection::GeneratorBehaviour
         | ConfigSection::FrostBehaviour
         | ConfigSection::ScheduleBehaviour
-        | ConfigSection::LoadShedBehaviour
-        | ConfigSection::Cloud => panic!("fixture only supports identity and network"),
+        | ConfigSection::LoadShedBehaviour => {
+            let (record, start) = match section {
+                ConfigSection::GeneratorBehaviour => {
+                    (map::GENERATOR_CONFIG, map::SITE_CONFIG.end())
+                }
+                ConfigSection::FrostBehaviour => (map::FROST_CONFIG, map::GENERATOR_CONFIG.end()),
+                ConfigSection::ScheduleBehaviour => (map::SCHEDULE_CONFIG, map::FROST_CONFIG.end()),
+                ConfigSection::LoadShedBehaviour => {
+                    (map::LOAD_SHED_CONFIG, map::SCHEDULE_CONFIG.end())
+                }
+                ConfigSection::IdentityAndSite
+                | ConfigSection::Network
+                | ConfigSection::Channels
+                | ConfigSection::BusesAndDevices
+                | ConfigSection::Cloud => panic!("behaviour fixture"),
+            };
+            if malformed {
+                let _ = block_on(record.prefix().write(
+                    part,
+                    Position::Start,
+                    &[0x42; o89_core::BEHAVIOUR_RECORD_BYTES],
+                ))
+                .expect("malformed");
+            } else {
+                block_on(part.write(start, &[0x42; 20])).expect("corrupt A");
+                block_on(part.write(start.plus(o89_core::slot_bytes(1024)), &[0x42; 20]))
+                    .expect("corrupt B");
+            }
+        }
+        ConfigSection::Channels | ConfigSection::BusesAndDevices | ConfigSection::Cloud => {
+            panic!("unsupported section")
+        }
     }
     part.reboot();
-    part
 }
 
 #[test]
-fn p_102_damaged_sections_accept_only_version_zero_and_keep_reads_refused_until_replaced() {
-    for section in [ConfigSection::Network, ConfigSection::IdentityAndSite] {
+fn p_108_p_100_damaged_sections_read_unwritten_and_accept_only_version_zero() {
+    for section in [
+        ConfigSection::Network,
+        ConfigSection::IdentityAndSite,
+        ConfigSection::GeneratorBehaviour,
+        ConfigSection::FrostBehaviour,
+        ConfigSection::ScheduleBehaviour,
+        ConfigSection::LoadShedBehaviour,
+    ] {
         for malformed in [false, true] {
-            let mut part = damaged_config(section, malformed);
+            let mut part = SimFram::fresh();
+            damage_config(&mut part, section, malformed);
             let mut config = block_on(Configuration::read(&mut part)).expect("read");
             let mut network =
                 block_on(Kept::<Network, 160>::read(map::NETWORK, &mut part)).expect("read");
@@ -358,17 +392,20 @@ fn p_102_damaged_sections_accept_only_version_zero_and_keep_reads_refused_until_
             .expect("body");
             let body = if section == ConfigSection::Network {
                 &encoded[..len]
-            } else {
+            } else if section == ConfigSection::IdentityAndSite {
                 &[0xa1, 1, 0x61, b'a'][..]
+            } else {
+                &[0xa1, 1, 0xf5][..]
             };
             let mut answer = [0; 160];
-            assert_eq!(
-                config.answer(section, &network, &mut answer),
-                Err(km43::ErrorCode::BusyRetry)
-            );
+            let len = config
+                .answer(section, &network, &mut answer)
+                .expect("damaged read");
+            let read = ConfigAnswer::decode(&answer[..len]).expect("answer");
+            assert_eq!((read.version(), read.body()), (0, None));
             let operation = SetConfigOperation {
                 section,
-                expected_version: 7,
+                expected_version: 1,
                 body,
             };
             assert_eq!(
