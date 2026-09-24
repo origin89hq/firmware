@@ -268,9 +268,12 @@ nothing. The part has no RNG, and a counter that repeats re-mints a challenge
 a recorded proof verifies against twice. Source:
 [`ARCHITECTURE.md`](ARCHITECTURE.md), where challenges come from. M4.
 
-**F-042** — The comms processor's own access point is up only while no
-network is cached or the pairing window is open, and goes away when either
-ends. Source: [#3][plan] §9 item 3. M4.
+F-042, the comms processor's own access point, is retired: the comms
+processor raises none. Running it beside the station while the pairing
+window was open reset the module every seven seconds on board A (bench
+2026-09-24), which took BLE down for exactly the window a phone pairs in.
+Setup is over BLE (F-043) and later access over the site network. The
+number is not reused.
 
 **F-043** — V1 initial pairing is available over BLE GATT from the native
 phone app without cached Wi-Fi credentials, a working site network, or

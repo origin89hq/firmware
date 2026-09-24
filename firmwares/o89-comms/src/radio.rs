@@ -1,8 +1,7 @@
 //! Radio ownership is independent of the controller handshake and association.
 //! One desired configuration replaces the previous value; there is no queue.
 use core::cell::RefCell;
-use embassy_futures::join::join3;
-use embassy_futures::select::{select, select3, select4};
+use embassy_futures::select::{select, select4};
 use embassy_net::{Config, DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
@@ -17,7 +16,6 @@ use o89_comms_core::{
     sockets,
 };
 
-use crate::access_point;
 use crate::clients::{Buffers, STATION_WORKERS};
 use crate::link::LINK;
 use static_cell::{ConstStaticCell, StaticCell};
@@ -35,14 +33,6 @@ static CLIENTS: ConstStaticCell<[Buffers; STATION_WORKERS]> =
 /// The station's mDNS responder's buffers, lent to each session.
 static MDNS: ConstStaticCell<crate::mdns::Buffers> =
     ConstStaticCell::new(crate::mdns::Buffers::EMPTY);
-/// The access point's sockets: embassy-net's DNS, which every stack of
-/// this build carries, its DHCP server, and one TCP socket per WebSocket
-/// worker.
-const AP_SOCKETS: usize = sockets::ACCESS_POINT;
-static AP_RESOURCES: StaticCell<StackResources<AP_SOCKETS>> = StaticCell::new();
-/// The access point's WebSocket workers' buffers.
-static AP_CLIENTS: ConstStaticCell<[Buffers; access_point::WORKERS]> =
-    ConstStaticCell::new([const { Buffers::EMPTY }; access_point::WORKERS]);
 /// One sample in flight; full means drop the fresh sample, never evict a queued one.
 pub static SAMPLES: Channel<CriticalSectionRawMutex, Sample, 1> = Channel::new();
 /// A sample is used only during the next link turn and never adjusts a local clock.
@@ -89,21 +79,17 @@ pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<
         resources: RESOURCES.try_init(StackResources::new()).ok_or(())?,
         clients: CLIENTS.try_take().ok_or(())?,
         mdns: MDNS.try_take().ok_or(())?,
-        ap_resources: AP_RESOURCES.try_init(StackResources::new()).ok_or(())?,
-        ap_clients: AP_CLIENTS.try_take().ok_or(())?,
     };
     spawner.spawn(radio(wifi, held).map_err(|_| ())?);
     Ok(())
 }
 
-/// What every session borrows: each network's stack resources, its
-/// WebSocket workers' buffers, and the station's mDNS buffers.
+/// What every station session borrows: the stack's resources, its
+/// WebSocket workers' buffers, and the mDNS responder's.
 struct Held {
     resources: &'static mut StackResources<SOCKETS>,
     clients: &'static mut [Buffers; STATION_WORKERS],
     mdns: &'static mut crate::mdns::Buffers,
-    ap_resources: &'static mut StackResources<AP_SOCKETS>,
-    ap_clients: &'static mut [Buffers; access_point::WORKERS],
 }
 
 #[embassy_executor::task]
@@ -114,7 +100,7 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
         if desired().is_some_and(|record| record.change().is_err()) {
             esp_hal::system::software_reset();
         }
-        let plan = plan().await;
+        let plan = plan();
         observe_plan(plan).await;
         match plan {
             Plan::Off => {}
@@ -122,12 +108,16 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
             // runner/interface before the controller, whose guard stops and
             // deinitializes the driver. Reborrow keeps WIFI here for the
             // next plan without duplicating ownership.
-            Plan::Station | Plan::AccessPoint { .. } | Plan::Both { .. } => {
+            Plan::Station | Plan::Scan { .. } => {
                 let version = desired().map_or(0, |record| record.version());
                 session(wifi.reborrow(), &mut held, plan).await;
                 diagnostics().await.wifi.cancel_scan();
-                if matches!(plan, Plan::Station | Plan::Both { .. }) {
-                    station_observed(version, false, None, Some(km43::WifiFailure::Other)).await;
+                match plan {
+                    Plan::Station => {
+                        station_observed(version, false, None, Some(km43::WifiFailure::Other))
+                            .await;
+                    }
+                    Plan::Scan { .. } | Plan::Off => {}
                 }
             }
         }
@@ -136,12 +126,9 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     }
 }
 
-/// What the radio should run now: the record held, and the controller's
-/// pairing window as the link measures it (L-196).
-async fn plan() -> Plan {
-    let now = Tick::from_millis(Instant::now().as_millis());
-    let pairing_open = diagnostics().await.pairing_window(now).is_some();
-    Plan::of(desired().as_ref(), pairing_open)
+/// What the radio should run now: the record held.
+fn plan() -> Plan {
+    Plan::of(desired().as_ref())
 }
 
 /// The station's configuration, its DHCP configuration, the country and the
@@ -187,8 +174,7 @@ async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) {
     match plan {
         Plan::Off => {}
         Plan::Station => station_session(&mut controller, held, record).await,
-        Plan::AccessPoint { country } => access_point_session(&mut controller, held, country).await,
-        Plan::Both { country } => both_session(&mut controller, held, record, country).await,
+        Plan::Scan { country } => scan_session(&mut controller, country).await,
     }
 }
 
@@ -228,121 +214,29 @@ async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, r
     .await;
 }
 
-/// The access point alone: no network cached, a country known.
-async fn access_point_session(
-    controller: &mut WifiController<'_>,
-    held: &mut Held,
-    country: Country,
-) {
-    let Some(interface) = Interface::try_access_point() else {
-        return;
-    };
-    let Some(config) = access_point::config(interface.mac_address()) else {
-        return;
-    };
+/// No network cached: the station interface up without joining, for scans
+/// alone, until the record changes. Reports progress for the network,
+/// station and NTP it does not run.
+async fn scan_session(controller: &mut WifiController<'_>, country: Country) {
     if country_code_of(country).is_err()
         || controller
-            .set_config(&WifiConfig::AccessPointStation(
-                StationConfig::default(),
-                config,
-            ))
+            .set_config(&WifiConfig::Station(StationConfig::default()))
             .is_err()
     {
         return;
     }
-    crate::clients::open_access_point();
-    let (stack, runner) = embassy_net::new(
-        interface,
-        access_point::network(),
-        &mut *held.ap_resources,
-        seed(),
-    );
-    let _finished = select4(
-        network(runner),
-        access_point::dhcp(stack),
-        crate::clients::serve(stack, STATION_WORKERS, held.ap_clients),
-        hold(controller, Plan::AccessPoint { country }),
-    )
-    .await;
-}
-
-/// The cached network, and the access point while the pairing window is
-/// open.
-async fn both_session(
-    controller: &mut WifiController<'_>,
-    held: &mut Held,
-    record: Credential,
-    country: Country,
-) {
-    let Some((station_config, dhcp, _, hostname)) = station_config(&record) else {
-        return;
-    };
-    let (Some(station_interface), Some(ap_interface)) =
-        (Interface::try_station(), Interface::try_access_point())
-    else {
-        return;
-    };
-    let Some(ap_config) = access_point::config(ap_interface.mac_address()) else {
-        return;
-    };
-    if country_code_of(country).is_err()
-        || controller
-            .set_config(&WifiConfig::AccessPointStation(station_config, ap_config))
-            .is_err()
-    {
-        return;
-    }
-    crate::clients::open_access_point();
-    let Held {
-        resources,
-        clients,
-        mdns,
-        ap_resources,
-        ap_clients,
-    } = held;
-    let (stack, runner) = embassy_net::new(
-        station_interface,
-        Config::dhcpv4(dhcp),
-        &mut **resources,
-        seed(),
-    );
-    let (ap_stack, ap_runner) = embassy_net::new(
-        ap_interface,
-        access_point::network(),
-        &mut **ap_resources,
-        seed(),
-    );
-    // Station returns when the record or the plan changes, after draining
-    // the access point if the window closed (L-196).
-    let _finished = select3(
-        select4(
-            network(runner),
-            ntp(stack),
-            station(controller, stack, record, Plan::Both { country }),
-            crate::clients::serve(stack, 0, clients),
-        ),
-        crate::mdns::respond(stack, hostname, mdns),
-        join3(
-            network(ap_runner),
-            access_point::dhcp(ap_stack),
-            crate::clients::serve(ap_stack, STATION_WORKERS, ap_clients),
-        ),
-    )
-    .await;
-}
-
-/// The access point alone: report progress for the station and NTP it does
-/// not run, and return when the plan changes.
-async fn hold(controller: &mut WifiController<'_>, plan: Plan) {
+    let plan = Plan::Scan { country };
     loop {
+        progress(Task::Network);
         progress(Task::Station);
         progress(Task::Ntp);
-        if self::plan().await != plan {
+        if self::plan() != plan {
             return;
         }
         if scan(controller).await {
             return;
         }
+        progress(Task::Network);
         progress(Task::Ntp);
         Timer::after_secs(1).await;
     }
@@ -375,7 +269,8 @@ fn country_code(country: &str) -> Result<(), ()> {
     let terminated = [first, second, 0];
     // SAFETY: a live, exclusively owned WifiController initialized this blob;
     // the three-byte NUL-terminated input remains alive for this synchronous
-    // call. The blob copies it. False keeps AP advertisements from changing it.
+    // call. The blob copies it. False keeps a network's advertisements from
+    // changing it.
     let result = unsafe {
         esp_wifi_sys_esp32c6::include::esp_wifi_set_country_code(terminated.as_ptr().cast(), false)
     };
@@ -407,13 +302,7 @@ async fn station(
             crate::mdns::leave().await;
             return;
         }
-        let next = self::plan().await;
-        if next != plan {
-            if plan.window_closes(next) {
-                // The phone on the access point takes what is already on its
-                // way before the access point goes (L-196).
-                crate::clients::drain_access_point().await;
-            }
+        if self::plan() != plan {
             crate::mdns::leave().await;
             return;
         }
@@ -555,8 +444,8 @@ async fn station_observed(
 async fn observe_plan(plan: Plan) {
     let version = desired().map_or(0, |credential| credential.version());
     let radio = match plan {
-        Plan::Off | Plan::AccessPoint { .. } => km43::Radio::Off,
-        Plan::Station | Plan::Both { .. } => km43::Radio::Joining,
+        Plan::Off | Plan::Scan { .. } => km43::Radio::Off,
+        Plan::Station => km43::Radio::Joining,
     };
     observe(version, radio).await;
 }

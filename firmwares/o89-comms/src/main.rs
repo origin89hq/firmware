@@ -29,7 +29,6 @@
 #![no_std]
 #![no_main]
 
-mod access_point;
 mod ble;
 mod clients;
 mod credentials;

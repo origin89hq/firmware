@@ -1,6 +1,6 @@
-//! The comms processor's socket budgets, against `embassy-net`'s own stack.
+//! The comms processor's socket budget, against `embassy-net`'s own stack.
 //!
-//! Each stack is built as the firmware builds it, with the release and
+//! The station's stack is built as the firmware builds it, with the release and
 //! features `firmwares/o89-comms` uses, and every socket its session opens
 //! is held open at once. A socket past the budget panics in smoltcp, which
 //! on the part resets the module; here it fails the test. The budget one
@@ -12,11 +12,9 @@ use core::task::Context;
 use embassy_net::driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{
-    Config, DhcpConfig, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
-};
+use embassy_net::{Config, DhcpConfig, Ipv4Address, Stack, StackResources};
 use o89_comms_core::mdns::{MDNS_GROUP, MDNS_PORT};
-use o89_comms_core::sockets::{ACCESS_POINT, ACCESS_POINT_WORKERS, STATION, STATION_WORKERS};
+use o89_comms_core::sockets::{STATION, STATION_WORKERS};
 
 /// A link that never comes up: the stack is built and holds sockets, and
 /// no frame moves.
@@ -63,16 +61,6 @@ impl Driver for Unplugged {
     }
 }
 
-/// The access point's configuration: a static address, as
-/// `access_point::network` gives it.
-fn access_point_config() -> Config {
-    Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 4, 1), 24),
-        gateway: None,
-        dns_servers: core::iter::empty().collect(),
-    })
-}
-
 /// The station's configuration: DHCP, as a network record gives it.
 fn station_config() -> Config {
     Config::dhcpv4(DhcpConfig::default())
@@ -97,14 +85,6 @@ fn workers<const N: usize>(stack: Stack<'_>) {
         .map(|(rx, tx)| TcpSocket::new(stack, rx, tx));
 }
 
-/// The access point's session: embassy-net's DNS, the DHCP server, and
-/// every worker.
-fn access_point_session<const SOCK: usize>() {
-    let mut resources = StackResources::<SOCK>::new();
-    let (stack, _runner) = embassy_net::new(Unplugged, access_point_config(), &mut resources, 1);
-    with_udp(stack, 67, || workers::<ACCESS_POINT_WORKERS>(stack));
-}
-
 /// The station's session: embassy-net's DNS and DHCP client, an NTP query,
 /// the mDNS responder, and every worker.
 fn station_session<const SOCK: usize>() {
@@ -122,19 +102,7 @@ fn station_session<const SOCK: usize>() {
     });
 }
 
-const ACCESS_POINT_SHORT: usize = ACCESS_POINT.saturating_sub(1);
 const STATION_SHORT: usize = STATION.saturating_sub(1);
-
-#[test]
-fn the_access_point_stack_holds_embassy_dns_its_dhcp_server_and_every_worker() {
-    access_point_session::<ACCESS_POINT>();
-}
-
-#[test]
-#[should_panic(expected = "adding a socket to a full SocketSet")]
-fn an_access_point_budget_one_slot_short_panics_on_its_last_worker() {
-    access_point_session::<ACCESS_POINT_SHORT>();
-}
 
 #[test]
 fn the_station_stack_holds_embassy_dns_and_dhcp_ntp_mdns_and_every_worker() {

@@ -1435,36 +1435,26 @@ stamped frames reach the UART through a two-envelope queue the link task
 drains one a turn after reading the UART; a frame that cannot enter it
 within a second is lost and its client retries. The opening handshake is
 RFC 6455's within 1 024 bytes and five seconds, on port `WS_PORT` (80) at
-`WS_PATH` (`/km43`) on both the station and the access point; any other
+`WS_PATH` (`/km43`); any other
 request-target is answered 404 without an upgrade (P-223). No origin or
 subprotocol is decided on. A text frame, a fragmented message, an unmasked
 frame or one over one envelope closes the connection (1003, 1002, 1009).
 Every close carries a code and a reason a client can show (L-061). A ninth
 client finds no listening socket. The link, with the table, is shared with
 the workers through an async mutex no task holds across an await. The comms
-processor's own access point remains the browser provisioning fallback,
-raised only while no network is cached or the pairing window is open, and
-only under a regulatory country from the controller's network record: a
-pairing report carries none, and an unwritten clear keeps every radio off
-(L-133). A unit never given a network therefore has no access point; its
-first pairing is BLE's. The
+processor raises no access point of its own (F-042 is retired): run beside
+the station while the pairing window was open, it reset the module every
+seven seconds on board A, which took BLE down for the window a phone pairs
+in. First pairing is BLE's, and later access is the site network's. The
 controller reports its window over the link with KM43's `PairingWindow`
 after every link-up, on the opening and on every closure, an enrolment's
 `Pair` answer ahead of the closed report (L-195); the comms processor acts
 on it only from the controller UART once its own link is up (L-194) and
-keeps the lifetime on its own clock from receipt. The radio reads that
-lifetime once a second (`o89_comms_core::Plan`): a `clear` record raises
-the access point alone, a `set` record raises it beside the station while
-the window is open, and a change of plan restarts the Wi-Fi session. When
-the window's end takes the access point down, its workers take no new
-client and their clients get 500 ms to take what is already queued (L-196).
-The access point is open, named `origin89-` and the last two bytes of its
-address, on the country's channel plan through the same country lookup the
-station uses, at 192.168.4.1/24 with no gateway. It admits eight phones.
-`edge-dhcp` answers their DHCP over a UDP socket of ours, eight leases of
-five minutes over a range of eight addresses, so an expired lease is reused
-and a ninth phone waits for one; it allocates nothing. Two WebSocket
-workers serve it, their rows from the same table.
+keeps the lifetime on its own clock from receipt. The radio's plan
+(`o89_comms_core::Plan`) reads the network record alone: a `set` record
+runs the station, a `clear` that kept a country brings the station
+interface up without joining so a client can still scan, and a change of
+record restarts the Wi-Fi session.
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
 
@@ -1574,17 +1564,15 @@ association does not hold up the UART or BLE tasks. Each reports
 progress before the link feeds the watchdog. A changed network record ends
 the session, dropping its sockets and interface before the controller; the
 radio driver then stops and deinitializes Wi-Fi. An unwritten clear keeps
-Wi-Fi off; a written clear retains the country and provisioning access point. A later network record creates a fresh session from a reborrow
+Wi-Fi off; a written clear retains the country, and the radio scans under it without joining. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
-The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. Each IP stack's
+The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
-socket arrives at a full one, so each budget is a sum of named slots in
+socket arrives at a full one, so the budget is a sum of named slots in
 `o89_comms_core::sockets`, one per socket anything opens. The station's
-stack has twelve: embassy-net's own DNS and DHCP client, NTP, the mDNS
-responder, and one TCP socket per WebSocket worker. The access point's has four: embassy-net's
-DNS, which its `dns` feature adds to every stack, its DHCP server, and two
-workers. A host test builds both stacks with the firmware's embassy-net
-release and features and holds every socket open at once, and `cargo xtask
+stack, the only one, has twelve: embassy-net's own DNS and DHCP client,
+NTP, the mDNS responder, and one TCP socket per WebSocket worker. A host
+test builds it with the firmware's embassy-net release and features and holds every socket open at once, and `cargo xtask
 check` refuses the two feature lists differing. The time-offer channel
 holds one sample, refusing a new sample while full.
 
