@@ -69,6 +69,13 @@ pub fn store_credential(
     flash: &mut impl CredentialFlash,
     credential: &Credential,
 ) -> Result<(), CredentialStorageError> {
+    if credential.change() == Ok(km43::NetChange::ClearUnwritten) {
+        flash.erase().map_err(|_| CredentialStorageError)?;
+        return match load_credential(flash)? {
+            None => Ok(()),
+            Some(_) => Err(CredentialStorageError),
+        };
+    }
     let mut bytes = [0u8; STORED_CREDENTIAL_BYTES];
     let payload = credential.encoded();
     let len = u32::try_from(payload.len()).map_err(|_| CredentialStorageError)?;
@@ -162,6 +169,65 @@ mod tests {
         })
         .unwrap()
     }
+    #[test]
+    fn l_133_unwritten_clear_erases_the_entire_cache_and_reboots_at_zero() {
+        let mut flash = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        store_credential(&mut flash, &record()).unwrap();
+        let clear = Credential::new(NetChange::ClearUnwritten).unwrap();
+        store_credential(&mut flash, &clear).unwrap();
+        assert!(flash.bytes.iter().all(|byte| *byte == 255));
+        assert_eq!(load_credential(&mut flash), Ok(None));
+        assert_eq!(
+            crate::Network::new(load_credential(&mut flash).unwrap()).stored_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn l_137_unwritten_clear_cut_at_every_erase_byte_retries_without_foreign_ram() {
+        let mut seed = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        store_credential(&mut seed, &record()).unwrap();
+        for cut in 0..=4096 {
+            let mut flash = Flash {
+                bytes: seed.bytes,
+                budget: cut,
+            };
+            let mut network = crate::Network::new(Some(record()));
+            let verdict = network.apply(NetChange::ClearUnwritten, |clear| {
+                store_credential(&mut flash, clear).is_ok()
+            });
+            assert_eq!(
+                verdict.outcome,
+                km43::NetConfig::NvsWriteFailed,
+                "cut {cut}"
+            );
+            assert_eq!(verdict.version, 7, "cut {cut}");
+            assert_eq!(
+                network.credential().unwrap().change(),
+                Ok(NetChange::ClearUnwritten)
+            );
+            flash.budget = usize::MAX;
+            let verdict = network.apply(NetChange::ClearUnwritten, |clear| {
+                store_credential(&mut flash, clear).is_ok()
+            });
+            assert_eq!(
+                verdict,
+                km43::NetVerdict {
+                    outcome: km43::NetConfig::Stored,
+                    version: 0
+                }
+            );
+            assert!(flash.bytes.iter().all(|byte| *byte == 255), "cut {cut}");
+            assert_eq!(load_credential(&mut flash), Ok(None));
+        }
+    }
+
     #[test]
     fn l_136_record_replaces_and_clear_physically_erases_the_passphrase() {
         let mut flash = Flash {

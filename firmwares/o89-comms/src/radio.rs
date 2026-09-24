@@ -1,8 +1,8 @@
 //! Radio ownership is independent of the controller handshake and association.
 //! One desired configuration replaces the previous value; there is no queue.
 use core::cell::RefCell;
-use embassy_futures::select::select;
-use embassy_net::{Config, ConfigV4, DhcpConfig, Runner, Stack, StackResources};
+use embassy_futures::select::{select, select3};
+use embassy_net::{Config, DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
@@ -37,8 +37,8 @@ pub fn time_offered(now: Tick) {
     NTP_SCHEDULE.lock(|schedule| schedule.borrow_mut().offered(now));
 }
 
-/// Each task reports progress within bounded waits. Idle radio and network tasks
-/// still turn once a second; a hung task cannot borrow the link's watchdog feed.
+/// Each concurrent operation reports progress within bounded waits. The idle
+/// radio still turns once a second; a hang cannot borrow the link's watchdog feed.
 static PROGRESS: Mutex<CriticalSectionRawMutex, RefCell<[u64; 3]>> =
     Mutex::new(RefCell::new([0; 3]));
 fn progress(task: usize) {
@@ -64,23 +64,81 @@ fn desired() -> Option<Credential> {
 }
 
 pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<(), ()> {
-    let controller = WifiController::new(wifi, ControllerConfig::default()).map_err(|_| ())?;
     let resources = RESOURCES.try_init(StackResources::new()).ok_or(())?;
-    let seed = (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random());
-    let (stack, runner) = embassy_net::new(
-        Interface::station(),
-        Config::dhcpv4(DhcpConfig::default()),
-        resources,
-        seed,
-    );
-    spawner.spawn(network(runner).map_err(|_| ())?);
-    spawner.spawn(station(controller, stack).map_err(|_| ())?);
-    spawner.spawn(ntp(stack).map_err(|_| ())?);
+    spawner.spawn(radio(wifi, resources).map_err(|_| ())?);
     Ok(())
 }
 
 #[embassy_executor::task]
-async fn network(mut runner: Runner<'static, Interface>) {
+async fn radio(mut wifi: WIFI<'static>, resources: &'static mut StackResources<SOCKETS>) {
+    loop {
+        for task in 0..3 {
+            progress(task);
+        }
+        if let Some(record) = desired() {
+            match record.change() {
+                Ok(km43::NetChange::Set { .. }) => {
+                    // The session owns every Wi-Fi resource. Returning drops the
+                    // runner/interface before the controller, whose guard stops
+                    // and deinitializes the driver. Reborrow keeps WIFI here for
+                    // the next configured network without duplicating ownership.
+                    session(wifi.reborrow(), resources, record).await;
+                }
+                Ok(km43::NetChange::Clear { .. } | km43::NetChange::ClearUnwritten) => {}
+                Err(_) => esp_hal::system::software_reset(),
+            }
+        }
+        // Idle and failed setup both yield, keeping watchdog progress bounded.
+        Timer::after_secs(1).await;
+    }
+}
+
+async fn session(wifi: WIFI<'_>, resources: &mut StackResources<SOCKETS>, record: Credential) {
+    let Ok(km43::NetChange::Set {
+        ssid,
+        psk,
+        country,
+        hostname,
+        ..
+    }) = record.change()
+    else {
+        return;
+    };
+    let (Ok(ssid), Ok(password), Ok(hostname)) =
+        (ssid.try_into(), psk.try_into(), hostname.try_into())
+    else {
+        return;
+    };
+    let Ok(mut controller) = WifiController::new(wifi, ControllerConfig::default()) else {
+        return;
+    };
+    let config = StationConfig::default()
+        .with_ssid(ssid)
+        .with_authentication(AuthenticationMethodConfig::Wpa2Personal(password));
+    if country_code(country).is_err()
+        || controller.set_config(&WifiConfig::Station(config)).is_err()
+    {
+        return;
+    }
+    let Some(interface) = Interface::try_station() else {
+        return;
+    };
+    let mut dhcp = DhcpConfig::default();
+    dhcp.hostname = Some(hostname);
+    let seed = (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random());
+    let (stack, runner) = embassy_net::new(interface, Config::dhcpv4(dhcp), resources, seed);
+    // All three futures are polled concurrently. Station returns when the
+    // desired record changes; cancellation drops NTP sockets and the runner
+    // before controller teardown. Their bounded waits report watchdog progress.
+    let _finished = select3(
+        network(runner),
+        ntp(stack),
+        station(&mut controller, record),
+    )
+    .await;
+}
+
+async fn network(mut runner: Runner<'_, Interface>) {
     loop {
         // Runner keeps its state in the stack. Cancellation only ends this poll
         // loop; packets already submitted to the driver remain its responsibility.
@@ -107,80 +165,30 @@ fn country_code(country: &str) -> Result<(), ()> {
     if result == 0 { Ok(()) } else { Err(()) }
 }
 
-async fn disconnect(controller: &mut WifiController<'static>) {
+async fn disconnect(controller: &mut WifiController<'_>) {
     let result = with_timeout(Duration::from_secs(4), controller.disconnect_async()).await;
     if !matches!(
         result,
         Ok(Ok(_) | Err(esp_radio::wifi::WifiError::NotConnected))
     ) {
         // A cancelled waiter does not prove the blob stopped. Re-enter the
-        // recovery window rather than apply a country while still connected.
+        // recovery window rather than leave an uncertain association running.
         esp_hal::system::software_reset();
     }
 }
 
-#[embassy_executor::task]
-async fn station(mut controller: WifiController<'static>, stack: Stack<'static>) {
-    let mut applied = None;
-    let mut enabled = false;
+async fn station(controller: &mut WifiController<'_>, applied: Credential) {
     loop {
         progress(1);
-        let next = desired();
-        if next != applied {
-            disconnect(&mut controller).await;
-            enabled = false;
-            if let Some(record) = next {
-                match record.change() {
-                    Ok(km43::NetChange::Set {
-                        ssid,
-                        psk,
-                        country,
-                        hostname,
-                        ..
-                    }) => {
-                        if let (Ok(ssid), Ok(password), Ok(hostname)) =
-                            (ssid.try_into(), psk.try_into(), hostname.try_into())
-                        {
-                            let config = StationConfig::default()
-                                .with_ssid(ssid)
-                                .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
-                                    password,
-                                ));
-                            let mut dhcp = DhcpConfig::default();
-                            dhcp.hostname = Some(hostname);
-                            stack.set_config_v4(ConfigV4::Dhcp(dhcp));
-                            enabled = country_code(country).is_ok()
-                                && controller.set_config(&WifiConfig::Station(config)).is_ok();
-                        }
-                    }
-                    Ok(km43::NetChange::Clear { .. }) => {
-                        let blank = StationConfig::default()
-                            .with_authentication(AuthenticationMethodConfig::Open);
-                        if controller.set_config(&WifiConfig::Station(blank)).is_err() {
-                            esp_hal::system::software_reset();
-                        }
-                        stack.set_config_v4(ConfigV4::None);
-                    }
-                    Err(_) => esp_hal::system::software_reset(),
-                }
-            }
-            // Failed setup is retried, without logging credentials.
-            if enabled
-                || matches!(
-                    next.as_ref().map(Credential::change),
-                    None | Some(Ok(km43::NetChange::Clear { .. }))
-                )
-            {
-                applied = next;
-            }
+        if desired() != Some(applied) {
+            return;
         }
-        progress(1);
-        if enabled && !controller.is_connected() {
+        if !controller.is_connected() {
             let result = with_timeout(Duration::from_secs(4), controller.connect_async()).await;
             if result.is_err() {
                 // Explicitly abort the blob operation after cancelling its waiter.
                 progress(1);
-                disconnect(&mut controller).await;
+                disconnect(controller).await;
             }
         }
         progress(1);
@@ -188,8 +196,7 @@ async fn station(mut controller: WifiController<'static>, stack: Stack<'static>)
     }
 }
 
-#[embassy_executor::task]
-async fn ntp(stack: Stack<'static>) {
+async fn ntp(stack: Stack<'_>) {
     loop {
         progress(2);
         let due = NTP_SCHEDULE.lock(|schedule| {
@@ -212,7 +219,7 @@ async fn ntp(stack: Stack<'static>) {
     }
 }
 
-async fn query(stack: Stack<'static>) -> Option<Sample> {
+async fn query(stack: Stack<'_>) -> Option<Sample> {
     let addresses = stack
         .dns_query(SERVER, embassy_net::dns::DnsQueryType::A)
         .await

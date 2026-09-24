@@ -102,6 +102,8 @@ pub enum Releases {
 pub struct Capabilities {
     /// Network version claimed at `LinkUp`; supports a module moved between units.
     pub net_version: u32,
+    /// Drop only network acknowledgements, leaving the handshake and beats intact.
+    pub withhold_network_ack: bool,
     /// Whether it answers at all.
     pub answers: Answers,
     /// Whether it states itself.
@@ -127,6 +129,7 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             net_version: 0,
+            withhold_network_ack: false,
             answers: Answers::Everything,
             statement: Statement::Given,
             beats: Beats::Given,
@@ -691,7 +694,8 @@ impl HostileComms {
             Answers::Nothing => true,
             Answers::Everything | Answers::TalksOnly => false,
         };
-        if silent
+        if (kind == Some(LinkMessageType::NetConfigAck) && self.caps.withhold_network_ack)
+            || silent
             || (statement && self.caps.statement == Statement::Withheld)
             || (beat && self.caps.beats == Beats::Withheld)
         {
@@ -1047,6 +1051,12 @@ fn first_value(envelope: LinkEnvelope<'_>) -> Option<u8> {
 fn heard_network(envelope: LinkEnvelope<'_>) -> Option<Heard> {
     km43::NetChange::decode(envelope).ok().and_then(|change| {
         let (version, join, country, hostname) = match change {
+            km43::NetChange::ClearUnwritten => {
+                return Some(Heard::NetConfig {
+                    version: 0,
+                    network: o89_core::Network::NONE,
+                });
+            }
             km43::NetChange::Set {
                 version,
                 ssid,

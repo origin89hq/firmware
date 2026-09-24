@@ -1955,11 +1955,101 @@ fn p_085_healthy_network_reset_scrubs_both_slots_after_reboot() {
 }
 
 #[test]
-fn l_133_unwritten_master_with_a_foreign_cache_reports_the_protocol_gap() {
+fn l_133_unwritten_master_clears_a_foreign_cache_including_after_damaged_reset() {
     // Capabilities: claim a cached version from another controller.
+    for damaged in [false, true] {
+        let mut bench = Bench::new(Capabilities {
+            net_version: 7,
+            ..Capabilities::default()
+        });
+        if damaged {
+            let (part, sessions) = damaged_network_unit(false);
+            bench.fram = part;
+            bench.endpoint.sessions = sessions;
+            block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
+        }
+        bench.run_for(Millis::from_millis(2000));
+        assert!(bench.comms.heard.iter().any(|heard| matches!(
+            heard, Heard::NetConfig { version: 0, network } if *network == o89_core::Network::NONE
+        )), "unwritten clear, damaged reset: {damaged}");
+        assert!(matches!(
+            bench.endpoint.sessions.keys().network.held(),
+            o89_core::Held::Absent
+        ));
+    }
+}
+
+#[test]
+fn l_133_unwritten_master_does_not_clear_a_module_already_at_zero() {
+    // Capabilities: none; the module has no network, including during a damaged reset.
+    for damaged in [false, true] {
+        let mut bench = Bench::new(Capabilities::default());
+        if damaged {
+            let (part, sessions) = damaged_network_unit(false);
+            bench.fram = part;
+            bench.endpoint.sessions = sessions;
+            bench.run_for(Millis::from_millis(2000));
+            block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
+        }
+        bench.run_for(Millis::from_millis(5000));
+        assert!(bench.endpoint.link.is_up());
+        assert!(
+            !bench
+                .comms
+                .heard
+                .iter()
+                .any(|heard| matches!(heard, Heard::NetConfig { .. })),
+            "already zero, damaged reset: {damaged}"
+        );
+    }
+}
+
+#[test]
+fn l_133_unanswered_unwritten_clear_retries_the_same_request() {
+    // Capabilities: claim a foreign cache and withhold network acknowledgements.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 7,
+        withhold_network_ack: true,
+        ..Capabilities::default()
+    });
+    let before = bench.asked.len();
+    bench.run_for(Millis::from_millis(2500));
+    let requests: Vec<_> = bench.asked[before..]
+        .iter()
+        .filter_map(|(_, action)| {
+            if let Action::Send(Outgoing::NetConfig { req_id }) = action {
+                Some(*req_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(requests.len() >= 2, "unanswered clear must retry");
+    assert!(requests.iter().all(|id| *id == requests[0]));
+}
+
+#[test]
+fn l_133_a_written_zero_version_record_never_sends_an_unwritten_clear() {
+    // Capabilities: claim a foreign cache; the controller holds an invalid written zero.
     let mut bench = Bench::new(Capabilities {
         net_version: 7,
         ..Capabilities::default()
+    });
+    let mut record = block_on(o89_core::Kept::read(
+        o89_core::map::NETWORK,
+        &mut bench.fram,
+    ))
+    .expect("read");
+    block_on(record.write(&mut bench.fram, o89_core::Network::NONE)).expect("written zero");
+    let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
+    bench.endpoint.sessions = Sessions::new(Keys {
+        configuration: store.configuration,
+        network: store.network,
+        secret: store.secret.present().copied(),
+        epoch: report.epoch.epoch(),
+        epoch_record: store.epoch,
+        clients: store.clients,
+        challenges: store.challenges,
     });
     bench.run_for(Millis::from_millis(2000));
     assert!(
@@ -1970,16 +2060,35 @@ fn l_133_unwritten_master_with_a_foreign_cache_reports_the_protocol_gap() {
             .any(|heard| matches!(heard, Heard::NetConfig { .. }))
     );
     assert!(
-        bench.asked.iter().any(|(_, action)| matches!(
-            action,
-            Action::Note(o89_core::Note::NetworkWithoutMaster)
-        ))
+        bench
+            .asked
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Note(Note::NetworkWithoutMaster)))
     );
-    block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
-    assert!(matches!(
-        bench.endpoint.sessions.keys().network.held(),
-        o89_core::Held::Absent
-    ));
+}
+
+#[test]
+fn l_137_failed_unwritten_clear_is_retried_at_the_next_link_up() {
+    // Capabilities: claim a foreign cache; HostileComms has no durable store.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 7,
+        ..Capabilities::default()
+    });
+    bench.run_for(Millis::from_millis(2000));
+    assert!(bench.asked.iter().any(|(_, action)| matches!(
+        action,
+        Action::Note(Note::NetworkRefused(km43::NetConfig::NvsWriteFailed))
+    )));
+    let before = bench.comms.heard.len();
+    let statement = bench.comms.restate(bench.now).expect("link-up");
+    bench.feed(&statement);
+    bench.run_for(Millis::from_millis(100));
+    assert!(
+        bench.comms.heard[before..]
+            .iter()
+            .any(|heard| matches!(heard,
+        Heard::NetConfig { version: 0, network } if *network == o89_core::Network::NONE))
+    );
 }
 
 #[test]

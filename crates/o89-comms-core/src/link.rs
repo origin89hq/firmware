@@ -548,10 +548,7 @@ impl Link {
             Ok(change) => self.network.apply(change, store),
             Err(_) => NetVerdict {
                 outcome: NetConfig::RejectedInvalid,
-                version: self
-                    .network
-                    .credential()
-                    .map_or(0, crate::Credential::version),
+                version: self.network.stored_version(),
             },
         };
         Frame::NetReport {
@@ -1445,7 +1442,7 @@ mod tests {
             Some(Frame::NetReport {
                 req_id: ReqId(55),
                 outcome: NetConfig::NvsWriteFailed,
-                version: 7
+                version: 0
             })
         );
         assert_eq!(link.credential().unwrap().version(), 7);

@@ -64,7 +64,11 @@ impl Endpoint {
         dst: &mut [u8],
     ) -> Option<Step> {
         self.link
-            .set_network(self.sessions.keys().network.present().copied());
+            .set_network(match self.sessions.keys().network.held() {
+                crate::Held::Present(network) => (network.version() != 0).then_some(*network),
+                crate::Held::Absent => Some(crate::Network::NONE),
+                crate::Held::Corrupt | crate::Held::Malformed(_) => None,
+            });
         let envelope = LinkEnvelope::decode(frame).ok()?;
         if is_for_the_link(&envelope) {
             let actions = self.link.received(envelope, now, &mut self.sessions);
@@ -102,7 +106,11 @@ impl Endpoint {
     /// read now, which the link reports when it changed (L-195).
     pub fn tick(&mut self, now: Tick, install_in_flight: bool, pairing: Option<Tick>) -> Actions {
         self.link
-            .set_network(self.sessions.keys().network.present().copied());
+            .set_network(match self.sessions.keys().network.held() {
+                crate::Held::Present(network) => (network.version() != 0).then_some(*network),
+                crate::Held::Absent => Some(crate::Network::NONE),
+                crate::Held::Corrupt | crate::Held::Malformed(_) => None,
+            });
         self.link.pairing_window(pairing, now);
         let mut actions = self.link.tick(now, install_in_flight, &mut self.sessions);
         for close in self.sessions.tick(now).iter() {

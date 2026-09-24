@@ -29,7 +29,8 @@ pub struct InvalidCredential;
 impl Credential {
     /// Validate and copy a configuration without allocating.
     pub fn new(change: NetChange<'_>) -> Result<Self, InvalidCredential> {
-        let (version, country, hostname) = match change {
+        let (version, metadata) = match change {
+            NetChange::ClearUnwritten => (0, None),
             NetChange::Set {
                 version,
                 ssid,
@@ -44,25 +45,26 @@ impl Credential {
                 {
                     return Err(InvalidCredential);
                 }
-                (version, country, hostname)
+                (version, Some((country, hostname)))
             }
             NetChange::Clear {
                 version,
                 country,
                 hostname,
-            } => (version, country, hostname),
+            } => (version, Some((country, hostname))),
         };
-        if <[u8; 2]>::try_from(country.as_bytes())
-            .ok()
-            .and_then(|code| o89_link::Country::new(code).ok())
-            .is_none()
-            || hostname.is_empty()
-            || hostname.len() > 32
-            || !hostname
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            || hostname.starts_with('-')
-            || hostname.ends_with('-')
+        if let Some((country, hostname)) = metadata
+            && (<[u8; 2]>::try_from(country.as_bytes())
+                .ok()
+                .and_then(|code| o89_link::Country::new(code).ok())
+                .is_none()
+                || hostname.is_empty()
+                || hostname.len() > 32
+                || !hostname
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || hostname.starts_with('-')
+                || hostname.ends_with('-'))
         {
             return Err(InvalidCredential);
         }
@@ -138,7 +140,7 @@ impl Network {
         let Ok(credential) = Credential::new(change) else {
             return NetVerdict {
                 outcome: NetConfig::RejectedInvalid,
-                version: self.credential.as_ref().map_or(0, Credential::version),
+                version: self.stored_version,
             };
         };
         if !self.dirty && self.credential == Some(credential) {
@@ -158,7 +160,7 @@ impl Network {
         };
         NetVerdict {
             outcome,
-            version: credential.version,
+            version: self.stored_version,
         }
     }
 
@@ -188,6 +190,38 @@ mod tests {
         }
     }
     #[test]
+    fn l_137_unwritten_clear_failure_reports_the_persisted_version_and_retries() {
+        let mut network = Network::new(Some(Credential::new(set(7, "foreign")).unwrap()));
+        assert_eq!(
+            network.apply(NetChange::ClearUnwritten, |_| false),
+            NetVerdict {
+                outcome: NetConfig::NvsWriteFailed,
+                version: 7,
+            }
+        );
+        assert_eq!(
+            network.credential().unwrap().change(),
+            Ok(NetChange::ClearUnwritten)
+        );
+        assert_eq!(network.stored_version(), 7);
+        assert_eq!(
+            network.apply(NetChange::ClearUnwritten, |_| true),
+            NetVerdict {
+                outcome: NetConfig::Stored,
+                version: 0,
+            }
+        );
+        assert_eq!(network.stored_version(), 0);
+        assert_eq!(
+            network.apply(NetChange::ClearUnwritten, |_| panic!("duplicate erase")),
+            NetVerdict {
+                outcome: NetConfig::Stored,
+                version: 0,
+            }
+        );
+    }
+
+    #[test]
     fn l_136_set_replaces_the_only_network_even_with_an_older_version() {
         let mut network = Network::new(None);
         assert_eq!(
@@ -206,7 +240,7 @@ mod tests {
         let mut network = Network::new(Some(Credential::new(set(1, "old")).unwrap()));
         let verdict = network.apply(set(2, "new"), |_| false);
         assert_eq!(verdict.outcome, NetConfig::NvsWriteFailed);
-        assert_eq!(verdict.version, 2);
+        assert_eq!(verdict.version, 1);
         assert_eq!(network.credential().unwrap().change(), Ok(set(2, "new")));
         assert_eq!(
             network.apply(set(2, "new"), |_| true).outcome,

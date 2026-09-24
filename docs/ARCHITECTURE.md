@@ -695,13 +695,20 @@ a retry finishes removing the old credentials. A damaged network record is erase
 the epoch advances; a failed erase also stops the reset. An absent record is
 erased too, so a retry finishes removing residue after a partial erase. No
 country or hostname is invented, and the section reads absent afterwards. A
-never-written section remains unwritten. If that unit meets
-a module reporting a nonzero network version, KM43 0.5.1 has no clear shape
-without country and hostname: the controller sends nothing and raises
-`NetworkWithoutMaster`. That protocol gap remains open in
-[KM43 #98](https://github.com/origin89hq/km43/issues/98); no regulatory country
-is guessed. The phone-to-Wi-Fi bench exit also remains open and depends on
-#90's comms side.
+never-written section remains unwritten. If that unit meets a module reporting
+a nonzero network version, it sends `ClearUnwritten`: version zero with no
+credentials, country or hostname (L-133). The module erases its cache durably
+before reporting `stored` and version zero, and stops both Wi-Fi modes until a
+valid nonzero configuration supplies radio metadata. An erase failure still
+clears the RAM configuration and disables Wi-Fi; the acknowledgement and next
+`LinkUp` retain the previously persisted version, and the controller retries at
+the next link-up (L-137). Unanswered clears use the same bounded retry machinery
+as written network changes. A module already reporting zero needs no clear.
+A corrupt or malformed master still raises `NetworkWithoutMaster` until it is
+replaced or reset; damage is not evidence of an unwritten section.
+Equal-version collisions remain tracked in [KM43 #100](https://github.com/origin89hq/km43/issues/100).
+The phone-to-Wi-Fi bench exit, including unwritten-clear radio shutdown and
+reconfiguration, remains open and depends on #90's comms side.
 
 The adapter owns the bytes
 and the rail pin. The ROM's boot text arrives on the link at 115200 after
@@ -1343,10 +1350,14 @@ country and hostname. Duplicate successful requests do not erase again.
 
 The Wi-Fi station starts after the recovery window and OTA confirmation,
 using that cache without waiting for the controller. Association, the network
-runner and NTP have separate tasks, so a failed association does not hold up
-the UART or a future BLE task. Each task reports progress before the link
-feeds the watchdog. The radio and its RTOS use a fixed 72 KiB heap; credential
-storage and application networking buffers do not allocate. The IP stack has
+runner and NTP run concurrently within one Wi-Fi session, so a failed
+association does not hold up the UART or a future BLE task. Each reports
+progress before the link feeds the watchdog. A changed network record ends
+the session, dropping its sockets and interface before the controller; the
+radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep
+Wi-Fi off. A later network record creates a fresh session from a reborrow
+of the owned peripheral, reusing the statically reserved stack resources.
+The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack has
 three socket slots (DHCP, DNS, NTP), and the time-offer channel holds one
 sample, refusing a new sample while full.
 
