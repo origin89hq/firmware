@@ -839,6 +839,7 @@ impl Link {
         store: impl FnMut(&crate::Credential) -> bool,
     ) -> Frame {
         let req_id = envelope.req_id();
+        let before = self.credential().copied();
         let verdict = match NetChange::decode(envelope) {
             Ok(change) => self.network.apply(change, store),
             Err(_) => NetVerdict {
@@ -846,7 +847,11 @@ impl Link {
                 version: self.network.stored_version(),
             },
         };
-        self.wifi_configuration();
+        // An unchanged or refused record leaves the radio as it is; its
+        // synthetic `joining` would read a joined station as unjoined (F-044).
+        if self.credential().copied() != before {
+            self.wifi_configuration();
+        }
         Frame::NetReport {
             req_id,
             outcome: verdict.outcome,
@@ -3237,5 +3242,35 @@ mod tests {
         unlinked.restore_network(link.credential().copied());
         assert!(!unlinked.wifi.joined());
         assert!(!ble.advertising(&unlinked, at(200)));
+    }
+
+    #[test]
+    fn f_044_a_repeated_or_rejected_netconfig_leaves_a_joined_station_unadvertised() {
+        let mut link = linked_at_boot();
+        let ble = crate::BleAdmission::new();
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "site");
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(10), |_| true);
+        link.station_observed(7, true, Some(STATION_IP), None, at(20));
+        assert!(!ble.advertising(&link, at(20)));
+        // The controller restores the same record at link-up (L-130).
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(30), |_| {
+                panic!("unchanged")
+            });
+        assert!(!ble.advertising(&link, at(30)), "unchanged record");
+        let mut bad = [0; 256];
+        let len = net_change(&mut bad, "");
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&bad[..len]).unwrap(), at(40), |_| {
+                panic!("invalid")
+            });
+        assert!(!ble.advertising(&link, at(40)), "rejected record");
+        // A different record is a new installation: not joined yet.
+        let len = net_change(&mut buf, "other");
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(50), |_| true);
+        assert!(ble.advertising(&link, at(50)));
     }
 }

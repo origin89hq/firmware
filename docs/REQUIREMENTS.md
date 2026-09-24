@@ -285,9 +285,9 @@ L-060, L-080, L-120. M4.
 
 **F-044** — The comms processor advertises over BLE while its station holds
 no address — no network cached, joining, failed or off — and while the
-pairing window is open; it withdraws the advertisement within 100 ms of the
-radio's once-a-second observation that the station holds an address with
-the window closed. A phone already connected
+pairing window is open; it requests the advertisement's cancellation within
+100 ms of the radio's once-a-second observation that the station holds an
+address with the window closed. A phone already connected
 keeps its connection, so the app can hand over to Wi-Fi. Once joined, a
 client finds the controller over mDNS (P-224); a changed router, passphrase
 or address leaves the station unjoined, and BLE is back for recovery.

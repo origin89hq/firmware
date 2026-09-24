@@ -1472,8 +1472,9 @@ controller checks its window when it processes `Pair`. Cloud stays out of V1.
 KM43 0.6.0: RX is Write Without Response and TX is Notify with a CCCD.
 Advertising includes the service UUID only after valid `LinkUp`; controller
 loss requests advertising cancellation within 100 ms and closes existing
-clients. The same 100 ms poll withdraws the advertisement when the station
-holds an address and the window is closed, leaving connected clients alone.
+clients. The same 100 ms poll requests cancellation when the station holds
+an address and the window is closed, leaving connected clients alone; the
+host's disable command completes after that request, unmeasured.
 The gate reads the station's latest observation, taken once a second, not
 its report: the report keeps `joined` through a rejoin (L-204), while a lost
 lease or association restores advertising at the next observation (F-044).

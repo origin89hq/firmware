@@ -179,7 +179,8 @@ async fn advertising_allowed() -> bool {
 }
 
 /// Controller loss, a station that holds an address with the pairing window
-/// closed, or the window closing while joined: the advertisement is withdrawn.
+/// closed, or the window closing while joined: returning drops the advertiser,
+/// which requests cancellation; the host disables advertising after that.
 async fn advertising_withdrawn() {
     loop {
         if !advertising_allowed().await {
