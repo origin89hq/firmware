@@ -355,13 +355,30 @@ fn same_stack(firmware: Option<Asked>, host: Option<Asked>) -> Result<()> {
     Ok(())
 }
 
-/// Apply both rules.
+/// The QR encoder and test decoder belong only to the host bench tool.
+fn reject_host_qr(name: &str, deps: &BTreeSet<String>) -> Result<()> {
+    for dep in ["qrcode", "rqrr"] {
+        if deps.contains(dep) {
+            bail!("{name} depends on {dep}: pairing QR tools belong only on the host");
+        }
+    }
+    Ok(())
+}
+
+/// Apply the dependency boundaries.
 pub fn check(repo: &Repo) -> Result<()> {
     let firmware = MetadataCommand::new()
         .manifest_path(repo.firmware_manifest())
         .features(CargoOpt::AllFeatures)
         .exec()
         .context("reading the firmware workspace")?;
+    let firmware_graph = Graph::from_metadata(&firmware)?;
+    for package in firmware.workspace_packages() {
+        reject_host_qr(
+            package.name.as_str(),
+            &firmware_graph.reachable(&package.id)?,
+        )?;
+    }
     let comms = firmware
         .workspace_packages()
         .into_iter()
@@ -396,6 +413,7 @@ pub fn check(repo: &Repo) -> Result<()> {
             .find(|package| package.name.as_str() == name)
             .with_context(|| format!("{name} vanished from the host workspace"))?;
         let deps = graph.reachable(&package.id)?;
+        reject_host_qr(&name, &deps)?;
         if let Some(hal) = deps
             .iter()
             .find(|dep| HAL_PREFIXES.iter().any(|prefix| dep.starts_with(prefix)))
@@ -466,6 +484,24 @@ mod tests {
     fn a_stack_neither_side_names_is_refused() {
         same_stack(None, Some(asked(&["dns"]))).expect_err("the firmware names none");
         same_stack(Some(asked(&["dns"])), None).expect_err("the host names none");
+    }
+
+    #[test]
+    fn qr_tools_are_refused_in_firmware_and_domain_dependencies() {
+        for name in [
+            "o89-controller",
+            "o89-boot",
+            "o89-comms",
+            "o89-core",
+            "o89-comms-core",
+            "o89-link",
+        ] {
+            for qr in ["qrcode", "rqrr"] {
+                let deps = BTreeSet::from([qr.to_owned()]);
+                assert!(reject_host_qr(name, &deps).is_err());
+            }
+            assert!(reject_host_qr(name, &BTreeSet::new()).is_ok());
+        }
     }
 
     fn id(repr: &str) -> PackageId {
