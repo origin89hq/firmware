@@ -333,7 +333,7 @@ fn l_070_p_076_a_client_connects_opens_a_session_says_goodbye_and_its_row_goes_w
 
 #[test]
 fn l_061_a_ninth_transport_is_refused_over_the_wire_and_no_row_is_evicted() {
-    // Capabilities: none.
+    // Capabilities: invent_connection, exhaust tables.
     let mut bench = linked();
     for handle in 1..=9 {
         announce(&mut bench, handle);
@@ -940,3 +940,4 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
 }
 
 mod adversarial;
+mod conformance;
