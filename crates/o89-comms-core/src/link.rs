@@ -130,7 +130,9 @@ pub enum Frame {
         req_id: ReqId,
         /// Persistence or validation outcome.
         outcome: NetConfig,
-        /// Version held in RAM, including after a failed write.
+        /// The version last stored durably (L-132). After a failed write it
+        /// is the previous one, so the next link-up repairs the cache
+        /// (L-137); the controller records it as the module's `net_version`.
         version: u32,
     },
     /// The controller's pairing report processed: its revision echoed,
