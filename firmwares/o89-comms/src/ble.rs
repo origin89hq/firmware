@@ -52,7 +52,7 @@ type Server<'a> = AttributeServer<'a, NoopRawMutex, Pool, ATTRIBUTES, BLE_CONNEC
 static ADMISSION: Blocking<CriticalSectionRawMutex, RefCell<BleAdmission>> =
     Blocking::new(RefCell::new(BleAdmission::new()));
 
-/// Only a successful HCI command can refresh BLE's independently owned report.
+/// After task startup, only a successful HCI command refreshes BLE's report.
 static PROGRESS: Blocking<CriticalSectionRawMutex, RefCell<Progress>> =
     Blocking::new(RefCell::new(Progress::at(0)));
 
@@ -71,6 +71,8 @@ fn uuid(text: &str) -> Option<[u8; 16]> {
 
 #[embassy_executor::task]
 pub async fn run(bt: esp_hal::peripherals::BT<'static>) {
+    // Boot and the recovery window must not consume BLE's bring-up grace period.
+    PROGRESS.lock(|state| state.borrow_mut().progress(Instant::now().as_millis()));
     let Ok(max_connections) = u16::try_from(BLE_CONNECTIONS) else {
         reset()
     };

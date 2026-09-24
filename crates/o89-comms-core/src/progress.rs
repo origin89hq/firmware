@@ -92,6 +92,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f_032_late_task_start_gets_its_own_bounded_grace_period() {
+        let started_ms = 10_000;
+        let mut wifi = WifiProgress::at(0);
+        let mut ble = Progress::at(0);
+        assert!(!wifi.healthy(started_ms) && !ble.healthy(started_ms));
+        wifi.reset(started_ms);
+        ble.progress(started_ms);
+        assert!(wifi.healthy(started_ms) && ble.healthy(started_ms));
+        assert!(wifi.healthy(15_999) && ble.healthy(15_999));
+        assert!(!wifi.healthy(16_000));
+        assert!(!ble.healthy(16_000));
+        assert!(!wifi.healthy(16_001));
+        assert!(!ble.healthy(16_001));
+    }
+
+    #[test]
     fn f_032_wifi_restarts_cannot_hide_a_stalled_ble_task() {
         let mut wifi = WifiProgress::at(0);
         let ble = Progress::at(0);
