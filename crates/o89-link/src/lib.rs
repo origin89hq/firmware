@@ -28,3 +28,8 @@ pub use wire::*;
 
 mod country;
 pub use country::{BadCountry, Country};
+
+/// Bytes of a `device_id` (P-038): what the controller's secret holds and
+/// states in every `LinkUp` (L-035), and what the comms processor
+/// advertises from it. KM43 keeps its own length private.
+pub const DEVICE_ID_BYTES: usize = 16;

@@ -18,6 +18,7 @@ fn km43_writes(fw: &str) -> bool {
         boot_id: 1,
         hw: "controller-a rev A",
         net_version: None,
+        device_id: Some([7; 16]),
     };
     let header = LinkHeader {
         kind: LinkMessageType::LinkUp,

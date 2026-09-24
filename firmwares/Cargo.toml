@@ -28,7 +28,7 @@ publish = false
 # Includes the metadata-free unwritten clear and rejects written version zero.
 # 0.6.1 clears key material on drop and ships canonical vectors for host tests.
 # 0.6.3 retains Wi-Fi diagnostics (P-216–P-221, L-200–L-207) and adds client enrolment storage.
-km43 = "=0.6.3"
+km43 = "=0.7.0"
 
 embassy-executor = { version = "=0.10.0", default-features = false }
 embassy-time = { version = "=0.5.1", default-features = false }

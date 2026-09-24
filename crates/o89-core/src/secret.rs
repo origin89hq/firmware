@@ -14,8 +14,7 @@ use km43::{DeviceId, DeviceSecret, PrintedSecret};
 
 use crate::body::{Body, Malformed, Reader, Writer};
 
-/// Bytes of the device id (P-038).
-pub const DEVICE_ID_BYTES: usize = 16;
+pub use o89_link::DEVICE_ID_BYTES;
 
 /// Bytes of the printed secret (P-044).
 pub const PRINTED_SECRET_BYTES: usize = 32;

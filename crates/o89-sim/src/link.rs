@@ -85,6 +85,7 @@ fn identity() -> Identity {
         fw: LinkText::new("0.0.0-sim+g0123abcd").expect("fits"),
         hw: LinkText::new("controller-a rev A").expect("fits"),
         boot_id: BootId::derive(b"unit-1", boot_count(7)),
+        device_id: Some(DEVICE),
     }
 }
 
@@ -141,6 +142,20 @@ impl Bench {
     }
 
     fn on_at(revision: Revision, caps: Capabilities, now: Tick) -> Self {
+        Self::stating(identity(), revision, caps, now)
+    }
+
+    /// A unit whose device secret did not read this boot: no key 8 to state
+    /// (L-035).
+    fn without_device_id(caps: Capabilities) -> Self {
+        let identity = Identity {
+            device_id: None,
+            ..identity()
+        };
+        Self::stating(identity, Revision::A, caps, Tick::from_millis(1_000))
+    }
+
+    fn stating(identity: Identity, revision: Revision, caps: Capabilities, now: Tick) -> Self {
         let mut sequencer = RailSequencer::new(revision);
         let _ = sequencer.power_on(now);
         let rail = Rail::new(sequencer, None);
@@ -153,7 +168,7 @@ impl Bench {
             clock_records: Vec::new(),
             now,
             endpoint: Endpoint {
-                link: Link::new(identity(), now),
+                link: Link::new(identity, now),
                 sessions: Sessions::new(keys),
             },
             comms: HostileComms::new(caps),
@@ -647,6 +662,34 @@ fn l_033_the_controller_and_the_comms_processors_own_link_come_up_together_and_s
         .filter(|h| matches!(h, Heard::HeartbeatAck { .. }))
         .count();
     assert!(answered >= 30, "the controller answered {answered} of them");
+}
+
+#[test]
+fn l_035_the_comms_processor_learns_the_secrets_device_id_over_the_link() {
+    // Capabilities: none.
+    let mut bench = Bench::new(Capabilities::default());
+    assert_eq!(bench.comms.controller_device_id(), None);
+    bench.run_for(Millis::from_millis(3_000));
+    assert!(bench.endpoint.link.is_up() && bench.comms.is_linked());
+    // The same bytes the unit's secret holds, which `Discover` carries.
+    assert_eq!(bench.comms.controller_device_id(), Some(DEVICE));
+}
+
+#[test]
+fn l_035_a_controller_without_a_device_id_never_links_and_never_cuts_the_module() {
+    // Capabilities: none; the module keeps stating itself every two
+    // seconds, as it does unlinked.
+    let mut bench = Bench::without_device_id(Capabilities::default());
+    bench.run_for(Millis::from_millis(10 * 60_000));
+    assert!(!bench.endpoint.link.is_up(), "the controller never linked");
+    assert!(!bench.comms.is_linked(), "nor did the comms processor");
+    assert_eq!(bench.comms.controller_device_id(), None);
+    // L-111 would have cut ten times over; the silence is on purpose.
+    assert!(bench.cuts().is_empty(), "cut at {:?}", bench.cuts());
+    assert!(
+        bench.comms.sent.contains(&LinkMessageType::LinkUp),
+        "the module did state itself"
+    );
 }
 
 #[test]

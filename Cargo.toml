@@ -31,7 +31,7 @@ publish = false
 # Includes the metadata-free unwritten clear and rejects written version zero.
 # 0.6.1 clears key material on drop and ships canonical vectors for host tests.
 # 0.6.3 retains Wi-Fi diagnostics (P-216–P-221, L-200–L-207) and adds client enrolment storage.
-km43 = "=0.6.3"
+km43 = "=0.7.0"
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }

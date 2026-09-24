@@ -176,6 +176,11 @@ pub struct Identity {
     pub hw: LinkText,
     /// Key 5.
     pub boot_id: BootId,
+    /// Key 8, from the device secret (L-035). A unit without one has
+    /// nothing to state: it keeps the link down for the boot, sends no
+    /// `LinkUp` and answers none, and its silence is no reason to cut the
+    /// rail (origin89hq/km43#127).
+    pub device_id: Option<[u8; crate::secret::DEVICE_ID_BYTES]>,
 }
 
 /// The peer, as its last `LinkUp` or acknowledgement stated it.
@@ -368,6 +373,9 @@ pub enum Note {
     PeerRefused(Option<u16>),
     /// A `LinkUp` claiming to be a controller.
     WrongRole,
+    /// A `LinkUp` left unanswered: without a `device_id` this side has no
+    /// statement to answer with (L-035).
+    NoDeviceId,
 }
 
 /// A frame to put on the wire, described rather than encoded so the
@@ -876,6 +884,13 @@ impl Link {
         self.pairing.retired()
     }
 
+    /// Whether the link is down on purpose for the rest of the boot: every
+    /// pairing-report revision spent (L-195), or no `device_id` to state
+    /// (L-035). Neither is anything a cycle of the module would cure.
+    const fn held_down(&self) -> bool {
+        self.pairing.retired() || self.identity.device_id.is_none()
+    }
+
     /// The last valid frame from the peer, from which silence is measured.
     #[must_use]
     pub const fn last_heard(&self) -> Option<Tick> {
@@ -975,15 +990,9 @@ impl Link {
             LinkMessageType::WifiScanAck
             | LinkMessageType::WifiScanResult
             | LinkMessageType::WifiState => self.wifi_received(kind, envelope, now, &mut actions),
-            LinkMessageType::LinkUp => match LinkUp::decode(envelope) {
-                Ok(theirs) => {
-                    if let Some((peer, compat)) = Self::accept(&theirs, &mut actions) {
-                        actions.push(Action::Send(Outgoing::LinkUpAck { req_id }));
-                        self.stated(peer, compat, now, rows, &mut actions);
-                    }
-                }
-                Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
-            },
+            LinkMessageType::LinkUp => {
+                self.statement_received(envelope, now, rows, &mut actions);
+            }
             LinkMessageType::LinkUpAck => {
                 if !self.requests.awaits(req_id, LinkMessageType::LinkUp) {
                     actions.push(Action::Note(Note::UnexpectedAck(kind)));
@@ -1505,7 +1514,7 @@ impl Link {
     /// last came up, past the earliest cut, and no install in flight
     /// (L-113).
     fn cut_due(&self, now: Tick, install_in_flight: bool) -> bool {
-        if self.pairing.retired() {
+        if self.held_down() {
             // Down on purpose for the rest of the boot: its silence is
             // nothing a cycle of the module would cure.
             return false;
@@ -1625,6 +1634,7 @@ impl Link {
             boot_id: self.identity.boot_id.get(),
             hw: self.identity.hw.as_str(),
             net_version: None,
+            device_id: self.identity.device_id,
         }
         .write(link_header(kind, req_id), dst)
     }
@@ -1679,6 +1689,33 @@ impl Link {
             },
         };
         Some((peer, compat))
+    }
+
+    /// A `LinkUp` from the peer: answered with ours and recorded, or, with
+    /// no `device_id` to state, left unanswered, because an acknowledgement
+    /// is a statement and one without key 8 is one the module must refuse
+    /// (L-035).
+    fn statement_received(
+        &mut self,
+        envelope: LinkEnvelope<'_>,
+        now: Tick,
+        rows: &mut impl Rows,
+        actions: &mut Actions,
+    ) {
+        if self.identity.device_id.is_none() {
+            actions.push(Action::Note(Note::NoDeviceId));
+            return;
+        }
+        let req_id = envelope.req_id();
+        match LinkUp::decode(envelope) {
+            Ok(theirs) => {
+                if let Some((peer, compat)) = Self::accept(&theirs, actions) {
+                    actions.push(Action::Send(Outgoing::LinkUpAck { req_id }));
+                    self.stated(peer, compat, now, rows, actions);
+                }
+            }
+            Err(_) => actions.push(Action::Note(Note::Malformed(LinkMessageType::LinkUp))),
+        }
     }
 
     /// The peer stated itself of its own accord (L-030): recorded and
@@ -1831,8 +1868,9 @@ impl Link {
     }
 
     fn announce(&mut self, now: Tick, actions: &mut Actions) {
-        if self.pairing.retired() {
-            // Only a controller reboot links again (L-195).
+        if self.held_down() {
+            // Only a controller reboot links again (L-195), and only with a
+            // device secret written (L-035).
             return;
         }
         if let Phase::Down { next_linkup } = &mut self.phase {
@@ -2230,11 +2268,15 @@ mod tests {
         BootCount::decode(&bytes).expect("a count decodes")
     }
 
+    /// The device secret's id the fixture unit states in key 8.
+    const DEVICE_ID: [u8; crate::secret::DEVICE_ID_BYTES] = [0x4f; crate::secret::DEVICE_ID_BYTES];
+
     fn identity() -> Identity {
         Identity {
             fw: LinkText::new("0.0.0+g0123abcd").expect("fits"),
             hw: LinkText::new("controller-a rev A").expect("fits"),
             boot_id: BootId::derive(b"unit", boot(3)),
+            device_id: Some(DEVICE_ID),
         }
     }
 
@@ -2270,6 +2312,7 @@ mod tests {
             boot_id: link.peer().expect("peer").boot_id,
             hw: "comms",
             net_version: Some(99),
+            device_id: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(100)), &mut body)
         .expect("statement");
@@ -2812,6 +2855,7 @@ mod tests {
             boot_id: 0x5EED,
             hw: "comms",
             net_version: Some(0),
+            device_id: None,
         }
         .write(link_header(LinkMessageType::LinkUpAck, req_id), &mut buf)
         .expect("fits");
@@ -3007,6 +3051,7 @@ mod tests {
             boot_id: 0xB007,
             hw: "comms",
             net_version: Some(0),
+            device_id: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(90)), &mut buf)
         .expect("fits");
@@ -3161,6 +3206,7 @@ mod tests {
             boot_id: 0x5EED,
             hw: "comms",
             net_version: Some(0),
+            device_id: None,
         }
         .write(
             link_header(LinkMessageType::LinkUp, ReqId(req_id)),
@@ -3297,5 +3343,90 @@ mod tests {
         assert_eq!(resync(&retried), Some(req_id));
         let _ = close_report(&mut link, &mut rows, req_id, at(7_650));
         assert_eq!(rows.0, 0);
+    }
+
+    /// A unit whose device secret is absent this boot.
+    fn without_device_id() -> Link {
+        Link::new(
+            Identity {
+                device_id: None,
+                ..identity()
+            },
+            Tick::ZERO,
+        )
+    }
+
+    /// Whether `actions` holds anything said to the module or a cut.
+    fn speaks_or_cuts(actions: &Actions) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Send(_) | Action::CutRail))
+    }
+
+    #[test]
+    fn l_035_every_statement_the_controller_writes_carries_its_device_id() {
+        let link = Link::new(identity(), Tick::ZERO);
+        for outgoing in [
+            Outgoing::LinkUp { req_id: ReqId(1) },
+            Outgoing::LinkUpAck { req_id: ReqId(2) },
+        ] {
+            let (bytes, len) = envelope_of(&link, outgoing, Tick::ZERO);
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("decodes");
+            let ours = LinkUp::decode(envelope).expect("a statement");
+            assert_eq!(ours.device_id, Some(DEVICE_ID), "{outgoing:?}");
+        }
+    }
+
+    #[test]
+    fn l_035_without_a_device_id_the_controller_states_nothing_and_never_cuts() {
+        let mut link = without_device_id();
+        let settled = link.module_settled(at(0));
+        assert!(!speaks_or_cuts(&settled), "{settled:?}");
+        // Well past the sixty seconds L-111 would count from the rail.
+        for now in (100..200_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(!speaks_or_cuts(&ticked), "{ticked:?} at {now}");
+        }
+        assert!(!link.is_up());
+    }
+
+    #[test]
+    fn l_035_without_a_device_id_a_comms_statement_is_left_unanswered() {
+        let mut link = without_device_id();
+        let _ = link.module_settled(at(0));
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: 0x5EED,
+            hw: "comms",
+            net_version: Some(0),
+            device_id: None,
+        }
+        .write(link_header(LinkMessageType::LinkUp, ReqId(40)), &mut buf)
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        let answered = link.received(envelope, at(10), &mut NoRows);
+        assert_eq!(only(&answered), Some(Action::Note(Note::NoDeviceId)));
+        assert!(!link.is_up());
+    }
+
+    /// The other side of the two tests above: a unit with its id, whose
+    /// module never answers, is cut once the ladder's sixty seconds pass.
+    #[test]
+    fn l_111_a_unit_with_its_device_id_still_cuts_a_silent_module() {
+        let mut link = Link::new(identity(), Tick::ZERO);
+        let settled = link.module_settled(at(0));
+        assert!(
+            settled
+                .iter()
+                .any(|a| matches!(a, Action::Send(Outgoing::LinkUp { .. })))
+        );
+        let cut = (100..=CUT_AFTER.as_millis())
+            .step_by(100)
+            .map(|now| link.tick(at(now), false, &mut NoRows))
+            .any(|ticked| ticked.iter().any(|a| *a == Action::CutRail));
+        assert!(cut, "no cut by sixty seconds of silence");
     }
 }

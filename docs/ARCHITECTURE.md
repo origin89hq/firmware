@@ -776,6 +776,13 @@ count (F-039): the G0 has no RNG, and what L-040 needs is a number that
 is new at every boot and never read back from RAM, which a boot count kept
 on the FRAM and advanced at every boot is; two boots
 share a value with the chance two random draws would, one in 2^32.
+Every controller `LinkUp` carries the device secret's `device_id` as key 8
+(KM43 L-035), the one fact about the controller the comms processor keeps:
+it names the controller in the mDNS advertisement and nothing reads it
+otherwise. A boot without a secret has nothing to state, so its link stays
+down on purpose, as it does once L-195's revisions are spent: no `LinkUp`
+goes out, the module's is left unanswered, and the ladder does not cut
+(F-039).
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
 (above). A frame from the comms processor that is not four elements is
@@ -1098,7 +1105,10 @@ switch is slew-limited, defaults on with the controller's pin high-impedance,
 and the pin drives low to cut it (A-23). The controller takes ownership once
 it has booted and applies its policy from there:
 
-- The recovery ladder's cuts (L-111, L-112), each recorded with the count
+- The recovery ladder's cuts (L-111, L-112), never while the link is down
+  on purpose (no device secret, or L-195's revisions spent; F-039,
+  [origin89hq/km43#127](https://github.com/origin89hq/km43/issues/127)),
+  each recorded with the count
   L-111 names, and the third rung with the branch it took: `comms
   unrecoverable` says whether the rail was left on or off (KM43 P-215). The cuts of the last hour
   are on the FRAM before the rail goes off, and a cut whose count does not
