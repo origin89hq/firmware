@@ -258,18 +258,14 @@ async fn worker(
                 LINK.lock().await.gone(conn, reason);
                 disconnect(&gatt).await;
             } else {
-                connection.disconnect();
-                reset();
+                LINK.lock()
+                    .await
+                    .gone(conn, DisconnectReason::TransportError);
+                disconnect_raw(&connection).await;
             }
             drop(row);
         } else {
-            connection.disconnect();
-            if !matches!(
-                with_timeout(CLOSE, connection.next()).await,
-                Ok(ConnectionEvent::Disconnected { .. })
-            ) {
-                reset();
-            }
+            disconnect_raw(&connection).await;
         }
         // Give the host runner a turn before advertising again.
         Timer::after(STATUS).await;
@@ -284,6 +280,28 @@ async fn announced(conn: Conn) -> bool {
             Some(Status::Close(_)) | None => return false,
         }
         Timer::after(STATUS).await;
+    }
+}
+
+/// Refusal and failed GATT registration still need the controller's close event.
+async fn disconnect_raw(connection: &Connection<'_, Pool>) {
+    if !connection.is_connected() {
+        return;
+    }
+    connection.disconnect();
+    let stopped = with_timeout(CLOSE, async {
+        loop {
+            if matches!(
+                connection.next().await,
+                ConnectionEvent::Disconnected { .. }
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    if stopped.is_err() {
+        reset();
     }
 }
 
