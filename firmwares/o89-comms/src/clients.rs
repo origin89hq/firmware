@@ -50,8 +50,8 @@ use o89_comms_core::{
 
 use crate::link::LINK;
 
-/// The port a client connects to.
-const PORT: u16 = 80;
+/// The port a client connects to, KM43's (P-223).
+const PORT: u16 = km43::WS_PORT;
 /// Workers on the station's network: one per row.
 pub const STATION_WORKERS: usize = o89_comms_core::sockets::STATION_WORKERS;
 /// BLE workers follow the station and access-point workers in the shared mailboxes.

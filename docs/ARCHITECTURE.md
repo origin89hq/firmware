@@ -1430,7 +1430,9 @@ frame arrives is closed rather than a frame dropped or evicted. Clients'
 stamped frames reach the UART through a two-envelope queue the link task
 drains one a turn after reading the UART; a frame that cannot enter it
 within a second is lost and its client retries. The opening handshake is
-RFC 6455's within 1 024 bytes and five seconds; no path, origin or
+RFC 6455's within 1 024 bytes and five seconds, on port `WS_PORT` (80) at
+`WS_PATH` (`/km43`) on both the station and the access point; any other
+request-target is answered 404 without an upgrade (P-223). No origin or
 subprotocol is decided on. A text frame, a fragmented message, an unmasked
 frame or one over one envelope closes the connection (1003, 1002, 1009).
 Every close carries a code and a reason a client can show (L-061). A ninth
