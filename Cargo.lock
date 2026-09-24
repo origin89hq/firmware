@@ -1293,6 +1293,7 @@ dependencies = [
  "km43",
  "o89-comms-core",
  "o89-core",
+ "serde_json",
 ]
 
 [[package]]

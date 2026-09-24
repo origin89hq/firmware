@@ -1428,9 +1428,12 @@ deadline, announcements three seconds and disconnect confirmation two seconds.
 The host tests consume all 2758 shared BLE trace steps from KM43's
 `docs/protocol/vectors/v1.json`, including selected value limits, maximum
 payloads, errors, expiry, disconnect, backpressure and message-ID wrap.
-`crates/o89-comms-core/tests/import_ble_vectors.py` imports the fixture into
-an allocation-free test representation and records the source hash. Re-import
-when updating the protocol pin. These are host checks, not BLE conformance.
+`crates/o89-sim/tests/ble_vectors.rs` reads `km43::VECTORS_JSON` from the
+exactly pinned crate and runs the firmware's `o89_comms_core::BlePipe`
+adapter. JSON parsing allocates only in the host harness; the dependency gate
+keeps the parser and vector feature out of the domain crates and firmware
+images. The test asserts the step count and each verdict and output. These
+are host checks, not BLE conformance.
 Native-app onboarding on each supported phone OS, coexistence, recovery and
 heap-exhaustion tests on board A remain open in
 [#96](https://github.com/origin89hq/firmware/issues/96) and

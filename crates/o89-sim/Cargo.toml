@@ -18,6 +18,9 @@ embedded-storage-async.workspace = true
 km43.workspace = true
 
 [dev-dependencies]
+# Canonical traces from the same exact protocol pin; parser stays on the host.
+km43 = { workspace = true, features = ["vectors"] }
+serde_json = "=1.0.151"
 # The comms processor's network stack, built on the laptop to show that
 # each socket budget in `o89_comms_core::sockets` holds every socket the
 # firmware and embassy-net open at once (`tests/comms_sockets.rs`). The same

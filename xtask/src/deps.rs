@@ -204,23 +204,24 @@ impl Graph {
 
 /// Every package a build of `name` alone for `target` would link, one a
 /// line as `name vX.Y.Z (path)|feature,feature`: the crate's own features
-/// all on, its normal and its test dependencies followed, procedural macros
-/// left out because they run on the laptop. `cargo tree` resolves features
+/// all on and the requested dependency edges followed. Domain checks include
+/// their own test dependencies; firmware checks follow normal dependencies.
+/// Procedural macros are left out because they run on the laptop. `cargo tree` resolves features
 /// as a build of the named package would, which a workspace-wide resolution
 /// does not.
-fn tree_features(repo: &Repo, name: &str, target: &str) -> Result<String> {
+fn tree_features(
+    repo: &Repo,
+    manifest: &Path,
+    name: &str,
+    target: &str,
+    edges: &str,
+) -> Result<String> {
     let output = repo
         .cargo()
         .args(["tree", "--manifest-path"])
-        .arg(repo.host_manifest())
+        .arg(manifest)
         .args(["-p", name, "--all-features", "--target", target])
-        .args([
-            "-e",
-            "normal,dev,no-proc-macro",
-            "--prefix",
-            "none",
-            "--no-dedupe",
-        ])
+        .args(["-e", edges, "--prefix", "none", "--no-dedupe"])
         .args(["-f", "{p}|{f}"])
         .output()
         .with_context(|| format!("running cargo tree for {name} on {target}"))?;
@@ -231,6 +232,26 @@ fn tree_features(repo: &Repo, name: &str, target: &str) -> Result<String> {
         );
     }
     String::from_utf8(output.stdout).context("cargo tree wrote something other than text")
+}
+
+/// Published fixtures and their JSON parser belong only to the host harness.
+/// Check resolved features per package, so the simulator's dev-dependencies
+/// cannot hide a feature enabled by a firmware or domain dependency.
+fn reject_host_vectors(name: &str, tree: &str) -> Result<()> {
+    for line in tree.lines() {
+        let Some((package, features)) = line.split_once('|') else {
+            continue;
+        };
+        let dependency = package.split_whitespace().next().unwrap_or_default();
+        if dependency == "serde_json"
+            || (dependency == "km43" && features.split(',').any(|f| f.trim() == "vectors"))
+        {
+            bail!(
+                "{name} reaches {package} with features {features:?}: km43 vectors and serde_json belong only to host tests"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The first package in a tree resolved with an `alloc` or `std` feature,
@@ -374,6 +395,16 @@ pub fn check(repo: &Repo) -> Result<()> {
         .context("reading the firmware workspace")?;
     let firmware_graph = Graph::from_metadata(&firmware)?;
     for package in firmware.workspace_packages() {
+        let name = package.name.as_str();
+        let target = if name == COMMS { RISCV } else { CORTEX_M0 };
+        let tree = tree_features(
+            repo,
+            &repo.firmware_manifest(),
+            name,
+            target,
+            "normal,no-proc-macro",
+        )?;
+        reject_host_vectors(name, &tree)?;
         reject_host_qr(
             package.name.as_str(),
             &firmware_graph.reachable(&package.id)?,
@@ -421,7 +452,14 @@ pub fn check(repo: &Repo) -> Result<()> {
             bail!("{name} depends on {hal}: a domain crate names no peripheral");
         }
         for target in [CORTEX_M0, RISCV] {
-            let tree = tree_features(repo, &name, target)?;
+            let tree = tree_features(
+                repo,
+                &repo.host_manifest(),
+                &name,
+                target,
+                "normal,dev,no-proc-macro",
+            )?;
+            reject_host_vectors(&name, &tree)?;
             if let Some((dep, feature)) = alloc_feature_in(&tree) {
                 bail!(
                     "{name} reaches {dep} with its {feature:?} feature on for {target}: an allocator arriving through a dependency is still an allocator"
@@ -441,7 +479,7 @@ pub fn check(repo: &Repo) -> Result<()> {
         }
     }
     println!(
-        "dependency boundaries kept: {COMMS} never sees {CORE}; domain crates name no peripheral and no allocator; {SIM} tests the {NET} {COMMS} builds"
+        "dependency boundaries kept: {COMMS} never sees {CORE}; domain crates name no peripheral and no allocator; vectors and JSON stay in host tests; {SIM} tests the {NET} {COMMS} builds"
     );
     Ok(())
 }
@@ -449,6 +487,35 @@ pub fn check(repo: &Repo) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_vectors_are_refused_in_firmware_and_domain_trees() {
+        for name in [
+            "o89-boot",
+            "o89-controller",
+            "o89-comms",
+            "o89-core",
+            "o89-comms-core",
+            "o89-link",
+        ] {
+            assert!(reject_host_vectors(name, "km43 v0.6.1|defmt,vectors\n").is_err());
+            assert!(reject_host_vectors(name, "serde_json v1.0.151|\n").is_err());
+            assert!(reject_host_vectors(name, "km43 v0.6.1|defmt\n").is_ok());
+        }
+    }
+
+    #[test]
+    fn vector_boundary_matches_whole_package_and_feature_names() {
+        assert!(
+            reject_host_vectors(
+                "domain",
+                "km43 v0.6.1|vectors-extra\nserde_json_core v0.6.0|\n"
+            )
+            .is_ok()
+        );
+        assert!(reject_host_vectors("domain", "km43 v0.6.1|defmt, vectors\n").is_err());
+        assert!(reject_host_vectors("domain", "").is_ok());
+    }
 
     fn asked(features: &[&str]) -> Asked {
         Asked {
