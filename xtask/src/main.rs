@@ -23,6 +23,9 @@ mod link_version;
 #[cfg(test)]
 mod link_version_tests;
 
+#[cfg(test)]
+mod frozen_watchdog_tests;
+
 mod bootloader;
 mod cross;
 mod deps;
