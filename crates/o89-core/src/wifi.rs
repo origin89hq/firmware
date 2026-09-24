@@ -34,6 +34,10 @@ pub struct Wifi {
     list_at: Tick,
     report: Option<RadioReport>,
     announced: Option<(RadioReport, Tick)>,
+    /// The latest version whose `joined` this controller boot announced
+    /// (P-220). Versions rise except when a damaged section is rewritten from
+    /// zero, and then the worst case is one join early or one held.
+    joined: Option<u32>,
 }
 
 impl Wifi {
@@ -48,6 +52,7 @@ impl Wifi {
         list_at: Tick::ZERO,
         report: None,
         announced: None,
+        joined: None,
     };
 
     /// P-218: joining precedes refusals; otherwise the first gate wins.
@@ -209,15 +214,30 @@ impl Wifi {
             if same_announcement(previous, report) {
                 return None;
             }
-            if previous.version == report.version && elapsed(now, at) < WIFI_RECORD_INTERVAL_MS {
+            if previous.version == report.version
+                && !self.first_join_after_failure(previous, report)
+                && elapsed(now, at) < WIFI_RECORD_INTERVAL_MS
+            {
                 return None;
             }
         }
         Some(WifiStatusChanged { section, report })
     }
+
     /// Advance the record rate only after the recorder queue accepted the decision.
     pub fn recorded(&mut self, record: WifiStatusChanged, now: Tick) {
         self.announced = Some((record.report, now));
+        if matches!(record.report.radio, Radio::Joined { .. }) {
+            self.joined = Some(record.report.version);
+        }
+    }
+
+    /// P-220: a `failed` can be a retry seconds from its lease, so the first
+    /// join after one is written at once, once per version per controller boot.
+    fn first_join_after_failure(&self, previous: RadioReport, report: RadioReport) -> bool {
+        matches!(previous.radio, Radio::Failed { .. })
+            && matches!(report.radio, Radio::Joined { .. })
+            && self.joined != Some(report.version)
     }
 }
 
@@ -422,5 +442,102 @@ mod tests {
             radio: Radio::Joined { ipv4: [1, 2, 3, 5] },
         });
         assert!(record(&mut wifi, 1, at(600_000)).is_none());
+    }
+    fn failed(version: u32) -> RadioReport {
+        RadioReport {
+            version,
+            radio: Radio::Failed {
+                reason: WifiFailure::NoIp,
+            },
+        }
+    }
+    fn joined(version: u32) -> RadioReport {
+        RadioReport {
+            version,
+            radio: Radio::Joined { ipv4: [1, 2, 3, 4] },
+        }
+    }
+    #[test]
+    fn f_093_p_220_first_join_after_a_failure_is_written_at_once_and_stays_due_until_queued() {
+        let mut wifi = Wifi::EMPTY;
+        wifi.reported(failed(1));
+        assert_eq!(
+            record(&mut wifi, 1, at(9_100)).expect("first").report,
+            failed(1)
+        );
+        wifi.reported(joined(1));
+        let due = wifi.record(1, at(12_000)).expect("join at once");
+        assert_eq!(due.report, joined(1));
+        assert_eq!(
+            wifi.record(1, at(12_001)),
+            Some(due),
+            "queue refused: still due"
+        );
+        wifi.recorded(due, at(12_001));
+        assert_eq!(wifi.record(1, at(12_002)), None);
+    }
+    #[test]
+    fn f_093_p_220_second_join_after_a_failure_in_the_same_boot_waits_even_across_a_comms_reboot() {
+        let mut wifi = Wifi::EMPTY;
+        wifi.reported(failed(1));
+        assert!(record(&mut wifi, 1, at(0)).is_some());
+        wifi.reported(joined(1));
+        assert!(record(&mut wifi, 1, at(1)).is_some(), "first join at once");
+        wifi.reported(failed(1));
+        assert_eq!(record(&mut wifi, 1, at(2)), None);
+        assert_eq!(
+            record(&mut wifi, 1, at(600_001)).expect("interval").report,
+            failed(1)
+        );
+        wifi.lost();
+        wifi.reported(joined(1));
+        assert_eq!(
+            record(&mut wifi, 1, at(600_002)),
+            None,
+            "one exception per boot"
+        );
+        assert_eq!(record(&mut wifi, 1, at(1_200_000)), None);
+        assert_eq!(
+            record(&mut wifi, 1, at(1_200_001))
+                .expect("interval")
+                .report,
+            joined(1)
+        );
+    }
+    #[test]
+    fn p_220_a_join_after_anything_but_a_failure_waits_the_interval() {
+        let mut wifi = Wifi::EMPTY;
+        wifi.reported(RadioReport {
+            version: 1,
+            radio: Radio::Off,
+        });
+        assert!(record(&mut wifi, 1, at(0)).is_some());
+        wifi.reported(joined(1));
+        assert_eq!(record(&mut wifi, 1, at(1)), None);
+        assert_eq!(record(&mut wifi, 1, at(599_999)), None);
+        assert_eq!(
+            record(&mut wifi, 1, at(600_000)).expect("interval").report,
+            joined(1)
+        );
+    }
+    #[test]
+    fn f_093_p_220_a_new_version_grants_its_own_first_join_after_a_failure() {
+        let mut wifi = Wifi::EMPTY;
+        wifi.reported(failed(1));
+        assert!(record(&mut wifi, 1, at(0)).is_some());
+        wifi.reported(joined(1));
+        assert!(record(&mut wifi, 1, at(1)).is_some());
+        wifi.reported(failed(2));
+        assert_eq!(
+            record(&mut wifi, 2, at(2)).expect("new version").report,
+            failed(2)
+        );
+        wifi.reported(joined(2));
+        assert_eq!(
+            record(&mut wifi, 2, at(3)).expect("join at once").report,
+            joined(2)
+        );
+        wifi.reported(failed(2));
+        assert_eq!(record(&mut wifi, 2, at(4)), None);
     }
 }
