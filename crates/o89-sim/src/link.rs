@@ -90,6 +90,9 @@ fn identity() -> Identity {
 
 pub(crate) struct Bench {
     clock: o89_core::WallClock,
+    /// The selector's override at the instant the recorder processes the request.
+    floor_override: clock::FloorOverride,
+    clock_notes: Vec<clock::ClockNote>,
     pub(crate) calendar: Option<(o89_core::UnixMillis, Tick)>,
     pub(crate) clock_records: Vec<km43::ControllerRecord>,
     pub(crate) now: Tick,
@@ -141,6 +144,8 @@ impl Bench {
         let (fram, keys) = unit();
         let mut bench = Self {
             clock: o89_core::WallClock::new(),
+            floor_override: clock::FloorOverride::Unarmed,
+            clock_notes: Vec::new(),
             calendar: None,
             clock_records: Vec::new(),
             now,
