@@ -72,7 +72,7 @@ impl Configuration {
         })
     }
 
-    /// Encode only the read shape. A damaged record is never reported unwritten.
+    /// Encode the read shape; unreadable records answer as unwritten (P-108).
     pub fn answer(
         &self,
         section: ConfigSection,
@@ -81,13 +81,13 @@ impl Configuration {
     ) -> Result<usize, ErrorCode> {
         let mut bytes = [0; km43::MAX_NETWORK_READ_BYTES];
         let (version, body) = match section {
-            ConfigSection::IdentityAndSite => shown(&self.identity)?,
-            ConfigSection::GeneratorBehaviour => shown(&self.generator)?,
-            ConfigSection::FrostBehaviour => shown(&self.frost)?,
-            ConfigSection::ScheduleBehaviour => shown(&self.schedule)?,
-            ConfigSection::LoadShedBehaviour => shown(&self.load_shed)?,
+            ConfigSection::IdentityAndSite => shown(&self.identity),
+            ConfigSection::GeneratorBehaviour => shown(&self.generator),
+            ConfigSection::FrostBehaviour => shown(&self.frost),
+            ConfigSection::ScheduleBehaviour => shown(&self.schedule),
+            ConfigSection::LoadShedBehaviour => shown(&self.load_shed),
             ConfigSection::Network => match network.held() {
-                Held::Absent => (0, None),
+                Held::Absent | Held::Corrupt | Held::Malformed(_) => (0, None),
                 Held::Present(value) => {
                     let len = value
                         .read_body()
@@ -98,7 +98,6 @@ impl Configuration {
                         Some(bytes.get(..len).ok_or(ErrorCode::BusyRetry)?),
                     )
                 }
-                Held::Corrupt | Held::Malformed(_) => return Err(ErrorCode::BusyRetry),
             },
             ConfigSection::Channels | ConfigSection::BusesAndDevices | ConfigSection::Cloud => {
                 return Err(ErrorCode::UnknownSection);
@@ -195,13 +194,10 @@ impl Configuration {
         }
     }
 }
-fn shown<const N: usize, const M: usize>(
-    record: &Kept<Section<N>, M>,
-) -> Result<(u32, Option<&[u8]>), ErrorCode> {
+fn shown<const N: usize, const M: usize>(record: &Kept<Section<N>, M>) -> (u32, Option<&[u8]>) {
     match record.held() {
-        Held::Absent => Ok((0, None)),
-        Held::Present(value) => Ok((value.version, Some(value.body()))),
-        Held::Corrupt | Held::Malformed(_) => Err(ErrorCode::BusyRetry),
+        Held::Absent | Held::Corrupt | Held::Malformed(_) => (0, None),
+        Held::Present(value) => (value.version, Some(value.body())),
     }
 }
 fn ack(operation: SetConfigOperation<'_>, version: u32, outcome: SetConfig) -> SetConfigAck {
@@ -263,4 +259,146 @@ async fn save<F: Fram, const N: usize, const M: usize>(
         .await
         .map_err(|_| ErrorCode::BusyRetry)?;
     Ok(ack(operation, next, SetConfig::Accepted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Address, Position, Refused};
+    use embassy_futures::block_on;
+
+    struct Part([u8; crate::FRAM_BYTES]);
+    impl Fram for Part {
+        type Error = ();
+        fn read(
+            &mut self,
+            at: Address,
+            into: &mut [u8],
+        ) -> impl core::future::Future<Output = Result<(), ()>> {
+            into.copy_from_slice(&self.0[usize::from(at.0)..][..into.len()]);
+            core::future::ready(Ok(()))
+        }
+        fn write(
+            &mut self,
+            at: Address,
+            bytes: &[u8],
+        ) -> impl core::future::Future<Output = Result<(), Refused<()>>> {
+            self.0[usize::from(at.0)..][..bytes.len()].copy_from_slice(bytes);
+            core::future::ready(Ok(()))
+        }
+    }
+
+    #[expect(
+        clippy::large_stack_arrays,
+        reason = "The host fixture models bounded FRAM without an allocator, including unused reservations."
+    )]
+    fn damaged_part(malformed: bool) -> Part {
+        let mut part = Part([0x42; crate::FRAM_BYTES]);
+        if malformed {
+            let _ =
+                block_on(map::NETWORK.write(&mut part, Position::Start, &[0x42; NETWORK_BYTES]))
+                    .expect("network");
+            let _ = block_on(map::SITE_CONFIG.prefix().write(
+                &mut part,
+                Position::Start,
+                &[0x42; IDENTITY_RECORD_BYTES],
+            ))
+            .expect("identity");
+            for record in [
+                map::GENERATOR_CONFIG,
+                map::FROST_CONFIG,
+                map::SCHEDULE_CONFIG,
+                map::LOAD_SHED_CONFIG,
+            ] {
+                let _ = block_on(record.prefix().write(
+                    &mut part,
+                    Position::Start,
+                    &[0x42; BEHAVIOUR_RECORD_BYTES],
+                ))
+                .expect("behaviour");
+            }
+        }
+        part
+    }
+
+    #[test]
+    fn p_108_p_100_unreadable_sections_read_zero_and_replace_only_at_zero() {
+        for malformed in [false, true] {
+            let mut part = damaged_part(malformed);
+            let mut config = block_on(Configuration::read(&mut part)).expect("config");
+            let mut network = block_on(Kept::read(map::NETWORK, &mut part)).expect("network");
+            assert_eq!(matches!(network.held(), Held::Malformed(_)), malformed);
+            assert_eq!(
+                matches!(config.identity.held(), Held::Malformed(_)),
+                malformed
+            );
+            assert_eq!(matches!(network.held(), Held::Corrupt), !malformed);
+            for section in [
+                ConfigSection::IdentityAndSite,
+                ConfigSection::Network,
+                ConfigSection::GeneratorBehaviour,
+                ConfigSection::FrostBehaviour,
+                ConfigSection::ScheduleBehaviour,
+                ConfigSection::LoadShedBehaviour,
+            ] {
+                let before = part.0;
+                let mut bytes = [0; 160];
+                let len = config
+                    .answer(section, &network, &mut bytes)
+                    .expect("damaged read");
+                let answer = ConfigAnswer::decode(&bytes[..len]).expect("answer");
+                assert_eq!(
+                    (answer.section(), answer.version(), answer.body()),
+                    (section, 0, None)
+                );
+                let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+                let len = match section {
+                    ConfigSection::IdentityAndSite => {
+                        body[..4].copy_from_slice(&[0xa1, 1, 0x61, b'a']);
+                        4
+                    }
+                    ConfigSection::Network => km43::NetworkWrite {
+                        join: None,
+                        country: km43::Country::new("CA").expect("country"),
+                        hostname: km43::Hostname::new("origin89").expect("host"),
+                    }
+                    .encode(&mut body)
+                    .expect("network"),
+                    ConfigSection::GeneratorBehaviour
+                    | ConfigSection::FrostBehaviour
+                    | ConfigSection::ScheduleBehaviour
+                    | ConfigSection::LoadShedBehaviour => km43::BehaviourSection { shadow: true }
+                        .encode(&mut body)
+                        .expect("behaviour"),
+                    ConfigSection::Channels
+                    | ConfigSection::BusesAndDevices
+                    | ConfigSection::Cloud => panic!("unsupported section"),
+                };
+                let operation = SetConfigOperation {
+                    section,
+                    expected_version: 1,
+                    body: &body[..len],
+                };
+                let ack =
+                    block_on(config.set(operation, &mut network, &mut part)).expect("stale ack");
+                assert_eq!((ack.version, ack.outcome), (0, SetConfig::StaleVersion));
+                assert_eq!(part.0, before, "read and stale write preserve damage");
+                let ack = block_on(config.set(
+                    SetConfigOperation {
+                        expected_version: 0,
+                        ..operation
+                    },
+                    &mut network,
+                    &mut part,
+                ))
+                .expect("repair");
+                assert_eq!((ack.version, ack.outcome), (1, SetConfig::Accepted));
+                let len = config
+                    .answer(section, &network, &mut bytes)
+                    .expect("repaired read");
+                let answer = ConfigAnswer::decode(&bytes[..len]).expect("answer");
+                assert_eq!((answer.version(), answer.body()), (1, Some(operation.body)));
+            }
+        }
+    }
 }

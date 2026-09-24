@@ -949,6 +949,7 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
 }
 
 mod adversarial;
+mod configuration;
 mod conformance;
 
 #[test]

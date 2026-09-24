@@ -889,9 +889,13 @@ No existing record moves. The network body uses 138 of its reserved 160 bytes:
 4 version + 1 metadata marker + 2 country + 33 hostname + 1 join marker +
 33 SSID + 64 passphrase. A clear retains country and hostname and advances the
 version. Configuration is canonicalized after validation; unknown CBOR keys
-are not persisted. Never-written records answer version zero with no body;
-damaged reads refuse rather than pretending to be unwritten. An authenticated
-replacement of a damaged section requires expected version zero because its
+are not persisted. Never-written or unreadable records answer version zero with
+no body (P-108),
+so a client can discover the version needed to repair a damaged section. Reads
+leave damaged bytes on the part, and a damaged network is not pushed to the
+comms processor. The network read shape never includes the passphrase (P-106).
+An authenticated replacement of a damaged section requires expected version
+zero because its
 version is unknowable; the validated replacement starts at version one. A
 local network replacement owes a push even when the module reports version one.
 
