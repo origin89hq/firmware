@@ -208,6 +208,18 @@ pub enum Compat {
     },
 }
 
+impl Compat {
+    /// Whether the two versions agree, so that more than the handshake and
+    /// heartbeats may cross (L-050).
+    #[must_use]
+    pub const fn is_agreed(self) -> bool {
+        match self {
+            Self::Agreed(_) => true,
+            Self::MajorMismatch { .. } => false,
+        }
+    }
+}
+
 /// Why every connection is being dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -363,6 +375,25 @@ pub enum Note {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Outgoing {
+    /// The sole scan order; its number is fixed through retries.
+    WifiScan {
+        /// Request identifier.
+        req_id: ReqId,
+        /// Fixed scan number.
+        order: km43::ScanOrder,
+    },
+    /// Every valid result is acknowledged, including a late number.
+    WifiScanResultAck {
+        /// Echoed request identifier.
+        req_id: ReqId,
+        /// Echoed scan number.
+        scan: NonZeroU32,
+    },
+    /// A decoded radio report has been held.
+    WifiStateAck {
+        /// Echoed request identifier.
+        req_id: ReqId,
+    },
     /// Push the fixed network snapshot tracked under this request.
     NetConfig {
         /// The request id, unchanged on retry.
@@ -443,6 +474,8 @@ pub enum Outgoing {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "an action nobody performs is a rule nothing did"]
 pub enum Action {
+    /// A rate-limited class A diagnostic for the recorder (P-220).
+    RecordWifi(km43::WifiStatusChanged),
     /// Submit a decoded offer to the recorder, which owns the RTC and floor.
     OfferTime {
         /// Request to acknowledge after processing.
@@ -562,6 +595,9 @@ enum NetworkDue {
 /// The link, on the controller's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
+    /// Diagnostic state shared with the wrapped-read endpoint.
+    pub wifi: crate::Wifi,
+    wifi_request: Option<ReqId>,
     network: Option<crate::Network>,
     network_sent: Option<(ReqId, crate::Network)>,
     network_due: NetworkDue,
@@ -621,6 +657,8 @@ impl Link {
     #[must_use]
     pub fn new(identity: Identity, now: Tick) -> Self {
         Self {
+            wifi: crate::Wifi::EMPTY,
+            wifi_request: None,
             network: None,
             network_sent: None,
             network_due: NetworkDue::None,
@@ -769,13 +807,10 @@ impl Link {
 
     /// Whether the link is up under an agreed version (L-050).
     const fn agreed(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Up {
-                compat: Compat::Agreed(_),
-                ..
-            }
-        )
+        match self.compat() {
+            Some(compat) => compat.is_agreed(),
+            None => false,
+        }
     }
 
     /// The peer, while the link is up.
@@ -937,6 +972,9 @@ impl Link {
             return actions;
         }
         match kind {
+            LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiState => self.wifi_received(kind, envelope, now, &mut actions),
             LinkMessageType::LinkUp => match LinkUp::decode(envelope) {
                 Ok(theirs) => {
                     if let Some((peer, compat)) = Self::accept(&theirs, &mut actions) {
@@ -1012,6 +1050,9 @@ impl Link {
             | LinkMessageType::PairingWindow
             | LinkMessageType::TimeOfferAck
             | LinkMessageType::CommsRelease
+            | LinkMessageType::WifiScan
+            | LinkMessageType::WifiScanResultAck
+            | LinkMessageType::WifiStateAck
             | LinkMessageType::EnterDownload => {
                 // `arriving` refuses these at this side; an arm so that a
                 // change to the direction table lands here and not in a
@@ -1020,6 +1061,7 @@ impl Link {
             }
         }
         self.report_network(now, &mut actions);
+        self.wifi_tick(now, &mut actions);
         actions
     }
 
@@ -1101,6 +1143,12 @@ impl Link {
             | LinkMessageType::CommsRelease
             | LinkMessageType::CommsReleaseAck
             | LinkMessageType::EnterDownload
+            | LinkMessageType::WifiScan
+            | LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiScanResultAck
+            | LinkMessageType::WifiState
+            | LinkMessageType::WifiStateAck
             | LinkMessageType::EnterDownloadAck => {
                 // Not a request of the peer's; `received` never sends these
                 // here, and an arm keeps a new opcode from landing in a
@@ -1448,6 +1496,7 @@ impl Link {
         }
         self.report(now, rows, &mut actions);
         self.report_network(now, &mut actions);
+        self.wifi_tick(now, &mut actions);
         actions
     }
 
@@ -1483,6 +1532,18 @@ impl Link {
     ) -> Result<usize, EncodeError> {
         let mut envelope = [0u8; LINK_ENVELOPE];
         let len = match outgoing {
+            Outgoing::WifiScan { req_id, order } => order.write(
+                link_header(LinkMessageType::WifiScan, req_id),
+                &mut envelope,
+            ),
+            Outgoing::WifiScanResultAck { req_id, scan } => km43::ScanResultAck { scan }.write(
+                link_header(LinkMessageType::WifiScanResultAck, req_id),
+                &mut envelope,
+            ),
+            Outgoing::WifiStateAck { req_id } => km43::RadioReportAck.write(
+                link_header(LinkMessageType::WifiStateAck, req_id),
+                &mut envelope,
+            ),
             Outgoing::NetConfig { req_id } => {
                 let (_, network) = self
                     .network_sent
@@ -1732,6 +1793,8 @@ impl Link {
     /// would name a handle the comms processor may have given to somebody
     /// else (L-041, L-080).
     fn drop_rows(&mut self, why: DropReason, rows: &mut impl Rows, actions: &mut Actions) {
+        self.wifi.lost();
+        self.forget_wifi_request();
         self.forget_network();
         self.network_due = NetworkDue::Compare;
         rows.drop_all();
@@ -1816,6 +1879,42 @@ impl Link {
 
     /// Requests unanswered for the timeout go again with the same id, up to
     /// the attempts; past that they are given up (L-015).
+    fn request_given_up(&mut self, kind: LinkMessageType, req_id: ReqId, actions: &mut Actions) {
+        if kind == LinkMessageType::WifiScan {
+            self.wifi_request = None;
+            self.wifi.failed();
+        }
+        // Failed to whatever asked, and nothing more: whether
+        // the link is down is L-100's timer alone (L-015). A
+        // close given up leaves its row to the transport's own
+        // release, or to the link falling.
+        if kind == LinkMessageType::CloseConnection {
+            let _ = self.take_closing(req_id);
+            if self.resync == Resync::Sent(req_id) {
+                // Back to watching: the counts still disagree,
+                // and three more answers send it again.
+                self.resync = Resync::AGREED;
+            }
+        }
+        if kind == LinkMessageType::NetConfig {
+            if let Some(NetworkPush {
+                version, operation, ..
+            }) = self.network_push(req_id)
+            {
+                actions.push(Action::Note(Note::NetworkGaveUp {
+                    req_id,
+                    version,
+                    operation,
+                }));
+            }
+            self.network_sent = None;
+        }
+        if kind == LinkMessageType::PairingWindow {
+            self.pairing.given_up(req_id);
+        }
+        actions.push(Action::Note(Note::RequestFailed(kind)));
+    }
+
     fn retry(&mut self, now: Tick, actions: &mut Actions) {
         // Bounded: each call moves one request on, and no more than
         // `MAX_INFLIGHT` are in flight to move.
@@ -1823,37 +1922,14 @@ impl Link {
             match self.requests.overdue(now) {
                 None => return,
                 Some(Overdue::GivenUp { kind, req_id }) => {
-                    // Failed to whatever asked, and nothing more: whether
-                    // the link is down is L-100's timer alone (L-015). A
-                    // close given up leaves its row to the transport's own
-                    // release, or to the link falling.
-                    if kind == LinkMessageType::CloseConnection {
-                        let _ = self.take_closing(req_id);
-                        if self.resync == Resync::Sent(req_id) {
-                            // Back to watching: the counts still disagree,
-                            // and three more answers send it again.
-                            self.resync = Resync::AGREED;
-                        }
-                    }
-                    if kind == LinkMessageType::NetConfig {
-                        if let Some(NetworkPush {
-                            version, operation, ..
-                        }) = self.network_push(req_id)
-                        {
-                            actions.push(Action::Note(Note::NetworkGaveUp {
-                                req_id,
-                                version,
-                                operation,
-                            }));
-                        }
-                        self.network_sent = None;
-                    }
-                    if kind == LinkMessageType::PairingWindow {
-                        self.pairing.given_up(req_id);
-                    }
-                    actions.push(Action::Note(Note::RequestFailed(kind)));
+                    self.request_given_up(kind, req_id, actions);
                 }
                 Some(Overdue::Resend { kind, req_id }) => match kind {
+                    LinkMessageType::WifiScan => {
+                        if let Some(order) = self.wifi.order() {
+                            actions.push(Action::Send(Outgoing::WifiScan { req_id, order }));
+                        }
+                    }
                     LinkMessageType::LinkUp => {
                         actions.push(Action::Send(Outgoing::LinkUp { req_id }));
                     }
@@ -1919,12 +1995,96 @@ impl Link {
                     | LinkMessageType::CommsRelease
                     | LinkMessageType::CommsReleaseAck
                     | LinkMessageType::EnterDownload
+                    | LinkMessageType::WifiScanAck
+                    | LinkMessageType::WifiScanResult
+                    | LinkMessageType::WifiScanResultAck
+                    | LinkMessageType::WifiState
+                    | LinkMessageType::WifiStateAck
                     | LinkMessageType::EnterDownloadAck => {
                         // Nothing else is issued as a request yet; the arm
                         // lands here when one is.
                         let _ = self.requests.answered(req_id, kind);
                     }
                 },
+            }
+        }
+    }
+
+    fn forget_wifi_request(&mut self) {
+        if let Some(req_id) = self.wifi_request.take() {
+            let _ = self.requests.answered(req_id, LinkMessageType::WifiScan);
+        }
+    }
+
+    fn wifi_tick(&mut self, now: Tick, actions: &mut Actions) {
+        self.wifi.tick(now);
+        // The peer refuses a scan order under a major mismatch (L-050).
+        if !self.agreed() {
+            self.wifi.lost();
+            self.forget_wifi_request();
+            return;
+        }
+        if self.wifi.order().is_none() {
+            self.forget_wifi_request();
+        }
+        if let Some(order) = self.wifi.order()
+            && self.wifi_request.is_none()
+            && !self.wifi.started_already()
+            && let Some(req_id) = self.request(LinkMessageType::WifiScan, now)
+        {
+            self.wifi_request = Some(req_id);
+            actions.push(Action::Send(Outgoing::WifiScan { req_id, order }));
+        }
+        let section = self.network.map_or(0, |network| network.version());
+        if let Some(record) = self.wifi.record(section, now) {
+            actions.push(Action::RecordWifi(record));
+        }
+    }
+
+    fn wifi_received(
+        &mut self,
+        kind: LinkMessageType,
+        envelope: LinkEnvelope<'_>,
+        now: Tick,
+        actions: &mut Actions,
+    ) {
+        if !self.is_up() {
+            Self::refuse(LinkErrorCode::BeforeLinkUp, actions);
+            return;
+        }
+        let req_id = envelope.req_id();
+        if kind == LinkMessageType::WifiScanAck {
+            match km43::ScanOrderVerdict::decode(envelope) {
+                Ok(verdict) if self.wifi_request == Some(req_id) => {
+                    self.forget_wifi_request();
+                    match verdict.outcome {
+                        km43::WifiScan::Started => self.wifi.started(now),
+                        km43::WifiScan::RefusedBusy | km43::WifiScan::RefusedRadioOff => {
+                            self.wifi.failed();
+                        }
+                    }
+                }
+                Ok(_) => actions.push(Action::Note(Note::UnexpectedAck(kind))),
+                Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
+            }
+        } else if kind == LinkMessageType::WifiScanResult {
+            match km43::ScanResult::decode(envelope) {
+                Ok(result) => {
+                    self.wifi.result(result, now);
+                    actions.push(Action::Send(Outgoing::WifiScanResultAck {
+                        req_id,
+                        scan: result.scan,
+                    }));
+                }
+                Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
+            }
+        } else {
+            match km43::RadioReport::decode(envelope) {
+                Ok(report) => {
+                    self.wifi.reported(report);
+                    actions.push(Action::Send(Outgoing::WifiStateAck { req_id }));
+                }
+                Err(_) => actions.push(Action::Note(Note::Malformed(kind))),
             }
         }
     }
@@ -1943,6 +2103,43 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn l_015_l_203_scan_without_ack_is_failed_after_three_transmissions() {
+        let mut link = Link::new(identity(), Tick::ZERO);
+        assert_eq!(link.wifi.refresh(true, true, true, Tick::ZERO), None);
+        let req_id = ReqId(123);
+        assert!(
+            link.requests
+                .issue(LinkMessageType::WifiScan, req_id, Tick::ZERO)
+        );
+        link.wifi_request = Some(req_id);
+        for millis in [500, 1000] {
+            let mut actions = Actions::NONE;
+            link.retry(Tick::from_millis(millis), &mut actions);
+            assert!(link.wifi.order().is_some());
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                Action::Send(Outgoing::WifiScan {
+                    req_id: ReqId(123),
+                    ..
+                })
+            )));
+        }
+        let mut actions = Actions::NONE;
+        link.retry(Tick::from_millis(1500), &mut actions);
+        assert_eq!(link.wifi.order(), None);
+        assert_eq!(link.wifi_request, None);
+        let mut body = [0; km43::MAX_PAYLOAD];
+        let len = link
+            .wifi
+            .answer(None, Tick::from_millis(1500), &mut body)
+            .expect("answer");
+        assert_eq!(
+            km43::ScanAnswer::decode(&body[..len]).expect("body").scan(),
+            km43::ScanState::Failed
+        );
+    }
 
     /// Every event goes to the ring as the body KM43 defines for its kind,
     /// and reads back the same.

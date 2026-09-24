@@ -153,11 +153,13 @@ fn p_028_five_element_envelope_cannot_execute_its_goodbye() {
     // Refused before any element is read, so at 0, 0 (P-025): it names no
     // connection and stays on the link, as a refusal of the comms
     // processor's frame. An honest one answers its client itself.
+    let before = bench.comms.heard.len();
     assert!(client.send(&mut bench, &frame).is_empty());
     let refusals: Vec<_> = bench
         .comms
         .heard
         .iter()
+        .skip(before)
         .filter_map(|heard| match heard {
             Heard::Refusal {
                 code,

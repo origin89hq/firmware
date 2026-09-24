@@ -83,16 +83,21 @@ impl Endpoint {
                 actions,
             };
         }
+        let controller_fw = self.link.identity().fw;
+        let peer = self.link.peer().copied();
         let facts = Facts {
             model: local.model,
-            fw_controller: self.link.identity().fw.as_str(),
-            fw_comms: self.link.peer().map_or("", |peer| peer.fw.as_str()),
+            fw_controller: controller_fw.as_str(),
+            fw_comms: peer.as_ref().map_or("", |peer| peer.fw.as_str()),
             log: local.log,
             time_known: local.time_known,
             pairing_open: local.pairing_open,
-            link_up: self.link.is_up(),
+            link: self.link.compat(),
         };
-        let reply = self.sessions.frame(frame, now, &facts, fram, dst).await;
+        let reply = self
+            .sessions
+            .frame(frame, now, (&facts, &mut self.link.wifi), fram, dst)
+            .await;
         let actions = match reply.close {
             Some(close) => self.link.close(close.conn, close.reason, now),
             None => Actions::NONE,

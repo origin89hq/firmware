@@ -492,3 +492,23 @@ Source: owner decision 2026-09-24, temporary until
 [k35]: https://github.com/origin89hq/km43/issues/35
 [k36]: https://github.com/origin89hq/km43/issues/36
 [p58]: https://github.com/origin89hq/firmware/pull/58
+
+**F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller
+core. The adapter submits each due KM43 `0x0806` to the existing bounded
+recorder queue; diagnostics do not write configuration or grant authority.
+The core retains one scan list and one current-boot radio report, with
+P-218, L-203 and P-220 deadlines on the monotonic tick.
+
+Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
+KM43 P-216 to P-221 and L-200 to L-207.
+
+**F-092** — The comms radio adapter runs a requested scan with a four-second
+deadline. Cancellation ends the Wi-Fi session, allowing the driver to stop
+and deinitialize before another scan or join, and the core completes an
+unfinished accepted scan as failed. The core reports `no_ip` after four seconds
+associated without IPv4, continues trying, and reports `lost` on association
+loss. A country-only configuration enables a dormant station beside the
+provisioning AP so scanning works without attempting a station association.
+
+Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
+KM43 L-200 to L-206; pinned esp-radio's AP-only scan restriction.

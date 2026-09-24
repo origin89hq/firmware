@@ -110,6 +110,7 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
             esp_hal::system::software_reset();
         }
         let plan = plan().await;
+        observe_plan(plan).await;
         match plan {
             Plan::Off => {}
             // The session owns every Wi-Fi resource. Returning drops the
@@ -117,7 +118,12 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
             // deinitializes the driver. Reborrow keeps WIFI here for the
             // next plan without duplicating ownership.
             Plan::Station | Plan::AccessPoint { .. } | Plan::Both { .. } => {
+                let version = desired().map_or(0, |record| record.version());
                 session(wifi.reborrow(), &mut held, plan).await;
+                diagnostics().await.wifi.cancel_scan();
+                if matches!(plan, Plan::Station | Plan::Both { .. }) {
+                    station_observed(version, false, None, Some(km43::WifiFailure::Other)).await;
+                }
             }
         }
         // Idle and failed setup both yield, keeping watchdog progress bounded.
@@ -129,7 +135,7 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
 /// pairing window as the link measures it (L-196).
 async fn plan() -> Plan {
     let now = Tick::from_millis(Instant::now().as_millis());
-    let pairing_open = LINK.lock().await.pairing_window(now).is_some();
+    let pairing_open = diagnostics().await.pairing_window(now).is_some();
     Plan::of(desired().as_ref(), pairing_open)
 }
 
@@ -203,7 +209,7 @@ async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, r
     let _finished = select4(
         network(runner),
         ntp(stack),
-        station(controller, record, Plan::Station),
+        station(controller, stack, record, Plan::Station),
         crate::clients::serve(stack, 0, held.clients),
     )
     .await;
@@ -223,7 +229,10 @@ async fn access_point_session(
     };
     if country_code_of(country).is_err()
         || controller
-            .set_config(&WifiConfig::AccessPoint(config))
+            .set_config(&WifiConfig::AccessPointStation(
+                StationConfig::default(),
+                config,
+            ))
             .is_err()
     {
         return;
@@ -239,7 +248,7 @@ async fn access_point_session(
         network(runner),
         access_point::dhcp(stack),
         crate::clients::serve(stack, STATION_WORKERS, held.ap_clients),
-        hold(Plan::AccessPoint { country }),
+        hold(controller, Plan::AccessPoint { country }),
     )
     .await;
 }
@@ -295,7 +304,7 @@ async fn both_session(
         select4(
             network(runner),
             ntp(stack),
-            station(controller, record, Plan::Both { country }),
+            station(controller, stack, record, Plan::Both { country }),
             crate::clients::serve(stack, 0, clients),
         ),
         join3(
@@ -309,13 +318,17 @@ async fn both_session(
 
 /// The access point alone: report progress for the station and NTP it does
 /// not run, and return when the plan changes.
-async fn hold(plan: Plan) {
+async fn hold(controller: &mut WifiController<'_>, plan: Plan) {
     loop {
         progress(Task::Station);
         progress(Task::Ntp);
         if self::plan().await != plan {
             return;
         }
+        if scan(controller).await {
+            return;
+        }
+        progress(Task::Ntp);
         Timer::after_secs(1).await;
     }
 }
@@ -366,7 +379,12 @@ async fn disconnect(controller: &mut WifiController<'_>) {
     }
 }
 
-async fn station(controller: &mut WifiController<'_>, applied: Credential, plan: Plan) {
+async fn station(
+    controller: &mut WifiController<'_>,
+    stack: Stack<'_>,
+    applied: Credential,
+    plan: Plan,
+) {
     loop {
         progress(Task::Station);
         if desired() != Some(applied) {
@@ -381,12 +399,42 @@ async fn station(controller: &mut WifiController<'_>, applied: Credential, plan:
             }
             return;
         }
-        if !controller.is_connected() {
+        if scan(controller).await {
+            return;
+        }
+        let connected = controller.is_connected();
+        let address = if connected {
+            stack
+                .config_v4()
+                .map(|config| config.address.address().octets())
+        } else {
+            None
+        };
+        station_observed(applied.version(), connected, address, None).await;
+        if !connected {
             let result = with_timeout(Duration::from_secs(4), controller.connect_async()).await;
-            if result.is_err() {
-                // Explicitly abort the blob operation after cancelling its waiter.
-                progress(Task::Station);
-                disconnect(controller).await;
+            match result {
+                Ok(Ok(_)) => station_observed(applied.version(), true, None, None).await,
+                Ok(Err(error)) => {
+                    station_observed(
+                        applied.version(),
+                        false,
+                        None,
+                        Some(connection_failure(&error)),
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    progress(Task::Station);
+                    disconnect(controller).await;
+                    station_observed(
+                        applied.version(),
+                        false,
+                        None,
+                        Some(km43::WifiFailure::Other),
+                    )
+                    .await;
+                }
             }
         }
         progress(Task::Station);
@@ -449,4 +497,112 @@ async fn query(stack: Stack<'_>) -> Option<Sample> {
         accuracy_ms,
         at: Instant::now(),
     })
+}
+
+/// Link ownership never waits on the radio; a stalled lock resets through the
+/// recovery window rather than stranding an accepted scan indefinitely.
+async fn diagnostics() -> embassy_sync::mutex::MutexGuard<
+    'static,
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    o89_comms_core::Link,
+> {
+    match with_timeout(Duration::from_millis(100), LINK.lock()).await {
+        Ok(link) => link,
+        Err(_) => esp_hal::system::software_reset(),
+    }
+}
+
+async fn observe(version: u32, radio: km43::Radio) {
+    diagnostics()
+        .await
+        .radio_report(km43::RadioReport { version, radio });
+}
+
+async fn station_observed(
+    version: u32,
+    connected: bool,
+    ipv4: Option<[u8; 4]>,
+    failure: Option<km43::WifiFailure>,
+) {
+    diagnostics().await.station_observed(
+        version,
+        connected,
+        ipv4,
+        failure,
+        Tick::from_millis(Instant::now().as_millis()),
+    );
+}
+
+async fn observe_plan(plan: Plan) {
+    let version = desired().map_or(0, |credential| credential.version());
+    let radio = match plan {
+        Plan::Off | Plan::AccessPoint { .. } => km43::Radio::Off,
+        Plan::Station | Plan::Both { .. } => km43::Radio::Joining,
+    };
+    observe(version, radio).await;
+}
+
+/// Returns true only when the cancelled scan requires session teardown.
+async fn scan(controller: &mut WifiController<'_>) -> bool {
+    let Some(number) = diagnostics().await.wifi.take_scan() else {
+        return false;
+    };
+    // No max: truncation before SSID deduplication would lose strong choices
+    // and the exact unlisted count. Only the vendor crate allocates this Vec.
+    let config = esp_radio::wifi::scan::ScanConfig::default().with_show_hidden(true);
+    let (rows, timed_out) =
+        match with_timeout(Duration::from_secs(4), controller.scan_async(&config)).await {
+            Ok(Ok(mut heard)) => {
+                // Allocation-free in-place sort; count is the vendor u16 AP count.
+                heard.sort_unstable_by(|left, right| {
+                    right.signal_strength.cmp(&left.signal_strength)
+                });
+                let rows =
+                    o89_comms_core::ScanRows::collect(&heard, |ap| o89_comms_core::HeardAp {
+                        ssid: (ap.ssid.as_str().len() == ap.ssid.len()).then_some(ap.ssid.as_str()),
+                        rssi: ap.signal_strength,
+                        security: security(ap.auth_method),
+                        channel: ap.channel,
+                    })
+                    .ok();
+                // Vendor allocation dies before the next await.
+                drop(heard);
+                (rows, false)
+            }
+            Ok(Err(_)) => (None, false),
+            Err(_) => (None, true),
+        };
+    progress(Task::Station);
+    diagnostics().await.wifi.finished(number, rows.as_ref());
+    // Dropping the scan future releases the AP list; dropping the session
+    // additionally stops/deinitializes the driver before another scan or join.
+    timed_out
+}
+
+fn connection_failure(error: &esp_radio::wifi::ConnectionError) -> km43::WifiFailure {
+    use esp_radio::wifi::{ConnectionError, DisconnectReason};
+    match error {
+        ConnectionError::Failed(info) => match info.reason {
+            DisconnectReason::AuthenticationFailed
+            | DisconnectReason::FourWayHandshakeTimeout
+            | DisconnectReason::HandshakeTimeout
+            | DisconnectReason::_802_1xAuthenticationFailed => km43::WifiFailure::AuthFailed,
+            DisconnectReason::NoAccessPointFound => km43::WifiFailure::NotFound,
+            _ => km43::WifiFailure::Other,
+        },
+        _ => km43::WifiFailure::Other,
+    }
+}
+
+fn security(method: Option<esp_radio::wifi::AuthenticationMethod>) -> km43::WifiSecurity {
+    use esp_radio::wifi::AuthenticationMethod;
+    match method {
+        Some(AuthenticationMethod::None) => km43::WifiSecurity::Open,
+        Some(AuthenticationMethod::Wpa2Personal | AuthenticationMethod::WpaWpa2Personal) => {
+            km43::WifiSecurity::Wpa2Personal
+        }
+        Some(AuthenticationMethod::Wpa3Personal) => km43::WifiSecurity::Wpa3Personal,
+        Some(AuthenticationMethod::Wpa2Wpa3Personal) => km43::WifiSecurity::Wpa2Personal,
+        _ => km43::WifiSecurity::Other,
+    }
 }

@@ -482,6 +482,10 @@ pub async fn admit<'a, F: Fram>(
         | MessageType::EventResponse
         | MessageType::ReadLog
         | MessageType::ReadLogResponse
+        | MessageType::WifiScan
+        | MessageType::WifiScanResponse
+        | MessageType::WifiStatus
+        | MessageType::WifiStatusResponse
         | MessageType::GetConfig
         | MessageType::GetConfigResponse
         | MessageType::SetConfigResponse

@@ -69,6 +69,25 @@ pub struct Identity<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a frame the link asked for and nobody sent is a rule nothing performed"]
 pub enum Frame {
+    /// Answer to a scan order.
+    WifiScanAck {
+        /// Echoed controller request.
+        req_id: ReqId,
+        /// Accepted or refused scan.
+        outcome: km43::WifiScan,
+    },
+    /// One immutable scan result retained by the link until delivery ends.
+    WifiScanResult {
+        /// Request identifier retained on retries.
+        req_id: ReqId,
+    },
+    /// Immutable report snapshot for this request and its retries.
+    WifiState {
+        /// Request identifier retained on retries.
+        req_id: ReqId,
+        /// Snapshot retained on retries.
+        report: km43::RadioReport,
+    },
     /// This side's statement (L-030).
     LinkUp {
         /// The request, in flight until answered or given up.
@@ -191,6 +210,9 @@ struct Controller {
 /// The link's state on this side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
+    /// Bounded diagnostic decisions shared with the sole radio owner.
+    pub wifi: crate::WifiDiagnostics,
+    wifi_sent: Option<km43::RadioReport>,
     #[cfg(any(test, feature = "frames"))]
     controller_bench_mode: Option<bool>,
     network: crate::Network,
@@ -229,6 +251,8 @@ impl Link {
         Self {
             #[cfg(any(test, feature = "frames"))]
             controller_bench_mode: None,
+            wifi: crate::WifiDiagnostics::EMPTY,
+            wifi_sent: None,
             network: crate::Network::new(None),
             offer_rate: crate::OfferRate::new(),
             offer_requests: Requests::NONE,
@@ -321,12 +345,57 @@ impl Link {
     /// Restore durable credentials before the first handshake.
     pub fn restore_network(&mut self, credential: Option<crate::Credential>) {
         self.network = crate::Network::new(credential);
+        self.wifi_configuration();
     }
 
     /// The active RAM credential, including a clear.
     #[must_use]
     pub const fn credential(&self) -> Option<&crate::Credential> {
         self.network.credential()
+    }
+
+    /// Reports from a superseded radio session cannot overwrite current RAM state.
+    pub fn radio_report(&mut self, report: km43::RadioReport) {
+        if report.version == self.credential().map_or(0, crate::Credential::version) {
+            self.wifi.observe(report);
+        }
+    }
+
+    /// Physical station observations from the radio owner, about current RAM only.
+    pub fn station_observed(
+        &mut self,
+        version: u32,
+        connected: bool,
+        ipv4: Option<[u8; 4]>,
+        failure: Option<km43::WifiFailure>,
+        now: Tick,
+    ) {
+        if version == self.credential().map_or(0, crate::Credential::version) {
+            self.wifi
+                .station(version, connected, ipv4, failure, now.as_millis());
+        }
+    }
+
+    fn wifi_configuration(&mut self) {
+        let version = self.credential().map_or(0, crate::Credential::version);
+        let radio = if self
+            .credential()
+            .and_then(|record| record.change().ok())
+            .is_some_and(|change| matches!(change, NetChange::Set { .. }))
+        {
+            km43::Radio::Joining
+        } else {
+            km43::Radio::Off
+        };
+        self.wifi.observe(km43::RadioReport { version, radio });
+        if self
+            .credential()
+            .and_then(|record| record.change().ok())
+            .is_none_or(|change| matches!(change, NetChange::ClearUnwritten))
+            && let Some(scan) = self.wifi.take_scan()
+        {
+            self.wifi.finished(scan, None);
+        }
     }
 
     /// Frame a fresh NTP sample only on a compatible link and outside the rate
@@ -372,19 +441,65 @@ impl Link {
 
     fn retry_offer(&mut self, now: Tick) -> Option<Frame> {
         match self.offer_requests.overdue(now) {
-            Some(Overdue::Resend { req_id, .. }) => self
-                .offer_sample
-                .map(|offer| Frame::TimeOffer { req_id, offer }),
-            Some(Overdue::GivenUp { .. }) => {
-                self.offer_sample = None;
-                self.offer_delivery = OfferDelivery::Failed;
+            Some(Overdue::Resend { req_id, kind }) => {
+                if kind == LinkMessageType::WifiScanResult {
+                    Some(Frame::WifiScanResult { req_id })
+                } else if kind == LinkMessageType::WifiState {
+                    self.wifi_sent
+                        .map(|report| Frame::WifiState { req_id, report })
+                } else {
+                    self.offer_sample
+                        .map(|offer| Frame::TimeOffer { req_id, offer })
+                }
+            }
+            Some(Overdue::GivenUp { kind, .. }) => {
+                if kind == LinkMessageType::WifiScanResult {
+                    self.wifi.result_done();
+                } else if kind == LinkMessageType::WifiState {
+                    if let Some(report) = self.wifi_sent.take() {
+                        self.wifi.reported(report);
+                    }
+                } else {
+                    self.offer_sample = None;
+                    self.offer_delivery = OfferDelivery::Failed;
+                }
                 None
             }
             None => None,
         }
     }
 
+    fn wifi_request(&mut self, now: Tick) -> Option<Frame> {
+        if self.offer_requests.is_full()
+            || !self.controller.is_some_and(|controller| controller.agreed)
+        {
+            return None;
+        }
+        if self.wifi.result().is_some() {
+            let req_id = self.take_req();
+            if self
+                .offer_requests
+                .issue(LinkMessageType::WifiScanResult, req_id, now)
+            {
+                return Some(Frame::WifiScanResult { req_id });
+            }
+        }
+        if let Some(report) = self.wifi.due() {
+            let req_id = self.take_req();
+            if self
+                .offer_requests
+                .issue(LinkMessageType::WifiState, req_id, now)
+            {
+                self.wifi_sent = Some(report);
+                return Some(Frame::WifiState { req_id, report });
+            }
+        }
+        None
+    }
+
     fn forget_offer(&mut self) {
+        self.wifi.lost();
+        self.wifi_sent = None;
         if self.offer_sample.take().is_some() {
             self.offer_delivery = OfferDelivery::Failed;
         }
@@ -434,6 +549,9 @@ impl Link {
             if now < self.next_beat {
                 if let Some(offer) = self.retry_offer(now) {
                     return Some(offer);
+                }
+                if let Some(frame) = self.wifi_request(now) {
+                    return Some(frame);
                 }
                 return self.connection_request(now);
             }
@@ -503,6 +621,20 @@ impl Link {
         self.received_valid(kind, envelope, now, store)
     }
 
+    fn time_offer_answered(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Option<Frame> {
+        let req_id = envelope.req_id();
+        let verdict = km43::TimeVerdict::decode(envelope).ok()?;
+        if self
+            .offer_requests
+            .answered(req_id, LinkMessageType::TimeOffer)
+        {
+            self.offer_sample = None;
+            self.offer_delivery = OfferDelivery::Answered(verdict.outcome);
+            self.last_heard = Some(now);
+        }
+        None
+    }
+
     fn received_valid(
         &mut self,
         kind: LinkMessageType,
@@ -512,6 +644,12 @@ impl Link {
     ) -> Option<Frame> {
         let req_id = envelope.req_id();
         match kind {
+            LinkMessageType::WifiScan => self.scan_requested(envelope),
+            LinkMessageType::WifiScanResultAck | LinkMessageType::WifiStateAck => {
+                self.wifi_answered(kind, envelope, now);
+                None
+            }
+
             LinkMessageType::LinkUp => {
                 let theirs = LinkUp::decode(envelope).ok()?;
                 if theirs.role != Side::Controller {
@@ -570,18 +708,7 @@ impl Link {
                     code: LinkErrorCode::NoAuthorisation,
                 })
             }
-            LinkMessageType::TimeOfferAck => {
-                let verdict = km43::TimeVerdict::decode(envelope).ok()?;
-                if self
-                    .offer_requests
-                    .answered(req_id, LinkMessageType::TimeOffer)
-                {
-                    self.offer_sample = None;
-                    self.offer_delivery = OfferDelivery::Answered(verdict.outcome);
-                    self.last_heard = Some(now);
-                }
-                None
-            }
+            LinkMessageType::TimeOfferAck => self.time_offer_answered(envelope, now),
             LinkMessageType::PairingWindow => {
                 if !self.linked {
                     // Before this side's own statement is answered: discarded
@@ -616,6 +743,9 @@ impl Link {
             | LinkMessageType::PairingWindowAck
             | LinkMessageType::TimeOffer
             | LinkMessageType::CommsReleaseAck
+            | LinkMessageType::WifiScanAck
+            | LinkMessageType::WifiScanResult
+            | LinkMessageType::WifiState
             | LinkMessageType::EnterDownloadAck => {
                 // Refused by `arriving` at this side; an arm so a change to
                 // the direction table lands here.
@@ -648,6 +778,46 @@ impl Link {
         Some(Frame::PairingWindowAck { req_id, revision })
     }
 
+    fn scan_requested(&mut self, envelope: LinkEnvelope<'_>) -> Option<Frame> {
+        let req_id = envelope.req_id();
+        let order = km43::ScanOrder::decode(envelope).ok()?;
+        let country = self
+            .credential()
+            .and_then(|credential| credential.change().ok())
+            .is_some_and(|change| !matches!(change, km43::NetChange::ClearUnwritten));
+        Some(Frame::WifiScanAck {
+            req_id,
+            outcome: self.wifi.scan(order, req_id, country),
+        })
+    }
+
+    fn wifi_answered(&mut self, kind: LinkMessageType, envelope: LinkEnvelope<'_>, now: Tick) {
+        let req_id = envelope.req_id();
+        if kind == LinkMessageType::WifiScanResultAck {
+            if let Ok(ack) = km43::ScanResultAck::decode(envelope)
+                && self
+                    .wifi
+                    .result()
+                    .is_some_and(|result| result.scan == ack.scan)
+                && self
+                    .offer_requests
+                    .answered(req_id, LinkMessageType::WifiScanResult)
+            {
+                self.wifi.result_done();
+                self.last_heard = Some(now);
+            }
+        } else if km43::RadioReportAck::decode(envelope).is_ok()
+            && self
+                .offer_requests
+                .answered(req_id, LinkMessageType::WifiState)
+        {
+            if let Some(report) = self.wifi_sent.take() {
+                self.wifi.reported(report);
+            }
+            self.last_heard = Some(now);
+        }
+    }
+
     fn configure_network(
         &mut self,
         envelope: LinkEnvelope<'_>,
@@ -661,6 +831,7 @@ impl Link {
                 version: self.network.stored_version(),
             },
         };
+        self.wifi_configuration();
         Frame::NetReport {
             req_id,
             outcome: verdict.outcome,
@@ -712,6 +883,24 @@ impl Link {
         })
     }
 
+    fn statement_body(
+        &self,
+        me: &Identity<'_>,
+        kind: LinkMessageType,
+        req_id: ReqId,
+        dst: &mut [u8],
+    ) -> Result<usize, km43::LinkError> {
+        LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: me.fw,
+            boot_id: me.boot_id,
+            hw: me.hw,
+            net_version: Some(self.network.stored_version()),
+        }
+        .write(link_header(kind, req_id), dst)
+    }
+
     /// Build `frame` as this side sends it at `now`, framed into `dst`, and
     /// its length.
     pub fn build(
@@ -722,18 +911,7 @@ impl Link {
         writer: &mut FrameWriter,
         dst: &mut [u8; MAX_FRAME],
     ) -> Result<usize, EncodeError> {
-        let mut envelope = [0u8; LINK_ENVELOPE];
-        let statement = |kind, req_id, envelope: &mut [u8]| {
-            LinkUp {
-                version: OURS,
-                role: Side::Comms,
-                fw: me.fw,
-                boot_id: me.boot_id,
-                hw: me.hw,
-                net_version: Some(self.network.stored_version()),
-            }
-            .write(link_header(kind, req_id), envelope)
-        };
+        let mut envelope = [0u8; km43::MAX_PAYLOAD];
         let beat = |kind, req_id, envelope: &mut [u8]| {
             Heartbeat {
                 uptime_s: self.uptime_s(now),
@@ -742,9 +920,23 @@ impl Link {
             .write(link_header(kind, req_id), envelope)
         };
         let written = match frame {
-            Frame::LinkUp { req_id } => statement(LinkMessageType::LinkUp, req_id, &mut envelope),
+            Frame::WifiScanAck { req_id, outcome } => km43::ScanOrderVerdict { outcome }.write(
+                link_header(LinkMessageType::WifiScanAck, req_id),
+                &mut envelope,
+            ),
+            Frame::WifiScanResult { req_id } => self.wifi.result().ok_or(EncodeError::Body)?.write(
+                link_header(LinkMessageType::WifiScanResult, req_id),
+                &mut envelope,
+            ),
+            Frame::WifiState { req_id, report } => report.write(
+                link_header(LinkMessageType::WifiState, req_id),
+                &mut envelope,
+            ),
+            Frame::LinkUp { req_id } => {
+                self.statement_body(me, LinkMessageType::LinkUp, req_id, &mut envelope)
+            }
             Frame::LinkUpAck { req_id } => {
-                statement(LinkMessageType::LinkUpAck, req_id, &mut envelope)
+                self.statement_body(me, LinkMessageType::LinkUpAck, req_id, &mut envelope)
             }
             Frame::Heartbeat { req_id } => beat(LinkMessageType::Heartbeat, req_id, &mut envelope),
             Frame::HeartbeatAck { req_id } => {
@@ -852,6 +1044,7 @@ impl Link {
     /// a round trip, so it is heard (L-100).
     fn linked(&mut self, boot_id: u32, version: Version, now: Tick) {
         self.record(boot_id, version);
+        self.wifi.linked();
         self.linked = true;
         self.last_heard = Some(now);
         self.next_beat = now.after(HEARTBEAT_PERIOD).unwrap_or(now);
@@ -903,6 +1096,240 @@ mod tests {
         hw: "controller-a rev A",
         boot_id: 0x5939_BB7A,
     };
+
+    #[test]
+    fn l_205_l_204_report_after_link_uses_ram_even_when_credentials_did_not_persist() {
+        let mut link = linked_at_boot();
+        let mut bytes = [0; 256];
+        let change = NetChange::Set {
+            version: 27,
+            ssid: "cabin",
+            psk: "correct horse",
+            country: "CA",
+            hostname: "origin89",
+        };
+        let len = change
+            .write(
+                link_header(LinkMessageType::NetConfig, ReqId(40)),
+                &mut bytes,
+            )
+            .expect("config");
+        assert_eq!(
+            link.received_with_store(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(10),
+                |_| false
+            ),
+            Some(Frame::NetReport {
+                req_id: ReqId(40),
+                outcome: NetConfig::NvsWriteFailed,
+                version: 0
+            })
+        );
+        let report = km43::RadioReport {
+            version: 27,
+            radio: km43::Radio::Joining,
+        };
+        assert_eq!(link.wifi.due(), Some(report));
+        link.radio_report(km43::RadioReport {
+            version: 26,
+            radio: km43::Radio::Off,
+        });
+        assert_eq!(link.wifi.due(), Some(report));
+        assert!(
+            matches!(link.tick(at(11)),Some(Frame::WifiState {report:sent,..}) if sent==report)
+        );
+    }
+
+    #[test]
+    fn l_206_l_015_report_retries_its_snapshot_and_newest_follows_ack_or_give_up() {
+        let mut link = linked_at_boot();
+        let first = km43::RadioReport {
+            version: 1,
+            radio: km43::Radio::Joining,
+        };
+        let newest = km43::RadioReport {
+            version: 3,
+            radio: km43::Radio::Off,
+        };
+        link.wifi.observe(first);
+        let sent = link.wifi_request(at(10)).expect("report");
+        let Frame::WifiState { req_id, .. } = sent else {
+            panic!("state");
+        };
+        link.wifi.observe(km43::RadioReport {
+            version: 2,
+            radio: km43::Radio::Off,
+        });
+        link.wifi.observe(newest);
+        assert_eq!(link.wifi_request(at(11)), None);
+        assert_eq!(link.retry_offer(at(509)), None);
+        assert_eq!(link.retry_offer(at(510)), Some(sent));
+        let mut bytes = [0; 256];
+        let len = km43::RadioReportAck
+            .write(
+                link_header(LinkMessageType::WifiStateAck, ReqId(req_id.0 + 1)),
+                &mut bytes,
+            )
+            .expect("wrong ack");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(511)
+            ),
+            None
+        );
+        assert_eq!(link.wifi_request(at(511)), None);
+        let len = km43::RadioReportAck
+            .write(
+                link_header(LinkMessageType::WifiStateAck, req_id),
+                &mut bytes,
+            )
+            .expect("ack");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(512)
+            ),
+            None
+        );
+        let next = link.wifi_request(at(512)).expect("newest");
+        assert!(matches!(next,Frame::WifiState {report,..} if report==newest));
+        let final_report = km43::RadioReport {
+            version: 4,
+            radio: km43::Radio::Off,
+        };
+        link.wifi.observe(final_report);
+        assert_eq!(link.retry_offer(at(1012)), Some(next));
+        assert_eq!(link.retry_offer(at(1512)), Some(next));
+        assert_eq!(link.retry_offer(at(2012)), None);
+        assert!(
+            matches!(link.wifi_request(at(2012)),Some(Frame::WifiState {report,..}) if report==final_report)
+        );
+    }
+
+    #[test]
+    fn l_200_l_201_scan_result_remains_busy_through_retries_and_frees_after_ack() {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Clear {
+                version: 1,
+                country: "CA",
+                hostname: "origin89",
+            })
+            .expect("metadata"),
+        ));
+        let order = km43::ScanOrder {
+            scan: core::num::NonZeroU32::MIN,
+        };
+        let mut bytes = [0; 256];
+        let len = order
+            .write(
+                link_header(LinkMessageType::WifiScan, ReqId(80)),
+                &mut bytes,
+            )
+            .expect("order");
+        let expected = Some(Frame::WifiScanAck {
+            req_id: ReqId(80),
+            outcome: km43::WifiScan::Started,
+        });
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(10)
+            ),
+            expected
+        );
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(11)
+            ),
+            expected
+        );
+        assert_eq!(link.wifi.take_scan(), Some(order.scan));
+        assert_eq!(link.wifi.take_scan(), None);
+        link.wifi.finished(order.scan, None);
+        let result = link.wifi_request(at(12)).expect("result");
+        let Frame::WifiScanResult { req_id } = result else {
+            panic!("result");
+        };
+        assert_eq!(
+            link.wifi.scan(order, ReqId(81), true),
+            km43::WifiScan::RefusedBusy
+        );
+        assert_eq!(link.retry_offer(at(512)), Some(result));
+        let len = km43::ScanResultAck { scan: order.scan }
+            .write(
+                link_header(LinkMessageType::WifiScanResultAck, req_id),
+                &mut bytes,
+            )
+            .expect("ack");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(513)
+            ),
+            None
+        );
+        assert_eq!(link.wifi.result(), None);
+        assert_eq!(
+            link.wifi.scan(order, ReqId(81), true),
+            km43::WifiScan::Started
+        );
+        link.wifi.finished(order.scan, None);
+        let result = link.wifi_request(at(514)).expect("second result");
+        assert_eq!(link.retry_offer(at(1014)), Some(result));
+        assert_eq!(link.retry_offer(at(1514)), Some(result));
+        assert_eq!(link.retry_offer(at(2014)), None);
+        assert_eq!(link.wifi.result(), None);
+    }
+
+    #[test]
+    fn l_201_l_202_full_sixteen_row_result_fits_the_actual_link_encoder() {
+        let mut link = linked_at_boot();
+        let mut names = [[b'a'; 32]; km43::MAX_SCAN_APS];
+        for (index, name) in names.iter_mut().enumerate() {
+            name[31] = b'a' + u8::try_from(index).expect("small");
+        }
+        let heard = names.each_ref().map(|name| crate::HeardAp {
+            ssid: Some(core::str::from_utf8(name).expect("ASCII")),
+            rssi: -20,
+            security: km43::WifiSecurity::Wpa2Personal,
+            channel: 6,
+        });
+        let rows = crate::ScanRows::collect(&heard, |ap| *ap).expect("rows");
+        let order = km43::ScanOrder {
+            scan: core::num::NonZeroU32::MIN,
+        };
+        assert_eq!(
+            link.wifi.scan(order, ReqId(1), true),
+            km43::WifiScan::Started
+        );
+        link.wifi.finished(order.scan, Some(&rows));
+        let mut wire = [0; MAX_FRAME];
+        let len = link
+            .build(
+                Frame::WifiScanResult { req_id: ReqId(2) },
+                &ME,
+                at(1),
+                &mut FrameWriter::new(),
+                &mut wire,
+            )
+            .expect("full frame");
+        assert!(len > 256, "exercise more than the old link envelope");
+        let mut reader = FrameReader::new();
+        let mut count = None;
+        for byte in &wire[..len] {
+            if let Received::Frame(bytes) = reader.push(*byte) {
+                let result =
+                    km43::ScanResult::decode(LinkEnvelope::decode(bytes).expect("envelope"))
+                        .expect("result");
+                count = Some(result.list.expect("complete").len());
+            }
+        }
+        assert_eq!(count, Some(km43::MAX_SCAN_APS));
+    }
 
     fn at(millis: u64) -> Tick {
         Tick::from_millis(millis)
@@ -994,6 +1421,20 @@ mod tests {
         let answer = from_controller(&mut buf, LinkMessageType::LinkUpAck, req_id);
         assert_eq!(link.received(answer, Tick::ZERO), None);
         assert!(link.is_linked());
+        // Consume the initial L-204 report before exercising unrelated traffic.
+        let Some(Frame::WifiState { req_id, .. }) = link.tick(Tick::ZERO) else {
+            panic!("initial radio report");
+        };
+        let len = km43::RadioReportAck
+            .write(link_header(LinkMessageType::WifiStateAck, req_id), &mut buf)
+            .expect("ack");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&buf[..len]).expect("envelope"),
+                Tick::ZERO
+            ),
+            None
+        );
         link
     }
 

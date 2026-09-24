@@ -347,6 +347,9 @@ impl Bench {
                             };
                             pending.push_back(self.endpoint.link.time_verdict(*req_id, outcome));
                         }
+                        Action::RecordWifi(record) => {
+                            self.endpoint.link.wifi.recorded(*record, self.now);
+                        }
                         Action::DropConnections(_) | Action::Log(_) | Action::Note(_) => {}
                     }
                 }
@@ -440,7 +443,8 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::Log(event) => Some((*at, *event)),
-                Action::OfferTime { .. }
+                Action::RecordWifi(_)
+                | Action::OfferTime { .. }
                 | Action::Send(_)
                 | Action::DropConnections(_)
                 | Action::CutRail
@@ -454,7 +458,8 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::DropConnections(why) => Some((*at, *why)),
-                Action::OfferTime { .. }
+                Action::RecordWifi(_)
+                | Action::OfferTime { .. }
                 | Action::Send(_)
                 | Action::Log(_)
                 | Action::CutRail
@@ -475,7 +480,8 @@ impl Bench {
             .iter()
             .filter_map(|(_, action)| match action {
                 Action::Note(note) => Some(*note),
-                Action::OfferTime { .. }
+                Action::RecordWifi(_)
+                | Action::OfferTime { .. }
                 | Action::Send(_)
                 | Action::Log(_)
                 | Action::CutRail
@@ -489,7 +495,8 @@ impl Bench {
             .iter()
             .filter_map(|(at, action)| match action {
                 Action::Send(outgoing) if wanted(*outgoing) => Some((*at, *outgoing)),
-                Action::OfferTime { .. }
+                Action::RecordWifi(_)
+                | Action::OfferTime { .. }
                 | Action::Send(_)
                 | Action::Log(_)
                 | Action::CutRail
@@ -1585,6 +1592,7 @@ fn l_001_a_frame_from_the_wrong_side_is_refused_with_256_on_session_zero_and_req
     // Capabilities: none.
     let mut bench = Bench::new(Capabilities::default());
     bench.run_for(Millis::from_millis(1_000));
+    let before = bench.comms.heard.len();
     let bytes = bench
         .comms
         .send_from_the_wrong_side(bench.now)
@@ -1594,6 +1602,7 @@ fn l_001_a_frame_from_the_wrong_side_is_refused_with_256_on_session_zero_and_req
         .comms
         .heard
         .iter()
+        .skip(before)
         .find_map(|h| match h {
             Heard::Refusal {
                 code,
@@ -2389,3 +2398,241 @@ fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_ver
 }
 
 mod clock;
+
+fn wifi_started(bench: &mut Bench, at: Tick, outcome: km43::WifiScan) -> u32 {
+    bench.now = at;
+    assert_eq!(bench.endpoint.link.wifi.refresh(true, true, true, at), None);
+    let order = bench.endpoint.link.wifi.order().expect("scan");
+    let actions = bench.endpoint.tick(at, false, None);
+    let req_id = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::Send(Outgoing::WifiScan { req_id, .. }) => Some(*req_id),
+            _ => None,
+        })
+        .expect("order issued");
+    let mut bytes = [0; MAX_PAYLOAD];
+    let len = km43::ScanOrderVerdict { outcome }
+        .write(
+            wifi_header(LinkMessageType::WifiScanAck, req_id),
+            &mut bytes,
+        )
+        .expect("ack");
+    let frame = bench
+        .comms
+        .wifi_body(LinkMessageType::WifiScanAck, req_id, &bytes[..len], at)
+        .expect("peer ack");
+    bench.feed(&frame);
+    order.scan.get()
+}
+
+fn wifi_state(bench: &mut Bench) -> km43::ScanState {
+    let mut bytes = [0; MAX_PAYLOAD];
+    let len = bench
+        .endpoint
+        .link
+        .wifi
+        .answer(None, bench.now, &mut bytes)
+        .expect("answer");
+    km43::ScanAnswer::decode(&bytes[..len])
+        .expect("body")
+        .scan()
+}
+
+#[test]
+fn l_200_l_050_a_scan_owed_under_a_major_mismatch_is_never_ordered() {
+    // Capabilities: version 2.0 against the agreed run's 1.0. The order is
+    // made owed behind the session's gate, as one left from before a
+    // restatement would be.
+    for (version, orders) in [(Version { major: 2, minor: 0 }, 0), (Version::V1_0, 1)] {
+        let mut bench = Bench::new(Capabilities {
+            version,
+            ..Capabilities::default()
+        });
+        bench.run_for(Millis::from_millis(5_000));
+        assert!(bench.endpoint.link.is_up());
+        let at = bench.now;
+        assert_eq!(bench.endpoint.link.wifi.refresh(true, true, true, at), None);
+        bench.run_for(Millis::from_millis(2_000));
+        let sent = bench
+            .asked
+            .iter()
+            .filter(|(_, action)| matches!(action, Action::Send(Outgoing::WifiScan { .. })))
+            .count();
+        assert_eq!(sent, orders, "{version:?}");
+    }
+}
+
+#[test]
+fn l_203_l_200_p_218_hostile_comms_refuses_then_delivers_another_scan_number() {
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(2000));
+    let start = bench.now;
+    assert_eq!(
+        wifi_started(&mut bench, start, km43::WifiScan::RefusedBusy),
+        1
+    );
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Failed);
+    assert_eq!(
+        bench.endpoint.link.wifi.refresh(
+            true,
+            true,
+            true,
+            Tick::from_millis(start.as_millis() + 9999)
+        ),
+        Some(km43::ScanRefusal::TooSoon)
+    );
+    bench.run_for(Millis::from_millis(10000));
+    let next = bench.now;
+    assert_eq!(wifi_started(&mut bench, next, km43::WifiScan::Started), 2);
+    let mut bytes = [0; MAX_PAYLOAD];
+    let len = km43::ScanResult {
+        scan: core::num::NonZeroU32::MIN,
+        list: None,
+    }
+    .write(
+        wifi_header(LinkMessageType::WifiScanResult, ReqId(99)),
+        &mut bytes,
+    )
+    .expect("late result");
+    let frame = bench
+        .comms
+        .wifi_body(
+            LinkMessageType::WifiScanResult,
+            ReqId(99),
+            &bytes[..len],
+            next,
+        )
+        .expect("peer result");
+    bench.feed(&frame);
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Running);
+    assert!(bench.asked.iter().any(|(_,action)|matches!(action,Action::Send(Outgoing::WifiScanResultAck {req_id:ReqId(99),scan}) if scan.get()==1)));
+    bench
+        .endpoint
+        .link
+        .wifi
+        .tick(Tick::from_millis(next.as_millis() + 15000));
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Failed);
+}
+
+#[test]
+fn p_219_l_203_hostile_comms_lost_mid_scan_drops_diagnostic_report() {
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(2000));
+    let now = bench.now;
+    wifi_started(&mut bench, now, km43::WifiScan::Started);
+    bench.endpoint.link.wifi.reported(km43::RadioReport {
+        version: 8,
+        radio: km43::Radio::Off,
+    });
+    bench.comms.power_off();
+    bench.run_for(Millis::from_millis(7000));
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Failed);
+    assert_eq!(bench.endpoint.link.wifi.status(9).report, None);
+}
+
+#[test]
+fn p_221_l_207_hostile_radio_report_cannot_trigger_a_network_push() {
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(2000));
+    let before = bench
+        .comms
+        .heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+        .count();
+    let mut bytes = [0; MAX_PAYLOAD];
+    let report = km43::RadioReport {
+        version: 500,
+        radio: km43::Radio::Failed {
+            reason: km43::WifiFailure::AuthFailed,
+        },
+    };
+    let len = report
+        .write(
+            wifi_header(LinkMessageType::WifiState, ReqId(91)),
+            &mut bytes,
+        )
+        .expect("report");
+    let frame = bench
+        .comms
+        .wifi_body(
+            LinkMessageType::WifiState,
+            ReqId(91),
+            &bytes[..len],
+            bench.now,
+        )
+        .expect("peer report");
+    bench.feed(&frame);
+    bench.run_for(Millis::from_millis(2000));
+    assert_eq!(bench.endpoint.link.wifi.status(0).report, Some(report));
+    assert_eq!(
+        bench
+            .comms
+            .heard
+            .iter()
+            .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+            .count(),
+        before
+    );
+}
+
+#[test]
+fn l_207_hostile_scan_list_is_held_without_pushing_network_credentials() {
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(2000));
+    let before = bench
+        .comms
+        .heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+        .count();
+    let now = bench.now;
+    wifi_started(&mut bench, now, km43::WifiScan::Started);
+    let aps = [km43::AccessPoint {
+        ssid: "invented by comms",
+        rssi: -10,
+        security: km43::WifiSecurity::Open,
+        band: km43::WifiBand::Ghz24,
+        channel: 1,
+    }];
+    let mut bytes = [0; MAX_PAYLOAD];
+    let len = km43::ScanResult {
+        scan: core::num::NonZeroU32::MIN,
+        list: Some(km43::ScanList::new(&aps, 0).expect("list")),
+    }
+    .write(
+        wifi_header(LinkMessageType::WifiScanResult, ReqId(92)),
+        &mut bytes,
+    )
+    .expect("result");
+    let frame = bench
+        .comms
+        .wifi_body(
+            LinkMessageType::WifiScanResult,
+            ReqId(92),
+            &bytes[..len],
+            now,
+        )
+        .expect("peer result");
+    bench.feed(&frame);
+    bench.run_for(Millis::from_millis(2000));
+    assert_eq!(wifi_state(&mut bench), km43::ScanState::Complete);
+    assert_eq!(
+        bench
+            .comms
+            .heard
+            .iter()
+            .filter(|heard| matches!(heard, Heard::NetConfig { .. }))
+            .count(),
+        before
+    );
+}
+
+fn wifi_header(kind: LinkMessageType, req_id: ReqId) -> km43::LinkHeader {
+    km43::LinkHeader {
+        kind,
+        req_id,
+        session: SessionId::None,
+    }
+}

@@ -114,3 +114,6 @@ pub use text::*;
 pub use tick::*;
 pub use wall_clock::*;
 pub use write_volume::*;
+
+mod wifi;
+pub use wifi::*;

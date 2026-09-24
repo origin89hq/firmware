@@ -14,7 +14,7 @@ use km43::{
     HelloInner, Incoming, LinkTransport, MessageType, PairAckClaim, PairRequest, PairResponse,
     PrintedSecret, ReqId, Session, SessionId, SessionKey, Signed, Tagged, Version, Wrapper,
 };
-use o89_core::{DropReason, Facts, Millis, Sessions};
+use o89_core::{Compat, DropReason, Facts, Millis, Sessions};
 
 use crate::link::{Bench, DEVICE, LOG, MODEL, PRINTED, unit};
 use crate::{Answers, Capabilities, Heard, Releases, SimFram, crash_at_every_step};
@@ -668,11 +668,12 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
         log: LOG,
         time_known: false,
         pairing_open: false,
-        link_up: true,
+        link: Some(Compat::Agreed(Version::V1_0)),
     };
     // A fresh unit connects two clients and each discovers.
     let path = |part: &mut SimFram, keys| -> Result<(), ()> {
         let mut sessions = Sessions::new(keys);
+        let mut wifi = o89_core::Wifi::EMPTY;
         let now = o89_core::Tick::from_millis(1_000);
         for handle in 1..=2u16 {
             let conn = Conn::new(handle).ok_or(())?;
@@ -688,7 +689,8 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
             .write(0, &mut frame)
             .map_err(|_| ())?;
             let len = cbor.finish().map_err(|_| ())?;
-            let reply = block_on(sessions.frame(&frame[..len], now, &facts, part, &mut dst));
+            let reply =
+                block_on(sessions.frame(&frame[..len], now, (&facts, &mut wifi), part, &mut dst));
             let len = reply.answer.ok_or(())?;
             let envelope = Envelope::decode(&dst[..len]).map_err(|_| ())?;
             let discovery = Discovery::decode(envelope).map_err(|_| ())?;
@@ -774,6 +776,51 @@ impl Client {
         .expect("frame");
         frame[..len].to_vec()
     }
+
+    /// A signed write of the network section at version 1, accepted.
+    fn write_network(&mut self, bench: &mut Bench, key: &SessionKey) {
+        let write = km43::NetworkWrite {
+            join: Some(km43::JoinWrite {
+                ssid: km43::Ssid::new("cabin").expect("ssid"),
+                psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+            }),
+            country: km43::Country::new("CA").expect("country"),
+            hostname: km43::Hostname::new("origin89").expect("host"),
+        };
+        let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+        let len = write.encode(&mut body).expect("body");
+        let mut operation = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_WRITE_BYTES];
+        let len = km43::SetConfigOperation {
+            section: km43::ConfigSection::Network,
+            expected_version: 0,
+            body: &body[..len],
+        }
+        .encode(&mut operation)
+        .expect("operation");
+        let mut frame = [0; 256];
+        let len = Signed::over(
+            self.header(MessageType::SetConfig),
+            ClientId::new(1).expect("client"),
+            Counter(1),
+            &operation[..len],
+            key,
+        )
+        .expect("signed")
+        .write(&mut frame)
+        .expect("frame");
+        let answers = self.send(bench, &frame[..len]);
+        let verified =
+            Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
+                .expect("wrapper")
+                .verify(key)
+                .expect("MAC");
+        assert_eq!(
+            km43::SetConfigAck::decode(verified.payload())
+                .expect("ack")
+                .outcome,
+            km43::SetConfig::Accepted
+        );
+    }
 }
 
 #[test]
@@ -805,7 +852,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
         log: LOG,
         time_known: false,
         pairing_open: false,
-        link_up: true,
+        link: Some(Compat::Agreed(Version::V1_0)),
     };
     // Establish the exact write length once; each replay below gets a fresh session
     // over the same persisted first version, then the cut starts immediately.
@@ -831,7 +878,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
         let _ = block_on(bench.endpoint.sessions.frame(
             &frame,
             bench.now,
-            &facts,
+            (&facts, &mut bench.endpoint.link.wifi),
             &mut bench.fram,
             &mut dst,
         ));
@@ -871,6 +918,71 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
     assert!(steps.is_some_and(|steps| steps > 0 && steps < 2999));
 }
 
+/// The link opcode of a scan order, `WifiScan`.
+const WIFI_SCAN: u8 = 0x6a;
+
+#[test]
+fn p_218_l_200_a_refresh_under_a_major_mismatch_is_link_down_and_orders_no_scan() {
+    // Capabilities: version 2.0 restated under the same boot, which keeps
+    // the session (L-030); the agreed run restates 1.0.
+    for (version, refused) in [
+        (
+            Version { major: 2, minor: 0 },
+            Some(km43::ScanRefusal::LinkDown),
+        ),
+        (Version::V1_0, None),
+    ] {
+        let mut bench = linked();
+        announce(&mut bench, 1);
+        let mut client = Client::on(1);
+        let _ = client.open(&mut bench);
+        let key = client.key.take().expect("key");
+        client.write_network(&mut bench, &key);
+        bench.comms.capabilities().version = version;
+        let statement = bench.comms.restate(bench.now).expect("restates");
+        bench.feed(&statement);
+        bench.run_for(Millis::from_millis(20));
+        assert!(bench.endpoint.link.is_up());
+        assert_eq!(
+            bench.endpoint.link.compat().is_some_and(Compat::is_agreed),
+            refused.is_none()
+        );
+        let mut body = [0; 8];
+        let len = km43::ScanRequest { refresh: true }
+            .encode(&mut body)
+            .expect("request");
+        let mut frame = [0; 128];
+        let len = Tagged::over(client.header(MessageType::WifiScan), &body[..len], &key)
+            .expect("wrapped")
+            .write(&mut frame)
+            .expect("frame");
+        let answers = client.send(&mut bench, &frame[..len]);
+        let verified =
+            Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
+                .expect("wrapper")
+                .verify(&key)
+                .expect("MAC");
+        let answer = km43::ScanAnswer::decode(verified.payload()).expect("scan");
+        assert_eq!(answer.refused(), refused, "{version:?}");
+        bench.run_for(Millis::from_millis(2_000));
+        let orders = bench
+            .comms
+            .heard
+            .iter()
+            .filter(|heard| {
+                matches!(
+                    heard,
+                    Heard::Other {
+                        opcode: WIFI_SCAN,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(orders, usize::from(refused.is_none()), "{version:?}");
+    }
+}
+
 #[test]
 fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privately() {
     // Capabilities: none; the honest transport relays a signed write and wrapped read.
@@ -879,47 +991,9 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
     let key = client.key.take().expect("key");
-    let write = km43::NetworkWrite {
-        join: Some(km43::JoinWrite {
-            ssid: km43::Ssid::new("cabin").expect("ssid"),
-            psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
-        }),
-        country: km43::Country::new("CA").expect("country"),
-        hostname: km43::Hostname::new("origin89").expect("host"),
-    };
+    client.write_network(&mut bench, &key);
     let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
-    let len = write.encode(&mut body).expect("body");
-    let mut operation = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_WRITE_BYTES];
-    let len = km43::SetConfigOperation {
-        section: km43::ConfigSection::Network,
-        expected_version: 0,
-        body: &body[..len],
-    }
-    .encode(&mut operation)
-    .expect("operation");
     let mut frame = [0; 256];
-    let len = Signed::over(
-        client.header(MessageType::SetConfig),
-        ClientId::new(1).expect("client"),
-        Counter(1),
-        &operation[..len],
-        &key,
-    )
-    .expect("signed")
-    .write(&mut frame)
-    .expect("frame");
-    let answers = client.send(&mut bench, &frame[..len]);
-    let verified =
-        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-            .expect("wrapper")
-            .verify(&key)
-            .expect("MAC");
-    assert_eq!(
-        km43::SetConfigAck::decode(verified.payload())
-            .expect("ack")
-            .outcome,
-        km43::SetConfig::Accepted
-    );
     let len = km43::GetConfigRequest {
         section: km43::ConfigSection::Network,
     }

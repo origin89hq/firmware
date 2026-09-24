@@ -46,7 +46,8 @@ use o89_link::{Overdue, Requests, Tick};
 pub const ROWS: usize = MAX_SESSIONS;
 
 /// Connection requests in flight at once: L-014's four, less the time
-/// offer's one. A row due while all three are out waits for one to free.
+/// offer/diagnostic service slot. That slot serializes NTP, scan results and
+/// radio reports. A row due while all three are out waits for one to free.
 pub const CLIENT_REQUESTS: usize = MAX_INFLIGHT - 1;
 
 const _: () = assert!(ROWS <= u8::MAX as usize, "`conns` is a u8 on the wire");
