@@ -10,7 +10,7 @@ use km43::{
     Envelope, LinkHeader, LinkMessageType, MAX_FRAME, MessageType, Outcome, PairingWindowNotice,
     ReqId, SessionId,
 };
-use o89_core::{DropReason, Millis, Note, PAIRING_WINDOW};
+use o89_core::{DropReason, Millis, Note, PAIRING_WINDOW, Tick};
 
 use crate::link::Bench;
 use crate::sessions::{Client, announce};
@@ -347,6 +347,7 @@ fn l_194_a_relayed_client_frame_shaped_like_the_report_changes_nothing() {
 fn f_091_p_066_l_195_boot_window_is_reported_after_link_up_and_expires() {
     // HostileComms capabilities: none.
     let mut bench = Bench::first_enrolment(Capabilities::default());
+    assert_eq!(bench.now, Tick::ZERO);
     assert!(bench.window.is_open(bench.now));
     assert!(reports(&bench).is_empty());
     bench.run_for(Millis::from_millis(1_000));
@@ -356,7 +357,11 @@ fn f_091_p_066_l_195_boot_window_is_reported_after_link_up_and_expires() {
     assert_eq!(heard[0].0, 1);
     assert!((119_000..120_000).contains(&heard[0].1));
     assert!(bench.comms.pairing_window(bench.now).is_some());
-    bench.run_for(Millis::from_millis(119_020));
+    // Probe the exact boundary directly: the bench advances in 10 ms steps.
+    assert!(bench.window.is_open(Tick::from_millis(119_999)));
+    assert!(!bench.window.is_open(Tick::from_millis(120_000)));
+    bench.run_for(Millis::from_millis(119_000));
+    assert_eq!(bench.now, Tick::from_millis(120_000));
     assert!(!bench.window.is_open(bench.now));
     assert_eq!(reports(&bench).last(), Some(&(2, 0)));
     assert_eq!(bench.comms.pairing_window(bench.now), None);
