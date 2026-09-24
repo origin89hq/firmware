@@ -210,6 +210,9 @@ enum StoreCommand {
         /// client enrolled under it.
         #[arg(long)]
         replace: bool,
+        /// Recover the label from an interrupted secret write.
+        #[arg(long, conflicts_with_all = ["device_id", "replace"])]
+        resume: bool,
     },
 }
 
@@ -302,13 +305,15 @@ fn main() -> Result<()> {
             println!("boot {boot}");
             Ok(())
         }
-        Command::Store { what: None } => store::show(&mut link),
-        Command::Store {
-            what: Some(StoreCommand::WriteEpoch { epoch }),
-        } => store::write_epoch(&mut link, epoch),
-        Command::Store {
-            what: Some(StoreCommand::WriteSecret { device_id, replace }),
-        } => store::write_secret(&mut link, device_id.as_deref(), replace),
+        Command::Store { what } => match what {
+            None => store::show(&mut link),
+            Some(StoreCommand::WriteEpoch { epoch }) => store::write_epoch(&mut link, epoch),
+            Some(StoreCommand::WriteSecret {
+                device_id,
+                replace,
+                resume,
+            }) => store::write_secret(&mut link, device_id.as_deref(), replace, resume),
+        },
         Command::Rail { revision } => {
             let readout = rail::read(&mut link, revision.into())?;
             println!("pin  {:?}", readout.pin);

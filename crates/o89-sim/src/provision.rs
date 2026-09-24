@@ -39,6 +39,13 @@ fn f_041_secret_replacement_cut_at_every_byte_recovers_only_the_old_or_new_pair(
             let earlier = Secret::new([1; 16], [4; 32]).expect("earlier entropy");
             block_on(stage_secret(&mut start, earlier, true)).expect("previous transaction");
             let (mut store, _) = block_on(Store::boot(&mut start, None)).expect("previous boot");
+            let mut transaction = block_on(o89_core::Kept::<
+                o89_core::SecretChange,
+                { o89_core::SECRET_CHANGE_BYTES },
+            >::read(map::SECRET_CHANGE, &mut start))
+            .expect("transaction");
+            block_on(transaction.write(&mut start, o89_core::SecretChange::Complete))
+                .expect("label acknowledged");
             block_on(store.secret.write(&mut start, old())).expect("legacy key fixture");
             for _ in 0..7 {
                 let _ = block_on(store.challenges.mint(&mut start)).expect("mint");
@@ -172,4 +179,55 @@ fn f_041_garbage_intent_discard_cut_at_every_byte_keeps_the_active_pair() {
     )
     .expect("garbage does not stop boot");
     assert!(crashes.steps >= 122);
+}
+
+#[test]
+fn f_041_label_acknowledgement_cut_never_resets_the_applied_counter() {
+    use o89_core::{Kept, SECRET_CHANGE_BYTES, SecretChange};
+    let mut start = start(false);
+    block_on(stage_secret(&mut start, new(), true)).expect("stage");
+    let (mut store, _) = block_on(Store::boot(&mut start, None)).expect("apply");
+    assert_eq!(
+        block_on(store.challenges.mint(&mut start))
+            .expect("mint")
+            .counter(),
+        1
+    );
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            let mut transaction = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+                map::SECRET_CHANGE,
+                part,
+            ))
+            .map_err(|_| ())?;
+            block_on(transaction.write(part, SecretChange::Complete)).map_err(|_| ())?;
+            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+            report.boot_recorded.map_err(|_| ())?;
+            Ok(())
+        },
+        |part, step| {
+            let (mut store, _) = block_on(Store::boot(part, None)).expect("retry boot");
+            assert!(store.secret.present() == Some(&new()), "cut {step}");
+            assert_eq!(
+                block_on(store.challenges.mint(part))
+                    .expect("not reset")
+                    .counter(),
+                2,
+                "cut {step}"
+            );
+            let transaction = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+                map::SECRET_CHANGE,
+                part,
+            ))
+            .expect("transaction");
+            match transaction.present().expect("durable state") {
+                SecretChange::Applied(secret) => assert!(*secret == new(), "cut {step}"),
+                SecretChange::Complete => {}
+                SecretChange::Pending(_) => panic!("cut {step} reverted application"),
+            }
+        },
+    )
+    .expect("acknowledgement");
+    assert!(crashes.steps > 100);
 }

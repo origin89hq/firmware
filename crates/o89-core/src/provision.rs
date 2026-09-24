@@ -11,18 +11,24 @@ pub const SECRET_CHANGE_BYTES: usize = 49;
 /// A committed intent; no secret material is formatted or logged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SecretChange {
-    /// No replacement remains to finish.
+    /// The label has been acknowledged; no replacement remains to finish.
     Complete,
     /// Finish this replacement before exposing either secret or counter.
     Pending(Secret),
+    /// Applied at boot, retained until the host has printed the label.
+    Applied(Secret),
 }
 
 impl Body<SECRET_CHANGE_BYTES> for SecretChange {
     fn encode(&self) -> [u8; SECRET_CHANGE_BYTES] {
         let mut out = [0; SECRET_CHANGE_BYTES];
-        if let Self::Pending(secret) = self {
+        if let Self::Pending(secret) | Self::Applied(secret) = self {
             let mut writer = crate::body::Writer::over(&mut out);
-            writer.u8(1);
+            writer.u8(if matches!(self, Self::Pending(_)) {
+                1
+            } else {
+                2
+            });
             writer.put(&secret.encode());
         }
         out
@@ -33,6 +39,7 @@ impl Body<SECRET_CHANGE_BYTES> for SecretChange {
         match reader.u8()? {
             0 => Ok(Self::Complete),
             1 => Secret::decode(&reader.take::<SECRET_BYTES>()?).map(Self::Pending),
+            2 => Secret::decode(&reader.take::<SECRET_BYTES>()?).map(Self::Applied),
             _ => Err(Malformed { at: 0 }),
         }
     }
@@ -64,7 +71,7 @@ pub enum ProvisionFailed<E> {
     AlreadyProvisioned,
     /// Reusing the same secret would repeat challenges after resetting.
     SameSecret,
-    /// An earlier replacement must finish at boot first.
+    /// An earlier replacement must finish at boot and its label must be acknowledged.
     Pending,
 }
 
@@ -83,6 +90,15 @@ pub async fn stage_secret<F: Fram>(
     secret: Secret,
     replace: bool,
 ) -> Result<(), ProvisionFailed<F::Error>> {
+    let mut change =
+        Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(map::SECRET_CHANGE, fram).await?;
+    match change.held() {
+        Held::Present(SecretChange::Pending(_) | SecretChange::Applied(_)) => {
+            return Err(ProvisionFailed::Pending);
+        }
+        Held::Corrupt | Held::Malformed(_) => return Err(ProvisionFailed::Unknown),
+        Held::Absent | Held::Present(SecretChange::Complete) => {}
+    }
     let current = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
     if let Some(old) = current.present() {
         if *old == secret {
@@ -91,13 +107,6 @@ pub async fn stage_secret<F: Fram>(
         if !replace {
             return Err(ProvisionFailed::AlreadyProvisioned);
         }
-    }
-    let mut change =
-        Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(map::SECRET_CHANGE, fram).await?;
-    match change.held() {
-        Held::Present(SecretChange::Pending(_)) => return Err(ProvisionFailed::Pending),
-        Held::Corrupt | Held::Malformed(_) => return Err(ProvisionFailed::Unknown),
-        Held::Absent | Held::Present(SecretChange::Complete) => {}
     }
     change
         .write(fram, SecretChange::Pending(secret))
@@ -110,7 +119,7 @@ pub async fn stage_secret<F: Fram>(
 /// the fresh secret, so restarting at zero is safe. A cut before intent commits
 /// keeps the old pair; a cut afterwards replays this sequence before any session
 /// exists. A failed write returns no Store, so neither a partly replaced pair nor
-/// a counter reset repeated by recovery can mint a challenge. Clearing the intent
+/// a counter reset repeated by recovery can mint a challenge. Marking the intent applied
 /// is the commit point after which boot never resets this counter again.
 /// Unreadable intent cannot authorize any application step: erase only that
 /// record and retain the active secret/counter, including on legacy-layout units.
@@ -127,7 +136,7 @@ pub(crate) async fn finish<F: Fram>(
             change.erase(fram).await.map_err(ProvisionFailed::Write)?;
             Ok(SecretRecovery::Discarded)
         }
-        Held::Present(SecretChange::Complete) => {
+        Held::Present(SecretChange::Complete | SecretChange::Applied(_)) => {
             change
                 .erase_previous(fram)
                 .await
@@ -146,7 +155,7 @@ pub(crate) async fn finish<F: Fram>(
                 .await
                 .map_err(ProvisionFailed::Write)?;
             change
-                .write(fram, SecretChange::Complete)
+                .write(fram, SecretChange::Applied(new))
                 .await
                 .map_err(ProvisionFailed::Write)?;
             change

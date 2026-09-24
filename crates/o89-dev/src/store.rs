@@ -65,7 +65,7 @@ pub fn show(link: &mut Link) -> Result<()> {
 }
 
 fn read<T: Body<N>, const N: usize>(
-    link: &mut Link,
+    link: &mut impl o89_core::Fram<Error = anyhow::Error>,
     record: o89_core::Record<N>,
 ) -> Result<Kept<T, N>> {
     block_on(Kept::<T, N>::read(record, link))
@@ -107,7 +107,95 @@ pub fn write_epoch(link: &mut Link, raw: u32) -> Result<()> {
 }
 
 /// Write the secret, shown once.
-pub fn write_secret(link: &mut Link, device_id: Option<&str>, replace: bool) -> Result<()> {
+pub fn write_secret(
+    link: &mut Link,
+    device_id: Option<&str>,
+    replace: bool,
+    resume: bool,
+) -> Result<()> {
+    run_secret(
+        link,
+        device_id,
+        replace,
+        resume,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+fn run_secret(
+    link: &mut impl SecretLink,
+    device_id: Option<&str>,
+    replace: bool,
+    resume: bool,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    if resume {
+        return resume_secret(link, output).context(RESUME);
+    }
+    ensure_no_transaction(link)?;
+    let secret = generate_secret(link, device_id, replace)?;
+    link.stage_and_reboot(secret, replace).context(RESUME)?;
+    show_applied(link, secret, output).context(RESUME)
+}
+
+const RESUME: &str = "secret write interrupted; run: o89-dev store write-secret --resume";
+
+type Transaction = Kept<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
+
+fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<()> {
+    match read::<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(
+        link,
+        map::SECRET_CHANGE,
+    )?
+    .held()
+    {
+        Held::Present(o89_core::SecretChange::Pending(_) | o89_core::SecretChange::Applied(_)) => {
+            bail!(RESUME)
+        }
+        Held::Absent | Held::Present(o89_core::SecretChange::Complete) => Ok(()),
+        Held::Corrupt | Held::Malformed(_) => {
+            bail!("unreadable secret transaction; reboot before provisioning")
+        }
+    }
+}
+
+trait SecretLink: o89_core::Fram<Error = anyhow::Error> {
+    fn reboot(&mut self) -> Result<()>;
+    fn stage_and_reboot(&mut self, secret: Secret, replace: bool) -> Result<()>;
+}
+
+impl SecretLink for Link {
+    fn stage_and_reboot(&mut self, secret: Secret, replace: bool) -> Result<()> {
+        self.write_secret(&secret.encode(), replace)
+    }
+    fn reboot(&mut self) -> Result<()> {
+        Link::reboot(self)
+    }
+}
+
+fn resume_secret(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> Result<()> {
+    let transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
+    let secret = match *transaction.held() {
+        Held::Present(o89_core::SecretChange::Pending(secret)) => {
+            link.reboot()?;
+            secret
+        }
+        Held::Present(o89_core::SecretChange::Applied(secret)) => secret,
+        Held::Absent | Held::Present(o89_core::SecretChange::Complete) => {
+            bail!("no secret label to resume")
+        }
+        Held::Corrupt | Held::Malformed(_) => {
+            bail!("unreadable secret transaction; no label printed")
+        }
+    };
+    show_applied(link, secret, output)
+}
+
+fn generate_secret(
+    link: &mut impl o89_core::Fram<Error = anyhow::Error>,
+    device_id: Option<&str>,
+    replace: bool,
+) -> Result<Secret> {
     let kept = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
     if let Held::Present(_) = kept.held()
         && !replace
@@ -132,30 +220,46 @@ pub fn write_secret(link: &mut Link, device_id: Option<&str>, replace: bool) -> 
     let mut printed = [0u8; PRINTED_SECRET_BYTES];
     fill(&mut printed)?;
     let secret = Secret::new(id, printed).map_err(|_| anyhow!("the generator returned zeros"))?;
-    let payload = pairing_payload(&id, &printed);
-    let qr = pairing_qr(&payload)?;
-    link.write_secret(&secret.encode(), replace)?;
+    Ok(secret)
+}
+
+fn show_applied(
+    link: &mut impl o89_core::Fram<Error = anyhow::Error>,
+    secret: Secret,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
     let applied = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
-    let transaction = read::<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(
-        link,
-        map::SECRET_CHANGE,
-    )?;
+    let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
     let counter = read::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>(link, map::CHALLENGE_COUNTER)?;
     if applied.present() != Some(&secret)
         || counter.present().is_none()
-        || !matches!(
-            transaction.held(),
-            Held::Present(o89_core::SecretChange::Complete)
-        )
+        || transaction.present() != Some(&o89_core::SecretChange::Applied(secret))
     {
         bail!("the controller did not finish applying the secret; no label printed");
     }
-    println!("device id      {}", hex::encode(id));
-    println!("printed secret {}", hex::encode(printed));
-    println!("{payload}");
+    let encoded = secret.encode();
+    let id = secret.device_id_bytes();
+    let printed: [u8; PRINTED_SECRET_BYTES] = encoded
+        .get(DEVICE_ID_BYTES..)
+        .context("secret bytes")?
+        .try_into()
+        .context("printed secret length")?;
+    let payload = pairing_payload(&id, &printed);
+    let qr = pairing_qr(&payload)?;
+    writeln!(output, "device id      {}", hex::encode(id))?;
+    writeln!(output, "printed secret {}", hex::encode(printed))?;
+    writeln!(output, "{payload}")?;
     // Explicit black on white keeps the QR readable on either terminal theme.
-    println!("\x1b[30;47m{qr}\x1b[0m");
-    println!("shown once: it goes on the unit's label and nowhere else");
+    writeln!(output, "\x1b[30;47m{qr}\x1b[0m")?;
+    writeln!(
+        output,
+        "shown once: it goes on the unit's label and nowhere else"
+    )?;
+    output.flush()?;
+    // A failed output remains resumable. A crash between output and acknowledgement
+    // can repeat the same label, but never substitutes an unseen secret.
+    block_on(transaction.write(link, o89_core::SecretChange::Complete)).map_err(refused)?;
+    // Boot scrubs the previous transaction slot without resetting the counter.
     Ok(())
 }
 
@@ -232,3 +336,6 @@ mod tests {
         assert!(pairing_qr(&"x".repeat(10_000)).is_err());
     }
 }
+
+#[cfg(test)]
+mod resume_tests;

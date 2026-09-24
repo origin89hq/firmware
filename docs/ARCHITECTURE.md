@@ -249,6 +249,14 @@ the cost of a stolen label without changing the argument.
 A corrupt challenge counter refuses to mint. On the bench, `o89-dev store
 write-secret` (or `--replace`) stages a fresh secret through a firmware mailbox
 operation, then reboots and reads back completion before printing the label.
+An applied transaction retains its secret until the host flushes the label and
+acknowledges it. After a failed reboot or read-back, `o89-dev store write-secret
+--resume` finishes the same transaction and verifies the active secret and counter
+before displaying the device id, printed secret, P-049 payload and QR. Pending or
+unacknowledged transactions refuse new writes, including `--replace`; an acknowledged
+transaction refuses resume. Output and FRAM acknowledgement cannot be atomic:
+a crash after output but before acknowledgement can repeat the same label on resume.
+No secret is saved on the host.
 The intent is a 49-byte body in two 61-byte slots appended after the existing
 FRAM map, leaving every existing record at its address. Before exposing a
 `Store`, boot writes the new secret, writes counter zero, commits the completed
