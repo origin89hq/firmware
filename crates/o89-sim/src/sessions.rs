@@ -938,3 +938,5 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
     );
     assert!(bench.comms.heard.iter().any(|heard| matches!(heard, Heard::NetConfig { version: 1, network } if network.credentials().is_some())));
 }
+
+mod adversarial;

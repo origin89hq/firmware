@@ -24,6 +24,27 @@
 # km43 0.5.1; the probe note is tested, and the protocol gap remains open.
 # The phone-to-Wi-Fi bench exit remains open and requires comms #90.
 
+# Adversarial corpus (KM43 VERIFICATION section 7; attacker A unless stated).
+# New HostileComms tests in o89-sim/src/sessions/adversarial.rs:
+# - reorder/read plaintext: p_022_reordered_wrapped_requests_are_answered_once_and_replays_stay_silent
+# - withhold/replay: p_022_p_077_withheld_request_below_the_window_and_replays_cannot_extend_a_session
+# - stamp/invent connection: p_072_stamping_another_live_handle_does_not_transfer_authority
+# - response req_id tampering: p_047_response_moved_to_another_request_fails_its_mac
+# - Hello proof: p_051_hello_proof_for_another_challenge_binds_nothing
+# - Pair proof: p_064_pair_proof_under_a_foreign_printed_secret_enrols_nothing
+# - signed MAC: p_080_a_signed_command_under_another_session_key_spends_no_counter
+# - offer time and signed clock step: p_004_clock_moved_eleven_minutes_under_a_session_does_not_move_the_tick
+# Existing HostileComms evidence retained rather than duplicated:
+# - drop: sessions::l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_without_a_reboot
+# - delay: link::a_late_peer_is_still_a_peer_inside_the_timeout
+# - exhaust/invent: sessions::l_061_a_ninth_transport_is_refused_over_the_wire_and_no_row_is_evicted
+# - reboot: sessions::l_041_a_comms_reboot_takes_every_row_and_session_with_it
+# - signed replay: sessions::p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once
+# - network: link::l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions
+# Slow drain/CTS, P-098 event queues and selective event suppression remain open:
+# Subscribe currently returns error 2; the event plane belongs to M5 (#12).
+# These tests do not establish the week-alone site exit or hardware CTS behavior.
+
 # The list somebody defends at each audit round: the F rules that have
 # neither a test nor a declaration below, by name. The check fails when a
 # rule is uncovered and not listed — a new rule nobody listed, or a test that
