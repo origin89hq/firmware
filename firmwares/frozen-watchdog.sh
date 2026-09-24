@@ -3,14 +3,16 @@
 # frozen while the probe holds the core halted, then thaws it however the
 # command ends (#125).
 #
-# The IWDG keeps counting through a halt, and `probe-rs download` holds the
-# core halted in its flash loader for the whole transfer: a 175 KB image
-# takes longer than the watchdog's 8 s, and the part reset under the probe,
-# leaving a boot record that blamed the watchdog.
+# The IWDG keeps counting while a debugger halts a running image, so a halt
+# of more than 8 s resets the part under the probe. The download itself is
+# not such a halt: it begins with a reset that stops the IWDG, and the bench
+# of 2026-09-24 found no watchdog reset in one. Freezing does not stop the
+# watchdog record #125 reports, whose cause is still open.
 #
 # DBG_IWDG_STOP is bit 12 of DBGMCU_APB_FZ1 on the STM32G0. It acts only
-# while the core is halted by a debugger, and only a power-on reset clears
-# it, so a system reset keeps it. The thaw writes the register back to 0,
+# while the core is halted by a debugger. It survived `probe-rs reset` on the
+# bench, and the reference manual has a power-on reset clear it; the second
+# is not yet checked on a board. The thaw writes the register back to 0,
 # its value after a power-on reset, and no firmware of ours writes it. A
 # unit left frozen by a thaw that failed is cleared by its next power cycle.
 #

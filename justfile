@@ -74,9 +74,8 @@ comms-bootloader:
 #
 # Every controller flash, here and through the crates' `probe-rs run`
 # runners, goes through `firmwares/frozen-watchdog.sh`: the IWDG is frozen
-# while the probe holds the core halted and thawed when the command ends, so
-# a download longer than the watchdog's 8 s does not reset the part under the
-# probe and leave a watchdog boot record (#125).
+# while the probe holds the core halted and thawed when the command ends. It
+# does not stop the watchdog boot record a flash can leave (#125).
 # ---------------------------------------------------------------------------
 
 chip := "STM32G0B1RETx"
