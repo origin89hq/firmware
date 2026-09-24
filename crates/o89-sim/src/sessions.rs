@@ -950,3 +950,20 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
 
 mod adversarial;
 mod conformance;
+
+#[test]
+fn f_041_discover_after_secret_replacement_over_a_corrupt_counter_has_a_challenge() {
+    use o89_core::{Address, Fram as _, Secret, stage_secret};
+    let mut bench = Bench::new(Capabilities::default());
+    block_on(bench.fram.write(Address(32), &[0x55; 40])).expect("damage counter");
+    let fresh = Secret::new(DEVICE, [0x35; 32]).expect("new entropy");
+    block_on(stage_secret(&mut bench.fram, fresh, true)).expect("stage");
+    let keys = reread(&mut bench.fram).expect("recover before sessions");
+    bench.endpoint.sessions = Sessions::new(keys);
+    bench.run_for(Millis::from_millis(2_000));
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let challenge = client.discover(&mut bench);
+    assert_ne!(challenge, [0; 16]);
+    assert_ne!(challenge, device().challenge(1));
+}

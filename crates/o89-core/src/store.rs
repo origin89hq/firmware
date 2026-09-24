@@ -17,7 +17,10 @@
 //! A boot that cannot read the part returns the bus error and nothing
 //! else: there is no partial store to hold, and nothing was written, so a
 //! boot tried again on the same part counts once. A write the boot could
-//! not make is in the report, so the caller raises what it owes.
+//! not make is in the report, so the caller raises what it owes. A pending
+//! bench secret replacement is completed after all reads and before these
+//! ordinary boot writes; a failed recovery write returns no store and therefore
+//! no session keys (F-041). Unreadable intent is discarded without changing keys.
 //!
 //! cites: P-085, P-121, F-026
 
@@ -190,6 +193,8 @@ pub struct BootReport<E> {
     pub boot_recorded: Result<(), Refused<E>>,
     /// Whether the last words landed, if a run left any.
     pub panic_recorded: Option<PanicRecorded<E>>,
+    /// Applied replacement or discarded unreadable bench intent.
+    pub secret_recovery: crate::SecretRecovery,
 }
 
 impl Store {
@@ -198,11 +203,11 @@ impl Store {
     pub async fn boot<F: Fram>(
         fram: &mut F,
         last_words: Option<LastWords>,
-    ) -> Result<(Self, BootReport<F::Error>), F::Error> {
+    ) -> Result<(Self, BootReport<F::Error>), crate::ProvisionFailed<F::Error>> {
         // Every read first, then every write: a read that fails returns
         // the bus error with nothing written, so a boot tried again on
         // the same part is the same boot and not one count later.
-        let secret = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
+        let mut secret = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
         let mut clients =
             Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
@@ -210,7 +215,7 @@ impl Store {
         let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
         let mut panics =
             Kept::<PanicRecord, PANIC_RECORD_BYTES>::read(map::PANIC_RECORD, fram).await?;
-        let challenges =
+        let mut challenges =
             Kept::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>::read(map::CHALLENGE_COUNTER, fram)
                 .await?;
         let volume = Kept::<WriteVolume, WRITE_VOLUME_BYTES>::read(map::WRITE_VOLUME, fram).await?;
@@ -220,6 +225,7 @@ impl Store {
         let mut cuts = Kept::<CutsRecord, CUTS_RECORD_BYTES>::read(map::RECENT_CUTS, fram).await?;
 
         let configuration = crate::Configuration::read(fram).await?;
+        let secret_recovery = crate::provision::finish(fram, &mut secret, &mut challenges).await?;
 
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
@@ -283,6 +289,7 @@ impl Store {
             boot,
             boot_recorded,
             panic_recorded,
+            secret_recovery,
         };
         Ok((
             Self {
@@ -557,6 +564,126 @@ mod tests {
         assert!(
             !crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
                 .pairing_open(Tick::ZERO)
+        );
+    }
+
+    #[test]
+    fn f_041_secret_replacement_requires_a_new_secret_and_explicit_replacement() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let old = Secret::new([1; 16], [2; 32]).expect("entropy");
+        let new = Secret::new([1; 16], [3; 32]).expect("fresh entropy");
+        block_on(store.secret.write(&mut part, old)).expect("old secret");
+        let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+        assert_eq!(
+            block_on(crate::stage_secret(&mut part, old, true)),
+            Err(crate::ProvisionFailed::SameSecret)
+        );
+        assert_eq!(
+            block_on(crate::stage_secret(&mut part, new, false)),
+            Err(crate::ProvisionFailed::AlreadyProvisioned)
+        );
+        let (store, _) = boot(&mut part, None);
+        assert!(store.secret.present() == Some(&old));
+        assert_eq!(store.challenges.present().expect("counter").last(), 1);
+    }
+
+    #[test]
+    fn f_041_staging_keeps_the_active_pair_and_refuses_a_second_pending_secret() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let old = Secret::new([1; 16], [2; 32]).expect("entropy");
+        let new = Secret::new([1; 16], [3; 32]).expect("fresh entropy");
+        block_on(store.secret.write(&mut part, old)).expect("old secret");
+        let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+        block_on(crate::stage_secret(&mut part, new, true)).expect("stage");
+        assert_eq!(
+            block_on(crate::stage_secret(&mut part, new, true)),
+            Err(crate::ProvisionFailed::Pending)
+        );
+        let current = block_on(Kept::<Secret, SECRET_BYTES>::read(
+            map::DEVICE_SECRET,
+            &mut part,
+        ))
+        .expect("read");
+        assert!(current.present() == Some(&old));
+        assert_eq!(
+            block_on(store.challenges.mint(&mut part))
+                .expect("old session")
+                .counter(),
+            2
+        );
+        let (mut store, _) = boot(&mut part, None);
+        assert!(store.secret.present() == Some(&new));
+        assert_eq!(
+            block_on(store.challenges.mint(&mut part))
+                .expect("new session")
+                .counter(),
+            1
+        );
+    }
+
+    #[test]
+    fn f_041_garbage_secret_intent_is_discarded_without_changing_the_active_pair() {
+        for malformed in [false, true] {
+            let mut part = Part::fresh();
+            let (mut store, _) = boot(&mut part, None);
+            let old = Secret::new([1; 16], [2; 32]).expect("entropy");
+            block_on(store.secret.write(&mut part, old)).expect("legacy secret");
+            let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+            let start = usize::from(map::LOAD_SHED_CONFIG.end().0);
+            part.bytes[start..].fill(0x55);
+            if malformed {
+                let mut bad = [0; crate::SECRET_CHANGE_BYTES];
+                bad[0] = 2;
+                let _ = block_on(map::SECRET_CHANGE.write(&mut part, Position::Start, &bad))
+                    .expect("malformed intent");
+            }
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(report.secret_recovery, crate::SecretRecovery::Discarded);
+            assert!(store.secret.present() == Some(&old));
+            assert_eq!(store.challenges.present().expect("old counter").last(), 1);
+            assert!(part.bytes[start..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn f_041_a_refused_secret_recovery_exposes_no_store_and_retries_at_boot() {
+        let mut part = Part::fresh();
+        let secret = Secret::new([1; 16], [2; 32]).expect("entropy");
+        block_on(crate::stage_secret(&mut part, secret, false)).expect("stage");
+        part.falling = true;
+        assert!(matches!(
+            block_on(Store::boot(&mut part, None)),
+            Err(crate::ProvisionFailed::Write(Refused::SupplyFalling))
+        ));
+        part.falling = false;
+        let (mut store, _) = boot(&mut part, None);
+        assert!(store.secret.present() == Some(&secret));
+        assert_eq!(
+            block_on(store.challenges.mint(&mut part))
+                .expect("mintable")
+                .counter(),
+            1
+        );
+    }
+
+    #[test]
+    fn f_041_secret_replacement_repairs_a_corrupt_challenge_counter() {
+        let mut part = Part::fresh();
+        part.bytes[32..72].fill(0x55);
+        let (mut store, _) = boot(&mut part, None);
+        let old = Secret::new([1; 16], [1; 32]).expect("old entropy");
+        block_on(store.secret.write(&mut part, old)).expect("old secret");
+        assert_eq!(store.challenges.held(), &Held::Corrupt);
+        let secret = Secret::new([1; 16], [2; 32]).expect("entropy");
+        block_on(crate::stage_secret(&mut part, secret, true)).expect("staged");
+        let (mut store, _) = boot(&mut part, None);
+        assert_eq!(
+            block_on(store.challenges.mint(&mut part))
+                .expect("mintable")
+                .counter(),
+            1
         );
     }
 

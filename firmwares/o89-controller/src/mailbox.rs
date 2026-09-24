@@ -132,6 +132,7 @@ pub async fn serve(parts: Parts<'_>) {
         }
         Some(Op::ReadFram) => read_fram(parts.fram, arg0, arg1).await,
         Some(Op::WriteFram) => write_fram(parts.fram, arg0, arg1).await,
+        Some(Op::WriteSecret) => write_secret(parts.fram, arg0, arg1).await,
         Some(Op::ReadNor) => match parts.ring {
             Some(ring) => read_nor(ring, arg0, arg1).await,
             None => (Status::NoNor, 0),
@@ -290,6 +291,33 @@ async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
         }
         Err(_) => (Status::Bus, 0),
     }
+}
+
+/// Stage only: active sessions keep the old secret and counter until the host
+/// reboots us. Boot completes the replacement before constructing sessions.
+async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32) {
+    use o89_core::{Body as _, ProvisionFailed, SECRET_BYTES, Secret};
+    if replace > 1 || usize::try_from(len) != Ok(SECRET_BYTES) {
+        return (Status::OutOfRange, 0);
+    }
+    let mut bytes = [0; SECRET_BYTES];
+    take(&mut bytes);
+    let Ok(secret) = Secret::decode(&bytes) else {
+        return (Status::OutOfRange, 0);
+    };
+    let status = match o89_core::stage_secret(fram, secret, replace == 1).await {
+        Ok(()) => Status::Ok,
+        Err(ProvisionFailed::Write(Refused::SupplyFalling)) => Status::SupplyFalling,
+        Err(
+            ProvisionFailed::Read(_)
+            | ProvisionFailed::Write(Refused::Bus(_) | Refused::AtTheCeiling),
+        ) => Status::Bus,
+        Err(ProvisionFailed::Unknown | ProvisionFailed::Pending) => Status::NoStore,
+        Err(ProvisionFailed::SameSecret | ProvisionFailed::AlreadyProvisioned) => {
+            Status::OutOfRange
+        }
+    };
+    (status, 0)
 }
 
 async fn write_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {

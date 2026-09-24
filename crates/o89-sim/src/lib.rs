@@ -47,3 +47,6 @@ pub use nor::*;
 
 #[cfg(test)]
 mod configuration;
+
+#[cfg(test)]
+mod provision;

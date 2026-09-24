@@ -200,7 +200,8 @@ enum StoreCommand {
         epoch: u32,
     },
     /// Write the device secret: sixteen bytes of id and thirty-two of
-    /// printed secret from the operating system's generator, shown once.
+    /// printed secret from the operating system's generator. Reboots the
+    /// controller to reset its challenge counter, then verifies and shows the label once.
     WriteSecret {
         /// The device id as thirty-two hex characters; generated when absent.
         #[arg(long)]

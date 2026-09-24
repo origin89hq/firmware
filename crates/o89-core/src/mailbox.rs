@@ -2,11 +2,11 @@
 //! and the recorder answers, so a laptop can read and write the FRAM and
 //! the NOR through the firmware that owns them.
 //!
-//! The firmware side moves bytes and nothing else: read this range, write
+//! Most operations move bytes: read this range, write
 //! these bytes, erase this block, reboot. Every write reaches the part
 //! through the same seam the store uses, so the voltage detector's refusal
 //! and the bus's answer are the ones the store would get. What the bytes
-//! mean is the host's business, and the host uses this crate's own
+//! mean is normally the host's business, and the host uses this crate's own
 //! [`Record`](crate::Record) and [`Kept`](crate::Kept) to mean it, so an
 //! epoch written from the bench lands the way the firmware would land it.
 //!
@@ -16,6 +16,8 @@
 //! as its response last. Nothing is read by either side while the other is
 //! writing it, because each waits for the other's sequence to move.
 //!
+//! Secret replacement is staged by the firmware and completed at boot, before
+//! sessions exist, so no old secret can use a reset challenge counter.
 //! One operation reads records rather than bytes: [`Op::ReadRing`] walks the
 //! event ring with the ring's own reader, because the ring is the one thing
 //! that knows where it starts and ends, and a host walking 3712 blocks a
@@ -43,8 +45,10 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"O89M");
 /// refuses the part, because an operation's meaning can change under the
 /// same number: 3 is where `EraseNorBlock` stopped erasing the ring's own
 /// blocks (#78), and a newer host that took a version 2 part's erase for
-/// a refusing one would recreate the hole it exists to prevent.
-pub const VERSION: u32 = 3;
+/// a refusing one would recreate the hole it exists to prevent. Version 4
+/// adds firmware-owned secret replacement: older tools must not write a secret
+/// alone and leave its challenge counter unrepaired.
+pub const VERSION: u32 = 4;
 
 /// Bytes of data a request or an answer carries: enough for the client
 /// table's record in one write.
@@ -137,6 +141,10 @@ pub enum Op {
     ReadRing,
     /// Erase the ring's oldest block, answered as a [`DropAnswer`].
     DropOldest,
+    /// Stage a secret replacement; `ARG0` is 0 for first provisioning, 1 for
+    /// replacement, and data is a Secret body. The host then requests Reboot
+    /// and verifies that boot applied the secret and its fresh counter.
+    WriteSecret,
 }
 
 impl Op {
@@ -154,6 +162,7 @@ impl Op {
             Self::Normal => 8,
             Self::ReadRing => 9,
             Self::DropOldest => 10,
+            Self::WriteSecret => 11,
         }
     }
 
@@ -171,6 +180,7 @@ impl Op {
             8 => Some(Self::Normal),
             9 => Some(Self::ReadRing),
             10 => Some(Self::DropOldest),
+            11 => Some(Self::WriteSecret),
             _ => None,
         }
     }
@@ -783,6 +793,7 @@ mod tests {
             Op::Normal,
             Op::ReadRing,
             Op::DropOldest,
+            Op::WriteSecret,
         ] {
             assert_eq!(Op::of(op.code()), Some(op));
         }
@@ -803,7 +814,7 @@ mod tests {
             assert_eq!(Status::of(status.code()), Some(status));
         }
         assert_eq!(Op::of(0), None);
-        assert_eq!(Op::of(11), None);
+        assert_eq!(Op::of(12), None);
         assert_eq!(Status::of(12), None);
         for entry in [
             DownloadEntry::Reset,

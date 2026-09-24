@@ -84,8 +84,14 @@ pub const SCHEDULE_CONFIG: Record<1024> = Record::at(magic(*b"SCHD"), FROST_CONF
 /// The load-shed behaviour's section.
 pub const LOAD_SHED_CONFIG: Record<1024> = Record::at(magic(*b"SHED"), SCHEDULE_CONFIG.end());
 
+pub(crate) const SECRET_CHANGE_START: Address = LOAD_SHED_CONFIG.end();
+
+/// Bench secret replacement intent, appended without moving existing records.
+pub const SECRET_CHANGE: Record<{ crate::SECRET_CHANGE_BYTES }> =
+    Record::at(magic(*b"SROT"), SECRET_CHANGE_START);
+
 /// The first address nothing in the map uses.
-pub const END: Address = LOAD_SHED_CONFIG.end();
+pub const END: Address = SECRET_CHANGE.end();
 
 // The budget: the whole map, both slots of every record, inside the part.
 const _: () = assert!((END.0 as usize) <= FRAM_BYTES);
@@ -117,6 +123,10 @@ mod tests {
         assert_eq!(EPOCH.end(), Address(32));
         assert_eq!(CHALLENGE_COUNTER.end(), Address(72));
         assert_eq!(
+            usize::from(END.0) - usize::from(LOAD_SHED_CONFIG.end().0),
+            122
+        );
+        assert_eq!(
             usize::from(RECENT_CUTS.end().0),
             usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(CUTS_RECORD_BYTES)
         );
@@ -145,6 +155,7 @@ mod tests {
             magic(*b"SCHD"),
             magic(*b"SHED"),
             magic(*b"LADR"),
+            magic(*b"SROT"),
         ];
         for (i, a) in magics.iter().enumerate() {
             // Never zero: zero is a slot's magic while a record lands over

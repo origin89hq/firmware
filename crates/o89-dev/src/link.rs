@@ -385,6 +385,15 @@ impl Link {
         Ok(count)
     }
 
+    /// Stage a secret in one firmware request and reboot to apply it before
+    /// sessions can use it. The caller reads it back before printing the label.
+    pub fn write_secret(&mut self, bytes: &[u8], replace: bool) -> Result<()> {
+        let len = u32::try_from(bytes.len()).context("secret length")?;
+        self.request(Op::WriteSecret, u32::from(replace), len, bytes)?
+            .ok("stage secret replacement")?;
+        self.reboot()
+    }
+
     /// Ask the firmware to reset the part. The answer lands a moment
     /// before the reset, and may be lost to it; the boot count afterwards
     /// says whether the part came back.

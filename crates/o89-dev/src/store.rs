@@ -1,6 +1,6 @@
 //! The store from the host's side: every record read with the `Kept` the
-//! firmware reads with, and the two records the bench writes, the epoch
-//! and the secret, written with the same.
+//! firmware reads with. Epoch writes use the same record seam; secret writes
+//! stage a firmware transaction, reboot, and verify it before printing the label.
 
 use anyhow::{Context, Result, anyhow, bail};
 use embassy_futures::block_on;
@@ -108,7 +108,7 @@ pub fn write_epoch(link: &mut Link, raw: u32) -> Result<()> {
 
 /// Write the secret, shown once.
 pub fn write_secret(link: &mut Link, device_id: Option<&str>, replace: bool) -> Result<()> {
-    let mut kept = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
+    let kept = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
     if let Held::Present(_) = kept.held()
         && !replace
     {
@@ -134,7 +134,22 @@ pub fn write_secret(link: &mut Link, device_id: Option<&str>, replace: bool) -> 
     let secret = Secret::new(id, printed).map_err(|_| anyhow!("the generator returned zeros"))?;
     let payload = pairing_payload(&id, &printed);
     let qr = pairing_qr(&payload)?;
-    block_on(kept.write(link, secret)).map_err(refused)?;
+    link.write_secret(&secret.encode(), replace)?;
+    let applied = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
+    let transaction = read::<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(
+        link,
+        map::SECRET_CHANGE,
+    )?;
+    let counter = read::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>(link, map::CHALLENGE_COUNTER)?;
+    if applied.present() != Some(&secret)
+        || counter.present().is_none()
+        || !matches!(
+            transaction.held(),
+            Held::Present(o89_core::SecretChange::Complete)
+        )
+    {
+        bail!("the controller did not finish applying the secret; no label printed");
+    }
     println!("device id      {}", hex::encode(id));
     println!("printed secret {}", hex::encode(printed));
     println!("{payload}");
