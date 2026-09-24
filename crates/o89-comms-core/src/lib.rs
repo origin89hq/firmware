@@ -24,6 +24,7 @@ mod link;
 mod network;
 mod ntp;
 mod relay;
+mod websocket;
 mod window;
 
 pub use connections::*;
@@ -34,6 +35,7 @@ pub use network::*;
 pub use ntp::*;
 pub use o89_link::{EncodeError, Millis, Tick};
 pub use relay::*;
+pub use websocket::*;
 pub use window::*;
 
 mod credential_store;

@@ -1,7 +1,7 @@
 //! Radio ownership is independent of the controller handshake and association.
 //! One desired configuration replaces the previous value; there is no queue.
 use core::cell::RefCell;
-use embassy_futures::select::{select, select3};
+use embassy_futures::select::{select, select4};
 use embassy_net::{Config, DhcpConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
@@ -12,13 +12,18 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use o89_comms_core::{Credential, NTP_BYTES, NtpRequest, NtpSchedule, Tick};
-use static_cell::StaticCell;
+
+use crate::clients::{Buffers, STATION_WORKERS};
+use static_cell::{ConstStaticCell, StaticCell};
 
 static DESIRED: Mutex<CriticalSectionRawMutex, RefCell<Option<Credential>>> =
     Mutex::new(RefCell::new(None));
-/// Three sockets: DHCP, DNS, and NTP. No client transport sockets in this slice.
-const SOCKETS: usize = 3;
+/// DHCP, DNS and NTP, and one TCP socket per WebSocket worker.
+const SOCKETS: usize = 3 + crate::clients::STATION_WORKERS;
 static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
+/// The station's WebSocket workers' buffers, lent to each session.
+static CLIENTS: ConstStaticCell<[Buffers; STATION_WORKERS]> =
+    ConstStaticCell::new([const { Buffers::EMPTY }; STATION_WORKERS]);
 /// One sample in flight; full means drop the fresh sample, never evict a queued one.
 pub static SAMPLES: Channel<CriticalSectionRawMutex, Sample, 1> = Channel::new();
 /// A sample is used only during the next link turn and never adjusts a local clock.
@@ -65,12 +70,17 @@ fn desired() -> Option<Credential> {
 
 pub fn start(spawner: embassy_executor::Spawner, wifi: WIFI<'static>) -> Result<(), ()> {
     let resources = RESOURCES.try_init(StackResources::new()).ok_or(())?;
-    spawner.spawn(radio(wifi, resources).map_err(|_| ())?);
+    let clients = CLIENTS.try_take().ok_or(())?;
+    spawner.spawn(radio(wifi, resources, clients).map_err(|_| ())?);
     Ok(())
 }
 
 #[embassy_executor::task]
-async fn radio(mut wifi: WIFI<'static>, resources: &'static mut StackResources<SOCKETS>) {
+async fn radio(
+    mut wifi: WIFI<'static>,
+    resources: &'static mut StackResources<SOCKETS>,
+    clients: &'static mut [Buffers; STATION_WORKERS],
+) {
     loop {
         for task in 0..3 {
             progress(task);
@@ -82,7 +92,7 @@ async fn radio(mut wifi: WIFI<'static>, resources: &'static mut StackResources<S
                     // runner/interface before the controller, whose guard stops
                     // and deinitializes the driver. Reborrow keeps WIFI here for
                     // the next configured network without duplicating ownership.
-                    session(wifi.reborrow(), resources, record).await;
+                    session(wifi.reborrow(), resources, clients, record).await;
                 }
                 Ok(km43::NetChange::Clear { .. } | km43::NetChange::ClearUnwritten) => {}
                 Err(_) => esp_hal::system::software_reset(),
@@ -93,7 +103,12 @@ async fn radio(mut wifi: WIFI<'static>, resources: &'static mut StackResources<S
     }
 }
 
-async fn session(wifi: WIFI<'_>, resources: &mut StackResources<SOCKETS>, record: Credential) {
+async fn session(
+    wifi: WIFI<'_>,
+    resources: &mut StackResources<SOCKETS>,
+    clients: &mut [Buffers; STATION_WORKERS],
+    record: Credential,
+) {
     let Ok(km43::NetChange::Set {
         ssid,
         psk,
@@ -127,13 +142,15 @@ async fn session(wifi: WIFI<'_>, resources: &mut StackResources<SOCKETS>, record
     dhcp.hostname = Some(hostname);
     let seed = (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random());
     let (stack, runner) = embassy_net::new(interface, Config::dhcpv4(dhcp), resources, seed);
-    // All three futures are polled concurrently. Station returns when the
-    // desired record changes; cancellation drops NTP sockets and the runner
-    // before controller teardown. Their bounded waits report watchdog progress.
-    let _finished = select3(
+    // All four futures are polled concurrently. Station returns when the
+    // desired record changes; cancellation drops the client connections,
+    // releasing their rows, then NTP sockets and the runner, before
+    // controller teardown. The first three report watchdog progress.
+    let _finished = select4(
         network(runner),
         ntp(stack),
         station(&mut controller, record),
+        crate::clients::serve(stack, 0, clients),
     )
     .await;
 }

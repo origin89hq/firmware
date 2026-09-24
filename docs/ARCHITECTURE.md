@@ -1309,7 +1309,22 @@ when cached credentials name an unavailable network. The ESP32 carries
 bytes; the STM32 verifies proofs, owns enrolment and holds every key.
 Bluetooth connection or bonding alone grants no KM43 permission.
 
-Local Wi-Fi uses one WebSocket connection per client (P-034). The comms
+Local Wi-Fi uses one WebSocket connection per client (P-034), on TCP port
+80 of the station's network, served by eight workers, one per row, inside
+the Wi-Fi session, so a changed network closes every connection and releases
+its row. Each worker owns fixed buffers for its socket, a client's envelope,
+its stamped copy and one frame for the client; each has a two-frame mailbox
+the link task fills from the UART, and a client whose mailbox is full when a
+frame arrives is closed rather than a frame dropped or evicted. Clients'
+stamped frames reach the UART through a two-envelope queue the link task
+drains one a turn after reading the UART; a frame that cannot enter it
+within a second is lost and its client retries. The opening handshake is
+RFC 6455's within 1 024 bytes and five seconds; no path, origin or
+subprotocol is decided on. A text frame, a fragmented message, an unmasked
+frame or one over one envelope closes the connection (1003, 1002, 1009).
+Every close carries a code and a reason a client can show (L-061). A ninth
+client finds no listening socket. The link, with the table, is shared with
+the workers through an async mutex no task holds across an await. The comms
 processor's own access point remains the browser provisioning fallback,
 raised only while no network is cached or the pairing window is open. The
 controller reports its window over the link with KM43's `PairingWindow`
@@ -1377,8 +1392,9 @@ radio driver then stops and deinitializes Wi-Fi. Both forms of clear keep
 Wi-Fi off. A later network record creates a fresh session from a reborrow
 of the owned peripheral, reusing the statically reserved stack resources.
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack has
-three socket slots (DHCP, DNS, NTP), and the time-offer channel holds one
-sample, refusing a new sample while full.
+eleven socket slots (DHCP, DNS, NTP and one TCP socket per WebSocket
+worker), and the time-offer channel holds one sample, refusing a new sample
+while full.
 
 NTP replies must match the request nonce and server endpoint and declare a
 synchronized server clock. Samples older than one second before their first send are discarded.

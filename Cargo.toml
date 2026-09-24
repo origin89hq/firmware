@@ -38,6 +38,9 @@ sha2 = { version = "0.11", default-features = false }
 # Not a security property and not ours: the format's, and the same
 # generation as `sha2` so they share `digest`.
 md-5 = { version = "0.11", default-features = false }
+# The WebSocket opening handshake's accept key (RFC 6455 §4.2.2), the same
+# generation as `sha2`. Not a security property: the handshake's.
+sha1 = { version = "0.11", default-features = false }
 # The NOR flash trait the ring is written against; the same release
 # embassy's flash drivers implement.
 embedded-storage-async = "=0.4.1"

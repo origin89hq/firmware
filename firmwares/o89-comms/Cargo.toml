@@ -71,7 +71,9 @@ esp-radio = { version = "=1.0.0-beta.1", features = ["esp32c6", "wifi", "unstabl
 esp-alloc = "=0.11.0"
 # Country-code lookup in the same blob as esp-radio; no guessed channel table.
 esp-wifi-sys-esp32c6 = "=0.3.0"
-embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "medium-ethernet"] }
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "udp", "tcp", "medium-ethernet"] }
+# The TCP socket's reads and writes, the release embassy-net implements.
+embedded-io-async = "=0.7.0"
 embassy-sync.workspace = true
 
 [lints]
