@@ -2450,4 +2450,111 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn l_120_ble_advertising_requires_link_and_stops_at_two_connections() {
+        let mut ble = crate::BleAdmission::new();
+        assert!(!ble.advertising(&Link::new(Tick::ZERO)));
+        let mut link = linked_at_boot();
+        assert!(ble.advertising(&link));
+        let (_, first) = ble.connect(&mut link, PEER).expect("first");
+        let (_, second) = ble.connect(&mut link, PEER).expect("second");
+        assert!(!ble.advertising(&link));
+        assert_eq!(ble.connect(&mut link, PEER), Err(Refused::TableFull));
+        assert_ne!(first, second);
+        ble.gone(&mut link, first, DisconnectReason::ClosedByClient);
+        assert!(ble.advertising(&link));
+        let (_, again) = ble.connect(&mut link, PEER).expect("free BLE slot");
+        assert_ne!(again, first, "the unacknowledged handle is reserved");
+        ble.gone(&mut link, first, DisconnectReason::ClosedByClient);
+        assert!(
+            !ble.advertising(&link),
+            "old cleanup cannot release the new owner"
+        );
+    }
+
+    #[test]
+    fn l_060_ble_and_websocket_share_all_eight_rows_without_eviction() {
+        let mut link = linked_at_boot();
+        let mut ble = crate::BleAdmission::new();
+        for _ in 0..crate::ROWS - 1 {
+            let _ = link.connect(LinkTransport::WifiLocal, PEER).expect("row");
+        }
+        let (_, conn) = ble
+            .connect(&mut link, Peer::Ble([1, 2, 3, 4, 5, 6]))
+            .expect("last shared row");
+        assert_eq!(ble.connect(&mut link, PEER), Err(Refused::TableFull));
+        assert_eq!(
+            link.connect(LinkTransport::WifiLocal, PEER),
+            Err(Refused::TableFull)
+        );
+        assert_eq!(link.status(conn), Some(Status::Announcing));
+        assert_eq!(
+            Peer::Ble([1, 2, 3, 4, 5, 255]).text().as_str(),
+            "01:02:03:04:05:ff"
+        );
+    }
+
+    #[test]
+    fn p_021_ble_stamps_its_own_handle_and_never_routes_to_the_websocket() {
+        let mut link = linked_at_boot();
+        let wifi = accepted(&mut link, at(10));
+        let mut ble = crate::BleAdmission::new();
+        let (_, conn) = ble.connect(&mut link, Peer::Ble([1; 6])).expect("BLE row");
+        let mut dst = [0; MAX_PAYLOAD];
+        let discover = [0x84, 0, 0, 1, 0xa0];
+        assert_eq!(link.from_client(conn, &discover, &mut dst), None);
+        let Some(Frame::ClientConnected {
+            req_id, transport, ..
+        }) = link.tick(at(20))
+        else {
+            panic!("announcement")
+        };
+        assert_eq!(transport, LinkTransport::Ble);
+        let mut buf = [0; 256];
+        let _ = link.received(
+            acked(&mut buf, LinkMessageType::ClientConnectedAck, req_id, 1),
+            at(20),
+        );
+        let Some(Ok(Inbound::Forward(len))) = link.from_client(conn, &discover, &mut dst) else {
+            panic!("stamped")
+        };
+        assert_eq!(link.route(&dst[..len]), Route::Client(conn));
+        assert_ne!(wifi, conn);
+        ble.gone(&mut link, conn, DisconnectReason::TransportError);
+        assert_eq!(link.route(&dst[..len]), Route::Nowhere);
+        assert_eq!(link.status(wifi), Some(Status::Open));
+    }
+
+    #[test]
+    fn l_120_ble_loses_advertising_and_rows_on_controller_loss_and_reboot() {
+        for reboot in [false, true] {
+            let mut link = linked_at_boot();
+            let mut ble = crate::BleAdmission::new();
+            let (_, conn) = ble.connect(&mut link, PEER).expect("row");
+            if reboot {
+                let mut buf = [0; 256];
+                let msg = statement(
+                    &mut buf,
+                    LinkMessageType::LinkUp,
+                    ReqId(1),
+                    Side::Controller,
+                    CONTROLLER_BOOT.wrapping_add(1),
+                    OURS,
+                );
+                let _ = link.received(msg, at(20));
+            } else {
+                let _ = link.tick(at(6000));
+            }
+            assert_eq!(
+                link.status(conn),
+                Some(Status::Close(crate::Closed::LinkLost))
+            );
+            ble.gone(&mut link, conn, DisconnectReason::ClosedByComms);
+            assert_eq!(link.status(conn), None);
+            if !reboot {
+                assert!(!ble.advertising(&link));
+                assert_eq!(ble.connect(&mut link, PEER), Err(Refused::NotLinked));
+            }
+        }
+    }
 }

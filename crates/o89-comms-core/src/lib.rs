@@ -18,18 +18,21 @@
 #![no_std]
 
 mod access_point;
+mod ble;
 mod connections;
 #[cfg(any(test, feature = "frames"))]
 mod frame_bench;
 mod link;
 mod network;
 mod ntp;
+mod progress;
 mod relay;
 pub mod sockets;
 mod websocket;
 mod window;
 
 pub use access_point::*;
+pub use ble::*;
 pub use connections::*;
 #[cfg(any(test, feature = "frames"))]
 pub use frame_bench::FrameBenchStart;
@@ -37,6 +40,7 @@ pub use link::*;
 pub use network::*;
 pub use ntp::*;
 pub use o89_link::{Country, EncodeError, Millis, Tick};
+pub use progress::*;
 pub use relay::*;
 pub use websocket::*;
 pub use window::*;

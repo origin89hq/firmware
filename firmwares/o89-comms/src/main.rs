@@ -30,6 +30,7 @@
 #![no_main]
 
 mod access_point;
+mod ble;
 mod clients;
 mod credentials;
 mod link;
@@ -184,6 +185,10 @@ fn main() -> ! {
         }
     };
     executor.run(move |spawner| {
+        match ble::run(p.BT) {
+            Ok(token) => spawner.spawn(token),
+            Err(_) => esp_hal::system::software_reset(),
+        }
         if radio::start(spawner, p.WIFI).is_err() {
             esp_hal::system::software_reset();
         }

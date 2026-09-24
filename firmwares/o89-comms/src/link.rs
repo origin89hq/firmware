@@ -125,16 +125,7 @@ pub async fn run(
             }
             Either::First(Ok(Err(_)) | Err(_)) => {}
             Either::Second(stamped) => {
-                // A client's frame, stamped with its handle (P-021). One that
-                // does not leave is lost, and the client's retry recovers it.
-                let mut bytes = [0u8; MAX_FRAME];
-                if let Ok(len) = writer.write(stamped.bytes(), &mut bytes) {
-                    let _left = with_timeout(
-                        WRITE_DEADLINE,
-                        write_all(&mut tx, bytes.get(..len).unwrap_or(&[])),
-                    )
-                    .await;
-                }
+                send_client(&stamped, &mut tx, &mut writer).await;
             }
         }
         let frame = LINK.lock().await.tick(now());
@@ -327,5 +318,24 @@ mod frames {
                 self.sent = self.sent.saturating_add(1);
             }
         }
+    }
+}
+
+/// A canceled connection cannot leave a queued envelope for the next link generation.
+async fn send_client(
+    stamped: &crate::clients::Upstream,
+    tx: &mut UartTx<'static, Async>,
+    writer: &mut FrameWriter,
+) {
+    if LINK.lock().await.status(stamped.conn) != Some(o89_comms_core::Status::Open) {
+        return;
+    }
+    let mut bytes = [0u8; MAX_FRAME];
+    if let Ok(len) = writer.write(stamped.bytes(), &mut bytes) {
+        let _left = with_timeout(
+            WRITE_DEADLINE,
+            write_all(tx, bytes.get(..len).unwrap_or(&[])),
+        )
+        .await;
     }
 }

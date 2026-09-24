@@ -88,6 +88,8 @@
 # 14: existing sessions::p_077_a_quiet_session_is_closed_at_fifteen_minutes_and_its_row_freed_by_the_answer
 #     proves only quiet expiry. Subscribe returns error 2 today; an active
 #     outbound-only subscription and slow-drain/P-098 require M5 (#12).
+# F-032 tests cover comms progress expiry and independent Wi-Fi/BLE ownership;
+# watchdog arming, reset and recovery-window timing still need board evidence.
 # No failing test is ignored or counted as coverage, and no bench exit is closed.
 
 # The list somebody defends at each audit round: the F rules that have
@@ -101,7 +103,6 @@ uncovered = [
     "F-006",
     "F-016",
     "F-030",
-    "F-032",
     "F-034",
     "F-035",
     # Table structure and flash guards are tested; factory-window permanence is not.
