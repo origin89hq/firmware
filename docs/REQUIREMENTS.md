@@ -284,8 +284,8 @@ shares the bounded client table with WebSocket, starts
 only after the recovery download window and valid `LinkUp`, and closes
 clients and stops advertising on controller loss. While the pairing window
 is open the comms processor keeps Wi-Fi off, because on the pinned radio a
-phone cannot open a BLE connection beside a running station (bench
-2026-09-24). Source: [#3][plan] §9
+station that is not joined can stop BLE advertising, and one started while
+a phone is connected drops it (bench 2026-09-25). Source: [#3][plan] §9
 item 3, [#96](https://github.com/origin89hq/firmware/issues/96), P-066,
 L-060, L-080, L-120. M4.
 
@@ -298,8 +298,8 @@ keeps its connection, so the app can hand over to Wi-Fi. Once joined, a
 client finds the controller over mDNS (P-224); a changed router, passphrase
 or address leaves the station unjoined, and BLE is back for recovery.
 With no network cached, Wi-Fi stays off until a connected client's scan is
-accepted, because on the pinned radio a phone cannot open a BLE connection
-beside a running station (#166).
+accepted, because on the pinned radio a station brought up for scans alone
+leaves BLE advertising nothing (#166).
 Source: [#147](https://github.com/origin89hq/firmware/issues/147), L-194,
 L-195. M4.
 

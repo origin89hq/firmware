@@ -3,10 +3,11 @@
 //!
 //! The comms processor raises no access point of its own. A phone reaches
 //! it over BLE for setup (#96) and over the site network once the station
-//! has joined. On the pinned radio a phone cannot open a BLE connection
-//! beside a running station, so Wi-Fi stays off while the controller's
-//! pairing window is open, and with no network cached it stays off until
-//! a client asks for a scan (#166). With a country known, from a clear
+//! has joined. On the pinned radio a station brought up for scans alone
+//! leaves BLE advertising nothing, and one started beside a BLE connection
+//! drops it, so Wi-Fi stays off while the controller's pairing window is
+//! open, and with no network cached it stays off until a client asks for a
+//! scan (#166). With a country known, from a clear
 //! that kept one, the station interface then comes up without joining, so
 //! the client that asked can pick a network to set. An unwritten clear
 //! turns Wi-Fi off entirely (L-133), and so does a record whose country
@@ -38,10 +39,10 @@ impl Plan {
     /// The plan for the network record held, whether the controller's
     /// pairing window is open, and whether a client wants the radio to
     /// scan. While the window is open, Wi-Fi stays off: the window is when a
-    /// phone pairs over BLE, and on the pinned radio BLE takes no connection
-    /// beside a running station (bench 2026-09-24). With no network cached,
-    /// it stays off until a scan is wanted, for the same reason: BLE is then
-    /// the only way in (#166).
+    /// phone pairs over BLE, and on the pinned radio a station that is not
+    /// joined can stop BLE advertising (bench 2026-09-25). With no network
+    /// cached, it stays off until a scan is wanted, for the same reason: BLE
+    /// is then the only way in (#166).
     pub fn of(credential: Option<&Credential>, pairing_open: bool, scan_wanted: bool) -> Self {
         if pairing_open {
             return Self::Off;

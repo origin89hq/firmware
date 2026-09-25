@@ -1339,7 +1339,7 @@ AP occupies **47 bytes** on this ESP32-C6 build, plus the Vec's spare capacity
 and allocator overhead; the blob's own scan list also occupies the radio heap.
 The public API reports a `u16` AP count. No smaller AP-count limit was found
 in the pinned radio configuration or blob API; APs in range and the remaining
-72 KiB heap bound it in practice, not a qualified density limit. Allocation
+128 KiB heap bound it in practice, not a qualified density limit. Allocation
 failure reaches the existing reset panic handler and the next recovery window.
 This remains part of F-037 exhaustion/coexistence qualification and the vendor
 allocation concern tracked in [#134](https://github.com/origin89hq/firmware/issues/134).
@@ -1358,12 +1358,18 @@ The radio-only allocation inventory includes the vendor Wi-Fi and BLE blobs,
 On the C6 the latter boxes incoming packets and queues them in a growable
 `VecDeque` with **no independent length cap**. Two BLE connections, controller
 buffer counts and HCI/ACL flow control constrain traffic, but do not establish
-a byte bound for that queue; its absolute bound is the shared 72 KiB heap.
+a byte bound for that queue; its absolute bound is the shared 128 KiB heap.
 The C6 controller defaults request a 4096-byte task stack, 30 high and eight
 low HCI event buffers of size 70, and 24 ACL buffers of size 255, plus
 controller and allocator overhead. These are runtime heap consumers, not
-additional application statics. Wi-Fi/BLE `coex` is enabled for the C6; the
-existing 72 KiB reservation is still provisional for combined operation.
+additional application statics. Wi-Fi/BLE `coex` is enabled for the C6.
+The heap was 72 KiB until board A ran out of it, a panic in the allocation
+error handler, each time Wi-Fi scanned or associated beside a BLE connection
+(#170). With room to spare the peaks were 73 KiB for a scan beside BLE and
+78 KiB for a join with a WebSocket client, repeated three times at 128 KiB
+without a failure (bench 2026-09-25). The driver's buffers grow with free
+heap, so a peak measured under one budget is not a requirement under
+another; 128 KiB is still provisional for combined operation.
 
 Allocation failure is not a sleep loop: `esp-alloc` returns null, Rust's
 infallible allocation handler panics, and this firmware's panic handler resets
@@ -1569,25 +1575,34 @@ it without joining once a client asks for a scan, until no client is left
 connected and the result is settled (#166). While the pairing window is open Wi-Fi stays off
 altogether (F-043).
 
-On esp-radio 1.0.0-beta.1 BLE and a running station do not share the radio.
-On board A, with the station joined, a phone found the advertisement within
-a second and never completed a BLE connection, twelve attempts of twelve,
-where with Wi-Fi never started it connected at once; the vendor's BLE-side
-coexistence callbacks are empty stubs. And disconnecting the station,
-stopping it, or dropping the last `WifiController` each left BLE advertising
-nothing until the module rebooted, while starting and joining did not
-(bench 2026-09-24). So Wi-Fi is off while a phone pairs, starting a station
+On esp-radio 1.0.0-beta.1, BLE shares the radio with a joined station but
+not with every station. With the station joined, a phone found the
+advertisement and never completed a connection, twelve attempts of twelve
+(bench 2026-09-24); that was the 72 KiB heap, since at 128 KiB three of
+three connected, held and answered, with the station joined at boot or
+after BLE (esp-rs/esp-hal#6397, bench 2026-09-25). What the heap does not
+explain, on board A at 128 KiB: a station brought up for scans alone,
+without connecting, left BLE advertising nothing; a BLE connection open
+when a station starts ends in a supervision timeout; and disconnecting the
+station, stopping it, or dropping the last `WifiController` each left BLE
+advertising nothing until the module rebooted (bench 2026-09-24 and
+2026-09-25). The vendor's BLE-side coexistence callbacks are empty stubs.
+So Wi-Fi is off while a phone pairs, starting a station
 is the only transition the radio makes in place, and any session that ends,
 a changed record, a changed plan or a stuck scan, reboots the module
 through its recovery window into the new plan, after the station's mDNS
 goodbye. A window opened while the station runs costs that reboot; the
 window at boot does not, because Wi-Fi waits for its report. With no network
 cached, a scan starts the station only once its client is connected over
-BLE. On board A the module rebooted within five seconds of the station
-started beside a BLE client, for a scan and for a join alike, and the
-client lost its link (#170, bench 2026-09-25); the unit then advertised
-again and took a connection with Wi-Fi off (#166).
-The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
+BLE, and that client loses its link: on board A a supervision timeout
+ended it within a second of the station starting to scan and about two
+seconds into a join, with no reset (bench 2026-09-25). The scan still
+completes and its list reaches the controller, which keeps it; once the
+client has gone and the result is acknowledged, the module reboots into
+Wi-Fi off, and the phone reconnects and reads the kept list without a
+refresh. A join goes on after the link has gone, and the phone finds the
+controller over mDNS.
+The radio and its RTOS use a fixed 128 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
 socket arrives at a full one, so the budget is a sum of named slots in
 `o89_comms_core::sockets`, one per socket anything opens. The station's
