@@ -243,6 +243,27 @@ fn resume_refuses_mismatched_applied_secret_or_unreadable_generator() {
 }
 
 #[test]
+fn p_236_resume_refuses_a_label_whose_controller_key_does_not_read_or_match() {
+    for replace_key in [false, true] {
+        let mut link = FakeLink::new();
+        staged(&mut link, secret(), Some(birth()));
+        if replace_key {
+            let mut held =
+                read::<ControllerKey, CONTROLLER_KEY_BYTES>(&mut link, map::CONTROLLER_KEY)
+                    .unwrap();
+            block_on(held.write(&mut link, ControllerKey::new([6; 32]).unwrap())).unwrap();
+        } else {
+            let at = usize::from(map::DEVICE_SECRET.end().0);
+            link.bytes[at..usize::from(map::CONTROLLER_KEY.end().0)].fill(0x55);
+        }
+        let mut output = Vec::new();
+        assert!(resume_secret(&mut link, &mut output).is_err());
+        assert!(output.is_empty(), "no label for a key the unit cannot use");
+        assert!(matches!(link.transaction(), SecretChange::Applied(..)));
+    }
+}
+
+#[test]
 fn failed_output_keeps_the_same_label_resumable() {
     struct BrokenOutput;
     impl std::io::Write for BrokenOutput {

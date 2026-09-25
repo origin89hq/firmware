@@ -334,6 +334,13 @@ fn show_applied(
     if applied.present() != Some(&secret) || drbg.present().is_none() {
         bail!("the controller did not finish applying the secret; no label printed");
     }
+    // The label vouches for the key the unit pairs with now, not the one
+    // the transaction recorded: a key that no longer reads or no longer
+    // matches would print a label nothing can pair against (P-236).
+    let key = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    if key.present().map(ControllerKey::fingerprint) != Some(fingerprint) {
+        bail!("the controller key does not read back as the one applied; no label printed");
+    }
     let encoded = secret.encode();
     let id = secret.device_id_bytes();
     let printed: Zeroizing<[u8; PRINTED_SECRET_BYTES]> = Zeroizing::new(
