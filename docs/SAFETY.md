@@ -47,4 +47,4 @@ promise about coverage; the tests are named in the milestones.
 | Disconnect, malformed frame, duplicate or delayed command | H7, H9; the resynchroniser and CRC (M3); the dedup table and counters (M4) |
 | Stuck actuator, or command and feedback disagreeing | `FEEDBACK` against the commanded state; *stop not honoured* and *running, not ours* as states (M8) |
 | Timer wrap, full queue, exhausted retries, memory pressure | The 64-bit tick (H9); every table with a named capacity that refuses (M4, M5); allocator-free domain crates (F-081); the two-client BLE cap, bounded HCI health check, and fixed-budget ESP32 radio heap with its unbounded vendor HCI receive queue, temporary 47-byte-per-AP scan result allocation, and outstanding exhaustion/recovery qualification in [the comms architecture](ARCHITECTURE.md#the-comms-processor) (F-037, #89, #96) |
-| Interrupted update or corrupt persisted state | H1, H4, H8; the bootloader's trial and flip-back (M7); the ring's torn-write rule (M2) |
+| Interrupted update or corrupt persisted state | H1, H4, H8; the bootloader's trial count and its rollback copy from the NOR (M7); the ring's torn-write rule (M2) |
