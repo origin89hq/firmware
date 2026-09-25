@@ -1,66 +1,117 @@
 //! The store from the host's side: every record read with the `Kept` the
 //! firmware reads with. Epoch writes use the same record seam; secret writes
 //! stage a firmware transaction, reboot, and verify it before printing the label.
+//!
+//! On a unit's first transaction the host also draws the controller key and
+//! the generator's first state from the operating system's generator (P-235,
+//! P-237). Both go to the controller in the staged transaction and nowhere
+//! else: they are never printed, never written to disk, and the buffers that
+//! held them are cleared once the transaction is staged. What the label
+//! prints is the fingerprint the controller wrote into the applied
+//! transaction, so a resumed label never needs the private key (P-236).
 
 use anyhow::{Context, Result, anyhow, bail};
 use embassy_futures::block_on;
-use km43::Epoch;
+use km43::{ClientId, Epoch, Fingerprint};
 use o89_core::{
-    BOOT_COUNT_BYTES, Body, BootCount, CHALLENGE_COUNTER_BYTES, CLIENT_TABLE_BYTES,
-    COMMS_RELEASE_BYTES, ChallengeCounter, ClientTable, CommsRelease, DEVICE_ID_BYTES, EPOCH_BYTES,
-    Held, Kept, NETWORK_BYTES, Network, PANIC_RECORD_BYTES, PRINTED_SECRET_BYTES, PanicRecord,
-    RUN_REASON_BYTES, Refused, RunReason, SECRET_BYTES, Secret, WRITE_VOLUME_BYTES, WriteVolume,
-    map,
+    BOOT_COUNT_BYTES, Birth, Body, BootCount, COMMS_RELEASE_BYTES, CONTROLLER_KEY_BYTES, Clients,
+    CommsRelease, ControllerKey, DEVICE_ID_BYTES, DRBG_BYTES, DrbgState, EPOCH_BYTES, Held, Kept,
+    NETWORK_BYTES, Network, PANIC_RECORD_BYTES, PRINTED_SECRET_BYTES, PanicRecord,
+    RUN_REASON_BYTES, Refused, RunReason, SECRET_BYTES, Secret, SecretChange, WRITE_VOLUME_BYTES,
+    WriteVolume, map,
 };
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::link::Link;
 
-/// Every record, decoded, one line each.
+/// Every record, decoded, one line each. Never a key, a seed or an admission
+/// key: only whether each is there.
 pub fn show(link: &mut Link) -> Result<()> {
-    let secret = block_on(Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, link))?;
+    show_into(link, &mut std::io::stdout().lock())
+}
+
+fn show_into(
+    link: &mut impl o89_core::Fram<Error = anyhow::Error>,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    let secret = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
     match secret.held() {
-        Held::Present(secret) => {
-            let bytes = secret.encode();
-            let id = bytes.get(..DEVICE_ID_BYTES).unwrap_or(&[]);
-            println!("secret      Present, device id {}", hex::encode(id));
-        }
-        Held::Absent => println!("secret      Absent"),
-        Held::Corrupt => println!("secret      Corrupt"),
-        Held::Malformed(at) => println!("secret      Malformed({at:?})"),
+        Held::Present(secret) => writeln!(
+            out,
+            "secret      Present, device id {}",
+            hex::encode(secret.device_id_bytes())
+        )?,
+        Held::Absent => writeln!(out, "secret      Absent")?,
+        Held::Corrupt => writeln!(out, "secret      Corrupt")?,
+        Held::Malformed(at) => writeln!(out, "secret      Malformed({at:?})")?,
     }
-    line("epoch", &read::<Epoch, EPOCH_BYTES>(link, map::EPOCH)?);
+    let controller = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    match controller.held() {
+        Held::Present(key) => writeln!(
+            out,
+            "controller  Present, fingerprint {}",
+            hex::encode(key.fingerprint().as_bytes())
+        )?,
+        Held::Absent => writeln!(out, "controller  Absent")?,
+        Held::Corrupt => writeln!(out, "controller  Corrupt")?,
+        Held::Malformed(at) => writeln!(out, "controller  Malformed({at:?})")?,
+    }
+    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    writeln!(
+        out,
+        "drbg        {}",
+        match drbg.held() {
+            Held::Present(_) => "Present".to_owned(),
+            Held::Absent => "Absent".to_owned(),
+            Held::Corrupt => "Corrupt".to_owned(),
+            Held::Malformed(at) => format!("Malformed({at:?})"),
+        }
+    )?;
+    line(out, "epoch", &read::<Epoch, EPOCH_BYTES>(link, map::EPOCH)?)?;
     line(
+        out,
         "boots",
         &read::<BootCount, BOOT_COUNT_BYTES>(link, map::BOOT_COUNT)?,
-    );
+    )?;
     line(
-        "challenges",
-        &read::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>(link, map::CHALLENGE_COUNTER)?,
-    );
-    line(
+        out,
         "volume",
         &read::<WriteVolume, WRITE_VOLUME_BYTES>(link, map::WRITE_VOLUME)?,
-    );
+    )?;
     line(
+        out,
         "run",
         &read::<RunReason, RUN_REASON_BYTES>(link, map::RUN_REASON)?,
-    );
+    )?;
     line(
+        out,
         "panics",
         &read::<PanicRecord, PANIC_RECORD_BYTES>(link, map::PANIC_RECORD)?,
-    );
+    )?;
     line(
+        out,
         "release",
         &read::<CommsRelease, COMMS_RELEASE_BYTES>(link, map::COMMS_RELEASE)?,
-    );
+    )?;
     line(
+        out,
         "network",
         &read::<Network, NETWORK_BYTES>(link, map::NETWORK)?,
-    );
-    line(
-        "clients",
-        &read::<ClientTable, CLIENT_TABLE_BYTES>(link, map::CLIENT_TABLE)?,
-    );
+    )?;
+    let clients = block_on(Clients::read(link))?;
+    for id in (1u32..).map_while(ClientId::new).take(o89_core::SLOTS) {
+        // `KeyRecord`'s `Debug` leaves the admission key out.
+        if let (Some(key), Some(mark)) = (clients.key(id), clients.mark(id)) {
+            writeln!(
+                out,
+                "slot {:<6} {:?}, mark {:?}",
+                id.get(),
+                key.held(),
+                mark.held()
+            )?;
+        }
+    }
+    line(out, "dedup", clients.commands())?;
     Ok(())
 }
 
@@ -71,8 +122,13 @@ fn read<T: Body<N>, const N: usize>(
     block_on(Kept::<T, N>::read(record, link))
 }
 
-fn line<T: Body<N> + core::fmt::Debug, const N: usize>(name: &str, kept: &Kept<T, N>) {
-    println!("{name:<11} {:?}", kept.held());
+fn line<T: Body<N> + core::fmt::Debug, const N: usize>(
+    out: &mut impl std::io::Write,
+    name: &str,
+    kept: &Kept<T, N>,
+) -> Result<()> {
+    writeln!(out, "{name:<11} {:?}", kept.held())?;
+    Ok(())
 }
 
 /// Bytes from the operating system's generator, whose error is not one
@@ -96,7 +152,7 @@ pub fn write_epoch(link: &mut Link, raw: u32) -> Result<()> {
     let mut kept = read::<Epoch, EPOCH_BYTES>(link, map::EPOCH)?;
     match kept.held() {
         Held::Present(held) if *held >= epoch => bail!(
-            "the part holds epoch {}; a step back would leave a client table stamped above the record",
+            "the part holds epoch {}; a step back would retire nothing and repeat enrolment names",
             held.get()
         ),
         Held::Present(_) | Held::Absent | Held::Corrupt | Held::Malformed(_) => {}
@@ -106,7 +162,8 @@ pub fn write_epoch(link: &mut Link, raw: u32) -> Result<()> {
     Ok(())
 }
 
-/// Write the secret, shown once.
+/// Write the secret, and on a unit's first transaction its controller key
+/// and generator; the label is shown once.
 pub fn write_secret(
     link: &mut Link,
     device_id: Option<&str>,
@@ -134,39 +191,71 @@ fn run_secret(
     }
     ensure_no_transaction(link)?;
     let secret = generate_secret(link, device_id, replace)?;
-    link.stage_and_reboot(secret, replace).context(RESUME)?;
+    let birth = if born(link)? {
+        None
+    } else {
+        if replace {
+            bail!(
+                "the part holds no controller key and no generator; --replace is for a born unit, and a first write needs none"
+            );
+        }
+        Some(generate_birth()?)
+    };
+    // `Birth` is `Copy` and has no way to clear itself; the encoded body is
+    // the copy that crosses to the controller, and it is cleared below.
+    let mut body = Zeroizing::new(SecretChange::Pending(secret, birth).encode());
+    link.stage_and_reboot(&body[..], replace).context(RESUME)?;
+    body.zeroize();
     show_applied(link, secret, output).context(RESUME)
 }
 
 const RESUME: &str = "secret write interrupted; run: o89-dev store write-secret --resume";
 
-type Transaction = Kept<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
+type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
 
 fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<()> {
-    match read::<o89_core::SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(
-        link,
-        map::SECRET_CHANGE,
-    )?
-    .held()
+    match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
     {
-        Held::Present(o89_core::SecretChange::Pending(_) | o89_core::SecretChange::Applied(_)) => {
-            bail!(RESUME)
-        }
-        Held::Absent | Held::Present(o89_core::SecretChange::Complete) => Ok(()),
+        Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => bail!(RESUME),
+        Held::Absent | Held::Present(SecretChange::Complete) => Ok(()),
         Held::Corrupt | Held::Malformed(_) => {
             bail!("unreadable secret transaction; reboot before provisioning")
         }
     }
 }
 
+/// Whether the part holds a controller key or a generator, or damage where
+/// either would be: the firmware refuses birth material for any of these
+/// (P-235, P-237), and so does the host before drawing any.
+fn born(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<bool> {
+    let controller = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    Ok(!matches!(controller.held(), Held::Absent) || !matches!(drbg.held(), Held::Absent))
+}
+
+/// The controller key and the generator's first state, drawn here and
+/// recorded nowhere. The raw draws are cleared as they are consumed.
+fn generate_birth() -> Result<Birth> {
+    let mut key = Zeroizing::new([0u8; CONTROLLER_KEY_BYTES]);
+    fill(&mut *key)?;
+    let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
+    fill(&mut *seed)?;
+    Ok(Birth {
+        controller: ControllerKey::new(*key)
+            .map_err(|_| anyhow!("the generator returned zeros"))?,
+        drbg: DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?,
+    })
+}
+
 trait SecretLink: o89_core::Fram<Error = anyhow::Error> {
     fn reboot(&mut self) -> Result<()>;
-    fn stage_and_reboot(&mut self, secret: Secret, replace: bool) -> Result<()>;
+    /// Stage the encoded `SecretChange::Pending` body and reboot to apply it.
+    fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()>;
 }
 
 impl SecretLink for Link {
-    fn stage_and_reboot(&mut self, secret: Secret, replace: bool) -> Result<()> {
-        self.write_secret(&secret.encode(), replace)
+    fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()> {
+        self.write_secret(body, replace)
     }
     fn reboot(&mut self) -> Result<()> {
         Link::reboot(self)
@@ -176,12 +265,12 @@ impl SecretLink for Link {
 fn resume_secret(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> Result<()> {
     let transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
     let secret = match *transaction.held() {
-        Held::Present(o89_core::SecretChange::Pending(secret)) => {
+        Held::Present(SecretChange::Pending(secret, _)) => {
             link.reboot()?;
             secret
         }
-        Held::Present(o89_core::SecretChange::Applied(secret)) => secret,
-        Held::Absent | Held::Present(o89_core::SecretChange::Complete) => {
+        Held::Present(SecretChange::Applied(secret, _)) => secret,
+        Held::Absent | Held::Present(SecretChange::Complete) => {
             bail!("no secret label to resume")
         }
         Held::Corrupt | Held::Malformed(_) => {
@@ -200,7 +289,7 @@ fn generate_secret(
     if let Held::Present(_) = kept.held()
         && !replace
     {
-        bail!("the part holds a secret; --replace orphans every client enrolled under it");
+        bail!("the part holds a secret; --replace invalidates the label every holder has");
     }
     let id: [u8; DEVICE_ID_BYTES] = if let Some(text) = device_id {
         hex::decode(text)
@@ -217,9 +306,9 @@ fn generate_secret(
         fill(&mut id)?;
         id
     };
-    let mut printed = [0u8; PRINTED_SECRET_BYTES];
-    fill(&mut printed)?;
-    let secret = Secret::new(id, printed).map_err(|_| anyhow!("the generator returned zeros"))?;
+    let mut printed = Zeroizing::new([0u8; PRINTED_SECRET_BYTES]);
+    fill(&mut *printed)?;
+    let secret = Secret::new(id, *printed).map_err(|_| anyhow!("the generator returned zeros"))?;
     Ok(secret)
 }
 
@@ -230,24 +319,33 @@ fn show_applied(
 ) -> Result<()> {
     let applied = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
     let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
-    let counter = read::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>(link, map::CHALLENGE_COUNTER)?;
-    if applied.present() != Some(&secret)
-        || counter.present().is_none()
-        || transaction.present() != Some(&o89_core::SecretChange::Applied(secret))
-    {
+    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    let fingerprint = match transaction.present() {
+        Some(SecretChange::Applied(held, fingerprint)) if *held == secret => *fingerprint,
+        Some(SecretChange::Applied(..) | SecretChange::Pending(..) | SecretChange::Complete)
+        | None => bail!("the controller did not finish applying the secret; no label printed"),
+    };
+    if applied.present() != Some(&secret) || drbg.present().is_none() {
         bail!("the controller did not finish applying the secret; no label printed");
     }
     let encoded = secret.encode();
     let id = secret.device_id_bytes();
-    let printed: [u8; PRINTED_SECRET_BYTES] = encoded
-        .get(DEVICE_ID_BYTES..)
-        .context("secret bytes")?
-        .try_into()
-        .context("printed secret length")?;
-    let payload = pairing_payload(&id, &printed);
+    let printed: Zeroizing<[u8; PRINTED_SECRET_BYTES]> = Zeroizing::new(
+        encoded
+            .get(DEVICE_ID_BYTES..)
+            .context("secret bytes")?
+            .try_into()
+            .context("printed secret length")?,
+    );
+    let payload = pairing_payload(&id, &printed, &fingerprint);
     let qr = pairing_qr(&payload)?;
     writeln!(output, "device id      {}", hex::encode(id))?;
-    writeln!(output, "printed secret {}", hex::encode(printed))?;
+    writeln!(output, "printed secret {}", hex::encode(*printed))?;
+    writeln!(
+        output,
+        "fingerprint    {}",
+        hex::encode(fingerprint.as_bytes())
+    )?;
     writeln!(output, "{payload}")?;
     // Explicit black on white keeps the QR readable on either terminal theme.
     writeln!(output, "\x1b[30;47m{qr}\x1b[0m")?;
@@ -258,14 +356,23 @@ fn show_applied(
     output.flush()?;
     // A failed output remains resumable. A crash between output and acknowledgement
     // can repeat the same label, but never substitutes an unseen secret.
-    block_on(transaction.write(link, o89_core::SecretChange::Complete)).map_err(refused)?;
-    // Boot scrubs the previous transaction slot without resetting the counter.
+    block_on(transaction.write(link, SecretChange::Complete)).map_err(refused)?;
     Ok(())
 }
 
-/// P-038, P-044, P-049: the label's ASCII payload, with no trailing newline.
-fn pairing_payload(id: &[u8; DEVICE_ID_BYTES], printed: &[u8; PRINTED_SECRET_BYTES]) -> String {
-    format!("km43:1:{}:{}", hex::encode(id), hex::encode(printed))
+/// P-038, P-044, P-049, P-236: the label's ASCII payload, version 2, with no
+/// trailing newline.
+fn pairing_payload(
+    id: &[u8; DEVICE_ID_BYTES],
+    printed: &[u8; PRINTED_SECRET_BYTES],
+    fingerprint: &Fingerprint,
+) -> String {
+    format!(
+        "km43:2:{}:{}:{}",
+        hex::encode(id),
+        hex::encode(printed),
+        hex::encode(fingerprint.as_bytes())
+    )
 }
 
 /// Render only in memory; neither the payload nor the QR is saved on the host.
@@ -281,30 +388,49 @@ fn pairing_qr(payload: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    const PAYLOAD: &str = "km43:1:0123456789abcdef0123456789abcdef:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ID: [u8; DEVICE_ID_BYTES] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
+    ];
+    const PAYLOAD: &str = "km43:2:0123456789abcdef0123456789abcdef:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:efcdab8967452301efcdab8967452301";
+
+    fn fingerprint() -> Fingerprint {
+        let mut bytes = [0u8; 16];
+        for (slot, byte) in bytes.iter_mut().zip(ID.iter().rev()) {
+            *slot = *byte;
+        }
+        Fingerprint::from_label(bytes)
+    }
 
     #[test]
-    fn p_049_pairing_payload_is_exactly_104_lowercase_characters() {
-        let id = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
-            0xcd, 0xef,
-        ];
+    fn p_049_pairing_payload_is_exactly_137_lowercase_characters_and_round_trips() {
         let mut secret = [0; PRINTED_SECRET_BYTES];
-        secret[..16].copy_from_slice(&id);
-        secret[16..].copy_from_slice(&id);
-        let payload = pairing_payload(&id, &secret);
+        secret[..16].copy_from_slice(&ID);
+        secret[16..].copy_from_slice(&ID);
+        let payload = pairing_payload(&ID, &secret, &fingerprint());
         assert_eq!(payload, PAYLOAD);
-        assert_eq!(payload.len(), 104);
+        assert_eq!(payload.len(), 137);
+        assert_eq!(payload, payload.to_lowercase());
+        let fields: Vec<&str> = payload.split(':').collect();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[..2], ["km43", "2"]);
+        assert_eq!(hex::decode(fields[2]).unwrap(), ID);
+        assert_eq!(hex::decode(fields[3]).unwrap(), secret);
+        assert_eq!(hex::decode(fields[4]).unwrap(), fingerprint().as_bytes());
     }
 
     #[test]
     fn p_049_pairing_payload_preserves_leading_zeroes() {
-        let payload = pairing_payload(&[0; DEVICE_ID_BYTES], &[0; PRINTED_SECRET_BYTES]);
+        let payload = pairing_payload(
+            &[0; DEVICE_ID_BYTES],
+            &[0; PRINTED_SECRET_BYTES],
+            &Fingerprint::from_label([0; 16]),
+        );
         assert_eq!(
             payload,
-            "km43:1:00000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000"
+            "km43:2:00000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000:00000000000000000000000000000000"
         );
-        assert_eq!(payload.len(), 104);
+        assert_eq!(payload.len(), 137);
     }
 
     #[test]

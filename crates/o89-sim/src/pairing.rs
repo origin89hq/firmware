@@ -7,8 +7,8 @@
 use std::num::NonZeroU64;
 
 use km43::{
-    Envelope, LinkHeader, LinkMessageType, MAX_FRAME, MessageType, Outcome, PairingWindowNotice,
-    ReqId, SessionId,
+    Envelope, LinkHeader, LinkMessageType, MAX_FRAME, MessageType, Outcome, PairRefusal,
+    PairingWindowNotice, ReqId, SessionId,
 };
 use o89_core::{DropReason, Millis, Note, PAIRING_WINDOW, Tick};
 
@@ -142,11 +142,14 @@ fn l_195_an_enrolment_answers_pair_before_the_closed_report() {
     bench.open_pairing();
     bench.run_for(Millis::from_millis(20));
     assert!(bench.comms.pairing_window(bench.now).is_some());
-    let mut client = Client::on(3);
-    let answer = client.pair(&mut bench, "laptop");
-    assert!(matches!(answer.outcome, Outcome::Enrolled(_)), "{answer:?}");
+    let mut client = Client::install(3, 2);
+    let answer = client.pair(&mut bench, "laptop").expect("proceeds");
+    assert!(
+        matches!(answer.outcome, Outcome::Enrolled(..)),
+        "{answer:?}"
+    );
     bench.run_for(Millis::from_millis(20));
-    // On the wire, in order: the `Pair 0x8B`, then the closed report.
+    // On the wire, in order: the `Enrol 0x93`, then the closed report.
     let pair_answer = bench
         .comms
         .heard
@@ -154,12 +157,12 @@ fn l_195_an_enrolment_answers_pair_before_the_closed_report() {
         .position(|heard| {
             if let Heard::ToClient { session: 3, frame } = heard {
                 Envelope::decode(frame)
-                    .is_ok_and(|envelope| envelope.header().kind == MessageType::PairResponse)
+                    .is_ok_and(|envelope| envelope.header().kind == MessageType::EnrolResponse)
             } else {
                 false
             }
         })
-        .expect("the Pair answer reached the client");
+        .expect("the Enrol answer reached the client");
     let closed = bench
         .comms
         .heard
@@ -179,7 +182,7 @@ fn l_195_an_enrolment_answers_pair_before_the_closed_report() {
     assert_eq!(bench.comms.pairing_window(bench.now), None);
     // One press, one enrolment: a second `Pair` meets a closed window.
     let again = client.pair(&mut bench, "tablet");
-    assert_eq!(again.outcome, Outcome::WindowClosed);
+    assert_eq!(again.err(), Some(PairRefusal::WindowClosed));
     assert_eq!(reports(&bench).len(), 3, "no report for a refused Pair");
 }
 
@@ -373,23 +376,15 @@ fn f_091_p_066_enrolment_closes_boot_window_and_next_boot_stays_closed() {
     let mut bench = Bench::first_enrolment(Capabilities::default());
     bench.run_for(Millis::from_millis(1_000));
     announce(&mut bench, 3);
-    let answer = Client::on(3).pair(&mut bench, "first phone");
-    assert!(matches!(answer.outcome, Outcome::Enrolled(_)));
+    let answer = Client::install(3, 2)
+        .pair(&mut bench, "first phone")
+        .expect("proceeds");
+    assert!(matches!(answer.outcome, Outcome::Enrolled(..)));
     assert!(!bench.window.is_open(bench.now));
     bench.run_for(Millis::from_millis(20));
     assert_eq!(bench.comms.pairing_window(bench.now), None);
     bench.boot_clients(o89_core::Revision::A);
-    assert_eq!(
-        bench
-            .endpoint
-            .sessions
-            .keys()
-            .clients
-            .present()
-            .unwrap()
-            .enrolled(),
-        1
-    );
+    assert_eq!(crate::link::enrolled(&bench.endpoint.sessions), 1);
     assert!(!bench.window.is_open(bench.now));
 }
 
@@ -407,8 +402,8 @@ fn f_091_p_066_factory_reset_new_epoch_reopens_on_next_boot() {
     ))
     .unwrap();
     bench.boot_clients(o89_core::Revision::A);
-    let table = bench.endpoint.sessions.keys().clients.present().unwrap();
-    assert!(table.epoch() > previous);
-    assert_eq!(table.enrolled(), 0);
+    let now = bench.endpoint.sessions.keys().epoch.unwrap();
+    assert!(now > previous);
+    assert_eq!(crate::link::enrolled(&bench.endpoint.sessions), 0);
     assert!(bench.window.is_open(bench.now));
 }

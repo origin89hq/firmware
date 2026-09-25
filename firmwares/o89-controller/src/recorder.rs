@@ -4,7 +4,7 @@
 //! The store was read in `main`, before any output moved, because the run
 //! reason has to be known before the contact is (F-022, F-016); this task
 //! takes the ladder's cuts and the boot count from there, and the link task
-//! takes the epoch, the challenge counter and the client table, each
+//! takes the epoch, the generator and the client table, each
 //! through its own lease on the part. It identifies the NOR, opens the
 //! ring, writes the boot record, publishes the span of the log a `Hello`
 //! reports, and from then on holds the ring for whoever asks. A board whose NOR does not answer

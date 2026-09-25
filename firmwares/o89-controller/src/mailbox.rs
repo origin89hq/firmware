@@ -219,6 +219,14 @@ fn take(into: &mut [u8]) {
     }
 }
 
+/// Zero the data area: what crossed in it was secret, and the probe can
+/// read it back until something overwrites it.
+fn clear_data() {
+    for slot in &MAILBOX.data {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Both rings emptied, before the host is told the bridge is up.
 pub fn bridge_reset() {
     MAILBOX.to_module_read.store(0, Ordering::Relaxed);
@@ -293,19 +301,25 @@ async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-/// Stage only: active sessions keep the old secret and counter until the host
-/// reboots us. Boot completes the replacement before constructing sessions.
+/// Stage only: running sessions keep what the unit holds until the host
+/// reboots us, and boot applies the transaction before any session exists.
+/// The data is an encoded `SecretChange::Pending`: the secret and, on a
+/// unit's first transaction, its controller key and generator (P-235,
+/// P-237). The buffer it crossed in is cleared before this returns.
 async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32) {
-    use o89_core::{Body as _, ProvisionFailed, SECRET_BYTES, Secret};
-    if replace > 1 || usize::try_from(len) != Ok(SECRET_BYTES) {
+    use o89_core::{Body as _, ProvisionFailed, SECRET_CHANGE_BYTES, SecretChange};
+    if replace > 1 || usize::try_from(len) != Ok(SECRET_CHANGE_BYTES) {
         return (Status::OutOfRange, 0);
     }
-    let mut bytes = [0; SECRET_BYTES];
+    let mut bytes = [0; SECRET_CHANGE_BYTES];
     take(&mut bytes);
-    let Ok(secret) = Secret::decode(&bytes) else {
+    let decoded = SecretChange::decode(&bytes);
+    bytes.fill(0);
+    clear_data();
+    let Ok(SecretChange::Pending(secret, birth)) = decoded else {
         return (Status::OutOfRange, 0);
     };
-    let status = match o89_core::stage_secret(fram, secret, replace == 1).await {
+    let status = match o89_core::stage_secret(fram, secret, birth, replace == 1).await {
         Ok(()) => Status::Ok,
         Err(ProvisionFailed::Write(Refused::SupplyFalling)) => Status::SupplyFalling,
         Err(
@@ -313,9 +327,12 @@ async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32)
             | ProvisionFailed::Write(Refused::Bus(_) | Refused::AtTheCeiling),
         ) => Status::Bus,
         Err(ProvisionFailed::Unknown | ProvisionFailed::Pending) => Status::NoStore,
-        Err(ProvisionFailed::SameSecret | ProvisionFailed::AlreadyProvisioned) => {
-            Status::OutOfRange
-        }
+        Err(
+            ProvisionFailed::SameSecret
+            | ProvisionFailed::AlreadyProvisioned
+            | ProvisionFailed::AlreadyBorn
+            | ProvisionFailed::Unborn,
+        ) => Status::OutOfRange,
     };
     (status, 0)
 }

@@ -9,48 +9,95 @@ use std::cell::RefCell;
 
 use embassy_futures::block_on;
 use km43::{
-    Attempt, ClientId, ClientKind, CloseReason, CommandKind, CommandOperation, Conn, Counter,
-    DeviceId, DeviceSecret, Discovery, EmptyBody, Envelope, Epoch, ErrorBody, Handshake, Header,
-    HelloInner, Incoming, LinkTransport, MessageType, PairAckClaim, PairRequest, PairResponse,
-    PrintedSecret, ReqId, Session, SessionId, SessionKey, Signed, Tagged, Version, Wrapper,
+    ClientChannel, ClientId, ClientKind, CloseReason, CommandKind, CommandOperation, Conn,
+    DeviceId, Discovery, EmptyBody, EnrolAnswer, Envelope, Epoch, ErrorBody, Fingerprint, Header,
+    HelloOffer, HelloPending, Incoming, LinkTransport, MAX_FRAME, MAX_PAYLOAD, MessageType,
+    PairOffer, PairPending, PairRefusal, PairReply, Prologue, PrologueFields, ReqId, Sealed,
+    SessionId, Signed, Suite, Version,
 };
 use o89_core::{Compat, DropReason, Facts, Millis, Sessions};
 
-use crate::link::{Bench, DEVICE, LOG, MODEL, PRINTED, unit};
+use crate::link::{
+    Bench, DEVICE, LOG, MODEL, STEP, client_key, controller, enrolled, reread, secret, unit,
+};
 use crate::{Answers, Capabilities, Heard, Releases, SimFram, crash_at_every_step};
 
-fn device() -> DeviceSecret {
-    DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
+/// The one suite (P-226).
+pub(crate) const SUITE: Suite = Suite::X25519ChachapolySha256;
+
+/// P-236's fingerprint, as the label prints it.
+pub(crate) fn fingerprint() -> Fingerprint {
+    controller().fingerprint()
 }
 
-fn epoch() -> Epoch {
-    Epoch::FIRST
-}
-
-/// A client on one connection, speaking through the bench's comms
-/// processor, which stamps the handle into every frame (P-021).
+/// A client install on one connection, speaking through the bench's comms
+/// processor, which stamps the handle into every frame (P-021). Built from
+/// `km43`'s client half: it pairs from the label, checks the controller key
+/// message 2 proves against the label's fingerprint (P-236), keeps its
+/// enrolment before message 3 (P-064), says `Hello` against the key it
+/// pinned, and seals every request after it.
 pub(crate) struct Client {
     handle: u16,
     req: u32,
-    key: Option<SessionKey>,
+    draws: u8,
+    /// Which install's static key this client holds (`client_key`).
+    install: u8,
+    challenge: Option<[u8; 16]>,
+    epoch: Epoch,
+    enrolment: Option<km43::Enrolment>,
+    channel: Option<ClientChannel>,
 }
 
 impl Client {
-    pub(crate) const fn on(handle: u16) -> Self {
+    /// The unit's phone, install 1, as `unit()` enrolled it at slot 1.
+    pub(crate) fn on(handle: u16) -> Self {
+        let mut client = Self::install(handle, 1);
+        client.enrolment = Some(client.kept());
+        client
+    }
+
+    /// Install `n`, not enrolled anywhere yet.
+    pub(crate) fn install(handle: u16, n: u8) -> Self {
         Self {
             handle,
             req: 0,
-            key: None,
+            draws: 0,
+            install: n,
+            challenge: None,
+            epoch: Epoch::FIRST,
+            enrolment: None,
+            channel: None,
         }
     }
 
-    fn header(&mut self, kind: MessageType) -> Header {
+    /// The enrolment this install keeps once message 2 checked out (P-222).
+    fn kept(&self) -> km43::Enrolment {
+        km43::Enrolment::new(
+            DeviceId::new(DEVICE),
+            controller().public(),
+            client_key(self.install),
+            SUITE,
+            self.epoch,
+        )
+    }
+
+    pub(crate) fn header(&mut self, kind: MessageType) -> Header {
         self.req = self.req.wrapping_add(1);
         Header {
             kind,
             session: SessionId::from(self.handle),
             req_id: ReqId(self.req),
         }
+    }
+
+    fn entropy(&mut self) -> km43::Entropy {
+        self.draws = self.draws.wrapping_add(1);
+        let mut bytes = [0u8; 32];
+        bytes[0] = self.handle.to_le_bytes()[0];
+        bytes[1] = self.draws;
+        bytes[2] = self.install;
+        bytes[31] = 0x40;
+        km43::Entropy::new(bytes)
     }
 
     /// Put `frame` on the wire and let the bench settle; what the
@@ -63,14 +110,31 @@ impl Client {
         bench.comms.to_client(self.handle).split_off(before)
     }
 
-    fn empty(&mut self, kind: MessageType) -> Vec<u8> {
+    /// A handshake message: put on the wire, then the bench run until the
+    /// worker has nothing left, as a client waits out a second of X25519.
+    pub(crate) fn exchange(&self, bench: &mut Bench, frame: &[u8]) -> Vec<Vec<u8>> {
+        let before = bench.comms.to_client(self.handle).len();
+        let bytes = bench.comms.relay(frame, bench.now).expect("relays");
+        bench.feed(&bytes);
+        bench.run_for(Millis::from_millis(20));
+        for _ in 0..100_000 {
+            if !bench.computing() {
+                break;
+            }
+            bench.run_for(STEP);
+        }
+        bench.run_for(Millis::from_millis(20));
+        bench.comms.to_client(self.handle).split_off(before)
+    }
+
+    pub(crate) fn empty(&mut self, kind: MessageType) -> Vec<u8> {
         let mut dst = [0u8; 64];
         let cbor = self.header(kind).write(0, &mut dst).expect("fits");
         let len = cbor.finish().expect("fits");
         dst[..len].to_vec()
     }
 
-    fn discover(&mut self, bench: &mut Bench) -> [u8; 16] {
+    pub(crate) fn discover(&mut self, bench: &mut Bench) -> [u8; 16] {
         let frame = self.empty(MessageType::Discover);
         let answers = self.send(bench, &frame);
         let answer = answers.last().expect("Discover is answered");
@@ -84,93 +148,192 @@ impl Client {
         assert_eq!(discovery.model, MODEL);
         assert_eq!(
             discovery.provisioned,
-            bench
-                .endpoint
-                .sessions
-                .keys()
-                .clients
-                .present()
-                .unwrap()
-                .enrolled()
-                > 0
+            enrolled(&bench.endpoint.sessions) > 0
         );
+        self.challenge = Some(discovery.challenge);
+        self.epoch = discovery.epoch;
         discovery.challenge
     }
 
-    /// `Discover`, then a `Pair` from `label` proved under the printed
-    /// secret's pair key, and its `Pair 0x8B` verified as a client verifies
-    /// it.
-    pub(crate) fn pair(&mut self, bench: &mut Bench, label: &str) -> PairResponse {
-        let challenge = self.discover(bench);
-        let attempt = Attempt {
-            device_id: DEVICE,
-            challenge,
-            client_nonce: [self.handle.to_le_bytes()[0] ^ 0x5a; 16],
-        };
-        let mut dst = [0u8; 256];
+    /// P-227's prologue for the live challenge this client holds.
+    pub(crate) fn prologue(&self) -> Prologue {
+        Prologue::new(&PrologueFields {
+            suite: SUITE,
+            version: Version::V1_0,
+            device_id: DeviceId::new(DEVICE),
+            epoch: self.epoch,
+            challenge: self.challenge.as_ref().expect("a challenge to present"),
+            handle: SessionId::from(self.handle),
+        })
+    }
+
+    /// Pairing message 1 under `under`, offering `label`.
+    pub(crate) fn pair_frame(
+        &mut self,
+        under: &km43::Label,
+        label: &str,
+    ) -> (PairPending, Vec<u8>) {
+        let mut dst = [0u8; MAX_FRAME];
+        let entropy = self.entropy();
         let header = self.header(MessageType::Pair);
-        let len = PairRequest {
-            client_kind: ClientKind::Cli,
-            label,
-        }
-        .write(&device().pair_key(), &attempt, header, &mut dst)
-        .expect("fits");
-        let answers = self.send(bench, &dst[..len]);
+        let (pending, len) = PairPending::start(
+            &self.prologue(),
+            SUITE,
+            under,
+            entropy,
+            &PairOffer {
+                version: Version::V1_0,
+                client_version: "sim/1",
+                client_kind: ClientKind::Cli,
+                label,
+            },
+            header,
+            &mut dst,
+        )
+        .expect("message 1");
+        (pending, dst[..len].to_vec())
+    }
+
+    /// `Discover`, then a whole pairing from the label: message 2 checked
+    /// against the fingerprint the label prints, the enrolment kept, message
+    /// 3, and `Enrol 0x93` opened under the pairing's keys. A refusal is
+    /// believed only if the label's refusal key vouches for it (P-241).
+    pub(crate) fn pair(
+        &mut self,
+        bench: &mut Bench,
+        label: &str,
+    ) -> Result<EnrolAnswer, PairRefusal> {
+        let _ = self.discover(bench);
+        let (pending, frame) = self.pair_frame(&secret().label(), label);
+        let answers = self.exchange(bench, &frame);
         let answer = answers.last().expect("Pair is answered");
         let envelope = Envelope::decode(answer).expect("an envelope");
         assert_eq!(envelope.header().kind, MessageType::PairResponse);
-        PairAckClaim::decode(envelope)
-            .expect("a pair ack")
-            .verify(&device().pair_key(), &attempt, epoch())
-            .expect("MAC'd under the pair key")
-    }
-
-    fn hello_frame(&mut self, challenge: [u8; 16], nonce: [u8; 16]) -> Vec<u8> {
-        let enrolment = device().enrolment(epoch(), ClientId::new(1).expect("a slot"));
-        let mut inner = [0u8; 128];
-        let request = HelloInner {
-            version: Version::V1_0,
-            client_id: ClientId::new(1).expect("a slot"),
-            client_version: "sim/1",
-            client_nonce: nonce,
-        }
-        .prove(&enrolment.client_key(), &challenge, &mut inner)
-        .expect("proves");
-        let mut dst = [0u8; 256];
-        let len = request
-            .write(self.header(MessageType::Hello), &mut dst)
-            .expect("fits");
-        dst[..len].to_vec()
-    }
-
-    /// `Discover` then `Hello`, and the session opened as a client opens it
-    /// (P-072): the key from the envelope's handle, then the MAC.
-    fn open(&mut self, bench: &mut Bench) -> Vec<u8> {
-        let challenge = self.discover(bench);
-        let nonce = [self.handle.to_le_bytes()[0]; 16];
-        let frame = self.hello_frame(challenge, nonce);
-        let answers = self.send(bench, &frame);
-        let answer = answers.last().expect("Hello is answered");
-        let enrolment = device().enrolment(epoch(), ClientId::new(1).expect("a slot"));
-        let handshake = Handshake {
-            challenge,
-            client_nonce: nonce,
+        let proceeding = match pending
+            .read(envelope, &secret().label(), &fingerprint())
+            .expect("an answer the label vouches for")
+        {
+            PairReply::Proceed(proceeding) => proceeding,
+            PairReply::Refused(refusal) => return Err(refusal),
         };
-        let session = Session::open(
-            Envelope::decode(answer).expect("an envelope"),
-            &enrolment,
-            &handshake,
-            Version::V1_0,
+        let mut dst = [0u8; MAX_FRAME];
+        let header = self.header(MessageType::Enrol);
+        let (enrol, len) = proceeding
+            .finish(&client_key(self.install), header, &mut dst)
+            .expect("message 3");
+        // Kept before message 3 leaves (P-064).
+        self.enrolment = Some(self.kept());
+        let answers = self.exchange(bench, &dst[..len]);
+        let answer = answers.last().expect("Enrol is answered");
+        let mut plain = [0u8; MAX_PAYLOAD];
+        let answer = enrol
+            .read(Envelope::decode(answer).expect("an envelope"), &mut plain)
+            .expect("sealed under the pairing's keys");
+        self.challenge = Some(answer.next_challenge);
+        Ok(answer)
+    }
+
+    /// A `Hello` against the kept enrolment and the live challenge.
+    pub(crate) fn hello_frame(&mut self) -> (HelloPending, Vec<u8>) {
+        let mut dst = [0u8; MAX_FRAME];
+        let entropy = self.entropy();
+        let header = self.header(MessageType::Hello);
+        let (pending, len) = HelloPending::start(
+            &self.prologue(),
+            self.enrolment.as_ref().expect("enrolled"),
+            entropy,
+            &HelloOffer {
+                version: Version::V1_0,
+                client_version: "sim/1",
+            },
+            header,
+            &mut dst,
         )
-        .expect("the client opens the session");
+        .expect("message 1");
+        (pending, dst[..len].to_vec())
+    }
+
+    /// The `Hello 0x81` in `answer`, opened under the pinned key: the slot
+    /// and generation it names, and the session kept.
+    pub(crate) fn finish(
+        &mut self,
+        pending: HelloPending,
+        answer: &[u8],
+    ) -> Option<(ClientId, km43::Generation)> {
+        let envelope = Envelope::decode(answer).ok()?;
+        if envelope.header().kind != MessageType::HelloResponse {
+            return None;
+        }
+        let mut plain = [0u8; MAX_PAYLOAD];
+        let session = pending
+            .finish(
+                self.enrolment.as_ref().expect("enrolled"),
+                envelope,
+                &mut plain,
+            )
+            .expect("message 2 opens under the pinned key");
         assert_eq!(session.report().log_newest_seq, LOG.newest);
-        self.key = Some(enrolment.session_key(&handshake, SessionId::from(self.handle)));
+        let named = (session.report().client_id, session.report().generation);
+        self.channel = Some(session.into_channel());
+        Some(named)
+    }
+
+    /// `Discover` then `Hello`, and the session opened as a client opens it.
+    /// The `Hello` frame comes back for a replay.
+    pub(crate) fn open(&mut self, bench: &mut Bench) -> Vec<u8> {
+        let _ = self.discover(bench);
+        let (pending, frame) = self.hello_frame();
+        let answers = self.exchange(bench, &frame);
+        let answer = answers.last().expect("Hello is answered");
+        assert!(
+            self.finish(pending, answer).is_some(),
+            "Hello refused: {:?}",
+            code(answer)
+        );
         frame
     }
 
-    /// A signed `Command` under `counter`, as the client signs it.
-    fn command(&mut self, counter: u64, cmd_id: u32, key: &SessionKey) -> Vec<u8> {
-        let header = self.header(MessageType::Command);
+    /// A request sealed under the session (P-231).
+    pub(crate) fn sealed(&mut self, kind: MessageType, inner: &[u8]) -> Vec<u8> {
+        let mut dst = [0u8; MAX_FRAME];
+        let channel = self.channel.as_mut().expect("a session");
+        let (req_id, len) = channel
+            .tx
+            .seal(kind, SessionId::from(self.handle), inner, &mut dst)
+            .expect("sealed");
+        self.req = req_id.0;
+        dst[..len].to_vec()
+    }
+
+    /// A request with an empty map inside.
+    pub(crate) fn wrapped(&mut self, kind: MessageType) -> Vec<u8> {
+        self.sealed(kind, &[0xa0])
+    }
+
+    /// A sealed request whose tag was broken on the way: what a relay
+    /// without the session's keys can make.
+    pub(crate) fn forged(&mut self, kind: MessageType) -> Vec<u8> {
+        let mut frame = self.wrapped(kind);
+        if let Some(last) = frame.last_mut() {
+            *last ^= 1;
+        }
+        frame
+    }
+
+    /// A write, sealed.
+    pub(crate) fn signed(&mut self, kind: MessageType, operation: &[u8]) -> Vec<u8> {
+        let mut dst = [0u8; MAX_FRAME];
+        let channel = self.channel.as_mut().expect("a session");
+        let (req_id, len) = Signed::new(kind, operation)
+            .expect("a write")
+            .seal(&mut channel.tx, SessionId::from(self.handle), &mut dst)
+            .expect("sealed");
+        self.req = req_id.0;
+        dst[..len].to_vec()
+    }
+
+    /// A `StartGenerator` command under `cmd_id`, sealed.
+    pub(crate) fn command(&mut self, cmd_id: u32) -> Vec<u8> {
         let mut op = [0u8; 16];
         let len = CommandOperation {
             cmd_id,
@@ -179,28 +342,20 @@ impl Client {
         }
         .encode(&mut op)
         .expect("fits");
-        let mut dst = [0u8; 128];
-        let len = Signed::over(
-            header,
-            ClientId::new(1).expect("a slot"),
-            Counter(counter),
-            &op[..len],
-            key,
-        )
-        .expect("signs")
-        .write(&mut dst)
-        .expect("fits");
-        dst[..len].to_vec()
+        self.signed(MessageType::Command, &op[..len])
     }
 
-    fn wrapped(&mut self, kind: MessageType, key: &SessionKey) -> Vec<u8> {
-        let header = self.header(kind);
-        let mut dst = [0u8; 128];
-        let len = Tagged::over(header, &[0xa0], key)
-            .expect("wraps")
-            .write(&mut dst)
-            .expect("fits");
-        dst[..len].to_vec()
+    /// An answer opened under the session: its header and inner body, or
+    /// nothing if it does not open.
+    pub(crate) fn opened(&mut self, answer: &[u8]) -> Option<(Header, Vec<u8>)> {
+        let channel = self.channel.as_mut().expect("a session");
+        let envelope = Envelope::decode(answer).ok()?;
+        let header = envelope.header();
+        let mut plain = [0u8; MAX_PAYLOAD];
+        let opened = Sealed::decode(envelope)
+            .and_then(|sealed| sealed.open(&mut channel.rx, &mut plain))
+            .ok()?;
+        Some((header, opened.inner().to_vec()))
     }
 }
 
@@ -326,14 +481,13 @@ fn l_070_p_076_a_client_connects_opens_a_session_says_goodbye_and_its_row_goes_w
     );
     bench.run_for(Millis::from_millis(2_100));
     assert_eq!(conns(&bench), Some(1), "L-101: the row, bound");
-    let key = client.key.take().expect("a session");
-    let frame = client.wrapped(MessageType::Goodbye, &key);
+    let frame = client.wrapped(MessageType::Goodbye);
     let answers = client.send(&mut bench, &frame);
-    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
-    let verified = Wrapper::decode(envelope)
-        .and_then(|wrapper| wrapper.verify(&key))
-        .expect("under the key it ended");
-    assert!(EmptyBody::decode(MessageType::GoodbyeResponse, verified.payload()).is_ok());
+    let (header, body) = client
+        .opened(answers.last().expect("answered"))
+        .expect("sealed under the session it ended");
+    assert_eq!(header.kind, MessageType::GoodbyeResponse);
+    assert!(EmptyBody::decode(MessageType::GoodbyeResponse, &body).is_ok());
     bench.run_for(Millis::from_millis(2_100));
     assert_eq!(conns(&bench), Some(1), "P-076: goodbye leaves the row");
     release(&mut bench, 1);
@@ -401,8 +555,7 @@ fn l_080_p_061_replays_bind_nothing_and_allocate_nothing() {
     let answers = client.send(&mut bench, &hello);
     assert_eq!(code(answers.last().expect("answered")), Some(14));
     // The session the first one bound is untouched.
-    let key = client.key.take().expect("a session");
-    let goodbye = client.wrapped(MessageType::Goodbye, &key);
+    let goodbye = client.wrapped(MessageType::Goodbye);
     let _ = client.send(&mut bench, &goodbye);
     // The goodbye again: no session is held on the row now.
     let answers = client.send(&mut bench, &goodbye);
@@ -428,8 +581,7 @@ fn l_041_a_comms_reboot_takes_every_row_and_session_with_it() {
     assert!(bench.endpoint.link.is_up(), "linked again, to the new boot");
     assert_eq!(bench.endpoint.sessions.allocated(), 0);
     // The old handle is one this controller no longer knows (L-062).
-    let key = client.key.take().expect("a session");
-    let frame = client.wrapped(MessageType::Readings, &key);
+    let frame = client.wrapped(MessageType::Readings);
     let answers = client.send(&mut bench, &frame);
     assert_eq!(code(answers.last().expect("answered")), Some(0x103));
 }
@@ -471,13 +623,14 @@ fn l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_witho
     let _ = client.open(&mut bench);
     let boot_id = bench.comms.boot_id();
     bench.comms.capabilities().releases = Releases::Lost;
+    // Counted from the release that was lost, whatever the beat's phase.
+    let lost_at = bench.comms.heard.len();
     release(&mut bench, 1);
     assert_eq!(
         bench.endpoint.sessions.allocated(),
         2,
         "the controller was never told"
     );
-    let lost_at = bench.comms.heard.len();
     bench.run_for(Millis::from_millis(7_000));
     // The close of every connection went out on the third beat the two
     // counts disagreed on, and not before.
@@ -523,35 +676,25 @@ fn l_102_a_row_whose_release_was_lost_is_reclaimed_within_three_heartbeats_witho
 }
 
 #[test]
-fn p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once() {
+fn p_022_a_sealed_command_the_comms_processor_replays_acts_once_and_is_answered_once() {
     // Capabilities: replay.
     let mut bench = linked();
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
-    let key = client.key.take().expect("a session");
-    let frame = client.command(1, 7, &key);
+    let frame = client.command(7);
     let answers = client.send(&mut bench, &frame);
-    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
-    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
-    let accepted = |bench: &Bench| {
-        bench
-            .endpoint
-            .sessions
-            .keys()
-            .clients
-            .present()
-            .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
-    };
-    assert_eq!(accepted(&bench), Some(Counter(1)));
+    let (header, _) = client
+        .opened(answers.last().expect("answered"))
+        .expect("sealed");
+    assert_eq!(header.kind, MessageType::CommandResponse);
     // The same bytes, relayed again and again as the comms processor
-    // chooses: nothing reaches the client that it could take for an answer,
-    // the counter is not read again, and the connection is not shed.
+    // chooses: the opener's window drops each unanswered and uncounted, and
+    // the connection is not shed (P-022, P-051).
     for n in 1..=9 {
         let answers = client.send(&mut bench, &frame);
         assert!(answers.is_empty(), "replay {n} answered");
     }
-    assert_eq!(accepted(&bench), Some(Counter(1)));
     assert!(closes(&bench).is_empty());
     assert!(
         bench
@@ -560,11 +703,12 @@ fn p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answere
             .is_bound(Conn::new(1).expect("a handle"))
     );
     // The client's next request is served as if nothing had happened.
-    let next = client.command(2, 8, &key);
+    let next = client.command(8);
     let answers = client.send(&mut bench, &next);
-    let envelope = Envelope::decode(answers.last().expect("answered")).expect("an envelope");
-    assert_eq!(envelope.header().kind, MessageType::CommandResponse);
-    assert_eq!(accepted(&bench), Some(Counter(2)));
+    let (header, _) = client
+        .opened(answers.last().expect("answered"))
+        .expect("sealed");
+    assert_eq!(header.kind, MessageType::CommandResponse);
 }
 
 #[test]
@@ -591,17 +735,8 @@ fn p_051_eight_bad_macs_inside_a_minute_close_the_connection_over_the_wire() {
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
-    let forged = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]))
-        .enrolment(epoch(), ClientId::new(1).expect("a slot"))
-        .session_key(
-            &Handshake {
-                challenge: [0; 16],
-                client_nonce: [0; 16],
-            },
-            SessionId::from(1),
-        );
     for n in 1..=8 {
-        let frame = client.wrapped(MessageType::Readings, &forged);
+        let frame = client.forged(MessageType::Readings);
         let answers = client.send(&mut bench, &frame);
         assert_eq!(code(answers.last().expect("answered")), Some(10), "{n}");
     }
@@ -619,23 +754,14 @@ fn l_080_a_close_owed_for_a_released_handle_is_forgotten_before_the_handle_is_re
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
-    let forged = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]))
-        .enrolment(epoch(), ClientId::new(1).expect("a slot"))
-        .session_key(
-            &Handshake {
-                challenge: [0; 16],
-                client_nonce: [0; 16],
-            },
-            SessionId::from(1),
-        );
     for _ in 1..=7 {
-        let frame = client.wrapped(MessageType::Readings, &forged);
+        let frame = client.forged(MessageType::Readings);
         let _ = client.send(&mut bench, &frame);
     }
     // The comms processor stops hearing the controller: the close the
     // eighth failure asks for is never answered.
     bench.comms.capabilities().answers = Answers::TalksOnly;
-    let frame = client.wrapped(MessageType::Readings, &forged);
+    let frame = client.forged(MessageType::Readings);
     let _ = client.send(&mut bench, &frame);
     assert_eq!(
         closes(&bench),
@@ -657,7 +783,8 @@ fn l_080_a_close_owed_for_a_released_handle_is_forgotten_before_the_handle_is_re
 }
 
 #[test]
-fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_cut() {
+fn p_237_a_challenge_never_leaves_before_its_successor_is_on_the_part_and_none_repeats_across_a_cut()
+ {
     let (start, _) = unit();
     // What the uncut path handed out, and what each cut one did.
     let handed: RefCell<Vec<[u8; 16]>> = RefCell::new(Vec::new());
@@ -709,8 +836,8 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
         },
         |part, step| {
             // Whatever the cut left, the unit that boots from it hands out
-            // a challenge nobody has seen: its counter is past every one
-            // that left.
+            // a challenge nobody has seen: the generator's state on the part
+            // is past every draw that left (P-237).
             let read = reread(part).expect("the part is back");
             let before: Vec<[u8; 16]> = handed.borrow_mut().drain(..).collect();
             path(part, read).expect("the supply is steady");
@@ -732,29 +859,8 @@ fn f_041_a_challenge_never_leaves_before_its_counter_and_none_repeats_across_a_c
     assert!(crashes.steps > 0);
 }
 
-/// The four records the sessions take, read from `part` as a boot reads
-/// them.
-fn reread(part: &mut SimFram) -> Option<o89_core::Keys> {
-    let (store, report) = block_on(o89_core::Store::boot(part, None)).ok()?;
-    Some(o89_core::Keys {
-        configuration: store.configuration,
-        network: store.network,
-        secret: store.secret.present().copied(),
-        epoch: report.epoch.epoch(),
-        epoch_record: store.epoch,
-        clients: store.clients,
-        challenges: store.challenges,
-    })
-}
-
 impl Client {
-    fn config_write(
-        &mut self,
-        counter: u64,
-        expected: u32,
-        body: &[u8],
-        key: &SessionKey,
-    ) -> Vec<u8> {
+    fn config_write(&mut self, expected: u32, body: &[u8]) -> Vec<u8> {
         let mut operation = [0; 128];
         let len = km43::SetConfigOperation {
             section: km43::ConfigSection::IdentityAndSite,
@@ -763,22 +869,11 @@ impl Client {
         }
         .encode(&mut operation)
         .expect("operation");
-        let mut frame = [0; 256];
-        let len = Signed::over(
-            self.header(MessageType::SetConfig),
-            ClientId::new(1).expect("client"),
-            Counter(counter),
-            &operation[..len],
-            key,
-        )
-        .expect("signed")
-        .write(&mut frame)
-        .expect("frame");
-        frame[..len].to_vec()
+        self.signed(MessageType::SetConfig, &operation[..len])
     }
 
     /// A signed write of the network section at version 1, accepted.
-    fn write_network(&mut self, bench: &mut Bench, key: &SessionKey) {
+    fn write_network(&mut self, bench: &mut Bench) {
         let write = km43::NetworkWrite {
             join: Some(km43::JoinWrite {
                 ssid: km43::Ssid::new("cabin").expect("ssid"),
@@ -797,51 +892,32 @@ impl Client {
         }
         .encode(&mut operation)
         .expect("operation");
-        let mut frame = [0; 256];
-        let len = Signed::over(
-            self.header(MessageType::SetConfig),
-            ClientId::new(1).expect("client"),
-            Counter(1),
-            &operation[..len],
-            key,
-        )
-        .expect("signed")
-        .write(&mut frame)
-        .expect("frame");
-        let answers = self.send(bench, &frame[..len]);
-        let verified =
-            Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-                .expect("wrapper")
-                .verify(key)
-                .expect("MAC");
+        let frame = self.signed(MessageType::SetConfig, &operation[..len]);
+        let answers = self.send(bench, &frame);
+        let (_, body) = self
+            .opened(answers.last().expect("answer"))
+            .expect("sealed");
         assert_eq!(
-            km43::SetConfigAck::decode(verified.payload())
-                .expect("ack")
-                .outcome,
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
             km43::SetConfig::Accepted
         );
     }
 }
 
 #[test]
-fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
+fn p_102_signed_set_config_cut_at_every_step_keeps_the_old_section_or_the_new_one() {
     // Capabilities: none; cuts happen behind the FRAM seam, after authentication.
     let mut initial = linked();
     announce(&mut initial, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut initial);
-    let key = client.key.take().expect("key");
-    let first = client.config_write(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
+    let first = client.config_write(0, &[0xa1, 1, 0x61, b'a']);
     let answers = client.send(&mut initial, &first);
-    let verified =
-        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-            .expect("wrapper")
-            .verify(&key)
-            .expect("MAC");
+    let (_, body) = client
+        .opened(answers.last().expect("answer"))
+        .expect("sealed");
     assert_eq!(
-        km43::SetConfigAck::decode(verified.payload())
-            .expect("ack")
-            .outcome,
+        km43::SetConfigAck::decode(&body).expect("ack").outcome,
         km43::SetConfig::Accepted
     );
     let seed = initial.fram.clone();
@@ -868,8 +944,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
         announce(&mut bench, 1);
         let mut client = Client::on(1);
         let _ = client.open(&mut bench);
-        let key = client.key.take().expect("key");
-        let frame = client.config_write(2, 1, &[0xa1, 1, 0x61, b'b'], &key);
+        let frame = client.config_write(1, &[0xa1, 1, 0x61, b'b']);
         bench.fram.reboot();
         if steps.is_some() {
             bench.fram.cut_after(cut - 1);
@@ -905,17 +980,87 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_counter_and_section_order() {
             ),
             "cut {cut}"
         );
-        if answer.version() == 2 {
-            assert_eq!(
-                keys.clients
-                    .present()
-                    .expect("table")
-                    .accepted(ClientId::new(1).expect("client")),
-                Some(Counter(2))
-            );
-        }
     }
     assert!(steps.is_some_and(|steps| steps > 0 && steps < 2999));
+}
+
+#[test]
+fn p_080_p_079_a_sealed_command_cut_at_every_step_leaves_its_entry_in_flight_or_absent() {
+    // Capabilities: none; cuts happen behind the FRAM seam, after the tag.
+    let seed = linked().fram;
+    let facts = Facts {
+        model: MODEL,
+        fw_controller: "sim",
+        fw_comms: "sim",
+        log: LOG,
+        time_known: false,
+        pairing_open: false,
+        link: Some(Compat::Agreed(Version::V1_0)),
+    };
+    let fingerprint = {
+        let mut op = [0u8; 16];
+        let len = CommandOperation {
+            cmd_id: 7,
+            kind: CommandKind::StartGenerator,
+            args: &[0xa0],
+        }
+        .encode(&mut op)
+        .expect("fits");
+        o89_core::Fingerprint::of(&op[..len])
+    };
+    let (mut absent, mut in_flight) = (0, 0);
+    let mut steps = None;
+    for cut in 0..5_000 {
+        if steps.is_some_and(|steps| cut > steps) {
+            break;
+        }
+        // A fresh session over the same part each time: the keys are the
+        // session's, and the cut starts with the command.
+        let mut bench = linked();
+        bench.fram = seed.clone();
+        bench.endpoint.sessions = Sessions::new(reread(&mut bench.fram).expect("boot"));
+        announce(&mut bench, 1);
+        let mut client = Client::on(1);
+        let _ = client.open(&mut bench);
+        let frame = client.command(7);
+        bench.fram.reboot();
+        if steps.is_some() {
+            bench.fram.cut_after(cut - 1);
+        }
+        let mut dst = [0; 256];
+        let _ = block_on(bench.endpoint.sessions.frame(
+            &frame,
+            bench.now,
+            (&facts, &mut bench.endpoint.link.wifi),
+            &mut bench.fram,
+            &mut dst,
+        ));
+        if steps.is_none() {
+            steps = Some(bench.fram.bytes_written());
+            continue;
+        }
+        bench.fram.reboot();
+        let keys = reread(&mut bench.fram).expect("recover");
+        let commands = keys.clients.commands().present().expect("the dedup record");
+        let retry = commands.clone().dedup_mut().admit(
+            ClientId::new(1).expect("a slot"),
+            7,
+            fingerprint,
+            o89_core::Tick::from_millis(1),
+        );
+        match retry {
+            o89_core::Verdict::Fresh(_) => absent += 1,
+            // Reserved and landed, its `rejected` not recorded: the state
+            // store answers the retry (P-080).
+            o89_core::Verdict::InFlight(_) => in_flight += 1,
+            other => panic!("cut {cut}: {other:?}"),
+        }
+    }
+    assert!(steps.is_some_and(|steps| steps > 0 && steps < 4_999));
+    assert!(
+        absent > 0 && in_flight > 0,
+        "{absent} absent, {in_flight} in flight"
+    );
 }
 
 /// The link opcode of a scan order, `WifiScan`.
@@ -936,8 +1081,7 @@ fn p_218_l_200_a_refresh_under_a_major_mismatch_is_link_down_and_orders_no_scan(
         announce(&mut bench, 1);
         let mut client = Client::on(1);
         let _ = client.open(&mut bench);
-        let key = client.key.take().expect("key");
-        client.write_network(&mut bench, &key);
+        client.write_network(&mut bench);
         bench.comms.capabilities().version = version;
         let statement = bench.comms.restate(bench.now).expect("restates");
         bench.feed(&statement);
@@ -951,18 +1095,12 @@ fn p_218_l_200_a_refresh_under_a_major_mismatch_is_link_down_and_orders_no_scan(
         let len = km43::ScanRequest { refresh: true }
             .encode(&mut body)
             .expect("request");
-        let mut frame = [0; 128];
-        let len = Tagged::over(client.header(MessageType::WifiScan), &body[..len], &key)
-            .expect("wrapped")
-            .write(&mut frame)
-            .expect("frame");
-        let answers = client.send(&mut bench, &frame[..len]);
-        let verified =
-            Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-                .expect("wrapper")
-                .verify(&key)
-                .expect("MAC");
-        let answer = km43::ScanAnswer::decode(verified.payload()).expect("scan");
+        let frame = client.sealed(MessageType::WifiScan, &body[..len]);
+        let answers = client.send(&mut bench, &frame);
+        let (_, payload) = client
+            .opened(answers.last().expect("answer"))
+            .expect("sealed");
+        let answer = km43::ScanAnswer::decode(&payload).expect("scan");
         assert_eq!(answer.refused(), refused, "{version:?}");
         bench.run_for(Millis::from_millis(2_000));
         let orders = bench
@@ -990,55 +1128,52 @@ fn p_106_signed_network_write_reads_only_presence_and_pushes_the_secret_privatel
     announce(&mut bench, 1);
     let mut client = Client::on(1);
     let _ = client.open(&mut bench);
-    let key = client.key.take().expect("key");
-    client.write_network(&mut bench, &key);
+    client.write_network(&mut bench);
     let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
-    let mut frame = [0; 256];
     let len = km43::GetConfigRequest {
         section: km43::ConfigSection::Network,
     }
     .encode(&mut body)
     .expect("get");
-    let len = Tagged::over(client.header(MessageType::GetConfig), &body[..len], &key)
-        .expect("wrapped")
-        .write(&mut frame)
-        .expect("frame");
-    let answers = client.send(&mut bench, &frame[..len]);
-    let verified =
-        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-            .expect("wrapper")
-            .verify(&key)
-            .expect("MAC");
-    let answer = km43::ConfigAnswer::decode(verified.payload()).expect("config");
+    let frame = client.sealed(MessageType::GetConfig, &body[..len]);
+    let answers = client.send(&mut bench, &frame);
+    let (_, payload) = client
+        .opened(answers.last().expect("answer"))
+        .expect("sealed");
+    let answer = km43::ConfigAnswer::decode(&payload).expect("config");
     let read = km43::NetworkRead::decode(answer.body().expect("body")).expect("read");
     assert_eq!(answer.version(), 1);
     assert!(read.join.expect("join").psk_set);
-    assert!(
-        !verified
-            .payload()
-            .windows(13)
-            .any(|window| window == b"correct horse")
-    );
+    assert!(!payload.windows(13).any(|window| window == b"correct horse"));
     assert!(bench.comms.heard.iter().any(|heard| matches!(heard, Heard::NetConfig { version: 1, network } if network.credentials().is_some())));
 }
 
-mod adversarial;
-mod configuration;
-mod conformance;
-
 #[test]
-fn f_041_discover_after_secret_replacement_over_a_corrupt_counter_has_a_challenge() {
-    use o89_core::{Address, Fram as _, Secret, stage_secret};
+fn p_237_a_unit_whose_generator_is_damaged_gives_no_challenge_and_a_new_label_does_not_reseed_it() {
+    // Capabilities: none; the damage is behind the storage seam.
+    use o89_core::{Fram as _, map, stage_secret};
     let mut bench = Bench::new(Capabilities::default());
-    block_on(bench.fram.write(Address(32), &[0x55; 40])).expect("damage counter");
-    let fresh = Secret::new(DEVICE, [0x35; 32]).expect("new entropy");
-    block_on(stage_secret(&mut bench.fram, fresh, true)).expect("stage");
+    let at = usize::from(map::DRBG.end().0) - 2 * 44;
+    let at = o89_core::Address(u16::try_from(at).expect("in the part"));
+    block_on(bench.fram.write(at, &[0x55; 88])).expect("damage both copies");
+    // A replacement label carries no generator: the unit is born already.
+    let fresh = o89_core::Secret::new(DEVICE, [0x35; 32]).expect("new entropy");
+    block_on(stage_secret(&mut bench.fram, fresh, None, true)).expect("stage");
     let keys = reread(&mut bench.fram).expect("recover before sessions");
+    assert!(!keys.generator.is_available());
     bench.endpoint.sessions = Sessions::new(keys);
     bench.run_for(Millis::from_millis(2_000));
     announce(&mut bench, 1);
     let mut client = Client::on(1);
-    let challenge = client.discover(&mut bench);
-    assert_ne!(challenge, [0; 16]);
-    assert_eq!(challenge, fresh.device_secret().challenge(1));
+    let frame = client.empty(MessageType::Discover);
+    let answers = client.send(&mut bench, &frame);
+    assert_eq!(
+        code(answers.last().expect("answered")),
+        Some(km43::ErrorCode::ChallengeUnavailable as u16)
+    );
 }
+
+mod adversarial;
+mod agreement;
+mod configuration;
+mod conformance;

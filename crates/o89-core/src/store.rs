@@ -2,34 +2,35 @@
 //! rules that tie one record to another applied where both are in hand.
 //!
 //! A boot reads the part once and holds what it read: the epoch, the
-//! client table, the counters, the run reason, the panic record and the
-//! rest, each as a [`Kept`] whose RAM copy moves only when the part has
-//! moved. Four things happen on the way: a fresh unit gets its first
-//! epoch; an epoch record behind the table's stamp is raised to it,
-//! because the stamp is a second copy of a counter that only climbs and
-//! the higher copy is the counter; a table under an earlier epoch than
-//! the record is cleared, finishing a reset that was cut (F-026); the boot
-//! count climbs and the last words, if a run left any, are written down
-//! with it. Everything that measures a window on the tick is restarted at
-//! this boot's tick zero (P-121), the recovery ladder's recent cuts
-//! included (F-017).
+//! client table, the controller key, the generator's state, the run
+//! reason, the panic record and the rest, each as a [`Kept`] whose RAM copy
+//! moves only when the part has moved. Four things happen on the way: a
+//! fresh unit gets its first epoch; an epoch record behind a slot written
+//! under a later one is raised to it, because a slot's epoch is a second
+//! copy of a counter that only climbs and the higher copy is the counter
+//! (F-026); the table is repaired as P-239 says, which may advance the
+//! epoch; the boot count climbs and the last words, if a run left any, are
+//! written down with it. Everything that measures a window on the tick is
+//! restarted at this boot's tick zero (P-121), the recovery ladder's recent
+//! cuts included (F-017).
 //!
 //! A boot that cannot read the part returns the bus error and nothing
 //! else: there is no partial store to hold, and nothing was written, so a
 //! boot tried again on the same part counts once. A write the boot could
 //! not make is in the report, so the caller raises what it owes. A pending
-//! bench secret replacement is completed after all reads and before these
-//! ordinary boot writes; a failed recovery write returns no store and therefore
-//! no session keys (F-041). Unreadable intent is discarded without changing keys.
+//! manufacturing transaction is completed after all reads and before these
+//! ordinary boot writes; a failed recovery write returns no store and
+//! therefore no sessions. Unreadable intent is discarded without changing
+//! keys.
 //!
-//! cites: P-085, P-121, F-026
+//! cites: P-085, P-121, P-235, P-237, P-239, F-026
 
 use km43::Epoch;
 
 use crate::body::{Held, Kept, Malformed};
 use crate::boot_count::{BOOT_COUNT_BYTES, BootCount};
-use crate::challenge::{CHALLENGE_COUNTER_BYTES, ChallengeCounter};
-use crate::clients::{Booted, CLIENT_TABLE_BYTES, ClientTable};
+use crate::clients::{Clients, Repaired, Unrepaired};
+use crate::drbg::{DRBG_BYTES, DrbgState};
 use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Fram, Refused};
 use crate::last_words::LastWords;
@@ -39,27 +40,29 @@ use crate::panic_record::{PANIC_RECORD_BYTES, PanicRecord};
 use crate::rail::{CUTS_RECORD_BYTES, CutsRecord};
 use crate::release::{COMMS_RELEASE_BYTES, CommsRelease};
 use crate::run_reason::{RUN_REASON_BYTES, RunReason};
-use crate::secret::{SECRET_BYTES, Secret};
+use crate::secret::{CONTROLLER_KEY_BYTES, ControllerKey, SECRET_BYTES, Secret};
 use crate::write_volume::{WRITE_VOLUME_BYTES, WriteVolume};
 
 /// What the controller keeps on the part, as this boot read it.
 pub struct Store {
     /// Versioned identity and behaviour sections.
     pub configuration: crate::Configuration,
-    /// The device secret every key derives from.
+    /// The device id and the printed secret the pairing keys derive from.
     pub secret: Kept<Secret, SECRET_BYTES>,
+    /// The controller key's private half (P-235).
+    pub controller: Kept<ControllerKey, CONTROLLER_KEY_BYTES>,
+    /// The generator's state (P-237).
+    pub drbg: Kept<DrbgState, DRBG_BYTES>,
     /// The epoch (P-085).
     pub epoch: Kept<Epoch, EPOCH_BYTES>,
-    /// The client table, its counters and the dedup table.
-    pub clients: Kept<ClientTable, CLIENT_TABLE_BYTES>,
+    /// The client table and the dedup table (P-239).
+    pub clients: Clients,
     /// Why the generator is running.
     pub run: Kept<RunReason, RUN_REASON_BYTES>,
     /// What the last run to panic said, and at which boot.
     pub panics: Kept<PanicRecord, PANIC_RECORD_BYTES>,
     /// How many times this unit has booted.
     pub boots: Kept<BootCount, BOOT_COUNT_BYTES>,
-    /// The challenge counter.
-    pub challenges: Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>,
     /// The event log's byte budget.
     pub volume: Kept<WriteVolume, WRITE_VOLUME_BYTES>,
     /// The authorised comms release.
@@ -83,9 +86,9 @@ pub enum NoEpoch<E> {
     Malformed(Malformed),
     /// A fresh unit whose first epoch would not land.
     Refused(Refused<E>),
-    /// The record is behind the table's stamp and raising it would not
-    /// land. Deriving under the record would mint keys the move to the
-    /// table's epoch was made to invalidate, so nothing derives.
+    /// The record is behind a slot's epoch and raising it would not land.
+    /// Enrolling under the record would issue names the move to the slot's
+    /// epoch was made to retire, so nothing is enrolled.
     Regressed {
         /// What the record holds.
         record: Epoch,
@@ -94,6 +97,10 @@ pub enum NoEpoch<E> {
         /// Why the raise did not land.
         refused: Refused<E>,
     },
+    /// A generation mark could not be read and the epoch it needed advanced
+    /// did not land: a table that cannot be trusted and no new epoch to
+    /// leave it behind under (P-239).
+    Unrepaired,
 }
 
 #[cfg(feature = "defmt")]
@@ -114,6 +121,7 @@ impl<E: defmt::Format> defmt::Format for NoEpoch<E> {
                 table.get(),
                 refused
             ),
+            Self::Unrepaired => defmt::write!(f, "table unrepaired: the epoch did not advance"),
         }
     }
 }
@@ -125,11 +133,20 @@ pub enum EpochAtBoot<E> {
     Held(Epoch),
     /// A fresh unit: this boot wrote the first epoch.
     First,
-    /// The record was behind the table's stamp and was raised to it.
+    /// The record was behind a slot written under a later epoch and was
+    /// raised to it.
     Raised {
         /// What the record held.
         from: Epoch,
-        /// What it holds now, which is what the table is under.
+        /// What it holds now, which is what the slot is under.
+        to: Epoch,
+    },
+    /// A generation mark could not be read, so the table was repaired under
+    /// a new epoch, as a factory reset would (P-239).
+    Advanced {
+        /// What the record held.
+        from: Epoch,
+        /// What it holds now.
         to: Epoch,
     },
     /// There is none.
@@ -141,7 +158,9 @@ impl<E> EpochAtBoot<E> {
     #[must_use]
     pub const fn epoch(&self) -> Option<Epoch> {
         match self {
-            Self::Held(epoch) | Self::Raised { to: epoch, .. } => Some(*epoch),
+            Self::Held(epoch)
+            | Self::Raised { to: epoch, .. }
+            | Self::Advanced { to: epoch, .. } => Some(*epoch),
             Self::First => Some(Epoch::FIRST),
             Self::None(_) => None,
         }
@@ -156,6 +175,14 @@ impl<E: defmt::Format> defmt::Format for EpochAtBoot<E> {
             Self::First => defmt::write!(f, "first boot, epoch 1 written"),
             Self::Raised { from, to } => {
                 defmt::write!(f, "epoch record raised from {} to {}", from.get(), to.get());
+            }
+            Self::Advanced { from, to } => {
+                defmt::write!(
+                    f,
+                    "table repaired: epoch advanced from {} to {}",
+                    from.get(),
+                    to.get()
+                );
             }
             Self::None(why) => defmt::write!(f, "no epoch: {}", why),
         }
@@ -182,9 +209,9 @@ pub enum PanicRecorded<E> {
 pub struct BootReport<E> {
     /// The epoch this boot runs under, or why there is none.
     pub epoch: EpochAtBoot<E>,
-    /// What became of the client table, or nothing because there was no
-    /// epoch to take it under.
-    pub clients: Option<Result<Booted, Refused<E>>>,
+    /// What the boot repaired in the client table, or nothing because there
+    /// was no epoch to take it under.
+    pub clients: Option<Result<Repaired, Unrepaired<E>>>,
     /// Pre-repair enrolment evidence, unavailable if boot repair fails (P-066, F-091).
     pub enrolment: crate::EnrolmentAtBoot,
     /// The number of this boot.
@@ -208,16 +235,15 @@ impl Store {
         // the bus error with nothing written, so a boot tried again on
         // the same part is the same boot and not one count later.
         let mut secret = Kept::<Secret, SECRET_BYTES>::read(map::DEVICE_SECRET, fram).await?;
+        let mut controller =
+            Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(map::CONTROLLER_KEY, fram).await?;
+        let mut drbg = Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, fram).await?;
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
-        let mut clients =
-            Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(map::CLIENT_TABLE, fram).await?;
+        let mut clients = Clients::read(fram).await?;
         let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
         let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
         let mut panics =
             Kept::<PanicRecord, PANIC_RECORD_BYTES>::read(map::PANIC_RECORD, fram).await?;
-        let mut challenges =
-            Kept::<ChallengeCounter, CHALLENGE_COUNTER_BYTES>::read(map::CHALLENGE_COUNTER, fram)
-                .await?;
         let volume = Kept::<WriteVolume, WRITE_VOLUME_BYTES>::read(map::WRITE_VOLUME, fram).await?;
         let mut release =
             Kept::<CommsRelease, COMMS_RELEASE_BYTES>::read(map::COMMS_RELEASE, fram).await?;
@@ -225,7 +251,8 @@ impl Store {
         let mut cuts = Kept::<CutsRecord, CUTS_RECORD_BYTES>::read(map::RECENT_CUTS, fram).await?;
 
         let configuration = crate::Configuration::read(fram).await?;
-        let secret_recovery = crate::provision::finish(fram, &mut secret, &mut challenges).await?;
+        let secret_recovery =
+            crate::provision::finish(fram, &mut secret, &mut controller, &mut drbg).await?;
 
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
@@ -236,10 +263,9 @@ impl Store {
             Held::Corrupt => EpochAtBoot::None(NoEpoch::Corrupt),
             Held::Malformed(malformed) => EpochAtBoot::None(NoEpoch::Malformed(malformed)),
         };
-        // The stamp is a second copy of the epoch: a record behind it is
-        // raised to it, and never the other way round.
-        if let (Some(record), Some(table)) =
-            (at_boot.epoch(), clients.present().map(ClientTable::epoch))
+        // A slot's epoch is a second copy of the epoch: a record behind it
+        // is raised to it, and never the other way round.
+        if let (Some(record), Some(table)) = (at_boot.epoch(), clients.highest_epoch())
             && table > record
         {
             at_boot = match epoch.write(fram, table).await {
@@ -254,7 +280,8 @@ impl Store {
                 }),
             };
         }
-        let (enrolment, clients_booted) = boot_clients(&mut clients, fram, at_boot.epoch()).await;
+        let (enrolment, clients_booted) =
+            boot_clients(&mut clients, &mut epoch, &mut at_boot, fram).await;
 
         let boot = match boots.held() {
             Held::Present(previous) => previous.next(),
@@ -295,12 +322,13 @@ impl Store {
             Self {
                 configuration,
                 secret,
+                controller,
+                drbg,
                 epoch,
                 clients,
                 run,
                 panics,
                 boots,
-                challenges,
                 volume,
                 release,
                 network,
@@ -311,33 +339,47 @@ impl Store {
     }
 }
 
-/// Capture pre-repair evidence, requiring a usable epoch and successful boot repair.
+/// Repair the table under the boot's epoch, and say what the read is
+/// evidence of for P-066's power-on window. A repair that advanced the
+/// epoch moves the boot's epoch with it.
 async fn boot_clients<F: Fram>(
-    clients: &mut Kept<ClientTable, CLIENT_TABLE_BYTES>,
+    clients: &mut Clients,
+    epoch: &mut Kept<Epoch, EPOCH_BYTES>,
+    at_boot: &mut EpochAtBoot<F::Error>,
     fram: &mut F,
-    epoch: Option<Epoch>,
 ) -> (
     crate::EnrolmentAtBoot,
-    Option<Result<Booted, Refused<F::Error>>>,
+    Option<Result<Repaired, Unrepaired<F::Error>>>,
 ) {
-    if let Some(under) = epoch {
-        let enrolment = crate::EnrolmentAtBoot::from_clients(clients.held());
-        let booted = clients.booted(fram, under).await;
-        let enrolment = if booted.is_ok() {
-            enrolment
-        } else {
-            crate::EnrolmentAtBoot::Unavailable
-        };
-        (enrolment, Some(booted))
-    } else {
-        // No epoch means no enrolment; restart table windows at tick zero
-        // in RAM only (P-121), without advertising an unusable window.
-        if let Some(held) = clients.present() {
+    let Some(before) = at_boot.epoch() else {
+        // No epoch means no enrolment, and no repair: advancing an epoch
+        // nobody can read would be a guess. The dedup windows still restart
+        // at tick zero, in RAM only (P-121).
+        if let Some(held) = clients.commands().present() {
             let rebased = held.clone().rebased();
-            clients.rebase(rebased);
+            clients.commands_mut().rebase(rebased);
         }
-        (crate::EnrolmentAtBoot::Unavailable, None)
+        return (crate::EnrolmentAtBoot::Unavailable, None);
+    };
+    let repaired = clients.booted(epoch, fram).await;
+    match &repaired {
+        Ok(Repaired::Rebuilt(after)) => {
+            *at_boot = EpochAtBoot::Advanced {
+                from: before,
+                to: *after,
+            };
+        }
+        Err(Unrepaired::Epoch(_) | Unrepaired::NoEpoch) => {
+            *at_boot = EpochAtBoot::None(NoEpoch::Unrepaired);
+        }
+        Ok(Repaired::Nothing | Repaired::Initialised | Repaired::Freed)
+        | Err(Unrepaired::Write(_)) => {}
     }
+    let enrolled = at_boot.epoch().map_or(0, |under| clients.enrolled(under));
+    (
+        crate::EnrolmentAtBoot::from_table(repaired.as_ref().ok().copied(), enrolled),
+        Some(repaired),
+    )
 }
 
 /// Every window measured on the tick restarts at this boot's tick zero
@@ -365,37 +407,66 @@ mod tests {
     use core::future::Future;
 
     use embassy_futures::block_on;
-    use km43::{ClientKind, Counter};
+    use km43::{ClientId, ClientKind, Generation, PublicKey, Suite};
 
     use super::*;
     use crate::body::Body as _;
-    use crate::clients::{Because, Label, Paired};
+    use crate::clients::{ClientLabel, Enrolment, KeyRecord};
     use crate::dedup::Fingerprint;
-    use crate::fram::{Address, FRAM_BYTES, Position};
+    use crate::fram::{Address, FRAM_BYTES, Position, slot_bytes};
     use crate::last_words::PanicSite;
+    use crate::provision::{Birth, SecretChange};
     use crate::release::{Digest, Release};
     use crate::text::Text;
     use crate::tick::Tick;
+    use crate::{EPOCH_BYTES, ProvisionFailed, SECRET_CHANGE_BYTES, SecretRecovery, stage_secret};
 
     /// Enough of the part for every record the boot reads.
     const PART_BYTES: usize = map::END.0 as usize;
     const _: () = assert!(map::RECENT_CUTS.end().0 as usize <= PART_BYTES);
     const _: () = assert!(PART_BYTES <= FRAM_BYTES);
 
+    #[derive(Clone)]
     struct Part {
         bytes: [u8; PART_BYTES],
         falling: bool,
         /// An address a read touching it is refused at, for a bus that
         /// fails partway through a boot.
         refuse_reads_at: Option<u16>,
+        /// Bytes landed since power-up, and the one the power is cut
+        /// before, if a cut is scheduled.
+        landed: usize,
+        cut_at: Option<usize>,
     }
 
     impl Part {
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the whole map, as the boot reads it; a test thread's stack holds it"
+        )]
         fn fresh() -> Self {
             Self {
                 bytes: [0; PART_BYTES],
                 falling: false,
                 refuse_reads_at: None,
+                landed: 0,
+                cut_at: None,
+            }
+        }
+
+        fn cut_before(&self, at: usize) -> Self {
+            Self {
+                landed: 0,
+                cut_at: Some(at),
+                ..self.clone()
+            }
+        }
+
+        fn rebooted(&self) -> Self {
+            Self {
+                landed: 0,
+                cut_at: None,
+                ..self.clone()
             }
         }
     }
@@ -421,14 +492,18 @@ mod tests {
             at: Address,
             bytes: &[u8],
         ) -> impl Future<Output = Result<(), Refused<()>>> {
-            let outcome = if self.falling {
-                Err(Refused::SupplyFalling)
-            } else {
-                let start = usize::from(at.0);
-                self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
-                Ok(())
-            };
-            core::future::ready(outcome)
+            if self.falling {
+                return core::future::ready(Err(Refused::SupplyFalling));
+            }
+            let start = usize::from(at.0);
+            for (offset, byte) in bytes.iter().enumerate() {
+                if self.cut_at.is_some_and(|cut| self.landed >= cut) {
+                    return core::future::ready(Err(Refused::Bus(())));
+                }
+                self.bytes[start.saturating_add(offset)] = *byte;
+                self.landed = self.landed.saturating_add(1);
+            }
+            core::future::ready(Ok(()))
         }
     }
 
@@ -436,57 +511,122 @@ mod tests {
         Epoch::new(raw).expect("a nonzero epoch")
     }
 
+    fn id(n: u32) -> ClientId {
+        ClientId::new(n).expect("a nonzero client")
+    }
+
     fn boot(part: &mut Part, words: Option<LastWords>) -> (Store, BootReport<()>) {
         block_on(Store::boot(part, words)).expect("the part answers")
+    }
+
+    fn secret(printed: u8) -> Secret {
+        Secret::new([1; 16], [printed; 32]).expect("entropy")
+    }
+
+    fn birth(key: u8, seed: u8) -> Birth {
+        Birth {
+            controller: ControllerKey::new([key; 32]).expect("entropy"),
+            drbg: DrbgState::new([seed; 32]).expect("entropy"),
+        }
+    }
+
+    /// A unit through its first manufacturing transaction and the boot that
+    /// applies it.
+    fn manufactured() -> (Part, Store) {
+        let mut part = Part::fresh();
+        block_on(stage_secret(&mut part, secret(2), Some(birth(7, 9)), false)).expect("stage");
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Applied);
+        (part, store)
+    }
+
+    fn enrolled(store: &mut Store, part: &mut Part, n: u32) -> Generation {
+        let under = *store.epoch.present().expect("an epoch");
+        block_on(store.clients.enrol(
+            id(n),
+            Enrolment {
+                client: PublicKey::from_bytes([u8::try_from(n).expect("small"); 32]),
+                admit: [3; 32],
+                suite: Suite::X25519ChachapolySha256,
+                kind: ClientKind::App,
+                label: ClientLabel::new("phone").expect("fits"),
+            },
+            under,
+            part,
+        ))
+        .expect("the slot lands")
+    }
+
+    /// The host printed the label and says so.
+    fn acknowledge(part: &mut Part) {
+        let mut change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+            map::SECRET_CHANGE,
+            part,
+        ))
+        .expect("reads");
+        block_on(change.write(part, SecretChange::Complete)).expect("acknowledged");
+    }
+
+    /// Flip a body byte in both copies of a record.
+    fn damage<const N: usize>(part: &mut Part, record: crate::fram::Record<N>) {
+        let start = usize::from(record.end().0).saturating_sub(slot_bytes(N).saturating_mul(2));
+        part.bytes[start.saturating_add(8)] ^= 1;
+        part.bytes[start.saturating_add(slot_bytes(N)).saturating_add(8)] ^= 1;
+    }
+
+    fn opens(report: &BootReport<()>) -> bool {
+        crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
+            .pairing_open(Tick::ZERO)
     }
 
     #[test]
     fn f_091_p_066_boot_repair_does_not_turn_absence_or_corruption_into_empty_evidence() {
         let mut part = Part::fresh();
-        let (mut store, report) = boot(&mut part, None);
-        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
-        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
-        let table = store.clients.present().unwrap().clone();
-        block_on(store.clients.write(&mut part, table)).unwrap();
-        let start = usize::from(map::CLIENT_TABLE.end().0)
-            - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
-        let second = start + crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
-        part.bytes[start + 8] ^= 1;
-        part.bytes[second + 8] ^= 1;
-        let (store, report) = boot(&mut part, None);
-        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
-        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        let (_, first) = boot(&mut part, None);
+        assert_eq!(first.clients, Some(Ok(Repaired::Initialised)));
+        assert_eq!(first.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert!(!opens(&first));
+        let (mut store, second) = boot(&mut part, None);
+        assert_eq!(second.enrolment, crate::EnrolmentAtBoot::Empty);
+        assert!(opens(&second));
+        let _ = enrolled(&mut store, &mut part, 2);
+        let (_, third) = boot(&mut part, None);
+        assert_eq!(third.enrolment, crate::EnrolmentAtBoot::Enrolled);
+        assert!(!opens(&third));
+        // A slot with no copy that reads is freed, and the boot that freed
+        // it is not evidence of an empty table.
+        damage(&mut part, map::CLIENT_KEYS[1]);
+        let (store, repair) = boot(&mut part, None);
+        assert_eq!(repair.clients, Some(Ok(Repaired::Freed)));
+        assert_eq!(repair.enrolment, crate::EnrolmentAtBoot::Unavailable);
+        assert_eq!(store.clients.enrolled(Epoch::FIRST), 0);
+        assert!(!opens(&repair));
+        let (_, next) = boot(&mut part, None);
+        assert_eq!(next.enrolment, crate::EnrolmentAtBoot::Empty);
+        assert!(opens(&next));
     }
 
     #[test]
-    fn f_091_p_066_repair_boot_stays_closed_and_next_valid_empty_boot_opens() {
-        for corrupt in [false, true] {
-            let mut part = Part::fresh();
-            if corrupt {
-                let (mut store, _) = boot(&mut part, None);
-                let mut table = store.clients.present().unwrap().clone();
-                let _ = table
-                    .pair(Label::new("lost phone").unwrap(), ClientKind::App)
-                    .unwrap();
-                block_on(store.clients.write(&mut part, table)).unwrap();
-                let start = usize::from(map::CLIENT_TABLE.end().0)
-                    - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
-                let second = start + crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
-                part.bytes[start + 8] ^= 1;
-                part.bytes[second + 8] ^= 1;
+    fn f_091_p_239_an_unreadable_mark_rebuilds_under_a_new_epoch_and_stays_closed_once() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let _ = enrolled(&mut store, &mut part, 1);
+        damage(&mut part, map::GENERATION_MARKS[0]);
+        let (store, repair) = boot(&mut part, None);
+        assert_eq!(repair.clients, Some(Ok(Repaired::Rebuilt(epoch(2)))));
+        assert_eq!(
+            repair.epoch,
+            EpochAtBoot::Advanced {
+                from: Epoch::FIRST,
+                to: epoch(2)
             }
-            let (store, repair) = boot(&mut part, None);
-            assert_eq!(store.clients.present().unwrap().enrolled(), 0);
-            assert!(
-                !crate::Panel::at_power_on(crate::Revision::A, repair.enrolment, Tick::ZERO)
-                    .pairing_open(Tick::ZERO)
-            );
-            let (_, next) = boot(&mut part, None);
-            assert!(
-                crate::Panel::at_power_on(crate::Revision::A, next.enrolment, Tick::ZERO)
-                    .pairing_open(Tick::ZERO)
-            );
-        }
+        );
+        assert_eq!(store.epoch.present(), Some(&epoch(2)));
+        assert_eq!(store.clients.enrolled(epoch(2)), 0);
+        assert!(!opens(&repair));
+        let (_, next) = boot(&mut part, None);
+        assert_eq!(next.epoch, EpochAtBoot::Held(epoch(2)));
+        assert!(opens(&next));
     }
 
     #[test]
@@ -505,50 +645,48 @@ mod tests {
                 ))
                 .unwrap();
                 part.bytes[8] ^= 1;
-                part.bytes[crate::fram::slot_bytes(EPOCH_BYTES) + 8] ^= 1;
+                part.bytes[slot_bytes(EPOCH_BYTES) + 8] ^= 1;
             }
-            let (store, report) = boot(&mut part, None);
-            assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+            let (_, report) = boot(&mut part, None);
             assert_eq!(report.epoch.epoch().is_some(), !damaged);
-            assert_eq!(
-                crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
-                    .pairing_open(Tick::ZERO),
-                !damaged
-            );
+            assert_eq!(report.clients.is_some(), !damaged);
+            assert_eq!(opens(&report), !damaged);
         }
     }
 
     #[test]
-    fn f_091_p_066_stale_empty_table_opens_only_after_boot_write_succeeds() {
+    fn f_026_p_085_a_reset_cut_after_its_epoch_leaves_a_valid_empty_table() {
         let mut part = Part::fresh();
         let (mut store, _) = boot(&mut part, None);
-        // A reset advanced the epoch but lost power before clearing the table.
-        let clearing = block_on(store.epoch.advance(&mut part)).unwrap();
-        assert_eq!(clearing.epoch(), epoch(2));
+        let _ = enrolled(&mut store, &mut part, 1);
+        let late = Tick::from_millis(1);
+        let _ = block_on(store.clients.commands_mut().update(&mut part, |table| {
+            table
+                .dedup_mut()
+                .admit(id(1), 7, Fingerprint::of(b"start"), late)
+        }))
+        .expect("lands");
+        // The reset moves the epoch and the power goes before the slots.
+        let _ = block_on(store.epoch.advance(&mut part)).expect("advances");
+        // A boot on a falling supply cannot clear the dedup table under the
+        // new epoch: no evidence, no window.
         part.falling = true;
-        let (store, refused) = boot(&mut part, None);
+        let (_, refused) = boot(&mut part, None);
         assert_eq!(refused.epoch.epoch(), Some(epoch(2)));
-        assert_eq!(refused.clients, Some(Err(Refused::SupplyFalling)));
-        assert_eq!(store.clients.present().unwrap().epoch(), Epoch::FIRST);
-        assert!(
-            !crate::Panel::at_power_on(crate::Revision::A, refused.enrolment, Tick::ZERO)
-                .pairing_open(Tick::ZERO)
-        );
+        assert!(matches!(refused.clients, Some(Err(Unrepaired::Write(_)))));
         assert_eq!(refused.enrolment, crate::EnrolmentAtBoot::Unavailable);
-
+        assert!(!opens(&refused));
         part.falling = false;
-        let (store, repaired) = boot(&mut part, None);
-        assert_eq!(
-            repaired.clients,
-            Some(Ok(Booted::Cleared(Because::Earlier(Epoch::FIRST))))
-        );
-        assert_eq!(store.clients.present().unwrap().epoch(), epoch(2));
-        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
-        assert_eq!(repaired.enrolment, crate::EnrolmentAtBoot::Empty);
-        assert!(
-            crate::Panel::at_power_on(crate::Revision::A, repaired.enrolment, Tick::ZERO)
-                .pairing_open(Tick::ZERO)
-        );
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.epoch, EpochAtBoot::Held(epoch(2)));
+        assert_eq!(report.clients, Some(Ok(Repaired::Nothing)));
+        // The slot under epoch 1 is free under epoch 2: a valid empty table.
+        assert_eq!(store.clients.enrolled(epoch(2)), 0);
+        assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Empty);
+        assert!(opens(&report));
+        let commands = store.clients.commands().present().expect("held");
+        assert_eq!(commands.epoch(), epoch(2));
+        assert!(!commands.dedup().holds(id(1)));
     }
 
     #[test]
@@ -557,193 +695,323 @@ mod tests {
         let _ = boot(&mut part, None);
         part.bytes[..usize::from(map::EPOCH.end().0)].fill(0);
         part.falling = true;
-        let (store, report) = boot(&mut part, None);
-        assert_eq!(store.clients.present().unwrap().enrolled(), 0);
+        let (_, report) = boot(&mut part, None);
         assert_eq!(report.epoch.epoch(), None);
+        assert_eq!(report.clients, None);
         assert_eq!(report.enrolment, crate::EnrolmentAtBoot::Unavailable);
-        assert!(
-            !crate::Panel::at_power_on(crate::Revision::A, report.enrolment, Tick::ZERO)
-                .pairing_open(Tick::ZERO)
+        assert!(!opens(&report));
+    }
+
+    #[test]
+    fn p_235_p_237_the_first_transaction_writes_the_key_and_the_generator_once() {
+        let (part, store) = manufactured();
+        assert!(store.secret.present() == Some(&secret(2)));
+        assert_eq!(store.controller.present(), Some(&birth(7, 9).controller));
+        assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
+        // Applied carries the fingerprint of the key the part holds, and no
+        // copy of the key or the state is left in the transaction.
+        let mut part = part;
+        let change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+            map::SECRET_CHANGE,
+            &mut part,
+        ))
+        .expect("reads");
+        let Some(SecretChange::Applied(held, fingerprint)) = change.present() else {
+            panic!("applied");
+        };
+        assert!(*held == secret(2));
+        assert!(fingerprint.vouches_for(&birth(7, 9).controller.public()));
+        let region = &part.bytes[usize::from(crate::map::SECRET_CHANGE_START.0)..];
+        assert!(!region.windows(32).any(|window| window == [7; 32]));
+        assert!(!region.windows(32).any(|window| window == [9; 32]));
+        // A second boot changes nothing.
+        let (again, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Unchanged);
+        assert_eq!(again.drbg.present(), Some(&birth(7, 9).drbg));
+    }
+
+    #[test]
+    fn p_235_p_237_a_born_unit_refuses_a_second_birth_and_an_unborn_one_needs_one() {
+        let (mut part, _) = manufactured();
+        acknowledge(&mut part);
+        assert_eq!(
+            block_on(stage_secret(&mut part, secret(3), Some(birth(8, 8)), true)),
+            Err(ProvisionFailed::AlreadyBorn)
+        );
+        let mut unborn = Part::fresh();
+        assert_eq!(
+            block_on(stage_secret(&mut unborn, secret(3), None, false)),
+            Err(ProvisionFailed::Unborn)
+        );
+        // A damaged key record is a key that was there: never written over.
+        let mut damaged = Part::fresh();
+        let mut key = block_on(Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(
+            map::CONTROLLER_KEY,
+            &mut damaged,
+        ))
+        .expect("reads");
+        block_on(key.write(&mut damaged, birth(4, 4).controller)).expect("lands");
+        block_on(key.write(&mut damaged, birth(5, 5).controller)).expect("lands");
+        damage(&mut damaged, map::CONTROLLER_KEY);
+        assert_eq!(
+            block_on(stage_secret(
+                &mut damaged,
+                secret(3),
+                Some(birth(8, 8)),
+                false
+            )),
+            Err(ProvisionFailed::AlreadyBorn)
+        );
+        // So is a generator record without a key beside it.
+        let mut state_only = Part::fresh();
+        let mut drbg = block_on(Kept::<DrbgState, DRBG_BYTES>::read(
+            map::DRBG,
+            &mut state_only,
+        ))
+        .expect("reads");
+        block_on(drbg.write(&mut state_only, birth(1, 6).drbg)).expect("lands");
+        assert_eq!(
+            block_on(stage_secret(
+                &mut state_only,
+                secret(3),
+                Some(birth(8, 8)),
+                false
+            )),
+            Err(ProvisionFailed::AlreadyBorn)
         );
     }
 
     #[test]
-    fn f_041_secret_replacement_requires_a_new_secret_and_explicit_replacement() {
+    fn p_235_a_part_with_a_damaged_generator_and_no_key_cannot_stage_a_label() {
         let mut part = Part::fresh();
-        let (mut store, _) = boot(&mut part, None);
-        let old = Secret::new([1; 16], [2; 32]).expect("entropy");
-        let new = Secret::new([1; 16], [3; 32]).expect("fresh entropy");
-        block_on(store.secret.write(&mut part, old)).expect("old secret");
-        let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+        let mut drbg =
+            block_on(Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, &mut part)).expect("reads");
+        block_on(drbg.write(&mut part, birth(1, 6).drbg)).expect("lands");
+        block_on(drbg.write(&mut part, birth(1, 5).drbg)).expect("lands");
+        damage(&mut part, map::DRBG);
+        let before = part.bytes;
+        // No key to fingerprint: a label alone is refused.
         assert_eq!(
-            block_on(crate::stage_secret(&mut part, old, true)),
-            Err(crate::ProvisionFailed::SameSecret)
+            block_on(stage_secret(&mut part, secret(3), None, false)),
+            Err(ProvisionFailed::Unborn)
         );
+        // And the damaged state is never written over by a birth.
         assert_eq!(
-            block_on(crate::stage_secret(&mut part, new, false)),
-            Err(crate::ProvisionFailed::AlreadyProvisioned)
+            block_on(stage_secret(&mut part, secret(3), Some(birth(8, 8)), false)),
+            Err(ProvisionFailed::AlreadyBorn)
         );
-        let (store, _) = boot(&mut part, None);
-        assert!(store.secret.present() == Some(&old));
-        assert_eq!(store.challenges.present().expect("counter").last(), 1);
+        assert_eq!(part.bytes, before);
     }
 
     #[test]
-    fn f_041_staging_keeps_the_active_pair_and_refuses_a_second_pending_secret() {
-        let mut part = Part::fresh();
-        let (mut store, _) = boot(&mut part, None);
-        let old = Secret::new([1; 16], [2; 32]).expect("entropy");
-        let new = Secret::new([1; 16], [3; 32]).expect("fresh entropy");
-        block_on(store.secret.write(&mut part, old)).expect("old secret");
-        let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
-        block_on(crate::stage_secret(&mut part, new, true)).expect("stage");
+    fn p_235_an_unappliable_intent_is_discarded_and_the_boot_goes_on() {
+        for damaged_key in [false, true] {
+            let mut part = Part::fresh();
+            if damaged_key {
+                let mut key = block_on(Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(
+                    map::CONTROLLER_KEY,
+                    &mut part,
+                ))
+                .expect("reads");
+                block_on(key.write(&mut part, birth(4, 4).controller)).expect("lands");
+                block_on(key.write(&mut part, birth(5, 5).controller)).expect("lands");
+                damage(&mut part, map::CONTROLLER_KEY);
+            }
+            // An intent `stage_secret` refuses, left by a bench that went
+            // around it: a label with no key, or a birth onto a damaged key.
+            let intent = if damaged_key {
+                SecretChange::Pending(secret(3), Some(birth(8, 8)))
+            } else {
+                SecretChange::Pending(secret(3), None)
+            };
+            let mut change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+                map::SECRET_CHANGE,
+                &mut part,
+            ))
+            .expect("reads");
+            block_on(change.write(&mut part, intent)).expect("lands");
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
+            // Nothing of it applied: all or nothing.
+            assert!(matches!(store.secret.held(), Held::Absent));
+            assert!(matches!(store.drbg.held(), Held::Absent));
+            assert!(store.controller.present().is_none());
+            let (_, again) = boot(&mut part, None);
+            assert_eq!(again.secret_recovery, SecretRecovery::Unchanged);
+        }
+    }
+
+    #[test]
+    fn f_041_p_237_boot_never_writes_over_a_generator_or_a_key_the_part_holds() {
+        let (mut part, mut store) = manufactured();
+        // The generator moved on since manufacture.
+        let advanced = DrbgState::new([0x42; 32]).expect("entropy");
+        block_on(store.drbg.write(&mut part, advanced)).expect("lands");
+        // A transaction carrying a birth, written past `stage_secret`'s
+        // refusal, as a torn or hostile bench could leave it.
+        let mut change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+            map::SECRET_CHANGE,
+            &mut part,
+        ))
+        .expect("reads");
+        block_on(change.write(
+            &mut part,
+            SecretChange::Pending(secret(3), Some(birth(8, 8))),
+        ))
+        .expect("lands");
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Applied);
+        assert!(store.secret.present() == Some(&secret(3)));
+        assert_eq!(store.drbg.present(), Some(&advanced));
+        assert_eq!(store.controller.present(), Some(&birth(7, 9).controller));
+    }
+
+    #[test]
+    fn p_235_p_237_manufacture_cut_at_every_byte_applies_everything_or_nothing_usable() {
+        let mut start = Part::fresh();
+        block_on(stage_secret(
+            &mut start,
+            secret(2),
+            Some(birth(7, 9)),
+            false,
+        ))
+        .expect("stage");
+        let mut landed_at = None;
+        for at in 0..4096 {
+            let mut cut = start.cut_before(at);
+            let outcome = block_on(Store::boot(&mut cut, None));
+            if let Ok((store, report)) = &outcome
+                && report.secret_recovery == SecretRecovery::Applied
+            {
+                assert_eq!(store.controller.present(), Some(&birth(7, 9).controller));
+                assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
+                landed_at = Some(at);
+                break;
+            }
+            // A cut boot exposes no key it did not finish; the next boot on
+            // the same bytes finishes the transaction.
+            assert!(outcome.is_err(), "a boot cut at {at} returned a store");
+            let mut after = cut.rebooted();
+            let (store, report) = boot(&mut after, None);
+            // Applied, or already applied by the cut boot, which was cut
+            // scrubbing the transaction behind it.
+            assert!(
+                matches!(
+                    report.secret_recovery,
+                    SecretRecovery::Applied | SecretRecovery::Unchanged
+                ),
+                "cut at {at}"
+            );
+            assert!(store.secret.present() == Some(&secret(2)));
+            assert_eq!(store.controller.present(), Some(&birth(7, 9).controller));
+            assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
+        }
+        assert!(landed_at.is_some_and(|at| at > 100), "{landed_at:?}");
+    }
+
+    #[test]
+    fn p_235_secret_replacement_requires_a_new_secret_and_explicit_replacement() {
+        let (mut part, store) = manufactured();
+        assert!(store.secret.present() == Some(&secret(2)));
+        // The label is acknowledged before another transaction.
         assert_eq!(
-            block_on(crate::stage_secret(&mut part, new, true)),
-            Err(crate::ProvisionFailed::Pending)
+            block_on(stage_secret(&mut part, secret(3), None, true)),
+            Err(ProvisionFailed::Pending)
         );
+        acknowledge(&mut part);
+        assert_eq!(
+            block_on(stage_secret(&mut part, secret(2), None, true)),
+            Err(ProvisionFailed::SameSecret)
+        );
+        assert_eq!(
+            block_on(stage_secret(&mut part, secret(3), None, false)),
+            Err(ProvisionFailed::AlreadyProvisioned)
+        );
+        block_on(stage_secret(&mut part, secret(3), None, true)).expect("stage");
+        assert_eq!(
+            block_on(stage_secret(&mut part, secret(4), None, true)),
+            Err(ProvisionFailed::Pending)
+        );
+        // Staging leaves the active secret; the boot applies the new one and
+        // keeps the key the unit was born with.
         let current = block_on(Kept::<Secret, SECRET_BYTES>::read(
             map::DEVICE_SECRET,
             &mut part,
         ))
         .expect("read");
-        assert!(current.present() == Some(&old));
-        assert_eq!(
-            block_on(store.challenges.mint(&mut part))
-                .expect("old session")
-                .counter(),
-            2
-        );
-        let (mut store, _) = boot(&mut part, None);
-        assert!(store.secret.present() == Some(&new));
-        assert_eq!(
-            block_on(store.challenges.mint(&mut part))
-                .expect("new session")
-                .counter(),
-            1
-        );
+        assert!(current.present() == Some(&secret(2)));
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Applied);
+        assert!(store.secret.present() == Some(&secret(3)));
+        assert_eq!(store.controller.present(), Some(&birth(7, 9).controller));
     }
 
     #[test]
-    fn f_041_garbage_secret_intent_is_discarded_without_changing_the_active_pair() {
+    fn p_235_garbage_secret_intent_is_discarded_without_changing_what_the_unit_holds() {
         for malformed in [false, true] {
-            let mut part = Part::fresh();
-            let (mut store, _) = boot(&mut part, None);
-            let old = Secret::new([1; 16], [2; 32]).expect("entropy");
-            block_on(store.secret.write(&mut part, old)).expect("legacy secret");
-            let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+            let (mut part, _) = manufactured();
             let start = usize::from(map::LOAD_SHED_CONFIG.end().0);
             part.bytes[start..].fill(0x55);
             if malformed {
-                let mut bad = [0; crate::SECRET_CHANGE_BYTES];
+                let mut bad = [0; SECRET_CHANGE_BYTES];
                 bad[0] = 2;
                 let _ = block_on(map::SECRET_CHANGE.write(&mut part, Position::Start, &bad))
                     .expect("malformed intent");
             }
             let (store, report) = boot(&mut part, None);
-            assert_eq!(report.secret_recovery, crate::SecretRecovery::Discarded);
-            assert!(store.secret.present() == Some(&old));
-            assert_eq!(store.challenges.present().expect("old counter").last(), 1);
+            assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
+            assert!(store.secret.present() == Some(&secret(2)));
+            assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
             assert!(part.bytes[start..].iter().all(|byte| *byte == 0));
         }
     }
 
     #[test]
-    fn f_041_a_refused_secret_recovery_exposes_no_store_and_retries_at_boot() {
+    fn p_235_a_refused_recovery_exposes_no_store_and_retries_at_boot() {
         let mut part = Part::fresh();
-        let secret = Secret::new([1; 16], [2; 32]).expect("entropy");
-        block_on(crate::stage_secret(&mut part, secret, false)).expect("stage");
+        block_on(stage_secret(&mut part, secret(2), Some(birth(7, 9)), false)).expect("stage");
         part.falling = true;
         assert!(matches!(
             block_on(Store::boot(&mut part, None)),
-            Err(crate::ProvisionFailed::Write(Refused::SupplyFalling))
+            Err(ProvisionFailed::Write(Refused::SupplyFalling))
         ));
         part.falling = false;
-        let (mut store, _) = boot(&mut part, None);
-        assert!(store.secret.present() == Some(&secret));
-        assert_eq!(
-            block_on(store.challenges.mint(&mut part))
-                .expect("mintable")
-                .counter(),
-            1
-        );
+        let (store, _) = boot(&mut part, None);
+        assert!(store.secret.present() == Some(&secret(2)));
+        assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
     }
 
     #[test]
-    fn f_041_secret_replacement_repairs_a_corrupt_challenge_counter() {
-        let mut part = Part::fresh();
-        part.bytes[32..72].fill(0x55);
-        let (mut store, _) = boot(&mut part, None);
-        let old = Secret::new([1; 16], [1; 32]).expect("old entropy");
-        block_on(store.secret.write(&mut part, old)).expect("old secret");
-        assert_eq!(store.challenges.held(), &Held::Corrupt);
-        let secret = Secret::new([1; 16], [2; 32]).expect("entropy");
-        block_on(crate::stage_secret(&mut part, secret, true)).expect("staged");
-        let (mut store, _) = boot(&mut part, None);
-        assert_eq!(
-            block_on(store.challenges.mint(&mut part))
-                .expect("mintable")
-                .counter(),
-            1
-        );
-    }
-
-    #[test]
-    fn p_085_a_first_boot_writes_epoch_one_and_clears_the_table_under_it() {
+    fn p_085_a_first_boot_writes_epoch_one_and_initialises_the_table_under_it() {
         let mut part = Part::fresh();
         let (store, report) = boot(&mut part, None);
         assert_eq!(report.epoch, EpochAtBoot::First);
         assert_eq!(report.epoch.epoch(), Some(Epoch::FIRST));
-        assert_eq!(report.clients, Some(Ok(Booted::Cleared(Because::Absent))));
+        assert_eq!(report.clients, Some(Ok(Repaired::Initialised)));
         assert_eq!(report.boot, BootCount::FIRST);
         assert_eq!(report.boot_recorded, Ok(()));
         assert_eq!(report.panic_recorded, None);
         assert_eq!(store.epoch.present(), Some(&Epoch::FIRST));
-        let table = store.clients.present().expect("a table");
-        assert!(table.is_under(Epoch::FIRST));
-        assert_eq!(table.enrolled(), 0);
+        assert_eq!(store.clients.enrolled(Epoch::FIRST), 0);
         assert!(matches!(store.secret.held(), Held::Absent));
+        assert!(matches!(store.controller.held(), Held::Absent));
+        assert!(matches!(store.drbg.held(), Held::Absent));
         assert_eq!(store.run.held(), &Held::Absent);
         assert_eq!(store.release.held(), &Held::Absent);
         assert_eq!(store.network.held(), &Held::Absent);
-        assert_eq!(store.challenges.held(), &Held::Absent);
         assert_eq!(store.volume.held(), &Held::Absent);
         // The second boot is not the first.
         let (_, again) = boot(&mut part, None);
         assert_eq!(again.epoch, EpochAtBoot::Held(Epoch::FIRST));
-        assert_eq!(again.clients, Some(Ok(Booted::Rebased)));
+        assert_eq!(again.clients, Some(Ok(Repaired::Nothing)));
         assert_eq!(again.boot, BootCount::FIRST.next());
-    }
-
-    #[test]
-    fn f_026_a_boot_finishes_a_reset_that_was_cut_after_the_epoch_moved() {
-        let mut part = Part::fresh();
-        let (mut store, _) = boot(&mut part, None);
-        let enrolled = block_on(store.clients.update(&mut part, |table| {
-            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
-        }))
-        .expect("the supply is fine");
-        assert!(matches!(enrolled, Ok(Paired::Enrolled(_))));
-        // The reset moves the epoch and the power goes before the table.
-        let _clearing = block_on(store.epoch.advance(&mut part)).expect("the supply is fine");
-        let (store, report) = boot(&mut part, None);
-        assert_eq!(report.epoch, EpochAtBoot::Held(epoch(2)));
-        assert_eq!(
-            report.clients,
-            Some(Ok(Booted::Cleared(Because::Earlier(Epoch::FIRST))))
-        );
-        let table = store.clients.present().expect("a table");
-        assert!(table.is_under(epoch(2)));
-        assert_eq!(table.enrolled(), 0);
     }
 
     #[test]
     fn p_085_a_boot_with_no_readable_epoch_has_none_and_leaves_the_table_alone() {
         let mut part = Part::fresh();
         let (mut store, _) = boot(&mut part, None);
-        let _ = block_on(store.clients.update(&mut part, |table| {
-            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
-        }))
-        .expect("the supply is fine");
+        let _ = enrolled(&mut store, &mut part, 1);
         // Both epoch slots damaged: slot A at 0, slot B at 16, bodies 8 in.
         let _two = block_on(map::EPOCH.write(
             &mut part,
@@ -755,13 +1023,16 @@ mod tests {
         ));
         part.bytes[8] ^= 0x01;
         part.bytes[16 + 8] ^= 0x01;
+        let before = part.bytes;
         let (store, report) = boot(&mut part, None);
         assert_eq!(report.epoch, EpochAtBoot::None(NoEpoch::Corrupt));
         assert_eq!(report.epoch.epoch(), None);
         assert_eq!(report.clients, None);
-        // The rows are still there, and nothing can enrol into them
+        // The slot is still there, and nothing can enrol or bind under it
         // until a person writes an epoch.
-        assert_eq!(store.clients.present().map(ClientTable::enrolled), Some(1));
+        assert_eq!(store.clients.enrolled(Epoch::FIRST), 1);
+        let table = usize::from(map::NETWORK.end().0)..usize::from(map::COMMANDS.end().0);
+        assert_eq!(part.bytes[table.clone()], before[table]);
         // A zero written raw is malformed, and no epoch either.
         let mut zero = Part::fresh();
         let _ = block_on(map::EPOCH.write(&mut zero, Position::Start, &[0; 4]));
@@ -773,22 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn f_026_a_boot_raises_a_record_behind_the_tables_stamp_and_derives_nothing_if_it_cannot() {
+    fn f_026_a_boot_raises_a_record_behind_a_slots_epoch_and_enrols_nothing_if_it_cannot() {
         let mut part = Part::fresh();
         let (mut store, _) = boot(&mut part, None);
-        let clearing = block_on(store.epoch.advance(&mut part)).expect("the supply is fine");
-        block_on(
-            store
-                .clients
-                .write(&mut part, ClientTable::cleared(&clearing)),
-        )
-        .expect("the supply is fine");
-        let id = block_on(store.clients.update(&mut part, |table| {
-            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
-        }))
-        .expect("the supply is fine")
-        .expect("room")
-        .client();
+        let _ = block_on(store.epoch.advance(&mut part)).expect("the supply is fine");
+        let generation = enrolled(&mut store, &mut part, 3);
         // The record regresses under somebody's hand: the public write.
         block_on(store.epoch.write(&mut part, Epoch::FIRST)).expect("the supply is fine");
         let (store, report) = boot(&mut part, None);
@@ -799,16 +1059,15 @@ mod tests {
                 to: epoch(2)
             }
         );
-        assert_eq!(report.clients, Some(Ok(Booted::Rebased)));
+        assert_eq!(report.clients, Some(Ok(Repaired::Nothing)));
         assert_eq!(store.epoch.present(), Some(&epoch(2)));
-        let table = store.clients.present().expect("a table");
-        assert!(table.is_under(epoch(2)));
-        assert_eq!(
-            table.row(id).map(|row| row.label().as_bytes()),
-            Some(&b"phone"[..])
-        );
-        // And when the raise will not land, nothing derives and nothing
-        // is cleared: the rows wait for a boot that can.
+        let occupant = store
+            .clients
+            .occupant(id(3), epoch(2))
+            .expect("still enrolled");
+        assert_eq!(occupant.generation(), generation);
+        // And when the raise will not land, nothing is enrolled under the
+        // lower record and nothing is repaired: the slot waits.
         let mut store = store;
         block_on(store.epoch.write(&mut part, Epoch::FIRST)).expect("the supply is fine");
         part.falling = true;
@@ -822,23 +1081,24 @@ mod tests {
             })
         );
         assert_eq!(report.clients, None);
-        assert_eq!(store.clients.present().map(ClientTable::enrolled), Some(1));
+        assert_eq!(store.clients.enrolled(epoch(2)), 1);
         assert_eq!(store.epoch.present(), Some(&Epoch::FIRST));
+        assert!(matches!(
+            store.clients.key(id(3)).and_then(|key| key.present()),
+            Some(KeyRecord::Occupied(_))
+        ));
     }
 
     #[test]
     fn p_121_a_boot_with_no_epoch_still_restarts_the_dedup_windows_at_tick_zero() {
         let mut part = Part::fresh();
         let (mut store, _) = boot(&mut part, None);
-        let id = block_on(store.clients.update(&mut part, |table| {
-            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
-        }))
-        .expect("the supply is fine")
-        .expect("room")
-        .client();
+        let _ = enrolled(&mut store, &mut part, 1);
         let late = Tick::from_millis(500_000);
-        let _ = block_on(store.clients.update(&mut part, |table| {
-            table.admit(id, Counter(1), 7, Fingerprint::of(b"start"), late)
+        let _ = block_on(store.clients.commands_mut().update(&mut part, |table| {
+            table
+                .dedup_mut()
+                .admit(id(1), 7, Fingerprint::of(b"start"), late)
         }))
         .expect("the supply is fine");
         // Both epoch slots damaged: this boot has no epoch.
@@ -857,9 +1117,9 @@ mod tests {
         assert_eq!(report.clients, None);
         // The entry lives ten minutes from this boot, not from the tick it
         // was inserted at in the last one.
-        let table = store.clients.present().expect("the table is held");
-        assert_eq!(table.dedup().live(Tick::from_millis(599_999)), 1);
-        assert_eq!(table.dedup().live(Tick::from_millis(600_000)), 0);
+        let dedup = store.clients.commands().present().expect("held").dedup();
+        assert_eq!(dedup.live(Tick::from_millis(599_999)), 1);
+        assert_eq!(dedup.live(Tick::from_millis(600_000)), 0);
     }
 
     #[test]
@@ -922,15 +1182,12 @@ mod tests {
     fn p_121_the_release_and_the_dedup_table_are_rebased_at_boot() {
         let mut part = Part::fresh();
         let (mut store, _) = boot(&mut part, None);
-        let id = block_on(store.clients.update(&mut part, |table| {
-            table.pair(Label::new("phone").expect("fits"), ClientKind::App)
-        }))
-        .expect("the supply is fine")
-        .expect("room")
-        .client();
+        let _ = enrolled(&mut store, &mut part, 1);
         let late = Tick::from_millis(500_000);
-        let _ = block_on(store.clients.update(&mut part, |table| {
-            table.admit(id, Counter(1), 7, Fingerprint::of(b"start"), late)
+        let _ = block_on(store.clients.commands_mut().update(&mut part, |table| {
+            table
+                .dedup_mut()
+                .admit(id(1), 7, Fingerprint::of(b"start"), late)
         }))
         .expect("the supply is fine");
         block_on(store.release.write(
@@ -944,9 +1201,9 @@ mod tests {
         ))
         .expect("the supply is fine");
         let (store, _) = boot(&mut part, None);
-        let table = store.clients.present().expect("a table");
-        assert_eq!(table.dedup().live(Tick::from_millis(599_999)), 1);
-        assert_eq!(table.dedup().live(Tick::from_millis(600_000)), 0);
+        let dedup = store.clients.commands().present().expect("held").dedup();
+        assert_eq!(dedup.live(Tick::from_millis(599_999)), 1);
+        assert_eq!(dedup.live(Tick::from_millis(600_000)), 0);
         let release = store.release.present().expect("a release");
         assert!(release.admits(&Digest([9; 32]), Tick::from_millis(599_999)));
         assert!(!release.admits(&Digest([9; 32]), Tick::from_millis(600_000)));
@@ -955,10 +1212,10 @@ mod tests {
     #[test]
     fn a_boot_whose_last_read_fails_writes_nothing_and_the_next_one_counts_once() {
         let mut part = Part::fresh();
-        // The last section's B-prefix CRC is the last read. Every earlier
-        // record has been read when this transaction fails.
-        let last_read = usize::from(map::LOAD_SHED_CONFIG.end().0) - crate::fram::slot_bytes(1024)
-            + crate::fram::slot_bytes(crate::BEHAVIOUR_RECORD_BYTES)
+        // The last section's B-prefix CRC is the last read of a record.
+        // Every earlier record has been read when this transaction fails.
+        let last_read = usize::from(map::LOAD_SHED_CONFIG.end().0) - slot_bytes(1024)
+            + slot_bytes(crate::BEHAVIOUR_RECORD_BYTES)
             - 1;
         part.refuse_reads_at = Some(u16::try_from(last_read).expect("inside FRAM"));
         let outcome = block_on(Store::boot(
@@ -966,7 +1223,7 @@ mod tests {
             Some(LastWords::Panicked(PanicSite { file: 1, line: 2 })),
         ));
         assert!(outcome.is_err());
-        // Nothing landed: no epoch, no count, no panic record.
+        // Nothing landed: no epoch, no count, no panic record, no mark.
         assert_eq!(
             block_on(map::EPOCH.read(&mut part)),
             Ok(crate::fram::Current::Empty)
@@ -977,6 +1234,10 @@ mod tests {
         );
         assert_eq!(
             block_on(map::PANIC_RECORD.read(&mut part)),
+            Ok(crate::fram::Current::Empty)
+        );
+        assert_eq!(
+            block_on(map::GENERATION_MARKS[0].read(&mut part)),
             Ok(crate::fram::Current::Empty)
         );
         // Tried again with the bus back, it is the first boot, once.

@@ -160,14 +160,13 @@ over budget raises a concern. Source: the capacity budget in
 every step, with the recovery invariant asserted after each. Source: KM43
 VERIFICATION §6. M2.
 
-**F-026** — The client table carries the epoch its rows were enrolled under.
-A boot that reads a table under an earlier epoch than the epoch record
-holds clears it: a factory reset cut between moving the epoch and clearing
-the table is finished at the next boot rather than leaving eight rows whose
-keys no longer derive counting towards `table_full`. A table under a later
-epoch than the record is never cleared under the earlier one: the record
-regressed, and the higher of the two copies is the epoch. Source: KM43
-P-085's order, F-025 on the reset path. M2.
+**F-026** — Every client slot carries the epoch it was written under, and
+only a slot under the current epoch is occupied, so the epoch write is a
+factory reset's commit and a reset cut after it leaves no slot anybody can
+use. A slot under a later epoch than the record is never freed under the
+earlier one: the record regressed, and the boot raises it to the higher
+copy. The dedup table carries its epoch and is cleared by a boot under any
+other. Source: KM43 P-085, P-239, F-025 on the reset path. M2.
 
 ## The link and the comms processor
 
@@ -262,11 +261,13 @@ override, factory reset — are defined on the selector for revision A and the
 button for revision B, and no gesture means two things. Source: KM43 P-066,
 P-117, `A-42`. M4.
 
-**F-041** — A challenge is derived from the device secret and a counter in
-FRAM that is written before the challenge leaves; a write that fails mints
-nothing. The part has no RNG, and a counter that repeats re-mints a challenge
-a recorded proof verifies against twice. Source:
-[`ARCHITECTURE.md`](ARCHITECTURE.md), where challenges come from. M4.
+**F-041** — Every challenge and every controller ephemeral key is a draw from
+the generator the station manufactured, released only once its successor is
+written and read back off the part; a draw whose successor does not land is
+withheld, and nothing ever writes the state but a draw and the unit's first
+manufacturing transaction. The part has no RNG, and a draw that repeats is a
+recorded `Hello` accepted twice. Source: KM43 P-237,
+[`ARCHITECTURE.md`](ARCHITECTURE.md), where randomness comes from. M4.
 
 F-042, the comms processor's own access point, is retired: the comms
 processor raises none. Running it beside the station while the pairing
@@ -278,8 +279,8 @@ number is not reused.
 **F-043** — V1 initial pairing is available over BLE GATT from the native
 phone app without cached Wi-Fi credentials, a working site network, or
 internet. The STM32 alone gates `Pair` on the 120-second window opened
-by a physical gesture or F-091's first-enrolment boot policy, and verifies
-the proof; Bluetooth connection or bonding grants no KM43 permission. BLE
+by a physical gesture or F-091's first-enrolment boot policy, and runs the
+pairing handshake; Bluetooth connection or bonding grants no KM43 permission. BLE
 shares the bounded client table with WebSocket, starts
 only after the recovery download window and valid `LinkUp`, and closes
 clients and stops advertising on controller loss. While the pairing window

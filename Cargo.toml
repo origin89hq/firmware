@@ -94,3 +94,9 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
+
+[patch.crates-io]
+# km43 at key agreement (#130), the retired write counter (#134) and the
+# asynchronous DRBG store (origin89hq/km43#136), none released yet. This pin
+# goes back to `=0.8.0` when that release carries all three.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "6b097edc4d79140a3ce041c531feaaef237a48fb" }

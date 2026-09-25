@@ -57,10 +57,13 @@ pub enum Task {
     /// once the store is read, so a boot the watchdog cuts short is still
     /// named by the boot after.
     Boot = 15,
+    /// Key agreement, on the executor below every other task's so that a
+    /// second of X25519 never delays the control tick (P-243).
+    Agreement = 16,
 }
 
 /// How many tasks the roll holds.
-pub const TASKS: usize = 16;
+pub const TASKS: usize = 17;
 const _: () = assert!(
     TASKS <= 256,
     "a task's place must fit the boot record's byte"
@@ -85,6 +88,7 @@ impl Task {
         Task::Lamp,
         Task::Rail,
         Task::Boot,
+        Task::Agreement,
     ];
 
     /// The task's place on the roll, which is what the last words carry.
@@ -124,6 +128,7 @@ impl Task {
             13 => Some(Self::Lamp),
             14 => Some(Self::Rail),
             15 => Some(Self::Boot),
+            16 => Some(Self::Agreement),
             _ => None,
         }
     }
@@ -136,7 +141,14 @@ impl Task {
     pub const fn window(self) -> Millis {
         let millis = match self {
             Self::Supervisor | Self::Control | Self::Selector | Self::Lamp => 5_000,
-            Self::Link | Self::Rs485One | Self::Rs485Two | Self::Rs485Three | Self::Can => 10_000,
+            // The agreement's longest job, a `Hello`, is about a second and a
+            // half at 64 MHz; ten covers it and a check-in either side.
+            Self::Link
+            | Self::Rs485One
+            | Self::Rs485Two
+            | Self::Rs485Three
+            | Self::Can
+            | Self::Agreement => 10_000,
             Self::VeDirectOne | Self::VeDirectTwo | Self::Adc => 15_000,
             Self::Recorder | Self::OneWire | Self::Rail => 30_000,
             Self::Boot => 3_000,
