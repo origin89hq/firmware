@@ -393,6 +393,7 @@ async fn main(spawner: Spawner) {
             drbg,
             epoch: epoch_record,
             clients,
+            budgets,
             configuration,
             network,
             cuts,
@@ -408,6 +409,8 @@ async fn main(spawner: Spawner) {
                 epoch_record,
                 clients,
                 generator: Generator::new(drbg),
+                invites: o89_core::Invites::new(),
+                budgets,
             }),
             recorder::Cuts {
                 kept: Some(cuts),

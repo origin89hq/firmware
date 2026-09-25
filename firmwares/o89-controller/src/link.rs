@@ -725,6 +725,28 @@ fn session_note(note: SessionNote) {
         SessionNote::TableNotStored => {
             defmt::error!("session: a slot did not land on the FRAM; the window stays open");
         }
+        // P-252's, P-255's and P-256's class A events, until the event log
+        // records them (#100).
+        SessionNote::Proposed(client) => {
+            defmt::info!("session: client {} proposed an invite", client);
+        }
+        SessionNote::Approved {
+            client,
+            budget_restored,
+        } => {
+            defmt::info!("session: an approved invite enrolled client {}", client);
+            if !budget_restored {
+                defmt::error!("session: the inviter's budget did not land on the FRAM");
+            }
+        }
+        SessionNote::Removed(client) => defmt::info!("session: client {} removed", client),
+        // P-254's, P-255's and P-256's `client table write failed`, until
+        // the concern table records it (#100).
+        SessionNote::MembershipNotStored => {
+            defmt::error!(
+                "session: a budget, an approved slot or a removal did not land on the FRAM"
+            );
+        }
         // P-079's `dedup write failed`, until the concern table records it
         // (#100).
         SessionNote::NotKept => {

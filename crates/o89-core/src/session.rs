@@ -71,6 +71,7 @@ use crate::drbg::{CHALLENGE_BYTES, Generator};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::{Compat, Rows};
+use crate::membership::{self, Answer, Approval, Removal, Sender};
 use crate::request::{Admission, Executed, Permit, admit};
 use crate::secret::Secret;
 use crate::tick::{Millis, Tick};
@@ -127,6 +128,10 @@ pub struct Keys {
     pub clients: Clients,
     /// Every challenge and every ephemeral key (P-237).
     pub generator: Generator,
+    /// The pending invites, in RAM: every boot starts with none (P-253).
+    pub invites: crate::Invites,
+    /// Each admin slot's proposal budget (P-254).
+    pub budgets: crate::ProposalBudgets,
 }
 
 impl Keys {
@@ -204,6 +209,23 @@ pub enum SessionNote {
     /// A pairing enrolled or reclaimed this client: the window that allowed
     /// it closes now (L-195).
     Paired(ClientId),
+    /// This slot proposed an invite: P-252's class A `invite proposed`.
+    Proposed(ClientId),
+    /// An owner's approval enrolled this slot: P-255's class A `client
+    /// enrolled`. A budget not restored is P-254's class A concern at
+    /// condition `client table write failed`, raised beside it.
+    Approved {
+        /// The slot written.
+        client: ClientId,
+        /// Whether the inviter's budget was restored.
+        budget_restored: bool,
+    },
+    /// This slot was removed: P-256's class A `client removed`.
+    Removed(ClientId),
+    /// A budget spend, an approved slot or a removal did not land: P-254,
+    /// P-255 and P-256 raise a class A concern at condition `client table
+    /// write failed`.
+    MembershipNotStored,
     /// A client's `Time`, for the recorder to decide and answer.
     TimeAsked(TimeAsked),
     /// The client said goodbye on this handle.
@@ -426,9 +448,20 @@ struct Row {
     failures: [Option<Tick>; FAILURES],
     pairing: Pairing,
     work: Work,
+    /// The `Approve` whose proof is out at the worker, if one is.
+    approving: Option<Approving>,
     /// Moves on every abandoned handshake, so a result that comes back for
     /// one is recognised and discarded.
     attempt: u32,
+}
+
+/// An `Approve` waiting on its proof (P-255 step 5): what the second half
+/// needs, and the binding its answer is sealed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Approving {
+    nonce: km43::InviteNonce,
+    sender: Sender,
+    serial: u32,
 }
 
 impl Row {
@@ -440,6 +473,7 @@ impl Row {
             failures: [None; FAILURES],
             pairing: Pairing::None,
             work: Work::Idle,
+            approving: None,
             attempt: 0,
         }
     }
@@ -489,6 +523,18 @@ impl Row {
         self.attempt = self.attempt.wrapping_add(1);
         self.pairing = Pairing::None;
         self.work = Work::Idle;
+        self.approving = None;
+    }
+}
+
+/// End every session bound to `client`, but the one on `except`.
+fn unbind(rows: &mut [Option<Row>], client: ClientId, except: Option<Conn>) {
+    for row in rows.iter_mut().flatten() {
+        if Some(row.conn) != except
+            && matches!(&row.bound, Bound::Session(binding) if binding.client == client)
+        {
+            row.bound = Bound::Ended;
+        }
     }
 }
 
@@ -623,6 +669,8 @@ impl Sessions {
             }
             row.abandon();
         }
+        // Every pending invite goes with the enrolments (P-085, P-253).
+        self.keys.invites.clear();
         match self.keys.network.held() {
             crate::Held::Present(held) => {
                 let mut cleared = *held;
@@ -950,10 +998,61 @@ impl Sessions {
                 }
             }
             Computed::HelloFailed(why) => self.refused(to, why.refusal(), why.counts(), now, dst),
+            Computed::Checked(checked) => {
+                let Some(approving) = row.approving.take() else {
+                    return Reply::noted(SessionNote::Stale);
+                };
+                self.approved(to, approving, checked, now, fram, dst).await
+            }
             Computed::Unwritable => {
                 row.abandon();
                 Reply::noted(SessionNote::TooLarge)
             }
+        }
+    }
+
+    /// An `Approve` whose proof came back: P-255's steps 5 to 8, answered
+    /// under the keys of the session that asked, if it is still the one
+    /// bound. A slot written for a session that has gone is still written,
+    /// and its note still raised.
+    async fn approved<F: Fram>(
+        &mut self,
+        to: Addressed,
+        approving: Approving,
+        checked: Result<km43::Verified, km43::InviteError>,
+        now: Tick,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        let Self { rows, keys, .. } = self;
+        let answer = membership::approved(
+            keys,
+            approving.sender,
+            &approving.nonce,
+            checked,
+            now,
+            |id| unbind(rows, id, None),
+            fram,
+        )
+        .await;
+        let binding = rows
+            .iter_mut()
+            .flatten()
+            .find(|row| row.conn == to.conn)
+            .and_then(|row| match &mut row.bound {
+                Bound::Session(binding) if binding.serial == approving.serial => Some(binding),
+                Bound::Session(_) | Bound::Never | Bound::Ended => None,
+            });
+        match binding {
+            Some(binding) => sealed_ack(
+                to,
+                binding,
+                MessageType::ApproveResponse,
+                answer,
+                |ack, body| ack.encode(body).ok(),
+                dst,
+            ),
+            None => Reply::noted(answer.note.unwrap_or(SessionNote::Stale)),
         }
     }
 
@@ -1165,8 +1264,10 @@ impl Sessions {
             match place.slot() {
                 Some((id, role)) => {
                     // Every session on the slot goes before it is rewritten
-                    // (P-240), whether or not the write then lands.
+                    // (P-240), whether or not the write then lands, and
+                    // every invite it proposed with them (P-253).
                     self.unbind(id);
+                    let _withdrawn = self.keys.invites.withdraw_inviter(id);
                     let enrolment = Enrolment {
                         client,
                         admit,
@@ -1343,6 +1444,9 @@ impl Sessions {
         } = self;
         let Some(Row {
             bound: Bound::Session(binding),
+            work,
+            approving,
+            attempt,
             ..
         }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
         else {
@@ -1357,74 +1461,44 @@ impl Sessions {
         binding.heard = now;
         let payload = opened.inner();
         let mask = keys.mask(binding);
-        let reply = match kind {
-            MessageType::Goodbye => goodbye(to, binding, payload, dst),
-            MessageType::WifiScan | MessageType::WifiStatus => {
+        let reply = match Request::of(kind) {
+            Request::Goodbye => goodbye(to, binding, payload, dst),
+            Request::Wifi => {
                 wifi_answer(to, binding, (keys, mask), link, (kind, payload, now), dst)
             }
-            MessageType::GetConfig => config_answer(to, binding, (keys, mask), payload, dst),
-            MessageType::Command => match signed(to, binding, &opened, dst) {
+            Request::GetConfig => config_answer(to, binding, (keys, mask), payload, dst),
+            Request::Command => match signed(to, binding, &opened, dst) {
                 Ok(write) => command(to, binding, keys, write, fram, now, dst).await,
                 Err(refused) => refused,
             },
-            MessageType::SetConfig => match signed(to, binding, &opened, dst) {
+            Request::SetConfig => match signed(to, binding, &opened, dst) {
                 Ok(write) => set_config(to, binding, (keys, mask), write, fram, dst).await,
                 Err(refused) => refused,
             },
-            MessageType::Time => match signed(to, binding, &opened, dst) {
+            Request::Time => match signed(to, binding, &opened, dst) {
                 Ok(write) => time_asked(to, binding, (time, tickets), mask, &write, now, dst),
                 Err(refused) => refused,
             },
-            // Opened, and not served by this slice: error 2 under the
-            // session's keys, which an opened request has earned. Firmware
-            // is unserved (P-143); the reads are the later slices'.
-            MessageType::Inventory
-            | MessageType::Readings
-            | MessageType::Concerns
-            | MessageType::History
-            | MessageType::Subscribe
-            | MessageType::ReadLog
-            | MessageType::Firmware
-            // Not answered, and capability bit 9 says so (P-246): a client
-            // does not send it here (#181). The client list, invites and
-            // removal are #180's.
-            | MessageType::Vouch
-            | MessageType::Clients
-            | MessageType::Invite
-            | MessageType::Approve
-            | MessageType::Remove => sealed_error(to, binding, ErrorCode::UnknownMessageType, dst),
-            // `frame` routes only the types above here.
-            MessageType::Discover
-            | MessageType::DiscoverResponse
-            | MessageType::Hello
-            | MessageType::HelloResponse
-            | MessageType::InventoryResponse
-            | MessageType::ReadingsResponse
-            | MessageType::ConcernsResponse
-            | MessageType::HistoryResponse
-            | MessageType::SubscribeResponse
-            | MessageType::EventResponse
-            | MessageType::ReadLogResponse
-            | MessageType::WifiScanResponse
-            | MessageType::WifiStatusResponse
-            | MessageType::GetConfigResponse
-            | MessageType::SetConfigResponse
-            | MessageType::CommandResponse
-            | MessageType::FirmwareResponse
-            | MessageType::TimeResponse
-            | MessageType::Pair
-            | MessageType::PairResponse
-            | MessageType::Enrol
-            | MessageType::EnrolResponse
-            | MessageType::GoodbyeResponse
-            | MessageType::VouchResponse
-            | MessageType::ClientsResponse
-            | MessageType::InviteResponse
-            | MessageType::ApproveResponse
-            | MessageType::RemoveResponse
-            | MessageType::ErrorResponse => {
-                sealed_error(to, binding, ErrorCode::MalformedFrame, dst)
-            }
+            Request::Clients => clients_answer(to, binding, (keys, mask), payload, now, dst),
+            Request::Invite => match signed(to, binding, &opened, dst) {
+                Ok(write) => invite(to, binding, keys, &write, now, fram, dst).await,
+                Err(refused) => refused,
+            },
+            Request::Approve => match signed(to, binding, &opened, dst) {
+                Ok(write) => approve(
+                    to,
+                    binding,
+                    keys,
+                    (work, approving, *attempt),
+                    &write,
+                    now,
+                    dst,
+                ),
+                Err(refused) => refused,
+            },
+            Request::Remove => remove(to, rows, keys, &opened, fram, dst).await,
+            Request::Unserved => sealed_error(to, binding, ErrorCode::UnknownMessageType, dst),
+            Request::NotOne => sealed_error(to, binding, ErrorCode::MalformedFrame, dst),
         };
         // Only a `Goodbye` whose body read unbinds: the binding goes and the
         // keys with it, and the row stays with its transport (P-076).
@@ -1547,11 +1621,7 @@ impl Sessions {
     /// End every session bound to `client`, leaving the rows to their
     /// transports (P-076, P-240).
     fn unbind(&mut self, client: ClientId) {
-        for row in self.rows.iter_mut().flatten() {
-            if matches!(&row.bound, Bound::Session(binding) if binding.client == client) {
-                row.bound = Bound::Ended;
-            }
-        }
+        unbind(&mut self.rows, client, None);
     }
 
     /// One more failure against `conn`; whether it reached the threshold,
@@ -1932,6 +2002,345 @@ async fn set_config<F: Fram>(
     answered(written)
 }
 
+/// What a sealed request asks, as [`Sessions::sealed`] serves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    Goodbye,
+    Wifi,
+    GetConfig,
+    Command,
+    SetConfig,
+    Time,
+    Clients,
+    Invite,
+    Approve,
+    Remove,
+    /// Opened, and not served by this slice: error 2 under the session's
+    /// keys, which an opened request has earned. Firmware is unserved
+    /// (P-143); the reads are the later slices'. `Vouch` is not answered,
+    /// and capability bit 9 says so (P-246): a client does not send it here
+    /// (#181).
+    Unserved,
+    /// Not a sealed request: `frame` routes none of these here.
+    NotOne,
+}
+
+impl Request {
+    const fn of(kind: MessageType) -> Self {
+        match kind {
+            MessageType::Goodbye => Self::Goodbye,
+            MessageType::WifiScan | MessageType::WifiStatus => Self::Wifi,
+            MessageType::GetConfig => Self::GetConfig,
+            MessageType::Command => Self::Command,
+            MessageType::SetConfig => Self::SetConfig,
+            MessageType::Time => Self::Time,
+            MessageType::Clients => Self::Clients,
+            MessageType::Invite => Self::Invite,
+            MessageType::Approve => Self::Approve,
+            MessageType::Remove => Self::Remove,
+            MessageType::Inventory
+            | MessageType::Readings
+            | MessageType::Concerns
+            | MessageType::History
+            | MessageType::Subscribe
+            | MessageType::ReadLog
+            | MessageType::Firmware
+            | MessageType::Vouch => Self::Unserved,
+            MessageType::Discover
+            | MessageType::DiscoverResponse
+            | MessageType::Hello
+            | MessageType::HelloResponse
+            | MessageType::InventoryResponse
+            | MessageType::ReadingsResponse
+            | MessageType::ConcernsResponse
+            | MessageType::HistoryResponse
+            | MessageType::SubscribeResponse
+            | MessageType::EventResponse
+            | MessageType::ReadLogResponse
+            | MessageType::WifiScanResponse
+            | MessageType::WifiStatusResponse
+            | MessageType::GetConfigResponse
+            | MessageType::SetConfigResponse
+            | MessageType::CommandResponse
+            | MessageType::FirmwareResponse
+            | MessageType::TimeResponse
+            | MessageType::Pair
+            | MessageType::PairResponse
+            | MessageType::Enrol
+            | MessageType::EnrolResponse
+            | MessageType::GoodbyeResponse
+            | MessageType::VouchResponse
+            | MessageType::ClientsResponse
+            | MessageType::InviteResponse
+            | MessageType::ApproveResponse
+            | MessageType::RemoveResponse
+            | MessageType::ErrorResponse => Self::NotOne,
+        }
+    }
+}
+
+/// The enrolment a session speaks for.
+const fn sender(binding: &Binding) -> Sender {
+    Sender {
+        client: binding.client,
+        generation: binding.generation,
+    }
+}
+
+/// The widest membership ack: `ApproveAck 0x96` with its slot and
+/// confirmation.
+const ACK_BYTES: usize = km43::MAX_APPROVE_ACK_BYTES;
+const _: () = assert!(km43::MAX_INVITE_ACK_BYTES <= ACK_BYTES);
+const _: () = assert!(km43::MAX_REMOVE_ACK_BYTES <= ACK_BYTES);
+
+/// A membership answer sealed under the session's keys: the ack, or the
+/// sealed error it was refused with, and its note.
+fn sealed_ack<T>(
+    to: Addressed,
+    binding: &mut Binding,
+    kind: MessageType,
+    answer: Answer<T>,
+    encode: impl FnOnce(T, &mut [u8]) -> Option<usize>,
+    dst: &mut [u8],
+) -> Reply {
+    let reply = match answer.reply {
+        Ok(ack) => {
+            let mut body = [0u8; ACK_BYTES];
+            let written = encode(ack, &mut body).and_then(|len| {
+                let body = body.get(..len)?;
+                binding.channel.tx.seal(to.header(kind), body, dst).ok()
+            });
+            answered(written)
+        }
+        Err(code) => sealed_error(to, binding, code, dst),
+    };
+    match answer.note {
+        Some(note) => reply.with(note),
+        None => reply,
+    }
+}
+
+fn sealed_remove(
+    to: Addressed,
+    binding: &mut Binding,
+    answer: Answer<km43::Remove>,
+    dst: &mut [u8],
+) -> Reply {
+    sealed_ack(
+        to,
+        binding,
+        MessageType::RemoveResponse,
+        answer,
+        |outcome, body| km43::RemoveAck(outcome).encode(body).ok(),
+        dst,
+    )
+}
+
+/// `Clients 0x18` that opened: every occupied slot and every pending invite
+/// (P-251), to a slot whose mask holds bit 5 `read_private`, and sealed
+/// error 20 to any other, before anything is read.
+fn clients_answer(
+    to: Addressed,
+    binding: &mut Binding,
+    keys: (&mut Keys, Option<km43::ClientCapability>),
+    payload: &[u8],
+    now: Tick,
+    dst: &mut [u8],
+) -> Reply {
+    let (keys, mask) = keys;
+    if EmptyBody::decode(MessageType::Clients, payload).is_err() {
+        return sealed_error(to, binding, ErrorCode::MalformedFrame, dst);
+    }
+    if !allows(mask, km43::ClientCapability::READ_PRIVATE) {
+        return sealed_error(to, binding, ErrorCode::RoleNotPermitted, dst);
+    }
+    let _expired = keys.invites.expire(now);
+    let clients = keys.epoch.and_then(|epoch| {
+        packed::<_, { crate::SLOTS }>(keys.clients.occupied(epoch).map(|(id, occupant)| {
+            km43::ClientRow {
+                client_id: id,
+                generation: occupant.generation(),
+                role: occupant.role(),
+                client_kind: occupant.kind(),
+                label: occupant.label().as_str(),
+            }
+        }))
+    });
+    let invites =
+        packed::<_, { km43::MAX_INVITES }>(keys.invites.pending().map(|row| row.row(now)));
+    let mut body = [0u8; MAX_PAYLOAD];
+    let written = km43::ClientsAnswer::new(filled(clients.as_ref()), filled(invites.as_ref()))
+        .and_then(|answer| answer.encode(&mut body))
+        .ok()
+        .and_then(|len| {
+            let body = body.get(..len)?;
+            binding
+                .channel
+                .tx
+                .seal(to.header(MessageType::ClientsResponse), body, dst)
+                .ok()
+        });
+    answered(written)
+}
+
+/// At most `N` items into an array, and how many there were: `None` for
+/// none. The rows have no value to pad with, so the first one does.
+fn packed<T: Copy, const N: usize>(mut items: impl Iterator<Item = T>) -> Option<([T; N], usize)> {
+    let first = items.next()?;
+    let mut out = [first; N];
+    let mut len: usize = 1;
+    for (slot, item) in out.iter_mut().skip(1).zip(items) {
+        *slot = item;
+        len = len.saturating_add(1);
+    }
+    Some((out, len))
+}
+
+/// The items [`packed`] kept.
+fn filled<T, const N: usize>(packed: Option<&([T; N], usize)>) -> &[T] {
+    packed
+        .and_then(|(items, len)| items.get(..*len))
+        .unwrap_or(&[])
+}
+
+/// `Invite 0x15` that opened: P-252's steps (P-253, P-254).
+async fn invite<F: Fram>(
+    to: Addressed,
+    binding: &mut Binding,
+    keys: &mut Keys,
+    write: &SignedWrite<'_>,
+    now: Tick,
+    fram: &mut F,
+    dst: &mut [u8],
+) -> Reply {
+    let operation = match km43::InviteOperation::decode(write.operation()) {
+        Ok(operation) => operation,
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
+    };
+    let answer = membership::propose(keys, sender(binding), &operation, now, fram).await;
+    sealed_ack(
+        to,
+        binding,
+        MessageType::InviteResponse,
+        answer,
+        |ack, body| ack.encode(body).ok(),
+        dst,
+    )
+}
+
+/// `Approve 0x16` that opened: P-255's steps 1 to 4, then its proof queued
+/// for the worker on the session's row (P-243). A row already waiting on
+/// the worker is error 7.
+fn approve(
+    to: Addressed,
+    binding: &mut Binding,
+    keys: &mut Keys,
+    row: (&mut Work, &mut Option<Approving>, u32),
+    write: &SignedWrite<'_>,
+    now: Tick,
+    dst: &mut [u8],
+) -> Reply {
+    let operation = match km43::ApproveOperation::decode(write.operation()) {
+        Ok(operation) => operation,
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
+    };
+    let (work, approving, attempt) = row;
+    if !matches!(work, Work::Idle) {
+        return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
+    }
+    let from = sender(binding);
+    match membership::approve(keys, from, &operation, now) {
+        Approval::Answered(answer) => sealed_ack(
+            to,
+            binding,
+            MessageType::ApproveResponse,
+            answer,
+            |ack, body| ack.encode(body).ok(),
+            dst,
+        ),
+        Approval::Verify(check) => {
+            let ticket = Ticket {
+                conn: to.conn,
+                attempt,
+                req_id: to.req_id,
+            };
+            *work = Work::Queued(Job::new(ticket, Task::Approve(check)));
+            *approving = Some(Approving {
+                nonce: operation.nonce,
+                sender: from,
+                serial: binding.serial,
+            });
+            Reply::noted(SessionNote::Queued(to.conn))
+        }
+    }
+}
+
+/// `Remove 0x17` that opened: P-256's steps 1 to 3 on the sender's
+/// binding, then [`removed`] for the rest.
+async fn remove<F: Fram>(
+    to: Addressed,
+    rows: &mut [Option<Row>],
+    keys: &mut Keys,
+    opened: &km43::Opened<'_>,
+    fram: &mut F,
+    dst: &mut [u8],
+) -> Reply {
+    let Some(Row {
+        bound: Bound::Session(binding),
+        ..
+    }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+    else {
+        return Reply::NOTHING;
+    };
+    let operation = match signed(to, binding, opened, dst).and_then(|write| {
+        km43::RemoveOperation::decode(write.operation())
+            .map_err(|why| refused_under(to, binding, why.refusal(), dst))
+    }) {
+        Ok(operation) => operation,
+        Err(refused) => return refused,
+    };
+    match membership::removal(keys, sender(binding), operation) {
+        Removal::Refused(outcome) => sealed_remove(to, binding, Answer::ack(outcome), dst),
+        Removal::Free(id) => removed(to, rows, keys, id, fram, dst).await,
+    }
+}
+
+/// P-256's step 4 and 5 for a removal steps 1 to 3 allowed: every other
+/// session on the slot unbound, its invites withdrawn, the slot freed, and
+/// the answer sealed. A sender that removed its own slot is unbound once
+/// the answer is out.
+async fn removed<F: Fram>(
+    to: Addressed,
+    rows: &mut [Option<Row>],
+    keys: &mut Keys,
+    id: ClientId,
+    fram: &mut F,
+    dst: &mut [u8],
+) -> Reply {
+    unbind(rows, id, Some(to.conn));
+    let (outcome, note) = membership::remove(keys, id, fram).await;
+    let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn) else {
+        return note.map_or(Reply::NOTHING, Reply::noted);
+    };
+    let Bound::Session(binding) = &mut row.bound else {
+        return note.map_or(Reply::NOTHING, Reply::noted);
+    };
+    let own = binding.client == id;
+    let reply = sealed_remove(
+        to,
+        binding,
+        Answer {
+            reply: Ok(outcome),
+            note,
+        },
+        dst,
+    );
+    if own && outcome == km43::Remove::Removed {
+        row.bound = Bound::Ended;
+    }
+    reply
+}
+
 /// Whether a section is the network's or the cloud's: written with bit 1,
 /// read with bit 5 (P-105, P-251).
 const fn private(section: km43::ConfigSection) -> bool {
@@ -2072,9 +2481,19 @@ mod tests {
         bytes: [u8; PART_BYTES],
         falling: bool,
         drbg_lost: bool,
-        /// Refuse writes to the slots and their marks only, as a part that
-        /// failed mid-way through an enrolment would.
-        table_refused: bool,
+        /// Records whose writes are refused while the rest land.
+        refusing: Refusing,
+    }
+
+    /// Which records a part refuses to write.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refusing {
+        Nothing,
+        /// The slots and their marks, as a part that failed mid-way through
+        /// an enrolment would.
+        Table,
+        /// The proposal budgets (P-254).
+        Budgets,
     }
 
     impl Fram for Part {
@@ -2096,7 +2515,11 @@ mod tests {
             let drbg = usize::from(map::EPOCH.end().0);
             let in_drbg = (drbg..usize::from(map::DRBG.end().0)).contains(&start);
             let table = usize::from(map::NETWORK.end().0)..usize::from(map::COMMANDS.end().0);
-            let outcome = if self.falling || (self.table_refused && table.contains(&start)) {
+            let budgets = usize::from(map::SECRET_CHANGE.end().0)..usize::from(map::END.0);
+            let outcome = if self.falling
+                || (self.refusing == Refusing::Table && table.contains(&start))
+                || (self.refusing == Refusing::Budgets && budgets.contains(&start))
+            {
                 Err(Refused::SupplyFalling)
             } else {
                 if !(self.drbg_lost && in_drbg) {
@@ -2186,7 +2609,7 @@ mod tests {
                 bytes: [0xFF; PART_BYTES],
                 falling: false,
                 drbg_lost: false,
-                table_refused: false,
+                refusing: Refusing::Nothing,
             };
             let secret = Secret::new(DEVICE, PRINTED).expect("entropy");
             let controller = ControllerKey::new(CONTROLLER).expect("entropy");
@@ -2215,6 +2638,8 @@ mod tests {
                 generator: Generator::new(
                     block_on(Kept::read(map::DRBG, &mut part)).expect("reads"),
                 ),
+                invites: crate::Invites::new(),
+                budgets: block_on(crate::ProposalBudgets::read(&mut part)).expect("reads"),
             };
             Self {
                 part,
@@ -2933,9 +3358,9 @@ mod tests {
         let (enrol, len) = proceeding
             .finish(&client_key(1), header, &mut dst)
             .expect("message 3");
-        rig.part.table_refused = true;
+        rig.part.refusing = Refusing::Table;
         let (reply, answer) = rig.exchange(&dst[..len]);
-        rig.part.table_refused = false;
+        rig.part.refusing = Refusing::Nothing;
         assert_eq!(reply.note, Some(SessionNote::TableNotStored));
         let answer = read_enrol(enrol, &answer);
         assert_eq!(answer.outcome, Outcome::NotStored);
@@ -3514,5 +3939,686 @@ mod tests {
         rig.at(120_000);
         phone.challenged(&mut rig);
         assert_ne!(phone.challenge, first);
+    }
+
+    /// An invitee's first half: the key `client_key(n)` would be, and the
+    /// nonce it commits to (P-257).
+    fn invitee(n: u8) -> km43::InviteeStart {
+        let mut bytes = [n; 32];
+        bytes[31] = 0x41;
+        km43::InviteeStart::new(Entropy::new(bytes), [n; 16])
+    }
+
+    /// A signed write, exchanged and opened: the ack's body, or the code of
+    /// the sealed error it was refused with.
+    fn write(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        kind: MessageType,
+        operation: &[u8],
+    ) -> (Reply, Result<Frame, Incoming>) {
+        let frame = phone.signed(kind, operation);
+        let (reply, answer) = rig.exchange(&frame);
+        let (answered, body) = phone.open(&answer);
+        if answered == MessageType::ErrorResponse {
+            let code = ErrorBody::authenticated(&body).expect("an error body").code;
+            (reply, Err(code))
+        } else {
+            (reply, Ok(body))
+        }
+    }
+
+    fn invite_key(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        role: Role,
+        invitee: PublicKey,
+        commitment: km43::Commitment,
+    ) -> (Reply, Result<km43::InviteAck, Incoming>) {
+        let mut operation = [0u8; km43::MAX_INVITE_OPERATION_BYTES];
+        let len = km43::InviteOperation {
+            role,
+            invitee,
+            commitment,
+            client_kind: ClientKind::App,
+            label: "tablet",
+        }
+        .encode(&mut operation)
+        .expect("fits");
+        let (reply, body) = write(rig, phone, MessageType::Invite, &operation[..len]);
+        let ack = body.map(|body| km43::InviteAck::decode(&body).expect("an InviteAck"));
+        (reply, ack)
+    }
+
+    fn propose(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        role: Role,
+        invitee: &km43::InviteeStart,
+    ) -> (Reply, Result<km43::InviteAck, Incoming>) {
+        invite_key(rig, phone, role, invitee.public(), invitee.commitment())
+    }
+
+    /// The nonce an invite was proposed under.
+    fn proposed(rig: &mut Rig, phone: &mut Phone, role: Role, n: u8) -> km43::InviteNonce {
+        let (_, ack) = propose(rig, phone, role, &invitee(n));
+        let ack = ack.expect("an ack");
+        assert_eq!(ack.outcome(), km43::Invite::Proposed);
+        ack.nonce().expect("a proposed invite is named")
+    }
+
+    fn decide(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        nonce: km43::InviteNonce,
+        decision: km43::Decision,
+    ) -> (Reply, Result<km43::ApproveAck, Incoming>) {
+        let mut operation = [0u8; km43::MAX_APPROVE_OPERATION_BYTES];
+        let len = km43::ApproveOperation { nonce, decision }
+            .encode(&mut operation)
+            .expect("fits");
+        let (reply, body) = write(rig, phone, MessageType::Approve, &operation[..len]);
+        let ack = body.map(|body| km43::ApproveAck::decode(&body).expect("an ApproveAck"));
+        (reply, ack)
+    }
+
+    fn outcome(answer: &Result<km43::ApproveAck, Incoming>) -> Option<km43::Approve> {
+        answer.as_ref().ok().map(|ack| ack.outcome())
+    }
+
+    /// What an invitee is told by the owner's app, read from the pending
+    /// invite (P-257).
+    fn details(rig: &Rig, nonce: km43::InviteNonce) -> km43::InviteDetails {
+        let pending = rig
+            .sessions
+            .keys
+            .invites
+            .pending()
+            .find(|pending| pending.nonce == nonce)
+            .expect("pending");
+        km43::InviteDetails {
+            device_id: DeviceId::new(DEVICE),
+            controller: proceeding_controller(),
+            epoch: Epoch::FIRST,
+            suite: pending.suite,
+            role: pending.role,
+            inviter: pending.inviter,
+            inviter_generation: pending.inviter_generation,
+            nonce,
+        }
+    }
+
+    /// The invitee's reveal and proof for `nonce`, as its app sends them
+    /// once the digits matched.
+    fn approval(rig: &Rig, n: u8, nonce: km43::InviteNonce) -> (km43::Decision, km43::Invitee) {
+        let invitee = invitee(n)
+            .receive(&details(rig, nonce))
+            .expect("a controller key that agrees");
+        let decision = km43::Decision::Approve {
+            reveal: invitee.reveal(),
+            proof: *invitee.proof().as_bytes(),
+        };
+        (decision, invitee)
+    }
+
+    fn remove(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        slot: u32,
+        generation: Generation,
+    ) -> (Reply, Result<km43::Remove, Incoming>) {
+        let mut operation = [0u8; km43::MAX_REMOVE_OPERATION_BYTES];
+        let len = km43::RemoveOperation {
+            client_id: ClientId::new(slot).expect("a slot"),
+            generation,
+        }
+        .encode(&mut operation)
+        .expect("fits");
+        let (reply, body) = write(rig, phone, MessageType::Remove, &operation[..len]);
+        let outcome = body.map(|body| km43::RemoveAck::decode(&body).expect("a RemoveAck").0);
+        (reply, outcome)
+    }
+
+    fn pending(rig: &Rig) -> usize {
+        rig.sessions.keys.invites.len()
+    }
+
+    fn budget(rig: &Rig, slot: u32) -> u8 {
+        rig.sessions.keys.budgets.left(
+            ClientId::new(slot).expect("a slot"),
+            Epoch::FIRST,
+            Generation::FIRST,
+        )
+    }
+
+    /// An owner on handle 1 at slot 1 and an admin on handle 2 at slot 2,
+    /// each with a session.
+    fn owner_and_admin(rig: &mut Rig) -> (Phone, Phone) {
+        let mut owner = enrolled_phone(rig, 1, "owner", 1);
+        let mut admin = enrolled_phone(rig, 2, "admin", 2);
+        owner.hello(rig).expect("a session");
+        admin.hello(rig).expect("a session");
+        assert_eq!(role_of(rig, 1), Some(Role::Owner));
+        assert_eq!(role_of(rig, 2), Some(Role::Admin));
+        (owner, admin)
+    }
+
+    /// Whether a sealed request on `phone`'s handle is refused as a session
+    /// that ended.
+    fn session_ended(rig: &mut Rig, phone: &mut Phone) -> bool {
+        let frame = phone.sealed(MessageType::Clients, &[0xA0]);
+        let (_, answer) = rig.send(&frame);
+        Envelope::decode(&answer).is_ok_and(|envelope| {
+            envelope.header().kind == MessageType::ErrorResponse
+                && bare_code(&answer) == ErrorCode::SessionExpired as u16
+        })
+    }
+
+    #[test]
+    fn p_252_p_255_p_257_an_owners_invite_is_approved_and_the_invitee_says_hello() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let (reply, ack) = propose(&mut rig, &mut owner, Role::Admin, &invitee(9));
+        assert_eq!(reply.note, Some(SessionNote::Proposed(conn_id(1))));
+        let nonce = ack.expect("an ack").nonce().expect("proposed");
+        let (decision, invitee) = approval(&rig, 9, nonce);
+        let (reply, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        let enrolled = ack.expect("an ack").slot().expect("enrolled");
+        assert_eq!(enrolled.client_id, conn_id(3));
+        assert_eq!(enrolled.generation, Generation::FIRST);
+        assert_eq!(
+            reply.note,
+            Some(SessionNote::Approved {
+                client: conn_id(3),
+                budget_restored: true,
+            })
+        );
+        assert_eq!(role_of(&rig, 3), Some(Role::Admin));
+        assert_eq!(pending(&rig), 0, "an invite is good for one decision");
+        // The invitee keeps the enrolment only once the confirmation
+        // verifies, then binds a session with it.
+        let enrolment = invitee
+            .digits_matched()
+            .keep(&enrolled.confirm, enrolled.client_id, enrolled.generation)
+            .expect("the controller wrote the slot");
+        rig.connect(3);
+        let mut tablet = Phone::on(3);
+        tablet.enrolment = Some(enrolment);
+        tablet.challenged(&mut rig);
+        let report = tablet.hello(&mut rig).expect("a session");
+        assert_eq!(report.client_id, conn_id(3));
+    }
+
+    fn conn_id(n: u32) -> ClientId {
+        ClientId::new(n).expect("a slot")
+    }
+
+    #[test]
+    fn p_251_p_252_an_admin_may_propose_an_admin_and_neither_an_owner_nor_a_viewer() {
+        let mut rig = Rig::new();
+        let (_owner, mut admin) = owner_and_admin(&mut rig);
+        for role in [Role::Owner, Role::Viewer] {
+            let (_, ack) = propose(&mut rig, &mut admin, role, &invitee(9));
+            assert_eq!(
+                ack.map(km43::InviteAck::outcome),
+                Ok(km43::Invite::Unauthorised),
+                "{role:?}"
+            );
+        }
+        assert_eq!(pending(&rig), 0);
+        assert_eq!(
+            budget(&rig, 2),
+            km43::INVITE_BUDGET,
+            "a refusal spends nothing"
+        );
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        assert_eq!(budget(&rig, 2), km43::INVITE_BUDGET - 1);
+    }
+
+    #[test]
+    fn p_252_a_key_an_occupied_slot_holds_is_known_key() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let enrolled = client_key(2).public();
+        let (_, ack) = invite_key(
+            &mut rig,
+            &mut owner,
+            Role::Admin,
+            enrolled,
+            km43::Commitment([0; 32]),
+        );
+        assert_eq!(
+            ack.map(km43::InviteAck::outcome),
+            Ok(km43::Invite::KnownKey)
+        );
+        assert_eq!(pending(&rig), 0);
+    }
+
+    #[test]
+    fn p_252_p_254_an_admin_with_no_budget_left_is_refused_no_budget_before_invites_full() {
+        let mut rig = Rig::new();
+        let (_owner, mut admin) = owner_and_admin(&mut rig);
+        let first = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let (_, ack) = decide(&mut rig, &mut admin, first, km43::Decision::Decline);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Declined));
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 10);
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 11);
+        // Nothing left, and both of its rows taken: step 3 answers before
+        // step 5 would. A decline restored nothing.
+        let (_, ack) = propose(&mut rig, &mut admin, Role::Admin, &invitee(12));
+        assert_eq!(
+            ack.map(km43::InviteAck::outcome),
+            Ok(km43::Invite::NoBudget)
+        );
+        let reread = block_on(crate::ProposalBudgets::read(&mut rig.part)).expect("reads");
+        assert_eq!(reread.left(conn_id(2), Epoch::FIRST, Generation::FIRST), 0);
+    }
+
+    #[test]
+    fn p_254_an_owners_approval_restores_the_inviters_budget() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 10);
+        assert_eq!(budget(&rig, 2), km43::INVITE_BUDGET - 2);
+        let (decision, _) = approval(&rig, 9, nonce);
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Enrolled));
+        assert_eq!(budget(&rig, 2), km43::INVITE_BUDGET);
+    }
+
+    #[test]
+    fn p_254_a_spend_that_does_not_land_is_error_7_and_stores_nothing() {
+        let mut rig = Rig::new();
+        let (_owner, mut admin) = owner_and_admin(&mut rig);
+        rig.part.refusing = Refusing::Budgets;
+        let (reply, ack) = propose(&mut rig, &mut admin, Role::Admin, &invitee(9));
+        assert_eq!(ack, Err(Incoming::Client(ErrorCode::BusyRetry)));
+        assert_eq!(reply.note, Some(SessionNote::MembershipNotStored));
+        assert_eq!(pending(&rig), 0);
+        rig.part.refusing = Refusing::Nothing;
+        let reread = block_on(crate::ProposalBudgets::read(&mut rig.part)).expect("reads");
+        assert_eq!(
+            reread.left(conn_id(2), Epoch::FIRST, Generation::FIRST),
+            km43::INVITE_BUDGET
+        );
+    }
+
+    #[test]
+    fn p_237_p_252_an_invite_with_no_draw_to_name_it_is_error_7_and_not_stored() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        rig.part.drbg_lost = true;
+        let (reply, ack) = propose(&mut rig, &mut owner, Role::Admin, &invitee(9));
+        assert_eq!(ack, Err(Incoming::Client(ErrorCode::BusyRetry)));
+        assert_eq!(reply.note, Some(SessionNote::EntropyUnavailable));
+        assert_eq!(pending(&rig), 0);
+    }
+
+    #[test]
+    fn p_253_a_slot_holds_two_pending_invites_and_the_third_is_invites_full() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let _ = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let _ = proposed(&mut rig, &mut owner, Role::Admin, 10);
+        let (_, ack) = propose(&mut rig, &mut owner, Role::Admin, &invitee(11));
+        assert_eq!(
+            ack.map(km43::InviteAck::outcome),
+            Ok(km43::Invite::InvitesFull)
+        );
+        assert_eq!(pending(&rig), 2, "nothing was evicted");
+    }
+
+    #[test]
+    fn p_253_an_invite_past_its_hour_is_unknown_invite() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        rig.at(km43::INVITE_TTL_MS);
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::UnknownInvite));
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_258_p_252_p_255_one_viewer_is_enrolled_and_a_second_is_table_full() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let first = proposed(&mut rig, &mut owner, Role::Viewer, 9);
+        let second = proposed(&mut rig, &mut owner, Role::Viewer, 10);
+        let (decision, _) = approval(&rig, 9, first);
+        let (_, ack) = decide(&mut rig, &mut owner, first, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Enrolled));
+        assert_eq!(role_of(&rig, 3), Some(Role::Viewer));
+        // At approval the second has no row, and stays pending (P-255
+        // step 7); a proposal for a third is refused at step 4.
+        let (decision, _) = approval(&rig, 10, second);
+        let (_, ack) = decide(&mut rig, &mut owner, second, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::TableFull));
+        assert_eq!(pending(&rig), 1);
+        let (_, ack) = propose(&mut rig, &mut owner, Role::Viewer, &invitee(11));
+        assert_eq!(
+            ack.map(km43::InviteAck::outcome),
+            Ok(km43::Invite::TableFull)
+        );
+    }
+
+    #[test]
+    fn p_255_a_nonce_no_invite_has_is_unknown_invite() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let (_, ack) = decide(
+            &mut rig,
+            &mut owner,
+            km43::InviteNonce([7; 16]),
+            km43::Decision::Decline,
+        );
+        assert_eq!(outcome(&ack), Some(km43::Approve::UnknownInvite));
+    }
+
+    #[test]
+    fn p_255_only_an_owner_approves_and_an_admin_declines_only_its_own() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let owners = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, owners);
+        let (_, ack) = decide(&mut rig, &mut admin, owners, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Unauthorised));
+        let (_, ack) = decide(&mut rig, &mut admin, owners, km43::Decision::Decline);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Unauthorised));
+        assert_eq!(pending(&rig), 1, "a refused sender consumes nothing");
+        // The admin may withdraw its own, and may not approve it.
+        let admins = proposed(&mut rig, &mut admin, Role::Admin, 10);
+        let (decision, _) = approval(&rig, 10, admins);
+        let (_, ack) = decide(&mut rig, &mut admin, admins, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Unauthorised));
+        let (_, ack) = decide(&mut rig, &mut admin, admins, km43::Decision::Decline);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Declined));
+        // An owner declines any, and what is declined is gone.
+        let (_, ack) = decide(&mut rig, &mut owner, owners, km43::Decision::Decline);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Declined));
+        let (_, ack) = decide(&mut rig, &mut owner, owners, km43::Decision::Decline);
+        assert_eq!(outcome(&ack), Some(km43::Approve::UnknownInvite));
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_255_p_257_a_reveal_that_does_not_open_the_commitment_is_refused_and_consumed() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        let km43::Decision::Approve { proof, .. } = decision else {
+            panic!("an approval");
+        };
+        let wrong = km43::Decision::Approve {
+            reveal: km43::Reveal([0xEE; 16]),
+            proof,
+        };
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, wrong);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Refused));
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::UnknownInvite));
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_255_p_257_a_proof_that_does_not_verify_is_refused() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        let km43::Decision::Approve { reveal, mut proof } = decision else {
+            panic!("an approval");
+        };
+        proof[0] ^= 1;
+        let (_, ack) = decide(
+            &mut rig,
+            &mut owner,
+            nonce,
+            km43::Decision::Approve { reveal, proof },
+        );
+        assert_eq!(outcome(&ack), Some(km43::Approve::Refused));
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_255_a_key_enrolled_since_the_proposal_is_known_key_and_consumed() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        // The same key pairs at the panel before the owner decides.
+        let _same = enrolled_phone(&mut rig, 3, "tablet", 9);
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::KnownKey));
+        assert_eq!(pending(&rig), 0);
+    }
+
+    #[test]
+    fn p_255_a_slot_that_does_not_land_is_not_stored_and_the_invite_stays_pending() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        rig.part.refusing = Refusing::Table;
+        let (reply, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::NotStored));
+        assert_eq!(reply.note, Some(SessionNote::MembershipNotStored));
+        assert_eq!(pending(&rig), 1);
+        rig.part.refusing = Refusing::Nothing;
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::Enrolled));
+    }
+
+    #[test]
+    fn p_255_an_inviter_that_no_longer_holds_its_enrolment_is_inviter_gone() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        // The row as it would read had the admin's slot moved on without
+        // the withdrawal P-253 makes: step 4 still refuses it.
+        let invites = &mut rig.sessions.keys.invites;
+        let mut stale = invites.withdraw(&nonce).expect("pending");
+        stale.inviter_generation = Generation::new(2).expect("a generation");
+        invites.propose(stale, Role::Owner).expect("a row");
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(outcome(&ack), Some(km43::Approve::InviterGone));
+        assert_eq!(pending(&rig), 0);
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_253_p_255_an_inviter_removed_while_the_proof_is_checked_enrols_nobody() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        let mut operation = [0u8; km43::MAX_APPROVE_OPERATION_BYTES];
+        let len = km43::ApproveOperation { nonce, decision }
+            .encode(&mut operation)
+            .expect("fits");
+        let frame = owner.signed(MessageType::Approve, &operation[..len]);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        // The admin removes itself before the worker is done.
+        let (_, removed) = remove(&mut rig, &mut admin, 2, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Removed));
+        let (_, answer) = rig.compute().expect("the proof was queued");
+        let (_, body) = owner.open(&answer);
+        let ack = km43::ApproveAck::decode(&body).expect("an ApproveAck");
+        assert_eq!(ack.outcome(), km43::Approve::UnknownInvite);
+        assert_eq!(role_of(&rig, 3), None);
+    }
+
+    #[test]
+    fn p_256_an_owner_removes_an_admin_whose_session_and_invites_go_with_it() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let (reply, removed) = remove(&mut rig, &mut owner, 2, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Removed));
+        assert_eq!(reply.note, Some(SessionNote::Removed(conn_id(2))));
+        assert_eq!(role_of(&rig, 2), None);
+        assert_eq!(pending(&rig), 0, "its invites were withdrawn");
+        let mark = rig.sessions.keys.clients.mark(conn_id(2)).expect("a slot");
+        assert_eq!(
+            mark.present().and_then(|mark| mark.next()),
+            Generation::new(3)
+        );
+        assert!(session_ended(&mut rig, &mut admin));
+        assert!(
+            !session_ended(&mut rig, &mut owner),
+            "the sender's session stays"
+        );
+    }
+
+    #[test]
+    fn p_256_a_generation_the_slot_does_not_hold_is_gone_and_changes_nothing() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let stale = Generation::new(2).expect("a generation");
+        let (_, removed) = remove(&mut rig, &mut owner, 2, stale);
+        assert_eq!(removed, Ok(km43::Remove::Gone));
+        let (_, removed) = remove(&mut rig, &mut owner, 5, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Gone));
+        assert_eq!(role_of(&rig, 2), Some(Role::Admin));
+        assert!(!session_ended(&mut rig, &mut admin));
+    }
+
+    #[test]
+    fn p_256_an_owner_is_protected_and_a_viewer_from_everyone_but_an_owner() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        seat(&mut rig, 3, Role::Viewer, "relay");
+        let (_, removed) = remove(&mut rig, &mut admin, 1, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Protected));
+        let (_, removed) = remove(&mut rig, &mut admin, 3, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Protected));
+        let (_, removed) = remove(&mut rig, &mut owner, 1, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Protected), "not even itself");
+        let (_, removed) = remove(&mut rig, &mut owner, 3, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Removed));
+        assert_eq!(role_of(&rig, 1), Some(Role::Owner));
+    }
+
+    /// Slot 2's enrolment written again as a viewer, and its phone bound.
+    fn viewer(rig: &mut Rig) -> Phone {
+        let _owner = enrolled_phone(rig, 1, "owner", 1);
+        let mut relay = enrolled_phone(rig, 2, "relay", 2);
+        let mut enrolment = rig
+            .sessions
+            .keys
+            .clients
+            .occupant(conn_id(2), Epoch::FIRST)
+            .expect("occupied")
+            .enrolment();
+        enrolment.role = Role::Viewer;
+        block_on(rig.sessions.keys.clients.enrol(
+            conn_id(2),
+            enrolment,
+            Epoch::FIRST,
+            &mut rig.part,
+        ))
+        .expect("lands");
+        relay.challenged(rig);
+        relay.hello(rig).expect("a session");
+        relay
+    }
+
+    #[test]
+    fn p_251_p_256_a_viewer_may_neither_remove_nor_invite() {
+        let mut rig = Rig::new();
+        let mut relay = viewer(&mut rig);
+        let (_, removed) = remove(&mut rig, &mut relay, 2, Generation::new(2).expect("gen"));
+        assert_eq!(removed, Ok(km43::Remove::Unauthorised));
+        for role in [Role::Owner, Role::Admin, Role::Viewer] {
+            let (_, ack) = propose(&mut rig, &mut relay, role, &invitee(9));
+            assert_eq!(
+                ack.map(km43::InviteAck::outcome),
+                Ok(km43::Invite::Unauthorised)
+            );
+        }
+    }
+
+    #[test]
+    fn p_256_an_admin_that_removes_itself_is_answered_then_unbound() {
+        let mut rig = Rig::new();
+        let (_owner, mut admin) = owner_and_admin(&mut rig);
+        let (reply, removed) = remove(&mut rig, &mut admin, 2, Generation::FIRST);
+        assert_eq!(removed, Ok(km43::Remove::Removed));
+        assert_eq!(reply.note, Some(SessionNote::Removed(conn_id(2))));
+        assert!(session_ended(&mut rig, &mut admin));
+    }
+
+    #[test]
+    fn p_256_a_slot_that_cannot_be_freed_is_not_stored_and_its_sessions_stay_ended() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        rig.part.refusing = Refusing::Table;
+        let (reply, removed) = remove(&mut rig, &mut owner, 2, Generation::FIRST);
+        rig.part.refusing = Refusing::Nothing;
+        assert_eq!(removed, Ok(km43::Remove::NotStored));
+        assert_eq!(reply.note, Some(SessionNote::MembershipNotStored));
+        assert!(session_ended(&mut rig, &mut admin));
+    }
+
+    #[test]
+    fn p_251_the_client_list_carries_every_slot_and_every_pending_invite() {
+        let mut rig = Rig::new();
+        let (mut owner, mut admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        rig.at(1_500);
+        let frame = owner.sealed(MessageType::Clients, &[0xA0]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, body) = owner.open(&answer);
+        assert_eq!(kind, MessageType::ClientsResponse);
+        let list = km43::ClientsAnswer::decode(&body).expect("a client list");
+        let mut clients = list.clients().map(|row| row.expect("a row"));
+        let first = clients.next().expect("the owner");
+        assert_eq!(
+            (first.client_id, first.role, first.label),
+            (conn_id(1), Role::Owner, "owner")
+        );
+        let second = clients.next().expect("the admin");
+        assert_eq!((second.client_id, second.role), (conn_id(2), Role::Admin));
+        assert!(clients.next().is_none());
+        let mut invites = list.invites().map(|row| row.expect("a row"));
+        let row = invites.next().expect("the invite");
+        assert_eq!(row.nonce, nonce);
+        assert_eq!(row.inviter, conn_id(2));
+        assert_eq!(row.invitee, invitee(9).public());
+        assert_eq!(row.expires_in, 3_599);
+        assert!(invites.next().is_none());
+    }
+
+    #[test]
+    fn p_251_a_viewer_asking_for_the_client_list_is_sealed_error_20() {
+        let mut rig = Rig::new();
+        let mut relay = viewer(&mut rig);
+        assert_eq!(
+            read_refused(&mut rig, &mut relay, MessageType::Clients, &[0xA0]),
+            Some(Incoming::Client(ErrorCode::RoleNotPermitted))
+        );
+    }
+
+    #[test]
+    fn p_240_p_253_an_inviter_re_keyed_at_the_panel_takes_its_invites_with_it() {
+        let mut rig = Rig::new();
+        let (_owner, mut admin) = owner_and_admin(&mut rig);
+        let _ = proposed(&mut rig, &mut admin, Role::Admin, 9);
+        let _again = enrolled_phone(&mut rig, 3, "admin", 2);
+        assert_eq!(pending(&rig), 0);
+    }
+
+    #[test]
+    fn p_085_p_253_a_factory_reset_withdraws_every_invite() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let _ = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        block_on(rig.sessions.factory_reset(&mut rig.part)).expect("resets");
+        assert_eq!(pending(&rig), 0);
     }
 }

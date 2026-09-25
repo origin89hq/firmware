@@ -57,6 +57,8 @@ pub struct Store {
     pub epoch: Kept<Epoch, EPOCH_BYTES>,
     /// The client table and the dedup table (P-239).
     pub clients: Clients,
+    /// Each admin slot's proposal budget (P-254).
+    pub budgets: crate::ProposalBudgets,
     /// Why the generator is running.
     pub run: Kept<RunReason, RUN_REASON_BYTES>,
     /// What the last run to panic said, and at which boot.
@@ -240,6 +242,7 @@ impl Store {
         let mut drbg = Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, fram).await?;
         let mut epoch = Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, fram).await?;
         let mut clients = Clients::read(fram).await?;
+        let budgets = crate::ProposalBudgets::read(fram).await?;
         let run = Kept::<RunReason, RUN_REASON_BYTES>::read(map::RUN_REASON, fram).await?;
         let mut boots = Kept::<BootCount, BOOT_COUNT_BYTES>::read(map::BOOT_COUNT, fram).await?;
         let mut panics =
@@ -326,6 +329,7 @@ impl Store {
                 drbg,
                 epoch,
                 clients,
+                budgets,
                 run,
                 panics,
                 boots,
@@ -985,7 +989,8 @@ mod tests {
         for malformed in [false, true] {
             let (mut part, _) = manufactured();
             let start = usize::from(map::LOAD_SHED_CONFIG.end().0);
-            part.bytes[start..].fill(0x55);
+            let end = usize::from(map::SECRET_CHANGE.end().0);
+            part.bytes[start..end].fill(0x55);
             if malformed {
                 let mut bad = [0; SECRET_CHANGE_BYTES];
                 bad[0] = 2;
@@ -996,7 +1001,7 @@ mod tests {
             assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
             assert!(store.secret.present() == Some(&secret(2)));
             assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
-            assert!(part.bytes[start..].iter().all(|byte| *byte == 0));
+            assert!(part.bytes[start..end].iter().all(|byte| *byte == 0));
         }
     }
 

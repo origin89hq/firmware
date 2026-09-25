@@ -11,7 +11,9 @@
 //! recovery ladder's cuts leave the ones before the cut or the ones after
 //! it, and never fewer than were kept. A run reason leaves the reason before
 //! it or the one being declared, and the contact is moved only on one the
-//! part holds.
+//! part holds. A removal leaves the enrolment, or a free slot whose
+//! generation has moved on. A proposal's spend leaves the budget as it was
+//! or one less, and never more.
 
 use embassy_futures::block_on;
 use km43::{ClientId, ClientKind, Epoch};
@@ -21,8 +23,8 @@ use o89_core::map::{DRBG, EPOCH, RECENT_CUTS, RUN_REASON};
 use o89_core::{
     Behaviour, BootCount, CUTS_RECORD_BYTES, Clients, CutsRecord, DRBG_BYTES, DrbgState,
     EPOCH_BYTES, Fingerprint, Generator, Held, Kept, KeyRecord, LastWords, PanicRecorded,
-    PanicSite, Plan, RUN_REASON_BYTES, RailSequencer, Recovery, Revision, RunReason, Running,
-    StartKind, Store, Tick, UnixMillis, Verdict,
+    PanicSite, Plan, ProposalBudgets, RUN_REASON_BYTES, RailSequencer, Recovery, Revision,
+    RunReason, Running, StartKind, Store, Tick, UnixMillis, Verdict,
 };
 
 use crate::link::{client_key, enrolment, unit};
@@ -63,6 +65,84 @@ fn boot(part: &mut SimFram) -> (Epochs, Clients) {
     let mut clients = block_on(Clients::read(part)).expect("the part is back");
     let _ = block_on(clients.booted(&mut epochs, part)).expect("repairs");
     (epochs, clients)
+}
+
+#[test]
+fn p_256_a_removal_cut_at_any_step_leaves_the_enrolment_or_a_free_slot_under_a_new_generation() {
+    let start = with_one_phone();
+    let remove = |part: &mut SimFram| {
+        let (_, mut clients) = boot(part);
+        block_on(clients.remove(client(1), Epoch::FIRST, part))
+            .map(|_| ())
+            .map_err(|_| ())
+    };
+    let mut raised = 0;
+    let crashes = crash_at_every_step(&start, remove, |part, step| {
+        let (_, clients) = boot(part);
+        let issued = clients
+            .mark(client(1))
+            .and_then(Kept::present)
+            .and_then(|mark| mark.next());
+        match clients.occupant(client(1), Epoch::FIRST) {
+            // Not removed: the enrolment the phone holds, whole.
+            Some(phone) => {
+                assert!(
+                    phone.client().matches(&client_key(1).public()),
+                    "cut at {step}"
+                );
+                assert_eq!(phone.generation(), km43::Generation::FIRST, "cut at {step}");
+                if issued > km43::Generation::new(2) {
+                    raised += 1;
+                }
+            }
+            // Removed: generation 1 names nothing the slot holds (P-239).
+            None => assert!(issued > km43::Generation::new(2), "cut at {step}"),
+        }
+    })
+    .expect("the path runs uncut");
+    assert!(crashes.steps > 0);
+    assert!(raised > 0, "no cut landed between the mark and the record");
+    // Uncut, the slot is free and its generation has moved on.
+    let mut whole = start.clone();
+    remove(&mut whole).expect("removes");
+    let (_, clients) = boot(&mut whole);
+    assert!(clients.occupant(client(1), Epoch::FIRST).is_none());
+}
+
+#[test]
+fn p_254_a_spend_cut_at_any_step_leaves_the_budget_as_it_was_or_one_less() {
+    let generation = km43::Generation::FIRST;
+    let spend = |part: &mut SimFram| {
+        let mut budgets = block_on(ProposalBudgets::read(part)).map_err(|_| ())?;
+        block_on(budgets.spend(client(2), Epoch::FIRST, generation, part))
+            .map(|_| ())
+            .map_err(|_| ())
+    };
+    // The first spend on a part that never held the record, and one onto
+    // a record with a copy already written.
+    for spent_before in [0, 1] {
+        let mut start = with_one_phone();
+        for _ in 0..spent_before {
+            spend(&mut start).expect("spent");
+        }
+        let before = km43::INVITE_BUDGET - spent_before;
+        let crashes = crash_at_every_step(&start, spend, |part, step| {
+            let budgets = block_on(ProposalBudgets::read(part)).expect("the part is back");
+            let left = budgets.left(client(2), Epoch::FIRST, generation);
+            // A cut before the spend landed is a spend that was not made:
+            // nothing was stored or answered, and nothing is given back.
+            assert_eq!(left, before, "cut at {step}, spent before: {spent_before}");
+        })
+        .expect("the path runs uncut");
+        assert!(crashes.steps > 0);
+        let mut whole = start.clone();
+        spend(&mut whole).expect("spent");
+        let budgets = block_on(ProposalBudgets::read(&mut whole)).expect("reads");
+        assert_eq!(
+            budgets.left(client(2), Epoch::FIRST, generation),
+            before - 1
+        );
+    }
 }
 
 #[test]
