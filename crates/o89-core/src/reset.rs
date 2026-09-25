@@ -103,7 +103,8 @@ pub enum ResetCause {
     Software,
     /// An illegal low-power mode entry.
     LowPower,
-    /// An option-byte reload: the bank flip.
+    /// An option-byte reload, which no image of ours asks for: revision A
+    /// never swaps its banks.
     OptionByte,
 }
 
@@ -508,7 +509,7 @@ mod tests {
         assert_eq!(
             record(ResetCause::OptionByte, None).body().cause,
             BootCause::OptionByteReload,
-            "a bank swap read as a power cut"
+            "an option-byte reload read as a power cut"
         );
     }
 }

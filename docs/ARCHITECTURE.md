@@ -41,7 +41,7 @@ one of the arguments; nothing here needs microsecond response.
 | Image | Part | Owns |
 |---|---|---|
 | `o89-controller` | STM32G0B1RE, Cortex-M0+ | Every decision, all persistence, all timing, all actuation. Runs a full week with the comms processor unplugged |
-| `o89-boot` | STM32G0B1RE | The controller's bootloader: the generator lines to their fail state before anything else, the selected bank's manifest verified, trial boots counted and a bad image flipped back. Frozen by the first unit that ships with read-out protection, so it is small and it is first |
+| `o89-boot` | STM32G0B1RE | The controller's bootloader: the generator lines to their fail state before anything else, an update staged on the NOR verified and copied in, trial boots counted and a bad image rolled back from the NOR. Frozen by the first unit that ships with read-out protection, so it is small and it is first |
 | `o89-comms` | ESP32-C6, RISC-V | The comms processor: Wi-Fi, BLE, cloud transport, the credential cache, NTP offers, OTA delivery, and the download window that is the only wire-free recovery path on board A revision A |
 
 Named by role, not by chip. The controller design keeps an STM32H5 as the
@@ -205,8 +205,8 @@ why exercise runs and quiet hours wait (below).
 ### Design rules
 
 Everything is swappable, but the mechanism differs by boundary, because the
-naive traits-everywhere version costs real resources on this part. Dual-bank
-A/B leaves an image budget of 248 KB, not 512; generics monomorphise, so
+naive traits-everywhere version costs real resources on this part. The
+image budget on revision A is 496 KB, not 512; generics monomorphise, so
 every instantiation duplicates code; `dyn Trait` in `no_std` means vtables,
 no inlining and usually a heap.
 
@@ -313,7 +313,7 @@ Three rules come with it:
    below every task that times anything (P-243, below). The failure mode of a cooperative executor is one task
    starving the rest, and it looks exactly like a dead controller.
 3. **The image is measured every time the gate runs**, the `.bin` against
-   the 248 KB slot with a stated margin, and a change that moves it records
+   the 496 KB region with a stated margin, and a change that moves it records
    the row in `sizes.tsv`. The number is wanted early, not in November.
 
 Exact pins on every firmware dependency, because Embassy and `esp-hal` move
@@ -928,7 +928,7 @@ event queue, which refuses when full.
 | | Part | Holds | Layout |
 |---|---|---|---|
 | FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the eight client slots, each a key record in two copies with a generation mark beside it (P-239), the dedup table under its epoch (P-080, P-121), the epoch (P-085), the generator's state (P-237), the device secret and the controller key (P-235), the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the manufacturing transaction (appended after the configuration reservations) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
-| NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
+| NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates in its bottom 14.5 MiB; above it, two 512 KiB regions for a staged controller update and the image it replaced (see "The bootloader and updates"); 512 KiB unassigned | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a
 power cut mid-write. A corrupted log must never be able to stop the site or
@@ -1169,7 +1169,7 @@ shows. An output without a declared fail state is not configured.
 
 | Output | Fail state | Held by | Notes |
 |---|---|---|---|
-| `RUN`, `KICK`: the generator contact, through board B | Open | Board B's run-enable monostable drops the contact when the kick stops; the firmware drives both lines low at the reset vector before anything else, and the bootloader does the same | ST's system bootloader on an empty flash can drive `RUN` high and pulse `KICK` (origin89hq/hardware#30), so there is never an empty-flash window: dual-bank swap, and `o89-boot` written at manufacture into both banks. Revision B pulls both down at the MCU (A-34). Any reset opens the contact on revision A; revision B's ride-through is 15 s (B-20), and a resumed automatic start re-raises `RUN` within 3 s (F-016) |
+| `RUN`, `KICK`: the generator contact, through board B | Open | Board B's run-enable monostable drops the contact when the kick stops; the firmware drives both lines low at the reset vector before anything else, and the bootloader does the same | ST's system bootloader on an empty flash can drive `RUN` high and pulse `KICK` (origin89hq/hardware#30), so there is never an empty-flash window: `o89-boot` is written at manufacture and never erased, and an update is copied in from the NOR. Revision B pulls both down at the MCU (A-34). Any reset opens the contact on revision A; revision B's ride-through is 15 s (B-20), and a resumed automatic start re-raises `RUN` within 3 s (F-016) |
 | The three RS-485 transmit lines | High, idle | Firmware, from the reset vector | Through reset the drivers float and hold the buses low (origin89hq/hardware#28). Every image configures all three USARTs |
 | The module lines: transmit, RTS, `EN`, `BOOT` | Inputs, or driven low; never high | Firmware | Input or low from before the rail drops until after it is up, so nothing back-powers an unpowered module (origin89hq/hardware#17, F-003). `EN` is driven low on purpose across every rail cycle and released after the rail settles (origin89hq/hardware#14) |
 | The comms processor's UART0 transmit and RTS, GPIO16 and GPIO5 | Not driven: high-impedance through the module's reset, a brown-out that resets it, and with the rail off | The ESP32-C6's pads (datasheet v1.5, table 2-1); neither net has a pull on board A | Released from reset, GPIO16 is the ROM's UART0 transmit, enabled with a weak pull-up and idle high, and GPIO5 an input with no pull, until the firmware's second statement makes them UART0's TX and RTS. So the controller's `PB7` and `PB4` float while the module is held in reset or unpowered, when USART1 is down (F-003, F-006), and `PB4` floats from the module's reset until the firmware takes its RTS: a controller write there may be held by a CTS reading high, and every write has a deadline and every request a retry (L-015, L-192). Measured on board A: bench 2026-09-19 §7 |
@@ -1291,51 +1291,74 @@ Not now: formal verification, redundant or lockstep MCUs, ECC, a
 certification process. Those answer failure rates for which there is no
 evidence yet.
 
-## The bootloader and A/B
+## The bootloader and updates
 
-The part's flash is two 256 KB banks it swaps in hardware by an option bit,
-so the application always links at one address and an update is: erase the
-inactive bank, program it, verify the manifest, flip the bit, reset. No copy
-and no half-copied window; an interrupted copy is exactly the empty-flash
-window origin89hq/hardware#30 describes, which is why `embassy-boot`'s
-copy-based scheme is not used. The HAL erases and programs either bank but
-never writes option bytes on this part; the bootloader does that through the
-PAC in one audited function, one of the five `unsafe` sites in the firmware,
-with the bootloader's jump into the application, the controller's hard-fault
-handler, and the polls of the supervisor's and the control executor from
-their interrupts.
+Revision A's part has 512 KB of flash in two 256 KB banks, and it does not
+swap them. The bootloader owns the bottom 16 KB and the application links at
+`0x08004000` into one region of 496 KB that runs across the bank boundary;
+the bank-swap option bit is never set, so bank 1 is always at the bottom.
+A/B across the two banks would leave the image one bank less the bootloader,
+248 KB, and the controller outgrew that with invites and removal (#184),
+before RS-485 devices, the generator behaviours, readings and history
+([#185](https://github.com/origin89hq/firmware/issues/185)). Revision B keeps
+A/B on a part with at least 1 MB of dual-bank flash
+([origin89hq/hardware#57](https://github.com/origin89hq/hardware/issues/57)),
+so the layout is per revision: `o89-boot/memory.x`, `o89-controller/memory.x`,
+the bootloader's `APPLICATION` and the gate's budget in `xtask/src/images.rs`
+state revision A's, and a revision B board gets its own.
 
-The invariants that make A/B what it claims:
+**An update is staged on the NOR.** The application writes the image the
+comms processor delivers into the free one of two 512 KiB image regions on
+the W25Q128, just past the log ring (`recorder.rs` names them so the ring
+cannot grow into them). The bootloader verifies the manifest's signature over
+NOR reads, and only then erases the application region and copies the image
+in. The image it replaced stays in the other region as the rollback target.
+`embassy-boot`'s copy-based scheme was declined for A/B because its
+interrupted copy was an empty-flash window; with the bootloader never erased
+that reason is gone, and its external-flash DFU partition is weighed again in
+M7.
 
-- **At no instant are there zero bootable images.** The selected bank is
-  never erased, and the flip is the last step after the whole inactive bank
-  has been written and verified, so at the instant of the flip both banks
-  hold a bootloader and a verified image: whichever bank the part selects
-  afterwards — the old, the new, or whatever it loads after an option-byte
-  write it could not verify — boots. No bank is ever empty after
-  manufacture, so the empty check that starts the system bootloader
-  (origin89hq/hardware#30) cannot fire. What the reference manual settles in
-  M7, before this is relied on, is what the part does with an option word
-  whose complement does not match — which values it loads, and whether
-  read-out protection is among them — and the bench test is an option-byte
-  write interrupted at every step.
-- **The bootloader is written at manufacture into both banks and never by an
-  update.** The updater refuses a manifest that covers the first 8 KB, and
-  the bootloader checks its twin at boot. Without that rule a bad release
-  puts a broken bootloader in the new bank and nothing ever flips back.
-- **Trial boots are counted and the flip-back is performed by the
-  bootloader**, not the application; an image that never confirms healthy is
-  rolled back without its cooperation.
+The invariants that make this what it claims:
+
+- **At no instant are there zero bootable images.** The bootloader is never
+  erased after manufacture, so the flash never reads empty and the empty
+  check that starts the system bootloader
+  ([origin89hq/hardware#30](https://github.com/origin89hq/hardware/issues/30))
+  cannot fire. Which word that check reads with the part in dual-bank mode
+  is settled against RM0444 in M7, before this is relied on. The application
+  region is erased only by the bootloader and only once a verified image is on
+  the NOR, and a copy cut at any step resumes on the next boot from a journal
+  and that image, so no boot finds a half-copied region and nothing to finish
+  it with.
+- **The bootloader is written at manufacture and never by an update.** The
+  updater refuses a manifest that covers the first 16 KB. Without that rule
+  a bad release puts a broken bootloader on the part and nothing ever rolls
+  back.
+- **Trial boots are counted and the rollback is performed by the
+  bootloader**, which copies the previous image back from the NOR; an image
+  that never confirms healthy is rolled back without its cooperation, and
+  neither step needs the comms processor, so the week without it still holds.
 - **The manifest carries a monotonic anti-rollback index**, and a downgrade
   below it is refused without the gesture.
 
-The bootloader does four things: drives `RUN` and `KICK` low, verifies the
-selected bank's manifest signature, counts trial boots and flips back, and
-jumps. It is frozen by the first unit that ships with read-out protection.
-The signature algorithm, where the public key sits, and where the
-highest-confirmed-healthy index is stored so the running image cannot lower
-it are decided in M7 against the reference manual and recorded in KM43's
-manifest specification
+What it costs. The bootloader carries a NOR driver, a signature check over
+NOR reads and a journaled copy; 16 KB is the estimate, against 8 KB for a bank
+flip. An update is about ten seconds of erase and program with no application
+running, so the bootloader's copy is bounded per page and keeps the watchdog
+fed. On revision A any reset already opens the contact, so the exposure is a
+longer reboot. A NOR that fails stops updates and rollback, and the running
+image keeps running. No option byte is ever written, so the audited
+option-byte function A/B needed is not an `unsafe` site. The bench test is
+an update cut at every step of the copy, and a rollback cut at every step, on
+board A.
+
+The bootloader does four things: drives `RUN` and `KICK` low, finishes or
+rolls back an update staged on the NOR, counts trial boots, and jumps. It is
+frozen by the first unit that ships with read-out protection. The signature
+algorithm, where the public key sits, where the copy's journal and the trial
+count live, and where the highest-confirmed-healthy index is stored so the
+running image cannot lower it are decided in M7 against the reference manual
+and recorded in KM43's manifest specification
 ([origin89hq/km43#34](https://github.com/origin89hq/km43/issues/34)).
 
 **Two firmwares, two roles in an update.** The comms processor *delivers* the
@@ -1497,9 +1520,11 @@ the bench. ESP-IDF's eFuse
 anti-rollback would refuse the factory image the first time its counter
 advanced, so the eFuse counter stays untouched and no-downgrade is enforced
 at the controller's authorisation (L-169). Kept open, not in V1: the
-controller has 16 MB of NOR and the authorised comms image is under 2 MB, so
-a controller that keeps the last authorised image can reflash a dead module
-through the ROM with no client and no drive.
+authorised comms image is under 2 MB, so a controller that keeps the last
+authorised image on its NOR can reflash a dead module through the ROM with no
+client and no drive. The NOR has 512 KiB free above the controller's image
+regions, so that image would take about 1.5 MiB from the log ring, 18 of its
+176 days.
 
 **Transports in V1**: BLE GATT is required for initial pairing from the
 native phone app, before site Wi-Fi is configured and without internet.
@@ -1778,7 +1803,7 @@ recovery-window qualification with the radio remain the bench exit for
 ## Because it will become a product
 
 Four things cannot be retrofitted to fielded hardware, so they are in from
-unit #1 regardless of scope: **the bootloader with A/B and rollback**,
+unit #1 regardless of scope: **the bootloader with rollback**,
 **per-device keys**, **protocol versioning**, and **serial numbers**.
 Everything else waits for evidence. The standard being aimed at is not exotic
 engineering; it is field data folded back into defaults, from three sites

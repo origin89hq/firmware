@@ -2,10 +2,9 @@
 //!
 //! The number is the `.bin`, never the ELF: an ELF here is mostly DWARF, which
 //! stays on the laptop, and reading `ls -l` on it reports an image four times
-//! the flash it goes into. The controller's budget is one dual-bank slot less
-//! the bootloader's 8 KB, which is 248 KB and not the part's 512; a firmware
-//! that fits the part and not the slot builds, flashes, ships, and fails its
-//! first update in a cabin.
+//! the flash it goes into. On revision A an update is staged on the NOR and
+//! copied into the one application region, so the controller's budget is
+//! the part's 512 KB less the bootloader's 16 KB: 496 KB, not 512 (#185).
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -63,17 +62,15 @@ const IMAGES: &[Image] = &[
         package: "o89-boot",
         target: CORTEX_M0,
         kind: Kind::RawBinary,
-        budget: 8 * KIB,
+        budget: 16 * KIB,
         margin: KIB,
     },
     Image {
         package: "o89-controller",
         target: CORTEX_M0,
         kind: Kind::RawBinary,
-        budget: 248 * KIB,
-        // 24 KB until key agreement took the image to 242,336 bytes;
-        // winning the room back is #175.
-        margin: 8 * KIB,
+        budget: 496 * KIB,
+        margin: 24 * KIB,
     },
     Image {
         package: "o89-comms",

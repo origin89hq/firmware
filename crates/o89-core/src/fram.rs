@@ -372,7 +372,7 @@ impl<const N: usize> Record<N> {
 /// A record with its body's length known at run time rather than in the
 /// type: the code every record shares. Typed, each of a dozen body sizes
 /// carried its own copy of the reads, the check and the five-step write,
-/// about 450 bytes apiece of a 248 KB slot; here there is one, and
+/// about 450 bytes apiece of the image budget; here there is one, and
 /// [`Record`] only lends it buffers of the right length.
 #[derive(Debug, Clone, Copy)]
 struct Slots {

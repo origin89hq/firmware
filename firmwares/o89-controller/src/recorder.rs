@@ -34,7 +34,7 @@ use o89_core::{
 
 use crate::fram::Lease;
 use crate::mailbox;
-use crate::nor::{JEDEC, Nor, SECTOR};
+use crate::nor::{CAPACITY, JEDEC, Nor, SECTOR};
 use crate::rtc::CalendarClock;
 use crate::selector;
 use crate::supervisor::check_in;
@@ -130,10 +130,26 @@ pub fn cancel_offers() {
     while TIME_ANSWER.try_receive().is_ok() {}
 }
 
-/// The ring's span: 14.5 MiB of the 16, in sectors. The rest is for the
-/// aggregates and, later, the last authorised comms image.
+/// The ring's span: 14.5 MiB of the 16, in sectors, from the bottom of the
+/// part. What sits above it is [`IMAGE_REGIONS`].
 pub const RING_BLOCKS: u32 = 3712;
-const _: () = assert!((RING_BLOCKS as usize) * SECTOR <= 16 * 1024 * 1024);
+
+/// Where revision A stages a controller update and keeps the image it
+/// replaced, in bytes from the bottom of the part: just past the ring, 512 KiB
+/// each, which holds the 496 KB application region with room for a manifest
+/// (#185). The updater and the bootloader that use them are M7; they are
+/// named here so the ring cannot grow into them.
+const IMAGE_REGIONS: [usize; 2] = [RING_END, RING_END + IMAGE_REGION];
+const IMAGE_REGION: usize = 512 * 1024;
+const RING_END: usize = RING_BLOCKS as usize * SECTOR;
+const _: () = {
+    // Back to back from the ring's end, and both on the part.
+    assert!(IMAGE_REGIONS[1] + IMAGE_REGION <= CAPACITY);
+    // Whole 64 KiB blocks, so an image region erases by the block.
+    assert!(IMAGE_REGIONS[0].is_multiple_of(64 * 1024) && IMAGE_REGION.is_multiple_of(64 * 1024));
+    // Room for the application region the bootloader copies into.
+    assert!(IMAGE_REGION >= 496 * 1024);
+};
 
 /// How often the task looks at the mailbox and checks in; its window on
 /// the roll is thirty seconds.

@@ -84,25 +84,25 @@ chip := "STM32G0B1RETx"
 controller_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-controller"
 comms_elf := "firmwares/target/riscv32imac-unknown-none-elf/release/o89-comms"
 boot_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-boot"
-boot_bin := "firmwares/target/thumbv6m-none-eabi/release/o89-boot.bin"
 
-# Flash the bootloader into both banks of the controller: the ELF at
-# 0x08000000, the same bytes as a `.bin` at 0x08040000, then a reset, because
+# Flash the bootloader at 0x08000000, then reset the part, because
 # `probe-rs download` leaves the part halted in its flash loader with every
 # pin an input, and the transceivers drive their buses low on a floating DI
 # (origin89hq/hardware#28). Effect: the part boots through the bootloader,
-# which drives RUN and KICK low and jumps to 0x08002000. Recovery:
+# which drives RUN and KICK low and jumps to 0x08004000. Recovery:
 # `just flash-controller` if the application is not there yet; the part
-# waits with the lines low until it is.
+# waits with the lines low until it is. A board flashed before #185 has an
+# 8 KB bootloader that jumps to 0x08002000: run this before its first
+# `flash-controller`, or its old bootloader jumps into the middle of the
+# new image.
 #
-# Flash the bootloader into both banks of the controller, then reset it.
+# Flash the bootloader into the controller, then reset it.
 flash-boot: sizes
     firmwares/frozen-watchdog.sh sh -c '\
       probe-rs download --chip {{chip}} --verify {{boot_elf}} && \
-      probe-rs download --chip {{chip}} --verify --binary-format bin --base-address 0x08040000 {{boot_bin}} && \
       probe-rs reset --chip {{chip}}'
 
-# Flash the production controller image at 0x08002000, then reset the part:
+# Flash the production controller image at 0x08004000, then reset the part:
 # `probe-rs download` alone leaves it halted in its flash loader with every
 # pin an input, which is a controller that runs nothing and buses driven low
 # by floating DIs (origin89hq/hardware#28). Needs the bootloader in front of
@@ -112,7 +112,7 @@ flash-boot: sizes
 # `just run-controller-bench` to bypass the bootloader, after which
 # `just flash-boot` has to come before the next production flash.
 #
-# Flash the production controller image at 0x08002000 and reset the part.
+# Flash the production controller image at 0x08004000 and reset the part.
 flash-controller: sizes
     firmwares/frozen-watchdog.sh sh -c '\
       probe-rs download --chip {{chip}} --verify {{controller_elf}} && \
@@ -130,13 +130,13 @@ run-controller:
     flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release
 
 # Flash and run the BENCH image: linked at 0x08000000 with no bootloader, and
-# carrying the one-shot proofs. Effect: overwrites the bootloader's 8 KB in
-# bank 1, starves the watchdog fifteen seconds into a boot the watchdog did
+# carrying the one-shot proofs. Effect: overwrites the bootloader's 16 KB,
+# starves the watchdog fifteen seconds into a boot the watchdog did
 # not cause, panics fifteen seconds into the boot after a watchdog reset, and
 # runs from the boot after that. Never on a unit that will take an update.
 # Recovery: `just flash-boot` then `just flash-controller` restore the
 # production layout. `flash-controller` alone does not: it writes from
-# 0x08002000 up, the bench image's vector table stays at the bottom, and every
+# 0x08004000 up, the bench image's vector table stays at the bottom, and every
 # reset jumps into the production image's code at the bench image's
 # addresses. That reads as a firmware fault: a reset loop or a lockup at a PC
 # inside no function's first instruction (bench 2026-09-25). Check with

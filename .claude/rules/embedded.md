@@ -1,9 +1,10 @@
 # Embedded
 
 - **Controller:** STM32G0B1RE, Cortex-M0+, no FPU, no compare-and-swap,
-  144 KB RAM. Two 256 KB banks swapped by an option bit; the image budget is
-  one bank less the bootloader's 8 KB — **248 KB, never 512**. No floating
-  point in interrupts or hot paths; software float is fine at 1 Hz.
+  144 KB RAM. Revision A stages updates on the NOR and never swaps banks;
+  the image budget is 512 KB less the bootloader's 16 KB — **496 KB, never
+  512** (#185). Revision B keeps A/B on a larger part. No floating point
+  in interrupts or hot paths; software float is fine at 1 Hz.
 - **Comms processor:** ESP32-C6, bare-metal `esp-hal`. `esp_hal::init`
   disables every watchdog; the firmware re-arms one as its first statement.
 - **The board is a firmware concept.** `docs/BOARD-A.md` carries the pin map

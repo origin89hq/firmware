@@ -1,14 +1,16 @@
-/* The image budget, which is not the part's flash.
+/* The image budget on revision A: the part's flash less the bootloader.
  *
- * The STM32G0B1RE has 512 KB in two banks the part swaps by an option bit. An
- * image lives in one bank while the other holds the one it is replacing, so
- * the budget is one bank, 256 KB, less the 8 KB at its bottom that the
- * bootloader owns. A firmware that fits the part and not the slot builds,
- * flashes, ships, and fails its first update in a cabin.
+ * The STM32G0B1RE has 512 KB in two banks. Revision A does not swap them: an
+ * update is staged and verified on the NOR and copied into this one region by
+ * the bootloader, with the previous image kept on the NOR for a rollback
+ * (#185). So the budget is 512 KB less the 16 KB at the bottom that the
+ * bootloader owns, and the region runs across the bank boundary at
+ * 0x08040000. Revision B keeps A/B on a larger part (origin89hq/hardware#57)
+ * and will have its own map.
  */
 MEMORY
 {
-  FLASH : ORIGIN = 0x08002000, LENGTH = 248K
+  FLASH : ORIGIN = 0x08004000, LENGTH = 496K
   RAM   : ORIGIN = 0x20000000, LENGTH = 136K
   /* The bench tool's mailbox and the bridge's rings: the last 8 KiB, out
    * of the stack's way and never loaded or zeroed by the runtime, at the
