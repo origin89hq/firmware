@@ -16,20 +16,37 @@
 # its value after a power-on reset, and no firmware of ours writes it. A
 # unit left frozen by a thaw that failed is cleared by its next power cycle.
 #
+# It also disarms the vector catches before the command and after it
+# (#155). By default `probe-rs attach` and `probe-rs run` arm the reset and
+# hard-fault catches in DEMCR and leave them armed when they end, and only a power-on
+# reset clears them: every later reset, a watchdog's or the firmware's own,
+# then stops the core on its first instruction until a probe runs it, and a
+# hard fault halts instead of reaching the firmware's handler. DEMCR is 0
+# after a power-on reset, and 0 is what is written back.
+#
 # Usage: frozen-watchdog.sh COMMAND [ARG...]
 set -euo pipefail
 
 chip=STM32G0B1RETx
 apb_fz1=0x40015808
 iwdg_stop=0x1000
+demcr=0xE000EDFC
 
+# Both writes are tried, whichever fails.
 thaw() {
+    local status=0
     if ! probe-rs write --chip "$chip" b32 "$apb_fz1" 0; then
         echo "frozen-watchdog: the IWDG freeze was not cleared; power-cycle the controller" >&2
-        return 1
+        status=1
     fi
+    if ! probe-rs write --chip "$chip" b32 "$demcr" 0; then
+        echo "frozen-watchdog: the vector catches were not disarmed; power-cycle the controller" >&2
+        status=1
+    fi
+    return "$status"
 }
 
+probe-rs write --chip "$chip" b32 "$demcr" 0
 probe-rs write --chip "$chip" b32 "$apb_fz1" "$iwdg_stop"
 trap 'status=$?; thaw || status=1; exit "$status"' EXIT
 

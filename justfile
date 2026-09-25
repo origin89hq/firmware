@@ -73,9 +73,11 @@ comms-bootloader:
 # and the recovery path. Board B is plugged and unplugged with 12 V off.
 #
 # Every controller flash, here and through the crates' `probe-rs run`
-# runners, goes through `firmwares/frozen-watchdog.sh`: the IWDG is frozen
-# while the probe holds the core halted and thawed when the command ends. It
-# does not stop the watchdog boot record a flash can leave (#125).
+# runners, and every attach and reset goes through
+# `firmwares/frozen-watchdog.sh`: the IWDG is frozen while the probe holds
+# the core halted and thawed when the command ends, and the vector catches
+# a probe session leaves armed are disarmed around it (#155). It does not
+# stop the watchdog boot record a flash can leave (#125).
 # ---------------------------------------------------------------------------
 
 chip := "STM32G0B1RETx"
@@ -161,18 +163,20 @@ run-comms-devkit:
 
 # Read the defmt log of whatever the controller is running, without flashing
 # or resetting it: the way to read a boot record after a reset the probe did
-# not cause. `elf` is the image on the part, for the log's strings.
+# not cause. `elf` is the image on the part, for the log's strings. A reset
+# during the attach runs through, rather than ending it with the core held
+# at its reset vector (#155).
 #
 # Read the controller's log without flashing or resetting it.
 attach-controller elf=controller_elf:
-    probe-rs attach --chip {{chip}} {{elf}}
+    firmwares/frozen-watchdog.sh probe-rs attach --chip {{chip}} --no-catch-reset {{elf}}
 
 # Reset the controller through the probe. Effect: a pin-class reset; the
 # boot record on the next attach says so.
 #
 # Reset the controller through the probe.
 reset-controller:
-    probe-rs reset --chip {{chip}}
+    firmwares/frozen-watchdog.sh probe-rs reset --chip {{chip}}
 
 # MASS ERASE the controller. Effect: an empty flash, on which the ST system
 # bootloader runs and can pull RUN to 2.1-2.6 V and pulse KICK
