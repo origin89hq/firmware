@@ -27,7 +27,7 @@
 
 use km43::Epoch;
 
-use crate::body::{Held, Kept, Malformed};
+use crate::body::{Held, Kept, Malformed, Unverified};
 use crate::boot_count::{BOOT_COUNT_BYTES, BootCount};
 use crate::clients::{Clients, Repaired, Unrepaired};
 use crate::drbg::{DRBG_BYTES, DrbgState};
@@ -84,8 +84,9 @@ pub enum NoEpoch<E> {
     Corrupt,
     /// A record that holds and does not decode: a zero.
     Malformed(Malformed),
-    /// A fresh unit whose first epoch would not land.
-    Refused(Refused<E>),
+    /// A fresh unit whose first epoch would not land, or did not read back
+    /// as written.
+    Refused(Unverified<E>),
     /// The record is behind a slot's epoch and raising it would not land.
     /// Enrolling under the record would issue names the move to the slot's
     /// epoch was made to retire, so nothing is enrolled.
@@ -94,8 +95,8 @@ pub enum NoEpoch<E> {
         record: Epoch,
         /// What the table is under.
         table: Epoch,
-        /// Why the raise did not land.
-        refused: Refused<E>,
+        /// Why the raise did not land, or did not read back as written.
+        refused: Unverified<E>,
     },
     /// A generation mark could not be read and the epoch it needed advanced
     /// did not land: a table that cannot be trusted and no new epoch to
@@ -256,7 +257,9 @@ impl Store {
 
         let mut at_boot = match *epoch.held() {
             Held::Present(held) => EpochAtBoot::Held(held),
-            Held::Absent => match epoch.write(fram, Epoch::FIRST).await {
+            // Read back (P-085): a first epoch the part does not hold would
+            // enrol names the next boot mints again.
+            Held::Absent => match epoch.write_verified(fram, Epoch::FIRST).await {
                 Ok(()) => EpochAtBoot::First,
                 Err(refused) => EpochAtBoot::None(NoEpoch::Refused(refused)),
             },
@@ -268,7 +271,7 @@ impl Store {
         if let (Some(record), Some(table)) = (at_boot.epoch(), clients.highest_epoch())
             && table > record
         {
-            at_boot = match epoch.write(fram, table).await {
+            at_boot = match epoch.write_verified(fram, table).await {
                 Ok(()) => EpochAtBoot::Raised {
                     from: record,
                     to: table,
@@ -435,6 +438,9 @@ mod tests {
         /// An address a read touching it is refused at, for a bus that
         /// fails partway through a boot.
         refuse_reads_at: Option<u16>,
+        /// Addresses whose writes are acknowledged and never land: what a
+        /// read-back exists to catch.
+        loses: Option<core::ops::Range<usize>>,
         /// Bytes landed since power-up, and the one the power is cut
         /// before, if a cut is scheduled.
         landed: usize,
@@ -451,6 +457,7 @@ mod tests {
                 bytes: [0; PART_BYTES],
                 falling: false,
                 refuse_reads_at: None,
+                loses: None,
                 landed: 0,
                 cut_at: None,
             }
@@ -502,7 +509,15 @@ mod tests {
                 if self.cut_at.is_some_and(|cut| self.landed >= cut) {
                     return core::future::ready(Err(Refused::Bus(())));
                 }
-                self.bytes[start.saturating_add(offset)] = *byte;
+                let address = start.saturating_add(offset);
+                if self
+                    .loses
+                    .as_ref()
+                    .is_some_and(|lost| lost.contains(&address))
+                {
+                    continue;
+                }
+                self.bytes[address] = *byte;
                 self.landed = self.landed.saturating_add(1);
             }
             core::future::ready(Ok(()))
@@ -1110,7 +1125,7 @@ mod tests {
             EpochAtBoot::None(NoEpoch::Regressed {
                 record: Epoch::FIRST,
                 table: epoch(2),
-                refused: Refused::SupplyFalling,
+                refused: Unverified::Refused(Refused::SupplyFalling),
             })
         );
         assert_eq!(report.clients, None);
@@ -1284,6 +1299,50 @@ mod tests {
         assert_eq!(store.panics.present().map(|r| r.boot), Some(1));
     }
 
+    /// The epoch record's two copies, as addresses.
+    fn epoch_record() -> core::ops::Range<usize> {
+        let end = usize::from(map::EPOCH.end().0);
+        end.saturating_sub(slot_bytes(EPOCH_BYTES).saturating_mul(2))..end
+    }
+
+    #[test]
+    fn p_085_a_first_epoch_that_does_not_read_back_is_no_epoch() {
+        let mut part = Part::fresh();
+        part.loses = Some(epoch_record());
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::None(NoEpoch::Refused(Unverified::Disagreed))
+        );
+        assert_eq!(report.clients, None);
+        assert!(!opens(&report), "no window under an epoch the part lacks");
+        assert_eq!(store.epoch.present(), None);
+    }
+
+    #[test]
+    fn p_085_p_239_a_raise_that_does_not_read_back_enrols_nothing_under_the_record() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let _ = enrolled(&mut store, &mut part, 1);
+        // The table moves to epoch 2 while the record stays behind.
+        damage(&mut part, map::GENERATION_MARKS[0]);
+        let (mut store, _) = boot(&mut part, None);
+        let _ = enrolled(&mut store, &mut part, 2);
+        block_on(store.epoch.write(&mut part, Epoch::FIRST)).expect("the supply is fine");
+        part.loses = Some(epoch_record());
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(
+            report.epoch,
+            EpochAtBoot::None(NoEpoch::Regressed {
+                record: Epoch::FIRST,
+                table: epoch(2),
+                refused: Unverified::Disagreed,
+            })
+        );
+        assert_eq!(report.clients, None);
+        assert_eq!(store.epoch.present(), Some(&Epoch::FIRST));
+    }
+
     #[test]
     fn a_boot_on_a_falling_supply_reads_everything_and_reports_every_write_it_could_not_make() {
         let mut part = Part::fresh();
@@ -1292,7 +1351,9 @@ mod tests {
         let (store, report) = boot(&mut part, Some(words));
         assert_eq!(
             report.epoch,
-            EpochAtBoot::None(NoEpoch::Refused(Refused::SupplyFalling))
+            EpochAtBoot::None(NoEpoch::Refused(Unverified::Refused(
+                Refused::SupplyFalling
+            )))
         );
         assert_eq!(report.clients, None);
         assert_eq!(report.boot, BootCount::FIRST);
