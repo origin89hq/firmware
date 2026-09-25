@@ -530,9 +530,10 @@ and deinitialize before another scan or join, and the core completes an
 unfinished accepted scan as failed. The core reports `no_ip` after four seconds
 associated without IPv4, continues trying, and reports `lost` on association
 loss. The DHCP client resends DISCOVER after two seconds, so one lost
-DISCOVER is resent before `no_ip` is reported. A country-only configuration enables a dormant station beside the
-provisioning AP so scanning works without attempting a station association.
+DISCOVER is resent before `no_ip` is reported. A country-only configuration
+brings the station interface up without joining, so scanning works without
+attempting a station association.
 
 Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
 [#143](https://github.com/origin89hq/firmware/issues/143), KM43 L-200 to
-L-206; pinned esp-radio's AP-only scan restriction.
+L-206.
