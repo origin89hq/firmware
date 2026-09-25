@@ -4,11 +4,11 @@
 //! the link, the rail and the other connections go on.
 use std::cell::Cell;
 
-use km43::{Generation, PairRefusal, PrintedSecret};
+use km43::{Generation, PairRefusal, PrintedSecret, Role};
 use o89_core::{Outgoing, Tick};
 
 use super::*;
-use crate::link::{agreement, enrolment, manufactured};
+use crate::link::{agreement, holding, manufactured, unit_as};
 
 /// Every heartbeat the controller put on the wire, by tick.
 fn beats(bench: &Bench) -> Vec<Tick> {
@@ -362,14 +362,19 @@ fn pair_directly(
 #[test]
 fn p_239_a_reclaim_cut_at_every_step_leaves_the_old_install_or_a_free_slot_or_the_new_one() {
     // Capabilities: none; the cuts are behind the storage seam. A full table
-    // with install 1 as "phone" at slot 1; install 9 pairs as "phone" and
-    // reclaims it (P-240 step 3).
-    let (mut start, mut keys) = unit();
+    // P-258 permits, with install 1 as the admin "phone" at slot 1; install 9
+    // pairs as "phone" and reclaims it (P-240 step 3).
+    let (mut start, mut keys) = unit_as(Role::Admin);
     let epoch = keys.epoch.expect("an epoch");
     for n in 2..=8u8 {
+        let role = match n {
+            2 => Role::Owner,
+            8 => Role::Viewer,
+            _ => Role::Admin,
+        };
         block_on(keys.clients.enrol(
             ClientId::new(u32::from(n)).unwrap(),
-            enrolment(n, "other", ClientKind::App),
+            holding(role, n, "other", ClientKind::App),
             epoch,
             &mut start,
         ))
@@ -402,10 +407,12 @@ fn p_239_a_reclaim_cut_at_every_step_leaves_the_old_install_or_a_free_slot_or_th
                 .expect("a mark");
             match keys.clients.occupant(slot, epoch) {
                 Some(occupant) if occupant.client().matches(&old) => {
+                    assert_eq!(occupant.role(), Role::Admin, "cut at {step}");
                     assert!(!gone.get(), "cut at {step}: the old key came back");
                     assert_eq!(occupant.generation(), Generation::FIRST, "cut at {step}");
                 }
                 Some(occupant) if occupant.client().matches(&new) => {
+                    assert_eq!(occupant.role(), Role::Admin, "cut at {step}");
                     gone.set(true);
                     reclaimed += 1;
                     let issued = Generation::new(2).unwrap();

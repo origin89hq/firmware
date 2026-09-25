@@ -15,7 +15,7 @@ use std::num::NonZeroU16;
 use embassy_futures::block_on;
 use km43::{
     ClientId, ClientKind, DeviceId, Entropy, Epoch, FrameReader, FrameWriter, LinkMessageType,
-    LogSeq, MAX_FRAME, MAX_PAYLOAD, Received, ReqId, SessionId, StaticKey, Suite, Version,
+    LogSeq, MAX_FRAME, MAX_PAYLOAD, Received, ReqId, Role, SessionId, StaticKey, Suite, Version,
 };
 use o89_core::{
     Action, Actions, Agreement, Birth, BootCount, BootId, CUT_AFTER, ClientLabel, Compat,
@@ -77,9 +77,15 @@ pub(crate) fn agreement() -> Agreement {
     Agreement::new(&secret(), &controller())
 }
 
-/// What slot `n` holds when install `n` is enrolled there under `label`:
-/// its key, and the admission key the controller computes from it (P-238).
+/// What slot `n` holds when install `n` is enrolled there under `label` as
+/// an admin: its key, and the admission key the controller computes from
+/// it (P-238).
 pub(crate) fn enrolment(n: u8, label: &str, kind: ClientKind) -> Enrolment {
+    holding(Role::Admin, n, label, kind)
+}
+
+/// [`enrolment`] with `role`.
+pub(crate) fn holding(role: Role, n: u8, label: &str, kind: ClientKind) -> Enrolment {
     let client = client_key(n).public();
     let admit = controller()
         .key()
@@ -89,6 +95,7 @@ pub(crate) fn enrolment(n: u8, label: &str, kind: ClientKind) -> Enrolment {
         client,
         admit: *admit.to_stored(),
         suite: Suite::X25519ChachapolySha256,
+        role,
         kind,
         label: ClientLabel::new(label).expect("fits"),
     }
@@ -135,16 +142,21 @@ pub(crate) fn reread(part: &mut SimFram) -> Option<Keys> {
 }
 
 /// A manufactured unit with one client, a phone, enrolled at slot 1 under
-/// install 1's key: the store booted on the part, and what the sessions
-/// take from it.
+/// install 1's key as the owner the first pairing makes it (P-250): the
+/// store booted on the part, and what the sessions take from it.
 pub(crate) fn unit() -> (SimFram, Keys) {
+    unit_as(Role::Owner)
+}
+
+/// [`unit`] with its phone holding `role`.
+pub(crate) fn unit_as(role: Role) -> (SimFram, Keys) {
     let mut part = manufactured();
     let (mut store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
     let epoch = report.epoch.epoch().expect("an epoch");
     let slot = ClientId::new(1).expect("a slot");
     block_on(store.clients.enrol(
         slot,
-        enrolment(1, "phone", ClientKind::App),
+        holding(role, 1, "phone", ClientKind::App),
         epoch,
         &mut part,
     ))
