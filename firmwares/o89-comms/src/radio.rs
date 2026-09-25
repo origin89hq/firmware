@@ -113,7 +113,12 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
         match plan {
             Plan::Off => {}
             Plan::Station | Plan::Scan { .. } => {
-                session(wifi.reborrow(), &mut held, plan).await;
+                if !session(wifi.reborrow(), &mut held, plan).await {
+                    // Nothing was started, so nothing needs taking down:
+                    // try again on the next turn.
+                    Timer::after_secs(1).await;
+                    continue;
+                }
                 // A session ends when the record, the plan or a stuck scan
                 // says the radio must stop. On the pinned radio, stopping,
                 // disconnecting or deinitializing a started station each left
@@ -170,18 +175,26 @@ fn seed() -> u64 {
     (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random())
 }
 
-async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) {
+/// Run `plan` until it has to end, and whether it created the Wi-Fi driver:
+/// only a created driver needs the reboot to be taken down. A record the
+/// station cannot use is refused before the driver exists, so it retries
+/// quietly rather than rebooting the module at every boot.
+async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) -> bool {
     let Some(record) = desired() else {
-        return;
+        return false;
     };
+    if matches!(plan, Plan::Station) && station_config(&record).is_none() {
+        return false;
+    }
     let Ok(mut controller) = WifiController::new(wifi, ControllerConfig::default()) else {
-        return;
+        return false;
     };
     match plan {
         Plan::Off => {}
         Plan::Station => station_session(&mut controller, held, record).await,
         Plan::Scan { country } => scan_session(&mut controller, country).await,
     }
+    true
 }
 
 /// The cached network alone.
