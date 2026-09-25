@@ -1558,14 +1558,28 @@ link-up. A clear erases the previous passphrase and retains only the version,
 country and hostname. Duplicate successful requests do not erase again.
 
 The Wi-Fi station starts after the recovery window and OTA confirmation,
-using that cache without waiting for the controller. Association, the network
+using that cache, once the controller has said whether its pairing window
+is open (L-195); without a controller there is no client to serve. Association, the network
 runner and NTP run concurrently within one Wi-Fi session, so a failed
 association does not hold up the UART or BLE tasks. Each reports
-progress before the link feeds the watchdog. A changed network record ends
-the session, dropping its sockets and interface before the controller; the
-radio driver then stops and deinitializes Wi-Fi. An unwritten clear keeps
-Wi-Fi off; a written clear retains the country, and the radio scans under it without joining. A later network record creates a fresh session from a reborrow
-of the owned peripheral, reusing the statically reserved stack resources.
+progress before the link feeds the watchdog. An unwritten clear keeps
+Wi-Fi off; a written clear retains the country, and the radio scans under
+it without joining. While the pairing window is open Wi-Fi stays off
+altogether (F-043).
+
+On esp-radio 1.0.0-beta.1 BLE and a running station do not share the radio.
+On board A, with the station joined, a phone found the advertisement within
+a second and never completed a BLE connection, twelve attempts of twelve,
+where with Wi-Fi never started it connected at once; the vendor's BLE-side
+coexistence callbacks are empty stubs. And disconnecting the station,
+stopping it, or dropping the last `WifiController` each left BLE advertising
+nothing until the module rebooted, while starting and joining did not
+(bench 2026-09-24). So Wi-Fi is off while a phone pairs, starting a station
+is the only transition the radio makes in place, and any session that ends,
+a changed record, a changed plan or a stuck scan, reboots the module
+through its recovery window into the new plan, after the station's mDNS
+goodbye. A window opened while the station runs costs that reboot; the
+window at boot does not, because Wi-Fi waits for its report.
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
 socket arrives at a full one, so the budget is a sum of named slots in

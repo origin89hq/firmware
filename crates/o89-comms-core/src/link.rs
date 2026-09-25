@@ -346,6 +346,15 @@ impl Link {
             .filter(|left| left.as_millis() > 0)
     }
 
+    /// Whether the controller's current boot has reported its pairing window
+    /// at all, open or closed (L-195). The radio waits for it before it
+    /// starts Wi-Fi, so a window open at boot is known before a station is
+    /// up that would have to be taken down again.
+    #[must_use]
+    pub const fn pairing_known(&self) -> bool {
+        self.pairing.is_some()
+    }
+
     /// Restore durable credentials before the first handshake.
     pub fn restore_network(&mut self, credential: Option<crate::Credential>) {
         self.network = crate::Network::new(credential);
@@ -2500,6 +2509,27 @@ mod tests {
                 .get(),
             2
         );
+    }
+
+    #[test]
+    fn l_195_the_window_is_unknown_until_the_controllers_boot_reports_it() {
+        let mut link = linked_at_boot();
+        assert!(!link.pairing_known(), "linked, nothing reported yet");
+        let mut buf = [0u8; 256];
+        // A closed report is knowledge too.
+        let _ = link.received(report(&mut buf, ReqId(8), 1, 0, 0), at(1_000));
+        assert!(link.pairing_known());
+        assert_eq!(link.pairing_window(at(1_000)), None);
+        let _ = link.received(report(&mut buf, ReqId(9), 2, 60_000, 0), at(2_000));
+        assert!(link.pairing_known());
+        assert!(link.pairing_window(at(2_000)).is_some());
+        // Another controller boot forgets it until that boot reports.
+        link.record(
+            CONTROLLER_BOOT.wrapping_add(1),
+            OURS,
+            Some(CONTROLLER_DEVICE),
+        );
+        assert!(!link.pairing_known());
     }
 
     #[test]
