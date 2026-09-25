@@ -249,6 +249,7 @@ async fn worker(
             }
             Either::Second(()) => continue,
         };
+        let accepted_at = Tick::from_millis(Instant::now().as_millis());
         let mut address = connection.peer_address().addr.into_inner();
         address.reverse();
         let admitted = {
@@ -263,7 +264,7 @@ async fn worker(
             };
             if let Ok(gatt) = connection.clone().with_attribute_server(server) {
                 if matches!(with_timeout(ANNOUNCE, announced(conn)).await, Ok(true)) {
-                    session(&gatt, rx, tx, conn, index, pipe).await;
+                    session(&gatt, rx, tx, conn, index, pipe, accepted_at).await;
                 }
                 // Cancel all local values before asking the controller to end the connection.
                 pipe.reset();
@@ -347,10 +348,10 @@ async fn session(
     conn: Conn,
     index: usize,
     pipe: &mut BlePipe,
+    since: Tick,
 ) {
     let mut stamped = [0; MAX_PAYLOAD];
     let mut subscribed = false;
-    let since = Tick::from_millis(Instant::now().as_millis());
     loop {
         pipe.expire(Instant::now().as_millis());
         // A connection that never subscribes gives its slot back.
