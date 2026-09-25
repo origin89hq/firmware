@@ -23,17 +23,22 @@
 //!
 //! Every slot carries the key its client proved at message 3, the
 //! admission key computed from it then (P-238), the suite it paired under,
-//! and the mask its kind was handed (P-105), all fixed until the next
-//! re-key. Nothing here runs a handshake; `km43` did that before anything
-//! in this file is asked.
+//! and its role (P-250), all fixed until the next re-key. The mask is the
+//! role's row and is never stored (P-105): `client_kind` is kept to be
+//! shown and decides nothing. Nothing here runs a handshake; `km43` did
+//! that before anything in this file is asked.
 //!
-//! cites: P-064, P-066, P-085, P-086, P-105, P-238, P-239, P-240
+//! **Which slot a pairing gets is decided here** (P-240), with the role
+//! ceilings of P-258 in its steps, because km43's `Allocation::choose`
+//! reads no role (origin89hq/km43#141).
+//!
+//! cites: P-064, P-066, P-085, P-086, P-105, P-238, P-239, P-240, P-250, P-258
 
 use core::fmt;
 
 use km43::{
-    AdmitKey, ClientCapability, ClientId, ClientKind, Epoch, Generation, KEY_BYTES, MAX_CLIENTS,
-    MAX_LABEL, PublicKey, SlotView, Suite,
+    AdmitKey, ClientCapability, ClientId, ClientKind, Epoch, Generation, KEY_BYTES, MAX_ADMINS,
+    MAX_CLIENTS, MAX_LABEL, MAX_VIEWERS, PublicKey, Role, Suite,
 };
 
 use crate::body::{Body, Held, Kept, Malformed, Reader, Unverified, Writer};
@@ -45,37 +50,44 @@ use crate::text::Text;
 /// The slots: one per `client_id` P-086 can allocate.
 pub const SLOTS: usize = MAX_CLIENTS;
 
-/// The bytes a key record budgets. The layout takes 110 of them.
+/// The bytes a key record budgets. The layout takes 109 of them.
 pub const KEY_RECORD_BYTES: usize = 128;
 
 /// The bytes a generation mark takes: one `u32`, zero for none issued.
 pub const MARK_BYTES: usize = 4;
 
-const LAYOUT: usize = 1 + 4 + 4 + 1 + KEY_BYTES + KEY_BYTES + 1 + (1 + MAX_LABEL) + 2;
+const LAYOUT: usize = 1 + 4 + 4 + 1 + KEY_BYTES + KEY_BYTES + 1 + 1 + (1 + MAX_LABEL);
 const _: () = assert!(LAYOUT <= KEY_RECORD_BYTES);
 
-/// The state byte of a free slot and of an occupied one.
+/// The state byte of a free slot and of an occupied one. 1 was the
+/// occupied layout before roles, which held the mask where the role is now:
+/// refused here, so its slot is freed at boot (P-239) rather than read a
+/// byte out of step. Never reuse it.
 const FREE: u8 = 0;
-const OCCUPIED: u8 = 1;
+const OCCUPIED: u8 = 2;
 
 /// A client's own name for itself, as the bytes `PairOffer` carried: byte
 /// equality is the only comparison P-240 permits, and a label past the cap
 /// is refused rather than truncated.
 pub type ClientLabel = Text<MAX_LABEL>;
 
-/// What an enrolment writes into a slot: everything message 3 proved and
-/// everything P-105 fixes from the offer.
+/// What an enrolment writes into a slot: the key it proved, what the
+/// client said of itself, and the role the controller decided.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Enrolment {
-    /// The static key message 3 proved (`IS`).
+    /// The static key the enrolment proved (`IS`).
     pub client: PublicKey,
     /// P-238's admission key, computed once from `cs` and `IS`.
     pub admit: [u8; KEY_BYTES],
     /// The suite the pairing ran.
     pub suite: Suite,
-    /// What `PairOffer` attested.
+    /// The role, which the caller decided: [`Place::role`] for a pairing
+    /// through the label, the invite's for an approved one (P-250). Never
+    /// derived from `kind`.
+    pub role: Role,
+    /// What the client said it was: shown, deciding nothing (P-105).
     pub kind: ClientKind,
-    /// What `PairOffer` named it.
+    /// What the client named itself.
     pub label: ClientLabel,
 }
 
@@ -87,9 +99,9 @@ pub struct Occupant {
     suite: Suite,
     client: PublicKey,
     admit: [u8; KEY_BYTES],
+    role: Role,
     kind: ClientKind,
     label: ClientLabel,
-    mask: ClientCapability,
 }
 
 impl Occupant {
@@ -123,7 +135,13 @@ impl Occupant {
         AdmitKey::from_stored(self.admit)
     }
 
-    /// The kind the client attested.
+    /// What the slot may do (P-250), fixed when it was written.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
+    /// The kind the client attested: shown, deciding nothing (P-105).
     #[must_use]
     pub const fn kind(&self) -> ClientKind {
         self.kind
@@ -135,16 +153,26 @@ impl Occupant {
         &self.label
     }
 
-    /// The mask fixed from that kind at enrolment (P-105).
+    /// The role's row of the registry and nothing else (P-105).
     #[must_use]
     pub const fn mask(&self) -> ClientCapability {
-        self.mask
+        ClientCapability::granted(self.role)
     }
+}
 
-    /// Whether the mask reaches every bit of `required`.
-    #[must_use]
-    pub const fn may(&self, required: ClientCapability) -> bool {
-        self.mask.0 & required.0 == required.0
+#[cfg(test)]
+impl Occupant {
+    /// The enrolment that wrote this record, for a test to write it again
+    /// with one field changed.
+    pub(crate) const fn enrolment(&self) -> Enrolment {
+        Enrolment {
+            client: self.client,
+            admit: self.admit,
+            suite: self.suite,
+            role: self.role,
+            kind: self.kind,
+            label: self.label,
+        }
     }
 }
 
@@ -173,9 +201,9 @@ impl fmt::Debug for KeyRecord {
                 .debug_struct("Occupied")
                 .field("epoch", &occupant.epoch.get())
                 .field("generation", &occupant.generation.get())
+                .field("role", &occupant.role)
                 .field("kind", &occupant.kind)
                 .field("label", &occupant.label)
-                .field("mask", &occupant.mask.0)
                 .field("client", &occupant.client)
                 .finish_non_exhaustive(),
         }
@@ -199,9 +227,9 @@ impl Body<KEY_RECORD_BYTES> for KeyRecord {
                 writer.u8(occupant.suite as u8);
                 writer.put(occupant.client.as_bytes());
                 writer.put(&occupant.admit);
+                writer.u8(occupant.role as u8);
                 writer.u8(occupant.kind as u8);
                 occupant.label.put(&mut writer);
-                writer.u16(occupant.mask.0);
             }
         }
         out
@@ -222,21 +250,54 @@ impl Body<KEY_RECORD_BYTES> for KeyRecord {
                 let suite = Suite::try_from(reader.u8()?).map_err(|()| reader.malformed(1))?;
                 let client = PublicKey::from_bytes(reader.take::<KEY_BYTES>()?);
                 let admit = reader.take::<KEY_BYTES>()?;
+                let role = Role::try_from(reader.u8()?).map_err(|()| reader.malformed(1))?;
                 let kind = ClientKind::try_from(reader.u8()?).map_err(|()| reader.malformed(1))?;
                 let label = ClientLabel::take(&mut reader)?;
-                let mask = ClientCapability(reader.u16()?);
                 Ok(Self::Occupied(Occupant {
                     epoch,
                     generation,
                     suite,
                     client,
                     admit,
+                    role,
                     kind,
                     label,
-                    mask,
                 }))
             }
             _ => Err(Malformed { at: 0 }),
+        }
+    }
+}
+
+/// Where P-240 puts a pairing through the label, and the role the slot is
+/// written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a placement nobody writes enrols nobody"]
+pub enum Place {
+    /// Step 1: the slot already holding this key, re-keyed with the role it
+    /// had (P-250), answered `reclaimed`.
+    SameKey(ClientId, Role),
+    /// Step 2: the lowest free slot the role may take (P-258), answered
+    /// `enrolled`. `owner` when no occupied slot holds one, else `admin`.
+    Free(ClientId, Role),
+    /// Step 3: the lowest `admin` slot with this label, re-keyed as an
+    /// admin and answered `reclaimed`. An owner or a viewer is never taken
+    /// this way (P-258).
+    Reclaim(ClientId),
+    /// Step 4: `table_full`.
+    Full,
+}
+
+impl Place {
+    /// The slot to write and the role to write it with, or `None` for a
+    /// full table.
+    #[must_use]
+    pub const fn slot(self) -> Option<(ClientId, Role)> {
+        match self {
+            Self::SameKey(id, role) | Self::Free(id, role) => Some((id, role)),
+            Self::Reclaim(id) => Some((id, Role::Admin)),
+            Self::Full => None,
         }
     }
 }
@@ -341,10 +402,6 @@ impl fmt::Debug for Clients {
     }
 }
 
-/// Slot 1's `client_id`, a placeholder the views overwrite. A constant: one
-/// is not zero, and were it, the build would fail rather than the part.
-const FIRST: ClientId = ClientId::new(1).unwrap();
-
 /// The `client_id` of each slot, counting from one (P-086).
 fn ids() -> impl Iterator<Item = ClientId> {
     (1u32..).map_while(ClientId::new)
@@ -369,19 +426,26 @@ impl Clients {
         })
     }
 
-    /// The occupied slots under `epoch`, with their numbers.
-    pub fn occupied(&self, epoch: Epoch) -> impl Iterator<Item = (ClientId, &Occupant)> {
+    /// Every slot under `epoch`, with its number: the occupant, or `None`
+    /// for a free slot (P-239).
+    fn slots(&self, epoch: Epoch) -> impl Iterator<Item = (ClientId, Option<&Occupant>)> {
         ids()
             .zip(&self.keys)
-            .filter_map(move |(id, key)| match key.held() {
+            .map(move |(id, key)| match key.held() {
                 Held::Present(KeyRecord::Occupied(occupant)) if occupant.epoch == epoch => {
-                    Some((id, occupant))
+                    (id, Some(occupant))
                 }
                 Held::Present(KeyRecord::Occupied(_) | KeyRecord::Free { .. })
                 | Held::Absent
                 | Held::Corrupt
-                | Held::Malformed(_) => None,
+                | Held::Malformed(_) => (id, None),
             })
+    }
+
+    /// The occupied slots under `epoch`, with their numbers.
+    pub fn occupied(&self, epoch: Epoch) -> impl Iterator<Item = (ClientId, &Occupant)> {
+        self.slots(epoch)
+            .filter_map(|(id, occupant)| occupant.map(|occupant| (id, occupant)))
     }
 
     /// The slot at `id`, if it is occupied under `epoch`.
@@ -398,27 +462,58 @@ impl Clients {
         self.occupied(epoch).count()
     }
 
-    /// Every slot as P-240 reads it: its number, and the key and label of
-    /// an occupied one.
+    /// Whether P-258 lets one more slot hold `role`: fewer than
+    /// `MAX_ADMINS` admins, fewer than `MAX_VIEWERS` viewers, and an owner
+    /// always. A free slot is a separate question, [`Self::free_for`]'s.
     #[must_use]
-    pub fn views(&self, epoch: Epoch) -> [SlotView<'_>; SLOTS] {
-        let mut views = [SlotView {
-            client_id: FIRST,
-            held: None,
-        }; SLOTS];
-        for ((view, id), key) in views.iter_mut().zip(ids()).zip(&self.keys) {
-            view.client_id = id;
-            view.held = match key.held() {
-                Held::Present(KeyRecord::Occupied(occupant)) if occupant.epoch == epoch => {
-                    Some((occupant.client, occupant.label.as_str()))
-                }
-                Held::Present(KeyRecord::Occupied(_) | KeyRecord::Free { .. })
-                | Held::Absent
-                | Held::Corrupt
-                | Held::Malformed(_) => None,
-            };
+    pub fn admits(&self, role: Role, epoch: Epoch) -> bool {
+        let holding = self
+            .occupied(epoch)
+            .filter(|(_, occupant)| occupant.role == role)
+            .count();
+        match role {
+            Role::Owner => true,
+            Role::Admin => holding < MAX_ADMINS,
+            Role::Viewer => holding < MAX_VIEWERS,
         }
-        views
+    }
+
+    /// The lowest free slot (P-086) an enrolment of `role` may take under
+    /// P-258, or `None`. This is where an approved invite goes: an invite
+    /// never reclaims by label (P-255).
+    #[must_use]
+    pub fn free_for(&self, role: Role, epoch: Epoch) -> Option<ClientId> {
+        if !self.admits(role, epoch) {
+            return None;
+        }
+        self.slots(epoch)
+            .find(|(_, occupant)| occupant.is_none())
+            .map(|(id, _)| id)
+    }
+
+    /// P-240 for a pairing through the label, in its order, with P-250's
+    /// role and P-258's ceilings. `key` is `None` at message 1, which
+    /// carries no client key, so only steps 2 to 4 run there; at message 3
+    /// step 1 wins over them. `label` is compared as bytes.
+    pub fn place(&self, epoch: Epoch, key: Option<&PublicKey>, label: &str) -> Place {
+        if let Some((id, occupant)) = key.and_then(|key| {
+            self.occupied(epoch)
+                .find(|(_, occupant)| occupant.client.matches(key))
+        }) {
+            return Place::SameKey(id, occupant.role);
+        }
+        let owned = self
+            .occupied(epoch)
+            .any(|(_, occupant)| occupant.role == Role::Owner);
+        let role = if owned { Role::Admin } else { Role::Owner };
+        if let Some(id) = self.free_for(role, epoch) {
+            return Place::Free(id, role);
+        }
+        self.occupied(epoch)
+            .find(|(_, occupant)| {
+                occupant.role == Role::Admin && occupant.label.as_bytes() == label.as_bytes()
+            })
+            .map_or(Place::Full, |(id, _)| Place::Reclaim(id))
     }
 
     /// The dedup table.
@@ -453,9 +548,9 @@ impl Clients {
                 suite: enrolment.suite,
                 client: enrolment.client,
                 admit: enrolment.admit,
+                role: enrolment.role,
                 kind: enrolment.kind,
                 label: enrolment.label,
-                mask: ClientCapability::granted(enrolment.kind),
             }),
         )
         .await?;
@@ -751,14 +846,26 @@ mod tests {
         Generation::new(n).expect("a nonzero generation")
     }
 
+    /// An admin's enrolment.
     fn phone(key: u8, label: &str) -> Enrolment {
+        holding(Role::Admin, key, label)
+    }
+
+    fn holding(role: Role, key: u8, label: &str) -> Enrolment {
         Enrolment {
             client: PublicKey::from_bytes([key; KEY_BYTES]),
             admit: [key; KEY_BYTES],
             suite: Suite::X25519ChachapolySha256,
+            role,
             kind: ClientKind::App,
             label: ClientLabel::new(label).expect("fits"),
         }
+    }
+
+    /// Slot `n` written with `role` and `label` under epoch 1.
+    fn seat(clients: &mut Clients, part: &mut Part, n: u32, role: Role, label: &str) {
+        let key = u8::try_from(n).expect("a slot number");
+        block_on(clients.enrol(id(n), holding(role, key, label), epoch(1), part)).expect("lands");
     }
 
     /// A part with an epoch, and its table booted under it.
@@ -807,12 +914,7 @@ mod tests {
     fn p_239_a_slot_is_occupied_only_under_the_epoch_it_was_written_in() {
         let (mut part, _, mut clients) = booted(1);
         assert_eq!(clients.enrolled(epoch(1)), 0);
-        assert!(
-            clients
-                .views(epoch(1))
-                .iter()
-                .all(|view| view.held.is_none())
-        );
+        assert_eq!(clients.free_for(Role::Admin, epoch(1)), Some(id(1)));
         let issued =
             block_on(clients.enrol(id(3), phone(3, "phone"), epoch(1), &mut part)).expect("lands");
         assert_eq!(issued, generation(1));
@@ -820,24 +922,22 @@ mod tests {
         let occupant = clients.occupant(id(3), epoch(1)).expect("occupied");
         assert!(occupant.client().matches(&PublicKey::from_bytes([3; 32])));
         assert_eq!(occupant.label().as_str(), "phone");
-        assert_eq!(occupant.mask(), ClientCapability::granted(ClientKind::App));
+        assert_eq!(occupant.role(), Role::Admin);
+        assert_eq!(occupant.mask(), ClientCapability::granted(Role::Admin));
         assert_eq!(occupant.epoch(), epoch(1));
-        let views = clients.views(epoch(1));
-        assert_eq!(views[2].client_id, id(3));
-        assert!(views[2].held.is_some());
-        assert_eq!(views.iter().filter(|view| view.held.is_some()).count(), 1);
-        for (n, view) in (1..).zip(views.iter()) {
-            assert_eq!(view.client_id, id(n));
-        }
+        let occupied: [Option<ClientId>; 2] = {
+            let mut found = clients.occupied(epoch(1)).map(|(id, _)| id);
+            [found.next(), found.next()]
+        };
+        assert_eq!(occupied, [Some(id(3)), None]);
         // Under the next epoch the same record is free and matched by
-        // nothing: not occupied, not in the views.
+        // nothing: not occupied, not a key a pairing finds.
         assert_eq!(clients.enrolled(epoch(2)), 0);
         assert!(clients.occupant(id(3), epoch(2)).is_none());
-        assert!(
-            clients
-                .views(epoch(2))
-                .iter()
-                .all(|view| view.held.is_none())
+        let key = PublicKey::from_bytes([3; 32]);
+        assert_eq!(
+            clients.place(epoch(2), Some(&key), "phone"),
+            Place::Free(id(1), Role::Owner)
         );
         // Nor under an earlier one.
         assert!(clients.occupant(id(3), Epoch::FIRST).is_some());
@@ -907,9 +1007,11 @@ mod tests {
     }
 
     #[test]
-    fn p_239_a_re_key_cut_at_every_byte_leaves_the_old_enrolment_or_a_free_slot_never_a_mix() {
+    fn p_239_p_250_a_re_key_cut_at_every_byte_leaves_the_old_enrolment_or_a_free_slot_never_a_mix()
+    {
         let (mut part, _, mut clients) = booted(1);
-        block_on(clients.enrol(id(1), phone(1, "old"), epoch(1), &mut part)).expect("old");
+        block_on(clients.enrol(id(1), holding(Role::Owner, 1, "old"), epoch(1), &mut part))
+            .expect("old");
         // An entry of the old install's, which a new install must not meet.
         block_on(clients.commands_mut().update(&mut part, |table| {
             let Verdict::Fresh(seat) =
@@ -943,6 +1045,7 @@ mod tests {
             match record(&found, 1) {
                 KeyRecord::Occupied(occupant) if occupant.client().as_bytes() == &[1; 32] => {
                     assert_eq!(occupant.label().as_str(), "old");
+                    assert_eq!(occupant.role(), Role::Owner);
                     assert_eq!(occupant.generation(), generation(1));
                     assert!(!seen_new, "the old enrolment came back after the new one");
                     assert!(!seen_free, "the old key came back after the slot was freed");
@@ -951,6 +1054,11 @@ mod tests {
                     assert_eq!(occupant.client().as_bytes(), &[2; 32]);
                     assert_eq!(occupant.admit, [2; 32]);
                     assert_eq!(occupant.label().as_str(), "new");
+                    // The role changes with the key and never apart from
+                    // it: no cut leaves the old key as an admin or the new
+                    // one as the owner (P-239, P-250).
+                    assert_eq!(occupant.role(), Role::Admin);
+                    assert_eq!(occupant.mask(), ClientCapability::granted(Role::Admin));
                     assert_eq!(occupant.generation(), generation(2));
                     assert!(
                         !found
@@ -1048,6 +1156,31 @@ mod tests {
             block_on(again.booted(&mut epoch_record, &mut part)),
             Ok(Repaired::Nothing)
         );
+    }
+
+    #[test]
+    fn p_239_a_record_in_the_layout_before_roles_is_refused_never_read_out_of_step() {
+        // As the firmware before roles wrote it: the kind after the keys,
+        // then the label, then a two-byte mask. Read in the new layout, an
+        // `app` kind would be an owner and a short label's length a kind.
+        for label in ["a", "phone", "", "relay"] {
+            let mut bytes = [0u8; KEY_RECORD_BYTES];
+            let mut writer = Writer::over(&mut bytes);
+            writer.u8(1);
+            writer.u32(1);
+            writer.u32(1);
+            writer.u8(Suite::X25519ChachapolySha256 as u8);
+            writer.put(&[4; KEY_BYTES]);
+            writer.put(&[5; KEY_BYTES]);
+            writer.u8(ClientKind::App as u8);
+            ClientLabel::new(label).expect("fits").put(&mut writer);
+            writer.put(&0b1_1111u16.to_le_bytes());
+            assert_eq!(
+                KeyRecord::decode(&bytes).err(),
+                Some(Malformed { at: 0 }),
+                "{label:?}"
+            );
+        }
     }
 
     #[test]
@@ -1184,9 +1317,9 @@ mod tests {
             suite: Suite::X25519ChachapolySha256,
             client: PublicKey::from_bytes([4; 32]),
             admit: [5; 32],
+            role: Role::Viewer,
             kind: ClientKind::Cloud,
             label: ClientLabel::new("relay").expect("fits"),
-            mask: ClientCapability::granted(ClientKind::Cloud),
         });
         for held in [
             KeyRecord::Free { generation: None },
@@ -1210,11 +1343,20 @@ mod tests {
         let mut bad = bytes;
         bad[9] = 0xEE;
         assert_eq!(KeyRecord::decode(&bad).err(), Some(Malformed { at: 9 }));
+        // A role the registry does not name, the byte after the keys.
+        for role in [0, 4, 0xEE] {
+            let mut bad = bytes;
+            bad[10 + 64] = role;
+            assert_eq!(
+                KeyRecord::decode(&bad).err(),
+                Some(Malformed { at: 10 + 64 })
+            );
+        }
         let mut bad = bytes;
-        bad[9 + 64 + 1] = 0xEE;
+        bad[10 + 64 + 1] = 0xEE;
         assert_eq!(
             KeyRecord::decode(&bad).err(),
-            Some(Malformed { at: 9 + 64 + 1 })
+            Some(Malformed { at: 10 + 64 + 1 })
         );
         // The debug form names the client and never the admission key.
         let mut text = [0u8; 512];
@@ -1238,6 +1380,147 @@ mod tests {
             self.1 = end;
             Ok(())
         }
+    }
+
+    #[test]
+    fn p_105_the_mask_is_the_role_row_whatever_the_client_said_it_was() {
+        let (mut part, _, mut clients) = booted(1);
+        let mut relay = holding(Role::Owner, 1, "relay");
+        relay.kind = ClientKind::Cloud;
+        block_on(clients.enrol(id(1), relay, epoch(1), &mut part)).expect("lands");
+        let occupant = clients.occupant(id(1), epoch(1)).expect("occupied");
+        assert_eq!(occupant.kind(), ClientKind::Cloud);
+        assert_eq!(occupant.mask(), ClientCapability::granted(Role::Owner));
+        assert!(
+            occupant
+                .mask()
+                .allows(ClientCapability::WRITE_NETWORK_AND_CLOUD)
+        );
+        // And the same kind as a viewer holds nothing.
+        let mut viewer = holding(Role::Viewer, 2, "relay");
+        viewer.kind = ClientKind::App;
+        block_on(clients.enrol(id(2), viewer, epoch(1), &mut part)).expect("lands");
+        let occupant = clients.occupant(id(2), epoch(1)).expect("occupied");
+        assert_eq!(occupant.mask(), ClientCapability(0));
+        // Read back from the part, the role is what was written.
+        let again = block_on(Clients::read(&mut part)).expect("reads");
+        assert_eq!(
+            again.occupant(id(1), epoch(1)).map(Occupant::role),
+            Some(Role::Owner)
+        );
+        assert_eq!(
+            again.occupant(id(2), epoch(1)).map(Occupant::role),
+            Some(Role::Viewer)
+        );
+    }
+
+    #[test]
+    fn p_258_the_ceilings_hold_at_the_bound_and_refuse_one_past_it() {
+        let (mut part, _, mut clients) = booted(1);
+        seat(&mut clients, &mut part, 1, Role::Owner, "owner");
+        for n in 2..=6 {
+            seat(&mut clients, &mut part, n, Role::Admin, "admin");
+        }
+        // Five admins: the sixth is admitted, at the lowest free slot.
+        assert!(clients.admits(Role::Admin, epoch(1)));
+        assert_eq!(clients.free_for(Role::Admin, epoch(1)), Some(id(7)));
+        seat(&mut clients, &mut part, 7, Role::Admin, "admin");
+        // Six: a seventh is not, though slot 8 is free.
+        assert!(!clients.admits(Role::Admin, epoch(1)));
+        assert_eq!(clients.free_for(Role::Admin, epoch(1)), None);
+        // The row left over is an owner's or the viewer's.
+        assert_eq!(clients.free_for(Role::Owner, epoch(1)), Some(id(8)));
+        assert_eq!(clients.free_for(Role::Viewer, epoch(1)), Some(id(8)));
+        seat(&mut clients, &mut part, 8, Role::Viewer, "cloud");
+        assert!(!clients.admits(Role::Viewer, epoch(1)));
+        // An owner is always admitted by the ceiling, and a full table
+        // still has no slot for it.
+        assert!(clients.admits(Role::Owner, epoch(1)));
+        assert_eq!(clients.free_for(Role::Owner, epoch(1)), None);
+        // Slots from another epoch hold no role at all.
+        assert!(clients.admits(Role::Admin, epoch(2)));
+        assert!(clients.admits(Role::Viewer, epoch(2)));
+        assert_eq!(clients.free_for(Role::Admin, epoch(2)), Some(id(1)));
+    }
+
+    #[test]
+    fn p_250_the_first_label_pairing_is_the_owner_and_the_next_an_admin() {
+        let (mut part, _, mut clients) = booted(1);
+        let key = PublicKey::from_bytes([9; KEY_BYTES]);
+        assert_eq!(
+            clients.place(epoch(1), None, "phone"),
+            Place::Free(id(1), Role::Owner)
+        );
+        assert_eq!(
+            clients.place(epoch(1), Some(&key), "phone"),
+            Place::Free(id(1), Role::Owner)
+        );
+        seat(&mut clients, &mut part, 1, Role::Owner, "phone");
+        assert_eq!(
+            clients.place(epoch(1), Some(&key), "tablet"),
+            Place::Free(id(2), Role::Admin)
+        );
+        // The same key again keeps its role: an owner pairing again is
+        // still the owner, though an owner now exists.
+        let own = PublicKey::from_bytes([1; KEY_BYTES]);
+        assert_eq!(
+            clients.place(epoch(1), Some(&own), "renamed"),
+            Place::SameKey(id(1), Role::Owner)
+        );
+        // Message 1 has no key, so it cannot reach step 1.
+        assert_eq!(
+            clients.place(epoch(1), None, "renamed"),
+            Place::Free(id(2), Role::Admin)
+        );
+        // With no owner left, a free slot is the owner's past the admin
+        // ceiling.
+        let (mut part, _, mut clients) = booted(1);
+        for n in 1..=6 {
+            seat(&mut clients, &mut part, n, Role::Admin, "admin");
+        }
+        assert_eq!(
+            clients.place(epoch(1), None, "new"),
+            Place::Free(id(7), Role::Owner)
+        );
+    }
+
+    #[test]
+    fn p_240_p_258_only_an_admin_slot_is_reclaimed_by_label_and_only_byte_for_byte() {
+        let (mut part, _, mut clients) = booted(1);
+        seat(&mut clients, &mut part, 1, Role::Owner, "owner");
+        for n in 2..=7 {
+            let label = ["a", "b", "phone", "phone", "c", "d"]
+                .get(usize::try_from(n - 2).expect("small"))
+                .copied()
+                .expect("six labels");
+            seat(&mut clients, &mut part, n, Role::Admin, label);
+        }
+        // Slot 8 is free and an admin may not take it: the lowest admin
+        // slot with the label is reclaimed instead.
+        assert_eq!(
+            clients.place(epoch(1), None, "phone"),
+            Place::Reclaim(id(4))
+        );
+        assert_eq!(Place::Reclaim(id(4)).slot(), Some((id(4), Role::Admin)));
+        assert_eq!(clients.place(epoch(1), None, "Phone"), Place::Full);
+        assert_eq!(clients.place(epoch(1), None, "phone "), Place::Full);
+        // The owner's label reclaims nothing.
+        assert_eq!(clients.place(epoch(1), None, "owner"), Place::Full);
+        assert_eq!(Place::Full.slot(), None);
+        // Nor does the viewer's.
+        seat(&mut clients, &mut part, 8, Role::Viewer, "cloud");
+        assert_eq!(clients.place(epoch(1), None, "cloud"), Place::Full);
+        // A key already enrolled is found before any of it.
+        let admin = PublicKey::from_bytes([5; KEY_BYTES]);
+        assert_eq!(
+            clients.place(epoch(1), Some(&admin), "owner"),
+            Place::SameKey(id(5), Role::Admin)
+        );
+        let viewer = PublicKey::from_bytes([8; KEY_BYTES]);
+        assert_eq!(
+            clients.place(epoch(1), Some(&viewer), "cloud"),
+            Place::SameKey(id(8), Role::Viewer)
+        );
     }
 
     #[test]
