@@ -109,7 +109,8 @@ flash-boot: sizes
 # it (`just flash-boot`); on its own the part waits at the bootloader with
 # the lines low. Effect: the controller boots in the order the hazards
 # dictate. Recovery: `just flash-controller` again, or
-# `just run-controller-bench` to bypass the bootloader.
+# `just run-controller-bench` to bypass the bootloader, after which
+# `just flash-boot` has to come before the next production flash.
 #
 # Flash the production controller image at 0x08002000 and reset the part.
 flash-controller: sizes
@@ -134,7 +135,13 @@ run-controller:
 # not cause, panics fifteen seconds into the boot after a watchdog reset, and
 # runs from the boot after that. Never on a unit that will take an update.
 # Recovery: `just flash-boot` then `just flash-controller` restore the
-# production layout.
+# production layout. `flash-controller` alone does not: it writes from
+# 0x08002000 up, the bench image's vector table stays at the bottom, and every
+# reset jumps into the production image's code at the bench image's
+# addresses. That reads as a firmware fault: a reset loop or a lockup at a PC
+# inside no function's first instruction (bench 2026-09-25). Check with
+# `probe-rs read --chip STM32G0B1RETx b32 0x08000000 2`: `o89-boot` is
+# `20024000 080000c1`.
 #
 # Flash and run the BENCH image at 0x08000000 with the one-shot proofs; never on a unit that will take an update.
 run-controller-bench:
