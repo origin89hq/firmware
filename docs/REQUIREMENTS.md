@@ -282,7 +282,10 @@ by a physical gesture or F-091's first-enrolment boot policy, and verifies
 the proof; Bluetooth connection or bonding grants no KM43 permission. BLE
 shares the bounded client table with WebSocket, starts
 only after the recovery download window and valid `LinkUp`, and closes
-clients and stops advertising on controller loss. Source: [#3][plan] §9
+clients and stops advertising on controller loss. While the pairing window
+is open the comms processor keeps Wi-Fi off, because on the pinned radio a
+phone cannot open a BLE connection beside a running station (bench
+2026-09-24). Source: [#3][plan] §9
 item 3, [#96](https://github.com/origin89hq/firmware/issues/96), P-066,
 L-060, L-080, L-120. M4.
 

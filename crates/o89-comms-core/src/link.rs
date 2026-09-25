@@ -346,6 +346,15 @@ impl Link {
             .filter(|left| left.as_millis() > 0)
     }
 
+    /// Whether the controller's current boot has reported its pairing window
+    /// at all, open or closed (L-195). The radio waits for it before it
+    /// starts Wi-Fi, so a window open at boot is known before a station is
+    /// up that would have to be taken down again.
+    #[must_use]
+    pub const fn pairing_known(&self) -> bool {
+        self.pairing.is_some()
+    }
+
     /// Restore durable credentials before the first handshake.
     pub fn restore_network(&mut self, credential: Option<crate::Credential>) {
         self.network = crate::Network::new(credential);
@@ -659,7 +668,7 @@ impl Link {
     ) -> Option<Frame> {
         let req_id = envelope.req_id();
         match kind {
-            LinkMessageType::WifiScan => self.scan_requested(envelope),
+            LinkMessageType::WifiScan => self.scan_requested(envelope, now),
             LinkMessageType::WifiScanResultAck | LinkMessageType::WifiStateAck => {
                 self.wifi_answered(kind, envelope, now);
                 None
@@ -793,16 +802,20 @@ impl Link {
         Some(Frame::PairingWindowAck { req_id, revision })
     }
 
-    fn scan_requested(&mut self, envelope: LinkEnvelope<'_>) -> Option<Frame> {
+    fn scan_requested(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Option<Frame> {
         let req_id = envelope.req_id();
         let order = km43::ScanOrder::decode(envelope).ok()?;
         let country = self
             .credential()
             .and_then(|credential| credential.change().ok())
             .is_some_and(|change| !matches!(change, km43::NetChange::ClearUnwritten));
+        // Wi-Fi is off while the pairing window is open (F-043): a scan
+        // accepted now would run only after it closes, past the
+        // controller's deadline for the result.
+        let radio = country && self.pairing_window(now).is_none();
         Some(Frame::WifiScanAck {
             req_id,
-            outcome: self.wifi.scan(order, req_id, country),
+            outcome: self.wifi.scan(order, req_id, radio),
         })
     }
 
@@ -1243,6 +1256,53 @@ mod tests {
         assert_eq!(link.retry_offer(at(2012)), None);
         assert!(
             matches!(link.wifi_request(at(2012)),Some(Frame::WifiState {report,..}) if report==final_report)
+        );
+    }
+
+    #[test]
+    fn f_043_a_scan_asked_while_the_pairing_window_is_open_is_refused_radio_off() {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Clear {
+                version: 1,
+                country: "CA",
+                hostname: "origin89",
+            })
+            .expect("metadata"),
+        ));
+        let mut buf = [0u8; 256];
+        let _ = link.received(report(&mut buf, ReqId(8), 1, 60_000, 0), at(1_000));
+        let order = km43::ScanOrder {
+            scan: core::num::NonZeroU32::MIN,
+        };
+        let mut bytes = [0; 256];
+        let len = order
+            .write(
+                link_header(LinkMessageType::WifiScan, ReqId(80)),
+                &mut bytes,
+            )
+            .expect("order");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(2_000)
+            ),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::RefusedRadioOff,
+            })
+        );
+        assert_eq!(link.wifi.take_scan(), None, "nothing queued for later");
+        // Once the window has run out, the same order starts.
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(61_000)
+            ),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::Started,
+            })
         );
     }
 
@@ -2500,6 +2560,27 @@ mod tests {
                 .get(),
             2
         );
+    }
+
+    #[test]
+    fn l_195_the_window_is_unknown_until_the_controllers_boot_reports_it() {
+        let mut link = linked_at_boot();
+        assert!(!link.pairing_known(), "linked, nothing reported yet");
+        let mut buf = [0u8; 256];
+        // A closed report is knowledge too.
+        let _ = link.received(report(&mut buf, ReqId(8), 1, 0, 0), at(1_000));
+        assert!(link.pairing_known());
+        assert_eq!(link.pairing_window(at(1_000)), None);
+        let _ = link.received(report(&mut buf, ReqId(9), 2, 60_000, 0), at(2_000));
+        assert!(link.pairing_known());
+        assert!(link.pairing_window(at(2_000)).is_some());
+        // Another controller boot forgets it until that boot reports.
+        link.record(
+            CONTROLLER_BOOT.wrapping_add(1),
+            OURS,
+            Some(CONTROLLER_DEVICE),
+        );
+        assert!(!link.pairing_known());
     }
 
     #[test]

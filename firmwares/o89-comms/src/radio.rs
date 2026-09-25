@@ -100,25 +100,33 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
         if desired().is_some_and(|record| record.change().is_err()) {
             esp_hal::system::software_reset();
         }
-        let plan = plan();
+        // Wi-Fi waits for the controller's first word on its pairing window,
+        // so a window open at boot keeps it off from the start rather than
+        // taking a station down (L-195). Without a controller there is no
+        // client to serve.
+        if !diagnostics().await.pairing_known() {
+            Timer::after_secs(1).await;
+            continue;
+        }
+        let plan = plan().await;
         observe_plan(plan).await;
         match plan {
             Plan::Off => {}
-            // The session owns every Wi-Fi resource. Returning drops the
-            // runner/interface before the controller, whose guard stops and
-            // deinitializes the driver. Reborrow keeps WIFI here for the
-            // next plan without duplicating ownership.
             Plan::Station | Plan::Scan { .. } => {
-                let version = desired().map_or(0, |record| record.version());
-                session(wifi.reborrow(), &mut held, plan).await;
-                diagnostics().await.wifi.cancel_scan();
-                match plan {
-                    Plan::Station => {
-                        station_observed(version, false, None, Some(km43::WifiFailure::Other))
-                            .await;
-                    }
-                    Plan::Scan { .. } | Plan::Off => {}
+                if !session(wifi.reborrow(), &mut held, plan).await {
+                    // Nothing was started, so nothing needs taking down:
+                    // try again on the next turn.
+                    Timer::after_secs(1).await;
+                    continue;
                 }
+                // A session ends when the record, the plan or a stuck scan
+                // says the radio must stop. On the pinned radio, stopping,
+                // disconnecting or deinitializing a started station each left
+                // BLE advertising nothing and taking no connection until the
+                // module rebooted (bench 2026-09-24). So the module reboots,
+                // through the recovery window, and comes up in the new plan;
+                // the station has already said its mDNS goodbye.
+                esp_hal::system::software_reset();
             }
         }
         // Idle and failed setup both yield, keeping watchdog progress bounded.
@@ -126,9 +134,12 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     }
 }
 
-/// What the radio should run now: the record held.
-fn plan() -> Plan {
-    Plan::of(desired().as_ref())
+/// What the radio should run now: the record held, and the controller's
+/// pairing window as the link measures it (L-196).
+async fn plan() -> Plan {
+    let now = Tick::from_millis(Instant::now().as_millis());
+    let pairing_open = diagnostics().await.pairing_window(now).is_some();
+    Plan::of(desired().as_ref(), pairing_open)
 }
 
 /// The station's configuration, its DHCP configuration, the country and the
@@ -164,18 +175,26 @@ fn seed() -> u64 {
     (u64::from(Rng::new().random()) << 32) | u64::from(Rng::new().random())
 }
 
-async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) {
+/// Run `plan` until it has to end, and whether it created the Wi-Fi driver:
+/// only a created driver needs the reboot to be taken down. A record the
+/// station cannot use is refused before the driver exists, so it retries
+/// quietly rather than rebooting the module at every boot.
+async fn session(wifi: WIFI<'_>, held: &mut Held, plan: Plan) -> bool {
     let Some(record) = desired() else {
-        return;
+        return false;
     };
+    if matches!(plan, Plan::Station) && station_config(&record).is_none() {
+        return false;
+    }
     let Ok(mut controller) = WifiController::new(wifi, ControllerConfig::default()) else {
-        return;
+        return false;
     };
     match plan {
         Plan::Off => {}
         Plan::Station => station_session(&mut controller, held, record).await,
         Plan::Scan { country } => scan_session(&mut controller, country).await,
     }
+    true
 }
 
 /// The cached network alone.
@@ -230,7 +249,7 @@ async fn scan_session(controller: &mut WifiController<'_>, country: Country) {
         progress(Task::Network);
         progress(Task::Station);
         progress(Task::Ntp);
-        if self::plan() != plan {
+        if self::plan().await != plan {
             return;
         }
         if scan(controller).await {
@@ -302,7 +321,7 @@ async fn station(
             crate::mdns::leave().await;
             return;
         }
-        if self::plan() != plan {
+        if self::plan().await != plan {
             crate::mdns::leave().await;
             return;
         }
