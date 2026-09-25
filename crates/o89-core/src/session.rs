@@ -817,7 +817,8 @@ impl Sessions {
             | MessageType::Command
             | MessageType::Time
             | MessageType::SetConfig
-            | MessageType::Firmware => {
+            | MessageType::Firmware
+            | MessageType::Vouch => {
                 let agreed = facts.link.is_some_and(Compat::is_agreed);
                 self.sealed(to, envelope, now, (wifi, agreed), fram, dst)
                     .await
@@ -843,7 +844,8 @@ impl Sessions {
             | MessageType::EnrolResponse
             | MessageType::WifiScanResponse
             | MessageType::WifiStatusResponse
-            | MessageType::GoodbyeResponse => {
+            | MessageType::GoodbyeResponse
+            | MessageType::VouchResponse => {
                 bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst)
             }
         }
@@ -1391,7 +1393,10 @@ impl Sessions {
             | MessageType::History
             | MessageType::Subscribe
             | MessageType::ReadLog
-            | MessageType::Firmware => {
+            | MessageType::Firmware
+            // Not answered, and capability bit 9 says so (P-246): a client
+            // does not send it here (#181).
+            | MessageType::Vouch => {
                 sealed_error(to, binding, ErrorCode::UnknownMessageType, dst)
             }
             // `frame` routes only the types above here.
@@ -1418,6 +1423,7 @@ impl Sessions {
             | MessageType::Enrol
             | MessageType::EnrolResponse
             | MessageType::GoodbyeResponse
+            | MessageType::VouchResponse
             | MessageType::ErrorResponse => {
                 sealed_error(to, binding, ErrorCode::MalformedFrame, dst)
             }
@@ -2990,6 +2996,25 @@ mod tests {
         );
         let second = rig.sessions.next_job().expect("the next one").ticket().conn;
         assert_ne!(second, served);
+    }
+
+    #[test]
+    fn p_246_vouch_is_refused_with_error_2_and_capability_bit_9_is_never_set() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        let report = phone.hello(&mut rig).expect("a session");
+        assert_eq!(
+            report.capabilities & (1 << 9),
+            0,
+            "bit 9 would promise Vouch"
+        );
+        let frame = phone.sealed(MessageType::Vouch, &[0xa0]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, payload) = phone.open(&answer);
+        assert_eq!(kind, MessageType::ErrorResponse);
+        // Key 1 is the code: 2, unknown message type, under the session's keys.
+        assert_eq!(payload.as_ref().get(1..3), Some(&[0x01, 0x02][..]));
+        assert!(rig.sessions.is_bound(conn(1)), "a refusal ends nothing");
     }
 
     #[test]
