@@ -309,6 +309,7 @@ async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
 async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32) {
     use o89_core::{Body as _, ProvisionFailed, SECRET_CHANGE_BYTES, SecretChange};
     if replace > 1 || usize::try_from(len) != Ok(SECRET_CHANGE_BYTES) {
+        clear_data();
         return (Status::OutOfRange, 0);
     }
     let mut bytes = [0; SECRET_CHANGE_BYTES];

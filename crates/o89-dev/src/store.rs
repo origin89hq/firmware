@@ -192,13 +192,19 @@ fn run_secret(
     ensure_no_transaction(link)?;
     let secret = generate_secret(link, device_id, replace)?;
     let birth = if born(link)? {
-        None
-    } else {
-        if replace {
+        // Checked before anything is staged: once applied, the new label
+        // has replaced the old one, and one that pairs with nothing is not
+        // printed (P-237).
+        if read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
+            .present()
+            .is_none()
+        {
             bail!(
-                "the part holds no controller key and no generator; --replace is for a born unit, and a first write needs none"
+                "the generator does not read back, so this unit cannot pair; nothing staged, the label it has stays"
             );
         }
+        None
+    } else {
         Some(generate_birth()?)
     };
     // `Birth` is `Copy` and has no way to clear itself; the encoded body is
