@@ -364,17 +364,44 @@ fn p_235_a_born_part_stages_no_birth_and_replace_keeps_the_fingerprint() {
 }
 
 #[test]
-fn p_235_replace_on_an_unborn_part_is_refused_before_anything_is_staged() {
+fn p_235_replace_on_an_unborn_part_holding_a_secret_stages_its_birth() {
     let mut link = FakeLink::new();
     // A secret with no controller key: a unit this layout is new to.
     let mut kept = read::<Secret, SECRET_BYTES>(&mut link, map::DEVICE_SECRET).unwrap();
     block_on(kept.write(&mut link, secret())).unwrap();
-    let before = link.bytes.clone();
     let mut output = Vec::new();
-    let error = run_secret(&mut link, None, true, false, &mut output).unwrap_err();
-    assert!(error.to_string().contains("--replace is for a born unit"));
-    assert_eq!(link.bytes, before);
+    // Without --replace the held secret is protected, as on any unit.
+    assert!(run_secret(&mut link, None, false, false, &mut output).is_err());
     assert_eq!(link.stages, 0);
+    run_secret(&mut link, None, true, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    assert!(born(&mut link).unwrap());
+    let fingerprint = held_fingerprint(&mut link);
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains(&hex::encode(fingerprint.as_bytes()))
+    );
+}
+
+#[test]
+fn p_237_a_born_part_whose_generator_does_not_read_is_refused_before_anything_is_staged() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    let at = usize::from(map::EPOCH.end().0);
+    link.bytes[at..usize::from(map::DRBG.end().0)].fill(0x55);
+    let before = link.bytes.clone();
+    let stages = link.stages;
+    output.clear();
+    let error = run_secret(&mut link, None, true, false, &mut output).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the generator does not read back")
+    );
+    assert_eq!(link.stages, stages, "nothing was staged");
+    assert_eq!(link.bytes, before, "the label the unit has stays");
     assert!(output.is_empty());
 }
 

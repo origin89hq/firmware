@@ -362,18 +362,20 @@ async fn boot_clients<F: Fram>(
         return (crate::EnrolmentAtBoot::Unavailable, None);
     };
     let repaired = clients.booted(epoch, fram).await;
-    match &repaired {
-        Ok(Repaired::Rebuilt(after)) => {
-            *at_boot = EpochAtBoot::Advanced {
-                from: before,
-                to: *after,
-            };
-        }
-        Err(Unrepaired::Epoch(_) | Unrepaired::NoEpoch) => {
+    // The record, not the repair's result, says which epoch the boot is
+    // under: a repair that advanced it and then failed a later write has
+    // still retired every slot of the old one.
+    match (&repaired, epoch.present()) {
+        (Err(Unrepaired::Epoch(_) | Unrepaired::NoEpoch), _) | (_, None) => {
             *at_boot = EpochAtBoot::None(NoEpoch::Unrepaired);
         }
-        Ok(Repaired::Nothing | Repaired::Initialised | Repaired::Freed)
-        | Err(Unrepaired::Write(_)) => {}
+        (Ok(_) | Err(Unrepaired::Write(_)), Some(&held)) if held != before => {
+            *at_boot = EpochAtBoot::Advanced {
+                from: before,
+                to: held,
+            };
+        }
+        (Ok(_) | Err(Unrepaired::Write(_)), Some(_)) => {}
     }
     let enrolled = at_boot.epoch().map_or(0, |under| clients.enrolled(under));
     (
@@ -627,6 +629,37 @@ mod tests {
         let (_, next) = boot(&mut part, None);
         assert_eq!(next.epoch, EpochAtBoot::Held(epoch(2)));
         assert!(opens(&next));
+    }
+
+    #[test]
+    fn p_239_a_repair_cut_after_its_epoch_landed_reports_the_epoch_the_part_holds() {
+        let mut part = Part::fresh();
+        let (mut store, _) = boot(&mut part, None);
+        let _ = enrolled(&mut store, &mut part, 1);
+        damage(&mut part, map::GENERATION_MARKS[0]);
+        let mut unfinished = 0;
+        for cut in 0..PART_BYTES {
+            let mut cut_part = part.cut_before(cut);
+            let (store, report) = boot(&mut cut_part, None);
+            if !matches!(report.clients, Some(Err(Unrepaired::Write(_)))) {
+                continue;
+            }
+            if store.epoch.present() != Some(&epoch(2)) {
+                continue;
+            }
+            unfinished += 1;
+            assert_eq!(
+                report.epoch.epoch(),
+                Some(epoch(2)),
+                "cut before byte {cut}"
+            );
+            assert_eq!(store.clients.enrolled(epoch(2)), 0, "cut before byte {cut}");
+            assert!(!opens(&report), "cut before byte {cut}");
+        }
+        assert!(
+            unfinished > 0,
+            "no cut left the epoch advanced and the repair unfinished"
+        );
     }
 
     #[test]
