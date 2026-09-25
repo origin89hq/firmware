@@ -273,6 +273,11 @@ Pending or unacknowledged transactions refuse new writes, and output and FRAM
 acknowledgement cannot be atomic: a crash after output but before
 acknowledgement can repeat the same label on resume. The intent keeps the
 secret and the fingerprint, never the key or the seed, once applied.
+`o89-dev store blank --yes` is the erase a bench repairs a part with: it zeroes
+the map, reads it back and reboots onto an unborn unit, which `write-secret`
+then gives a new key, generator and label. It is also how a part written under
+an earlier map is brought onto this one, since its old bytes read as a damaged
+key or generator.
 
 ### Embassy, and why the choice is cheap
 

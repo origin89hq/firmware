@@ -193,6 +193,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
+    /// Zero the whole FRAM map and reboot: the controller key, the
+    /// generator, the printed secret and every enrolment are gone, and the
+    /// unit needs `write-secret` and a new label. For a part written under
+    /// an earlier map, whose old bytes read as a damaged key or generator
+    /// that nothing else may write over.
+    Blank {
+        /// Say it in as many words: nothing brings the key back.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Write the epoch: refused unless above the one held, because a client
     /// table stamped with a later epoch would be left alone by the boot.
     WriteEpoch {
@@ -310,6 +320,7 @@ fn main() -> Result<()> {
         Command::Store { what } => match what {
             None => store::show(&mut link),
             Some(StoreCommand::WriteEpoch { epoch }) => store::write_epoch(&mut link, epoch),
+            Some(StoreCommand::Blank { yes }) => store::blank(&mut link, yes),
             Some(StoreCommand::WriteSecret {
                 device_id,
                 replace,

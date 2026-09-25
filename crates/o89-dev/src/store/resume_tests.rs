@@ -438,3 +438,60 @@ fn p_237_a_part_with_a_damaged_generator_is_born_and_never_reseeded() {
     assert_eq!(link.birth_stages, 0);
     assert!(output.is_empty());
 }
+
+#[test]
+fn p_235_blank_without_yes_writes_nothing() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    let before = link.bytes.clone();
+    let reboots = link.reboots;
+    output.clear();
+    let error = run_blank(&mut link, false, &mut output).unwrap_err();
+    assert!(error.to_string().contains("Pass --yes"));
+    assert_eq!(link.bytes, before);
+    assert_eq!(link.reboots, reboots);
+    assert!(output.is_empty());
+}
+
+#[test]
+fn p_235_p_237_a_part_written_under_an_earlier_map_is_blanked_and_born_again() {
+    let mut link = FakeLink::new();
+    // Bytes no record of this map wrote: the key and the generator read damaged.
+    link.bytes.fill(0x55);
+    assert!(born(&mut link).unwrap());
+    let mut output = Vec::new();
+    assert!(run_secret(&mut link, None, false, false, &mut output).is_err());
+    assert_eq!(link.stages, 0, "nothing may write over a damaged key");
+
+    run_blank(&mut link, true, &mut output).unwrap();
+    assert_eq!(link.reboots, 1);
+    assert!(!born(&mut link).unwrap());
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains("write-secret")
+    );
+
+    output.clear();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    let fingerprint = held_fingerprint(&mut link);
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains(&hex::encode(fingerprint.as_bytes()))
+    );
+}
+
+#[test]
+fn p_235_a_blank_that_does_not_read_back_stops_before_the_reboot() {
+    let mut link = FakeLink::new();
+    link.bytes.fill(0x55);
+    link.reads_fail = true;
+    let mut output = Vec::new();
+    let error = run_blank(&mut link, true, &mut output).unwrap_err();
+    assert!(format!("{error:#}").contains("reading back"));
+    assert_eq!(link.reboots, 0);
+    assert!(output.is_empty());
+}
