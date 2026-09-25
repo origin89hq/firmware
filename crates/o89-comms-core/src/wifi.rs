@@ -165,6 +165,9 @@ pub struct WifiDiagnostics {
     association_since: Option<u64>,
     announced: Option<RadioReport>,
     joined: bool,
+    /// A scan was accepted this boot. Never cleared: the radio leaves a
+    /// started scan-only session by rebooting the module (#166).
+    requested: bool,
 }
 impl WifiDiagnostics {
     /// Empty NVS means version zero and off.
@@ -180,6 +183,7 @@ impl WifiDiagnostics {
         association_since: None,
         announced: None,
         joined: false,
+        requested: false,
     };
     /// Duplicate retries retain their first verdict; another order is busy
     /// until the result is acknowledged or given up (L-200, L-201).
@@ -200,6 +204,7 @@ impl WifiDiagnostics {
             req_id,
             taken: false,
         });
+        self.requested = true;
         WifiScan::Started
     }
     /// Hand the accepted order to the sole radio owner exactly once.
@@ -306,6 +311,19 @@ impl WifiDiagnostics {
             Radio::Joining
         };
         self.observe(RadioReport { version, radio });
+    }
+
+    /// Whether a scan was accepted since boot.
+    #[must_use]
+    pub const fn scan_requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Whether an accepted scan still waits for its result's
+    /// acknowledgement or give-up.
+    #[must_use]
+    pub const fn scan_active(&self) -> bool {
+        self.active.is_some()
     }
 
     /// Whether the station holds an address as last observed. Unlike the

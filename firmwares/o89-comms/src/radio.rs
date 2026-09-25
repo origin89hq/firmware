@@ -134,12 +134,16 @@ async fn radio(mut wifi: WIFI<'static>, mut held: Held) {
     }
 }
 
-/// What the radio should run now: the record held, and the controller's
-/// pairing window as the link measures it (L-196).
+/// What the radio should run now: the record held, the controller's
+/// pairing window as the link measures it (L-196), and whether a client
+/// wants a scan with no network cached (#166).
 async fn plan() -> Plan {
     let now = Tick::from_millis(Instant::now().as_millis());
-    let pairing_open = diagnostics().await.pairing_window(now).is_some();
-    Plan::of(desired().as_ref(), pairing_open)
+    let (pairing_open, scan_wanted) = {
+        let link = diagnostics().await;
+        (link.pairing_window(now).is_some(), link.scan_wanted())
+    };
+    Plan::of(desired().as_ref(), pairing_open, scan_wanted)
 }
 
 /// The station's configuration, its DHCP configuration, the country and the
@@ -234,8 +238,8 @@ async fn station_session(controller: &mut WifiController<'_>, held: &mut Held, r
 }
 
 /// No network cached: the station interface up without joining, for scans
-/// alone, until the record changes. Reports progress for the network,
-/// station and NTP it does not run.
+/// alone, until the record changes or no client is left who wants one.
+/// Reports progress for the network, station and NTP it does not run.
 async fn scan_session(controller: &mut WifiController<'_>, country: Country) {
     if country_code_of(country).is_err()
         || controller

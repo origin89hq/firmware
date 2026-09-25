@@ -355,6 +355,17 @@ impl Link {
         self.pairing.is_some()
     }
 
+    /// Whether the radio should scan with no network cached: a scan was
+    /// accepted this boot, and either it is still outstanding or a client
+    /// is still connected who may want another. With no network there is
+    /// no station, so every such client is on BLE; once the last has gone
+    /// and the result is settled, Wi-Fi is off again and a phone can
+    /// connect (#166).
+    #[must_use]
+    pub fn scan_wanted(&self) -> bool {
+        self.wifi.scan_requested() && (self.wifi.scan_active() || self.connections.allocated() > 0)
+    }
+
     /// Restore durable credentials before the first handshake.
     pub fn restore_network(&mut self, credential: Option<crate::Credential>) {
         self.network = crate::Network::new(credential);
@@ -811,7 +822,8 @@ impl Link {
             .is_some_and(|change| !matches!(change, km43::NetChange::ClearUnwritten));
         // Wi-Fi is off while the pairing window is open (F-043): a scan
         // accepted now would run only after it closes, past the
-        // controller's deadline for the result.
+        // controller's deadline for the result. With the window closed, an
+        // accepted scan is what brings a scan-only radio up (#166).
         let radio = country && self.pairing_window(now).is_none();
         Some(Frame::WifiScanAck {
             req_id,
@@ -3384,5 +3396,121 @@ mod tests {
         let _ =
             link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(50), |_| true);
         assert!(ble.advertising(&link, at(50)));
+    }
+
+    /// A linked comms processor holding a clear that kept its country.
+    fn unconfigured() -> Link {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Clear {
+                version: 4,
+                country: "CA",
+                hostname: "origin89",
+            })
+            .expect("valid"),
+        ));
+        link
+    }
+
+    /// Hand `link` the controller's scan order `req_id` at `now`.
+    fn order_scan(link: &mut Link, req_id: ReqId, now: Tick) -> Option<Frame> {
+        let order = km43::ScanOrder {
+            scan: core::num::NonZeroU32::MIN,
+        };
+        let mut bytes = [0; 256];
+        let len = order
+            .write(link_header(LinkMessageType::WifiScan, req_id), &mut bytes)
+            .expect("order");
+        link.received(LinkEnvelope::decode(&bytes[..len]).expect("envelope"), now)
+    }
+
+    #[test]
+    fn f_044_with_no_network_a_phone_connecting_alone_never_brings_wifi_up() {
+        let mut link = unconfigured();
+        let mut ble = crate::BleAdmission::new();
+        assert!(!link.scan_wanted(), "boot");
+        assert!(ble.advertising(&link, at(0)));
+        let (_, conn) = ble.connect(&mut link, PEER).expect("row");
+        assert!(
+            !link.scan_wanted(),
+            "a connection is not a scan: Wi-Fi stays off and BLE stays usable"
+        );
+        ble.gone(&mut link, conn, DisconnectReason::ClosedByClient);
+        assert!(!link.scan_wanted());
+        assert!(ble.advertising(&link, at(100)));
+    }
+
+    #[test]
+    fn f_044_a_scan_keeps_wifi_up_while_its_phone_stays_and_releases_it_when_it_leaves() {
+        let mut link = unconfigured();
+        let mut ble = crate::BleAdmission::new();
+        let (_, conn) = ble.connect(&mut link, PEER).expect("row");
+        assert_eq!(
+            order_scan(&mut link, ReqId(80), at(10)),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::Started,
+            })
+        );
+        assert!(link.scan_wanted(), "accepted");
+        let scan = link.wifi.take_scan().expect("taken");
+        link.wifi.finished(scan, None);
+        link.wifi.result_done();
+        assert!(link.scan_wanted(), "settled, but the phone may refresh");
+        ble.gone(&mut link, conn, DisconnectReason::ClosedByClient);
+        assert!(!link.scan_wanted(), "the last client has gone");
+    }
+
+    #[test]
+    fn f_044_an_outstanding_scan_result_holds_wifi_up_after_its_phone_leaves() {
+        let mut link = unconfigured();
+        let mut ble = crate::BleAdmission::new();
+        let (_, conn) = ble.connect(&mut link, PEER).expect("row");
+        let _ = order_scan(&mut link, ReqId(80), at(10));
+        ble.gone(&mut link, conn, DisconnectReason::ClosedByClient);
+        assert!(
+            link.scan_wanted(),
+            "the controller still waits for its result"
+        );
+        let scan = link.wifi.take_scan().expect("taken");
+        link.wifi.finished(scan, None);
+        assert!(link.scan_wanted(), "result not yet acknowledged");
+        link.wifi.result_done();
+        assert!(!link.scan_wanted());
+    }
+
+    #[test]
+    fn f_043_a_scan_refused_during_the_pairing_window_brings_nothing_up() {
+        let mut link = unconfigured();
+        let mut buf = [0u8; 256];
+        let _ = link.received(report(&mut buf, ReqId(8), 1, 60_000, 0), at(1_000));
+        let mut ble = crate::BleAdmission::new();
+        let _ = ble.connect(&mut link, PEER).expect("row");
+        assert_eq!(
+            order_scan(&mut link, ReqId(80), at(2_000)),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::RefusedRadioOff,
+            })
+        );
+        assert!(!link.scan_wanted());
+    }
+
+    #[test]
+    fn l_133_an_unwritten_clear_refuses_the_scan_and_wants_no_radio() {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::ClearUnwritten).expect("valid"),
+        ));
+        let mut ble = crate::BleAdmission::new();
+        let _ = ble.connect(&mut link, PEER).expect("row");
+        assert_eq!(
+            order_scan(&mut link, ReqId(80), at(10)),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::RefusedRadioOff,
+            })
+        );
+        assert!(!link.scan_wanted());
     }
 }
