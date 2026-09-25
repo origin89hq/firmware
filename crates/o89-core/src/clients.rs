@@ -554,6 +554,19 @@ impl Clients {
         Ok(generation)
     }
 
+    /// End the enrolment in slot `id` (P-256): the slot freed under P-239's
+    /// order, so its generation has moved on before anything answers
+    /// `removed`. The caller has checked the enrolment is the one named and
+    /// unbound its sessions. The generation raised comes back.
+    pub async fn remove<F: Fram>(
+        &mut self,
+        id: ClientId,
+        epoch: Epoch,
+        fram: &mut F,
+    ) -> Result<Generation, NotStored<F::Error>> {
+        self.freed(id, epoch, fram).await
+    }
+
     /// Free slot `id`: the mark raised, the slot written free under it, and
     /// its dedup entries forgotten (P-239). The generation that was raised
     /// comes back for a re-key to use.

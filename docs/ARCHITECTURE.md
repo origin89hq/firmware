@@ -754,6 +754,26 @@ role's row of the registry, computed from the record and never stored
 with bit 5, and a slot without it is sealed error 20 before the section is
 read (P-251).
 
+**Invites, approvals and removal change the table from a session** (P-252,
+P-255, P-256), each a signed write taking its rule's steps in order. A
+pending invite is a row in RAM, at most four, two per slot, the last free
+row an owner's, withdrawn after an hour on the tick, on a reboot, on a reset,
+and when its inviter's slot is freed or re-keyed; full is a refusal, never
+an eviction (P-253). An admin's proposal spends one of three from a budget
+record of its own beside the key record, written and read back before the
+invite is stored (P-254). The record names the enrolment it was spent
+under, so a slot written for a new enrolment reads a full budget with no
+write of its own, and a record that does not read is an exhausted one, never
+a full one. An approval's proof is an HMAC under the invitee's admission key,
+a DH with the controller key, so it is a job for the worker like a
+handshake's (P-243): the first half answers what it can, the second looks
+the invite and its inviter up again, then writes the lowest free slot the
+role may take under P-239 and seals P-257's confirmation. A removal unbinds
+every other session on the slot, withdraws its invites and frees it under
+P-239 before anything answers `removed`; the sender that removed itself is
+unbound once the answer is out. `Clients` lists every slot and every pending
+invite to a slot holding bit 5.
+
 **Every request after a `Hello` is sealed** (P-231), opened under the
 session's keys before anything is read. The opener holds P-022's window: a
 `req_id` it accepted already, or below the highest less `MAX_INFLIGHT`, is
@@ -918,7 +938,7 @@ event queue, which refuses when full.
 
 | | Part | Holds | Layout |
 |---|---|---|---|
-| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the eight client slots, each a key record in two copies with a generation mark beside it (P-239), the dedup table under its epoch (P-080, P-121), the epoch (P-085), the generator's state (P-237), the device secret and the controller key (P-235), the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the manufacturing transaction (appended after the configuration reservations) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
+| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the eight client slots, each a key record in two copies with a generation mark beside it (P-239), the dedup table under its epoch (P-080, P-121), the epoch (P-085), the generator's state (P-237), the device secret and the controller key (P-235), the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the manufacturing transaction (appended after the configuration reservations), and each slot's proposal budget after it (P-254) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
 | NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a

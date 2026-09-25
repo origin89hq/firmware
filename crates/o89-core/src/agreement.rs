@@ -27,7 +27,7 @@
 //! handshake (P-229), and its result is recognised by its [`Ticket`] and
 //! discarded.
 //!
-//! cites: P-064, P-228, P-229, P-238, P-241, P-243
+//! cites: P-064, P-228, P-229, P-238, P-241, P-243, P-255, P-257
 
 use km43::{
     AdmitKey, ClientId, ControllerChannel, DeviceId, EnrolAwaiting, Enrolling, Entropy, Envelope,
@@ -158,6 +158,9 @@ pub(crate) enum Task {
         ephemeral: Entropy,
         report: Report,
     },
+    /// An `Approve`'s proof (P-255 step 5, P-257): the admission key for
+    /// the invitee's key, a DH, then one HMAC.
+    Approve(crate::membership::Check),
 }
 
 /// A job's result, to hand back to the sessions.
@@ -199,6 +202,8 @@ pub(crate) enum Computed {
     PairFailed(PairError),
     /// A `Hello` failed.
     HelloFailed(HelloError),
+    /// An approval's proof, verified or not.
+    Checked(Result<km43::Verified, km43::InviteError>),
     /// The frame did not re-read as the one that was queued, or an answer
     /// did not fit: a bug here, never the peer's.
     Unwritable,
@@ -251,6 +256,11 @@ impl Agreement {
                 ephemeral,
                 &report,
             ),
+            Task::Approve(check) => Computed::Checked(check.invitation.verify(
+                &check.commitment,
+                &check.proof,
+                &self.controller,
+            )),
         };
         Done { ticket, result }
     }
