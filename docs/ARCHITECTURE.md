@@ -1583,8 +1583,10 @@ through its recovery window into the new plan, after the station's mDNS
 goodbye. A window opened while the station runs costs that reboot; the
 window at boot does not, because Wi-Fi waits for its report. With no network
 cached, a scan starts the station only once its client is connected over
-BLE; whether that connection survives the station starting and scanning is
-not yet measured (#166).
+BLE. On board A the module rebooted within five seconds of the station
+started beside a BLE client, for a scan and for a join alike, and the
+client lost its link (#170, bench 2026-09-25); the unit then advertised
+again and took a connection with Wi-Fi off (#166).
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
 socket arrives at a full one, so the budget is a sum of named slots in
