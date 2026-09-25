@@ -2,14 +2,15 @@
 //!
 //! **Every task that times anything runs here, above thread mode** (P-243).
 //! Thread mode is the lowest priority a Cortex-M0+ has, so it is left to the
-//! one job that may take a second and a half, key agreement, which every
+//! one job that takes seconds, key agreement (2.46 s for a `Hello` on board
+//! A), which every
 //! task here preempts. The tasks here share this executor cooperatively,
 //! exactly as they shared the thread executor before; what changed is that
 //! nothing on it computes an X25519.
 //!
 //! The executor is driven by `USB_UCPD1_2`, whose peripherals board A never
-//! uses (`PA11` and `PA12` stay untouched), at the lowest priority, `P3`.
-//! The supervisor's executor sits one above at `P2`, so a task that blocks
+//! uses (`PA11` and `PA12` stay untouched), at the lowest real priority,
+//! `P12`. The supervisor's executor sits one above at `P8`, so a task that blocks
 //! this executor is still named in the last words before the watchdog
 //! fires; the time driver and every bus interrupt are above both.
 //!
@@ -21,7 +22,7 @@ use embassy_executor::{InterruptExecutor, SendSpawner};
 use embassy_futures::select::{Either, select};
 use embassy_stm32::gpio::{Input, Output};
 use embassy_stm32::interrupt;
-use embassy_stm32::interrupt::{InterruptExt, Priority};
+use embassy_stm32::interrupt::InterruptExt;
 use embassy_time::{Duration, Ticker};
 use o89_core::{Contact, Feedback, LastWords, Task};
 
@@ -41,7 +42,7 @@ fn USB_UCPD1_2() {
 /// Start the control executor, below the supervisor's and above thread
 /// mode, and hand back what spawns onto it.
 pub fn start() -> SendSpawner {
-    interrupt::USB_UCPD1_2.set_priority(Priority::P3);
+    interrupt::USB_UCPD1_2.set_priority(crate::supervisor::CONTROL);
     EXECUTOR.start(interrupt::USB_UCPD1_2)
 }
 

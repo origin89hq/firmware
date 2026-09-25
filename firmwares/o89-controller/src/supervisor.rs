@@ -15,7 +15,7 @@
 //! have no name to blame. From its own interrupt the supervisor keeps
 //! running through a blocked executor, so the watchdog is the floor and
 //! the blame is still written. The line is `CEC`, which nothing on this
-//! board drives, at `P2`: above the control executor at `P3` and key
+//! board drives, at `P8`: above the control executor at `P12` and key
 //! agreement in thread mode below it, and below the time driver and every
 //! bus, which it never delays.
 
@@ -43,13 +43,37 @@ fn CEC() {
     unsafe { EXECUTOR.on_interrupt() }
 }
 
+/// The priority bits a Cortex-M0+ implements: the top two of the byte.
+const IMPLEMENTED: u8 = 0b1100_0000;
+
+/// The supervisor's executor, above the control executor's.
+///
+/// embassy-stm32 builds its `Priority` for four bits on every STM32, so on
+/// this core `P2` and `P3` are `0x20` and `0x30`, whose implemented bits are
+/// both zero: every interrupt lands at the highest priority, nothing
+/// preempts a task that spins in one, and the supervisor never names it.
+/// Only the levels whose value lives in the top two bits are real here.
+pub const SUPERVISOR: Priority = Priority::P8;
+/// The control executor's, the lowest real level above thread mode.
+pub const CONTROL: Priority = Priority::P12;
+
+// `as` because `u8::from` is not `const`; these are fieldless enums.
+const _: () = assert!(
+    SUPERVISOR as u8 & !IMPLEMENTED == 0 && CONTROL as u8 & !IMPLEMENTED == 0,
+    "a priority whose value the core does not implement truncates to the highest"
+);
+const _: () = assert!(
+    (SUPERVISOR as u8) < (CONTROL as u8),
+    "the supervisor must preempt the control executor"
+);
+
 /// Start the supervisor on its own executor, above the control executor.
 pub fn start(
     wdg: IndependentWatchdog<'static, IWDG>,
     status: Output<'static>,
     fault: Output<'static>,
 ) -> Result<(), SpawnError> {
-    interrupt::CEC.set_priority(Priority::P2);
+    interrupt::CEC.set_priority(SUPERVISOR);
     let spawner = EXECUTOR.start(interrupt::CEC);
     spawner.spawn(run(wdg, status, fault)?);
     Ok(())

@@ -141,8 +141,8 @@ impl Task {
     pub const fn window(self) -> Millis {
         let millis = match self {
             Self::Supervisor | Self::Control | Self::Selector | Self::Lamp => 5_000,
-            // The agreement's longest job, a `Hello`, is about a second and a
-            // half at 64 MHz; ten covers it and a check-in either side.
+            // The agreement's longest job, a `Hello`, measured 2.46 s on
+            // board A; ten covers it and a check-in either side.
             Self::Link
             | Self::Rs485One
             | Self::Rs485Two

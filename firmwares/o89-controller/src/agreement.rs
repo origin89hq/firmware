@@ -1,8 +1,8 @@
 //! Key agreement, on the thread executor and nothing else there (P-243).
 //!
-//! A `Hello` costs this part about a second and a half of X25519, which
-//! cannot be split: each DH is a quarter of a second nobody else runs in if
-//! it shares their executor. So every task that times anything runs on the
+//! A `Hello` costs this part 2.46 s of X25519, measured on board A, and it
+//! cannot be split: nobody else runs for that long if it shares their
+//! executor. So every task that times anything runs on the
 //! control executor, from an interrupt above thread mode, and this worker
 //! is the only thing left below it. A job preempted by the control tick,
 //! the link or the rail loses nothing; they never wait for it.

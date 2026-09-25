@@ -404,16 +404,20 @@ Nothing blocks; a bus that hangs is a task that misses its
 check-in, which is a reset, which is the fail state.
 
 **Three executors, by priority.** Thread mode is the lowest priority a
-Cortex-M0+ has, so it holds the one job that may compute for a second and a
-half, key agreement, and nothing else (P-243). Every task that times
+Cortex-M0+ has, so it holds the one job that computes for seconds at a
+time, key agreement (a `Hello` measured 2.46 s on board A), and nothing else
+(P-243). Every task that times
 anything, control, link, rail and recorder, runs on the control executor,
-driven by `USB_UCPD1_2` at `P3`, and preempts the worker whenever it has
+driven by `USB_UCPD1_2` at `P12`, and preempts the worker whenever it has
 anything to do; the tasks there share it cooperatively as they always did.
-The supervisor runs from `CEC` at `P2`, above both, so a transfer that never
+The supervisor runs from `CEC` at `P8`, above both, so a transfer that never
 returns and holds the control executor is still a task named in the last
 words before the watchdog fires: the watchdog is the floor either way, the
 blame is what the next boot reads. The time driver and every bus interrupt
-are above all three. The worker is on the roll with a ten-second window, and
+are above all three. The M0+ implements two priority bits and embassy-stm32
+names levels for four, so only `P0`, `P4`, `P8` and `P12` are real here; any
+other truncates to the highest, where nothing preempts anything, and a
+compile-time assertion refuses them. The worker is on the roll with a ten-second window, and
 checks in between jobs and every idle second.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
