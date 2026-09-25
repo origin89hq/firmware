@@ -164,8 +164,10 @@ fn main() -> ! {
     let mut store = credentials::Store::new(flash);
     let credential = o89_comms_core::load_credential(&mut store).ok().flatten();
     radio::configure(credential);
-    // Fixed heap used only by the radio driver and its RTOS tasks.
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    // Fixed heap used only by the radio driver and its RTOS tasks. 72 KiB
+    // ran out when Wi-Fi scanned or joined beside a BLE connection (#170);
+    // board A peaked at 78 KiB with this budget (bench 2026-09-25).
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     // 5. The scheduler, then the true random source for the `boot_id`
     // (F-035): the bare RNG is pseudo-random until the ADC feeds it.
