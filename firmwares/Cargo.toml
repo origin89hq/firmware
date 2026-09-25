@@ -102,10 +102,11 @@ arithmetic_side_effects = "deny"
 # when the ring has room and masks the receive interrupt until it does
 # (F-090). This pin goes back to a release when one carries that commit.
 [patch.crates-io]
-# km43 at key agreement (#130), the retired write counter (#134) and the
-# asynchronous DRBG store (origin89hq/km43#136), none released yet. This pin
-# goes back to `=0.8.0` when that release carries all three.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "6b097edc4d79140a3ce041c531feaaef237a48fb" }
+# km43 at the asynchronous DRBG store (origin89hq/km43#136), with key
+# agreement (#130) and the retired write counter (#134) before it. 0.8.0
+# also carries roles, invites and vouching, which this firmware does not
+# implement yet (#178); the pin moves to that release with them.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "08040fa371f01b6e48ead0ed0bf5af960fb2aadc" }
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }

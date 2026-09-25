@@ -96,7 +96,8 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 
 [patch.crates-io]
-# km43 at key agreement (#130), the retired write counter (#134) and the
-# asynchronous DRBG store (origin89hq/km43#136), none released yet. This pin
-# goes back to `=0.8.0` when that release carries all three.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "6b097edc4d79140a3ce041c531feaaef237a48fb" }
+# km43 at the asynchronous DRBG store (origin89hq/km43#136), with key
+# agreement (#130) and the retired write counter (#134) before it. 0.8.0
+# also carries roles, invites and vouching, which this firmware does not
+# implement yet (#178); the pin moves to that release with them.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "08040fa371f01b6e48ead0ed0bf5af960fb2aadc" }
