@@ -69,6 +69,15 @@ impl SecretLink for FakeLink {
         Ok(())
     }
 
+    fn reboot_blank(&mut self) -> Result<()> {
+        self.reboots = self.reboots.checked_add(1).unwrap();
+        let (_, report) = block_on(Store::boot(self, None)).map_err(|_| anyhow!("boot failed"))?;
+        if report.boot != o89_core::BootCount::FIRST {
+            bail!("the boot count did not start over");
+        }
+        Ok(())
+    }
+
     /// What the firmware's mailbox op does with the body the host sends.
     fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()> {
         self.stages = self.stages.checked_add(1).unwrap();
@@ -494,4 +503,20 @@ fn p_235_a_blank_that_does_not_read_back_stops_before_the_reboot() {
     assert!(format!("{error:#}").contains("reading back"));
     assert_eq!(link.reboots, 0);
     assert!(output.is_empty());
+}
+
+#[test]
+fn p_235_a_provisioned_unit_blanks_to_an_unborn_one_whose_boot_count_starts_over() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    assert!(born(&mut link).unwrap());
+    output.clear();
+    run_blank(&mut link, true, &mut output).unwrap();
+    assert!(!born(&mut link).unwrap());
+    let held = read::<Secret, SECRET_BYTES>(&mut link, map::DEVICE_SECRET).unwrap();
+    assert!(
+        held.present().is_none(),
+        "the printed secret went with the rest"
+    );
 }

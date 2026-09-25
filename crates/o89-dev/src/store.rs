@@ -204,7 +204,7 @@ fn run_blank(
             );
         }
     }
-    link.reboot()?;
+    link.reboot_blank()?;
     if born(link)? {
         bail!("the rebooted unit still holds a controller key or a generator");
     }
@@ -308,6 +308,8 @@ fn generate_birth() -> Result<Birth> {
 
 trait SecretLink: o89_core::Fram<Error = anyhow::Error> {
     fn reboot(&mut self) -> Result<()>;
+    /// Reboot after a blank, which starts the boot count over.
+    fn reboot_blank(&mut self) -> Result<()>;
     /// Stage the encoded `SecretChange::Pending` body and reboot to apply it.
     fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()>;
 }
@@ -318,6 +320,9 @@ impl SecretLink for Link {
     }
     fn reboot(&mut self) -> Result<()> {
         Link::reboot(self)
+    }
+    fn reboot_blank(&mut self) -> Result<()> {
+        Link::reboot_blank(self)
     }
 }
 
