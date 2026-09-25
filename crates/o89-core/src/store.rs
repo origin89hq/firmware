@@ -409,7 +409,7 @@ mod tests {
     use core::future::Future;
 
     use embassy_futures::block_on;
-    use km43::{ClientId, ClientKind, Generation, PublicKey, Suite};
+    use km43::{ClientId, ClientKind, Generation, PublicKey, Role, Suite};
 
     use super::*;
     use crate::body::Body as _;
@@ -550,6 +550,7 @@ mod tests {
                 client: PublicKey::from_bytes([u8::try_from(n).expect("small"); 32]),
                 admit: [3; 32],
                 suite: Suite::X25519ChachapolySha256,
+                role: Role::Admin,
                 kind: ClientKind::App,
                 label: ClientLabel::new("phone").expect("fits"),
             },

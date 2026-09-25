@@ -294,10 +294,6 @@ impl<'a> Writer<'a> {
         self.put(&[value]);
     }
 
-    pub(crate) fn u16(&mut self, value: u16) {
-        self.put(&value.to_le_bytes());
-    }
-
     pub(crate) fn u32(&mut self, value: u32) {
         self.put(&value.to_le_bytes());
     }
@@ -350,10 +346,6 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn u8(&mut self) -> Result<u8, Malformed> {
         self.take::<1>().map(|[byte]| byte)
-    }
-
-    pub(crate) fn u16(&mut self) -> Result<u16, Malformed> {
-        self.take::<2>().map(u16::from_le_bytes)
     }
 
     pub(crate) fn u32(&mut self) -> Result<u32, Malformed> {

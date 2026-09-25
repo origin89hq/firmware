@@ -738,6 +738,22 @@ written as P-239 says. A slot that does not land is outcome 7: nothing
 enrolled, the window left open, condition 23. The pairing's keys seal the
 answer and are dropped with it; a pairing opens no session.
 
+**Every slot holds a role** (P-250), written in its key record with the
+key, so no cut separates them (P-239). A pairing through the label is the
+owner when no occupied slot holds one and an admin otherwise; the same key
+pairing again keeps its role; and the role is decided again at message 3
+with the slot, because another pairing may have enrolled an owner in
+between. `client_kind` and the link's transport are shown and decide
+nothing. At most six slots hold `admin` and one `viewer` (P-258), so P-240
+runs with the ceilings in its steps: a free slot is an admin's only below
+six, and a reclaim by label takes only an admin's slot, never an owner's
+or the viewer's. km43's `Allocation::choose` reads no role, so
+`Clients::place` runs P-240 itself (origin89hq/km43#141). The mask is the
+role's row of the registry, computed from the record and never stored
+(P-105); the network and cloud sections, and the scan list, are read only
+with bit 5, and a slot without it is sealed error 20 before the section is
+read (P-251).
+
 **Every request after a `Hello` is sealed** (P-231), opened under the
 session's keys before anything is read. The opener holds P-022's window: a
 `req_id` it accepted already, or below the highest less `MAX_INFLIGHT`, is
@@ -745,7 +761,8 @@ dropped unanswered, uncounted, and refreshes nothing. Only a request that
 opened refreshes the session (P-077); a tag that fails counts against the
 connection, and eight inside a minute close it (P-051). A session answers
 only while its slot still holds the enrolment it proved: a re-key or a
-reset unbinds it first, and a mask is read from the slot's current record.
+reset unbinds it first, and the mask is the role the slot's current record
+holds.
 A write carries no client of its own and no counter; its session is the only
 statement of who sent it (km43 #134). A `Command` goes through `admit` in
 P-080's order: the dedup lookup, the in-flight entry landed, then the

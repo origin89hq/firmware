@@ -55,18 +55,18 @@
 //! L-072, L-080, L-180, L-182, L-195
 
 use km43::{
-    Allocation, CapabilityBit, ClientConnected, ClientDisconnected, ClientId, ClientKind,
-    CloseReason, CommandAck, Conn, ControllerChannel, DeviceId, EmptyBody, EnrolAnswer,
-    EnrolAwaiting, Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Generation, Header,
-    HelloArrival, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
-    MAX_COMMAND_ACK_BYTES, MAX_PAYLOAD, MAX_SESSIONS, MAX_TIME_ACK_BYTES, MessageType, Outcome,
-    PairArrival, PairRefusal, Prologue, PrologueFields, PublicKey, Refusal as Code, ReqId, Sealed,
-    SessionId, SignedWrite, SlotView, TimeAck, TimeOperation, Version,
+    ClientConnected, ClientDisconnected, ClientId, ClientKind, CloseReason, CommandAck, Conn,
+    ControllerChannel, DeviceId, EmptyBody, EnrolAnswer, EnrolAwaiting, Envelope, EnvelopeError,
+    Epoch, ErrorBody, ErrorCode, Generation, Header, HelloArrival, Incoming, LinkEnvelope,
+    LinkErrorCode, LogSeq, MAX_AUTH_FAILURES, MAX_COMMAND_ACK_BYTES, MAX_PAYLOAD, MAX_SESSIONS,
+    MAX_TIME_ACK_BYTES, MessageType, Outcome, PairArrival, PairRefusal, Prologue, PrologueFields,
+    PublicKey, Refusal as Code, ReqId, Sealed, SessionId, SignedWrite, TimeAck, TimeOperation,
+    Version,
 };
 
 use crate::agreement::{Bytes, Computed, Done, Job, Report, ReportText, Task, Ticket};
 use crate::body::Kept;
-use crate::clients::{ClientLabel, Clients, Enrolment};
+use crate::clients::{ClientLabel, Clients, Enrolment, Place};
 use crate::drbg::{CHALLENGE_BYTES, Generator};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
@@ -818,7 +818,11 @@ impl Sessions {
             | MessageType::Time
             | MessageType::SetConfig
             | MessageType::Firmware
-            | MessageType::Vouch => {
+            | MessageType::Vouch
+            | MessageType::Clients
+            | MessageType::Invite
+            | MessageType::Approve
+            | MessageType::Remove => {
                 let agreed = facts.link.is_some_and(Compat::is_agreed);
                 self.sealed(to, envelope, now, (wifi, agreed), fram, dst)
                     .await
@@ -844,8 +848,12 @@ impl Sessions {
             | MessageType::EnrolResponse
             | MessageType::WifiScanResponse
             | MessageType::WifiStatusResponse
-            | MessageType::GoodbyeResponse
-            | MessageType::VouchResponse => {
+            | MessageType::VouchResponse
+            | MessageType::ClientsResponse
+            | MessageType::InviteResponse
+            | MessageType::ApproveResponse
+            | MessageType::RemoveResponse
+            | MessageType::GoodbyeResponse => {
                 bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst)
             }
         }
@@ -1050,7 +1058,7 @@ impl Sessions {
         };
         let refusal = if !facts.pairing_open {
             Some(PairRefusal::WindowClosed)
-        } else if !allocates(&self.keys.clients.views(epoch), offer.label) {
+        } else if self.keys.clients.place(epoch, None, offer.label) == Place::Full {
             Some(PairRefusal::TableFull)
         } else {
             None
@@ -1149,14 +1157,13 @@ impl Sessions {
             };
         }
         let client = enrolling.client();
-        let allocation = Allocation::choose(
-            &self.keys.clients.views(epoch),
-            &client,
-            offer.label.as_str(),
-        );
+        let place = self
+            .keys
+            .clients
+            .place(epoch, Some(&client), offer.label.as_str());
         let (outcome, note) = if facts.pairing_open {
-            match allocation {
-                Allocation::SameKey(id) | Allocation::Free(id) | Allocation::Reclaim(id) => {
+            match place.slot() {
+                Some((id, role)) => {
                     // Every session on the slot goes before it is rewritten
                     // (P-240), whether or not the write then lands.
                     self.unbind(id);
@@ -1164,23 +1171,24 @@ impl Sessions {
                         client,
                         admit,
                         suite: SUITE,
+                        role,
                         kind: offer.kind,
                         label: offer.label,
                     };
                     match self.keys.clients.enrol(id, enrolment, epoch, fram).await {
                         Ok(generation) => (
-                            match allocation {
-                                Allocation::Free(_) => Outcome::Enrolled(id, generation),
-                                Allocation::SameKey(_)
-                                | Allocation::Reclaim(_)
-                                | Allocation::Full => Outcome::Reclaimed(id, generation),
+                            match place {
+                                Place::Free(..) => Outcome::Enrolled(id, generation),
+                                Place::SameKey(..) | Place::Reclaim(_) | Place::Full => {
+                                    Outcome::Reclaimed(id, generation)
+                                }
                             },
                             Some(SessionNote::Paired(id)),
                         ),
                         Err(_) => (Outcome::NotStored, Some(SessionNote::TableNotStored)),
                     }
                 }
-                Allocation::Full => (Outcome::TableFull, None),
+                None => (Outcome::TableFull, None),
             }
         } else {
             (Outcome::WindowClosed, None)
@@ -1344,34 +1352,17 @@ impl Sessions {
             .and_then(|sealed| sealed.open(&mut binding.channel.rx, &mut plain));
         let opened = match opened {
             Ok(opened) => opened,
-            Err(why) => {
-                let counted = why.counts();
-                return match why.refusal() {
-                    Some(code) => self.refused(to, code, counted, now, dst),
-                    None => Reply::noted(SessionNote::Dropped),
-                };
-            }
+            Err(why) => return self.unopened(to, &why, now, dst),
         };
         binding.heard = now;
         let payload = opened.inner();
         let mask = keys.mask(binding);
-        match kind {
-            MessageType::Goodbye => {
-                let reply = goodbye(to, binding, payload, dst);
-                // The binding goes and the keys with it; the row stays with
-                // its transport (P-076). A body that did not read ends
-                // nothing.
-                if matches!(reply.note, Some(SessionNote::Unbound(_)))
-                    && let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-                {
-                    row.bound = Bound::Ended;
-                }
-                reply
-            }
+        let reply = match kind {
+            MessageType::Goodbye => goodbye(to, binding, payload, dst),
             MessageType::WifiScan | MessageType::WifiStatus => {
                 wifi_answer(to, binding, (keys, mask), link, (kind, payload, now), dst)
             }
-            MessageType::GetConfig => config_answer(to, binding, keys, payload, dst),
+            MessageType::GetConfig => config_answer(to, binding, (keys, mask), payload, dst),
             MessageType::Command => match signed(to, binding, &opened, dst) {
                 Ok(write) => command(to, binding, keys, write, fram, now, dst).await,
                 Err(refused) => refused,
@@ -1395,10 +1386,13 @@ impl Sessions {
             | MessageType::ReadLog
             | MessageType::Firmware
             // Not answered, and capability bit 9 says so (P-246): a client
-            // does not send it here (#181).
-            | MessageType::Vouch => {
-                sealed_error(to, binding, ErrorCode::UnknownMessageType, dst)
-            }
+            // does not send it here (#181). The client list, invites and
+            // removal are #180's.
+            | MessageType::Vouch
+            | MessageType::Clients
+            | MessageType::Invite
+            | MessageType::Approve
+            | MessageType::Remove => sealed_error(to, binding, ErrorCode::UnknownMessageType, dst),
             // `frame` routes only the types above here.
             MessageType::Discover
             | MessageType::DiscoverResponse
@@ -1424,10 +1418,22 @@ impl Sessions {
             | MessageType::EnrolResponse
             | MessageType::GoodbyeResponse
             | MessageType::VouchResponse
+            | MessageType::ClientsResponse
+            | MessageType::InviteResponse
+            | MessageType::ApproveResponse
+            | MessageType::RemoveResponse
             | MessageType::ErrorResponse => {
                 sealed_error(to, binding, ErrorCode::MalformedFrame, dst)
             }
+        };
+        // Only a `Goodbye` whose body read unbinds: the binding goes and the
+        // keys with it, and the row stays with its transport (P-076).
+        if matches!(reply.note, Some(SessionNote::Unbound(_)))
+            && let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+        {
+            row.bound = Bound::Ended;
         }
+        reply
     }
 
     /// The recorder's answer to the `Time` it was handed as `ticket`,
@@ -1474,6 +1480,21 @@ impl Sessions {
     /// A refusal answered bare, counted against the connection when the
     /// peer failed a check it should have passed (P-051); the one that
     /// reaches the threshold ends any session on it and closes it.
+    /// A sealed request that did not open: refused and counted as the
+    /// opener says, or dropped unanswered (P-022, P-051).
+    fn unopened(
+        &mut self,
+        to: Addressed,
+        why: &km43::SealError,
+        now: Tick,
+        dst: &mut [u8],
+    ) -> Reply {
+        match why.refusal() {
+            Some(code) => self.refused(to, code, why.counts(), now, dst),
+            None => Reply::noted(SessionNote::Dropped),
+        }
+    }
+
     fn refused(
         &mut self,
         to: Addressed,
@@ -1610,13 +1631,6 @@ fn prologue(
 
 /// P-241's condition for message 2: P-240's step 2 or 3 would allocate. At
 /// message 1 there is no client key, so step 1 cannot be run.
-fn allocates(slots: &[SlotView<'_>], label: &str) -> bool {
-    slots.iter().any(|slot| match slot.held {
-        None => true,
-        Some((_, held)) => held.as_bytes() == label.as_bytes(),
-    })
-}
-
 fn report_text(text: &str) -> ReportText {
     // `Facts` carries link texts, which are already within the cap; one that
     // is not is reported as nothing rather than cut mid-character.
@@ -1851,8 +1865,7 @@ fn time_asked(
     if time.is_some() {
         return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
     }
-    let authorised =
-        mask.is_some_and(|mask| mask.0 & (1 << CapabilityBit::ClockSettableByClient as u16) != 0);
+    let authorised = allows(mask, km43::ClientCapability::SET_CLOCK);
     *tickets = tickets.wrapping_add(1);
     *time = Some(AskedTime {
         ticket: *tickets,
@@ -1882,16 +1895,15 @@ async fn set_config<F: Fram>(
         Ok(operation) => operation,
         Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
-    let required = km43::ClientCapability::WRITE_CONFIG.0
-        | if matches!(
-            operation.section,
-            km43::ConfigSection::Network | km43::ConfigSection::Cloud
-        ) {
-            km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
-        } else {
-            0
-        };
-    let authorised = mask.is_some_and(|mask| mask.0 & required == required);
+    let required = km43::ClientCapability(
+        km43::ClientCapability::WRITE_CONFIG.0
+            | if private(operation.section) {
+                km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
+            } else {
+                0
+            },
+    );
+    let authorised = allows(mask, required);
     let ack = if authorised {
         match keys
             .configuration
@@ -1920,17 +1932,39 @@ async fn set_config<F: Fram>(
     answered(written)
 }
 
+/// Whether a section is the network's or the cloud's: written with bit 1,
+/// read with bit 5 (P-105, P-251).
+const fn private(section: km43::ConfigSection) -> bool {
+    matches!(
+        section,
+        km43::ConfigSection::Network | km43::ConfigSection::Cloud
+    )
+}
+
+/// Whether the mask of a session's enrolment reaches every bit of
+/// `required`. A session whose slot was re-keyed has no mask, and is
+/// allowed nothing.
+fn allows(mask: Option<km43::ClientCapability>, required: km43::ClientCapability) -> bool {
+    mask.is_some_and(|mask| mask.allows(required))
+}
+
+/// `GetConfig 0x06`. The network and cloud sections need bit 5, and a slot
+/// without it is sealed error 20 before the section is read (P-251).
 fn config_answer(
     to: Addressed,
     binding: &mut Binding,
-    keys: &Keys,
+    keys: (&Keys, Option<km43::ClientCapability>),
     payload: &[u8],
     dst: &mut [u8],
 ) -> Reply {
+    let (keys, mask) = keys;
     let request = match km43::GetConfigRequest::decode(payload) {
         Ok(request) => request,
         Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
+    if private(request.section) && !allows(mask, km43::ClientCapability::READ_PRIVATE) {
+        return sealed_error(to, binding, ErrorCode::RoleNotPermitted, dst);
+    }
     let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
     let len = match keys
         .configuration
@@ -1970,7 +2004,12 @@ fn wifi_answer(
             Ok(asked) => asked,
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         };
-        let authorised = mask.is_some_and(|mask| mask.0 & 2 != 0);
+        // The list is private (P-251); a refresh also moves the radio off
+        // the network, which is bit 1's (P-105).
+        if !allows(mask, km43::ClientCapability::READ_PRIVATE) {
+            return sealed_error(to, binding, ErrorCode::RoleNotPermitted, dst);
+        }
+        let authorised = allows(mask, km43::ClientCapability::WRITE_NETWORK_AND_CLOUD);
         let refused = if asked.refresh {
             wifi.refresh(authorised, section != 0, agreed, now)
         } else {
@@ -2007,12 +2046,13 @@ mod tests {
     use km43::{
         ClientChannel, CommandKind, CommandOperation, EnrolPending, Entropy, Fingerprint,
         HelloOffer, HelloPending, Label, MAX_FRAME, PairOffer, PairPending, PairReply,
-        PrintedSecret, Signed, StaticKey,
+        PrintedSecret, Role, Signed, StaticKey,
     };
 
     use super::*;
     use crate::agreement::Agreement;
     use crate::body::Kept;
+    use crate::clients::Occupant;
     use crate::drbg::DrbgState;
     use crate::fram::{Address, FRAM_BYTES, Refused};
     use crate::map;
@@ -2610,10 +2650,7 @@ mod tests {
             .expect("written before the answer named it");
         assert!(occupant.client().matches(&client_key(1).public()));
         assert_eq!(occupant.label().as_str(), "phone");
-        assert_eq!(
-            occupant.mask(),
-            km43::ClientCapability::granted(ClientKind::App)
-        );
+        assert_eq!(occupant.role(), Role::Owner);
     }
 
     #[test]
@@ -2648,10 +2685,17 @@ mod tests {
             let id = ClientId::new(u32::from(n)).expect("a slot");
             let mut name = [b'a'; 1];
             name[0] = b'a' + n;
+            // A table P-258 permits: an owner, six admins and the viewer.
+            let role = match n {
+                1 => Role::Owner,
+                8 => Role::Viewer,
+                _ => Role::Admin,
+            };
             let enrolment = Enrolment {
                 client: client_key(n).public(),
                 admit: [n; 32],
                 suite: SUITE,
+                role,
                 kind: ClientKind::App,
                 label: ClientLabel::new(core::str::from_utf8(&name).expect("ascii"))
                     .expect("short"),
@@ -2828,15 +2872,18 @@ mod tests {
     #[test]
     fn p_240_a_reclaim_by_label_revokes_the_old_install_and_unbinds_it() {
         let mut rig = Rig::new();
+        let _owner = enrolled_phone(&mut rig, 3, "owner", 9);
         let mut old = enrolled_phone(&mut rig, 1, "phone", 1);
         old.hello(&mut rig).expect("a session");
-        // Fill the rest, so the same label is reclaimed rather than a free slot.
-        for n in 2..=8u8 {
+        // Five more admins, so the same label is reclaimed: slot 8 is free,
+        // and past the admin ceiling (P-258).
+        for n in 3..=7u8 {
             let id = ClientId::new(u32::from(n)).expect("a slot");
             let enrolment = Enrolment {
                 client: client_key(n).public(),
                 admit: [n; 32],
                 suite: SUITE,
+                role: Role::Admin,
                 kind: ClientKind::App,
                 label: ClientLabel::new("other").expect("short"),
             };
@@ -2853,7 +2900,16 @@ mod tests {
         let answer = new
             .pair(&mut rig, "phone", ClientKind::App, client_key(30))
             .expect("proceeds");
-        assert!(matches!(answer.outcome, Outcome::Reclaimed(..)));
+        let slot = ClientId::new(2).expect("a slot");
+        assert!(matches!(answer.outcome, Outcome::Reclaimed(id, _) if id == slot));
+        assert_eq!(
+            rig.sessions
+                .keys
+                .clients
+                .occupant(slot, Epoch::FIRST)
+                .map(Occupant::role),
+            Some(Role::Admin)
+        );
         assert!(
             !rig.sessions.is_bound(conn(1)),
             "the old session went first"
@@ -2954,6 +3010,7 @@ mod tests {
             client: client_key(2).public(),
             admit: [2; 32],
             suite: SUITE,
+            role: Role::Admin,
             kind: ClientKind::App,
             label: ClientLabel::new("phone").expect("short"),
         };
@@ -3126,15 +3183,10 @@ mod tests {
         assert!(!dedup.dedup().holds(ClientId::new(1).expect("a slot")));
     }
 
-    #[test]
-    fn p_105_a_cloud_client_is_refused_a_network_write_inside_the_sealed_answer() {
-        let mut rig = Rig::new();
-        rig.connect(1);
-        let mut phone = Phone::on(1);
-        phone
-            .pair(&mut rig, "relay", ClientKind::Cloud, client_key(1))
-            .expect("proceeds");
-        phone.hello(&mut rig).expect("a session");
+    /// A `SetConfig` of the network section with a body no section takes:
+    /// the ack's outcome, or `None` for the sealed error the section
+    /// answers once the mask has let it through.
+    fn network_write(rig: &mut Rig, phone: &mut Phone) -> Option<km43::SetConfig> {
         let mut operation = [0u8; 64];
         let len = km43::SetConfigOperation {
             section: km43::ConfigSection::Network,
@@ -3146,10 +3198,232 @@ mod tests {
         let frame = phone.signed(MessageType::SetConfig, &operation[..len]);
         let (_, answer) = rig.send(&frame);
         let (kind, body) = phone.open(&answer);
-        assert_eq!(kind, MessageType::SetConfigResponse);
+        (kind == MessageType::SetConfigResponse)
+            .then(|| km43::SetConfigAck::decode(&body).expect("ack").outcome)
+    }
+
+    /// The role slot `n` holds now.
+    fn role_of(rig: &Rig, n: u32) -> Option<Role> {
+        rig.sessions
+            .keys
+            .clients
+            .occupant(ClientId::new(n).expect("a slot"), Epoch::FIRST)
+            .map(Occupant::role)
+    }
+
+    /// Slot `n` written straight to the table with `role`, as nothing but a
+    /// test writes it.
+    fn seat(rig: &mut Rig, n: u8, role: Role, label: &str) {
+        let enrolment = Enrolment {
+            client: client_key(n).public(),
+            admit: [n; 32],
+            suite: SUITE,
+            role,
+            kind: ClientKind::App,
+            label: ClientLabel::new(label).expect("short"),
+        };
+        let id = ClientId::new(u32::from(n)).expect("a slot");
+        block_on(
+            rig.sessions
+                .keys
+                .clients
+                .enrol(id, enrolment, Epoch::FIRST, &mut rig.part),
+        )
+        .expect("lands");
+    }
+
+    #[test]
+    fn p_105_p_250_a_cloud_kind_paired_first_is_the_owner_and_may_write_the_network() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut relay = Phone::on(1);
+        relay
+            .pair(&mut rig, "relay", ClientKind::Cloud, client_key(1))
+            .expect("proceeds");
+        // The kind decides nothing: the first pairing at the panel is the
+        // owner, whatever it said it was.
+        assert_eq!(role_of(&rig, 1), Some(Role::Owner));
+        relay.hello(&mut rig).expect("a session");
+        assert_eq!(network_write(&mut rig, &mut relay), None);
+    }
+
+    #[test]
+    fn p_105_p_250_a_later_label_pairing_is_an_admin_refused_a_network_write_sealed() {
+        let mut rig = Rig::new();
+        let _owner = enrolled_phone(&mut rig, 1, "owner", 1);
+        let mut phone = enrolled_phone(&mut rig, 2, "phone", 2);
+        assert_eq!(role_of(&rig, 2), Some(Role::Admin));
+        phone.hello(&mut rig).expect("a session");
         assert_eq!(
-            km43::SetConfigAck::decode(&body).expect("ack").outcome,
-            km43::SetConfig::Unauthorised
+            network_write(&mut rig, &mut phone),
+            Some(km43::SetConfig::Unauthorised)
+        );
+    }
+
+    #[test]
+    fn p_240_p_250_the_same_key_pairing_again_keeps_the_owner_role() {
+        let mut rig = Rig::new();
+        let _owner = enrolled_phone(&mut rig, 1, "owner", 1);
+        let _admin = enrolled_phone(&mut rig, 2, "admin", 2);
+        rig.connect(3);
+        let mut again = Phone::on(3);
+        let answer = again
+            .pair(&mut rig, "renamed", ClientKind::App, client_key(1))
+            .expect("proceeds");
+        assert!(matches!(answer.outcome, Outcome::Reclaimed(..)));
+        // An owner exists, and it is this one: still the owner.
+        assert_eq!(role_of(&rig, 1), Some(Role::Owner));
+        assert_eq!(role_of(&rig, 2), Some(Role::Admin));
+    }
+
+    #[test]
+    fn p_258_the_sixth_admin_is_enrolled_and_a_seventh_refused_table_full_at_message_1() {
+        let mut rig = Rig::new();
+        seat(&mut rig, 1, Role::Owner, "owner");
+        for n in 2..=6 {
+            seat(&mut rig, n, Role::Admin, "admin");
+        }
+        // Five admins: the sixth takes slot 7.
+        rig.connect(1);
+        let mut sixth = Phone::on(1);
+        let answer = sixth
+            .pair(&mut rig, "sixth", ClientKind::App, client_key(20))
+            .expect("proceeds");
+        let slot = ClientId::new(7).expect("a slot");
+        assert_eq!(answer.outcome, Outcome::Enrolled(slot, Generation::FIRST));
+        assert_eq!(role_of(&rig, 7), Some(Role::Admin));
+        // Six: slot 8 is free and no admin may take it. Refused under the
+        // refusal key before any DH (P-241).
+        rig.connect(2);
+        let mut seventh = Phone::on(2);
+        let refused = seventh
+            .pair(&mut rig, "seventh", ClientKind::App, client_key(21))
+            .err();
+        assert_eq!(refused, Some(PairRefusal::TableFull));
+        assert!(rig.sessions.next_job().is_none(), "no DH was queued");
+        assert_eq!(role_of(&rig, 8), None);
+    }
+
+    #[test]
+    fn p_250_the_role_is_decided_again_at_message_3() {
+        let mut rig = Rig::new();
+        // Two phones pass message 1 against an empty table, each as its
+        // owner.
+        rig.connect(1);
+        let mut late = Phone::on(1);
+        late.challenged(&mut rig);
+        let (pending, frame) = late.pair_frame(&label(), "late", ClientKind::App);
+        let (_, answer) = rig.exchange(&frame);
+        let proceeding = proceeds(pending, &answer);
+        rig.connect(2);
+        let mut first = Phone::on(2);
+        first
+            .pair(&mut rig, "first", ClientKind::App, client_key(2))
+            .expect("proceeds");
+        assert_eq!(role_of(&rig, 1), Some(Role::Owner));
+        // The late one finishes after an owner exists: an admin.
+        let mut dst = [0u8; MAX_FRAME];
+        let header = late.header(MessageType::Enrol);
+        let (enrol, len) = proceeding
+            .finish(&client_key(1), header, &mut dst)
+            .expect("message 3");
+        let (_, answer) = rig.exchange(&dst[..len]);
+        let answer = read_enrol(enrol, &answer);
+        let slot = ClientId::new(2).expect("a slot");
+        assert_eq!(answer.outcome, Outcome::Enrolled(slot, Generation::FIRST));
+        assert_eq!(role_of(&rig, 2), Some(Role::Admin));
+    }
+
+    /// A sealed read, and the code of the sealed error it was answered
+    /// with, if it was one.
+    fn read_refused(
+        rig: &mut Rig,
+        phone: &mut Phone,
+        kind: MessageType,
+        inner: &[u8],
+    ) -> Option<Incoming> {
+        let frame = phone.sealed(kind, inner);
+        let (_, answer) = rig.send(&frame);
+        let (answered, body) = phone.open(&answer);
+        (answered == MessageType::ErrorResponse)
+            .then(|| ErrorBody::authenticated(&body).expect("an error body").code)
+    }
+
+    fn get_config(section: km43::ConfigSection) -> ([u8; 16], usize) {
+        let mut inner = [0u8; 16];
+        let len = km43::GetConfigRequest { section }
+            .encode(&mut inner)
+            .expect("fits");
+        (inner, len)
+    }
+
+    #[test]
+    fn p_105_p_251_a_viewer_is_sealed_error_20_for_the_network_section_and_the_scan_list() {
+        let mut rig = Rig::new();
+        let _owner = enrolled_phone(&mut rig, 1, "owner", 1);
+        let mut relay = enrolled_phone(&mut rig, 2, "relay", 2);
+        // Written again as the viewer an owner's invite would make it.
+        let slot = ClientId::new(2).expect("a slot");
+        let mut enrolment = rig
+            .sessions
+            .keys
+            .clients
+            .occupant(slot, Epoch::FIRST)
+            .expect("occupied")
+            .enrolment();
+        enrolment.role = Role::Viewer;
+        block_on(
+            rig.sessions
+                .keys
+                .clients
+                .enrol(slot, enrolment, Epoch::FIRST, &mut rig.part),
+        )
+        .expect("lands");
+        relay.challenged(&mut rig);
+        relay.hello(&mut rig).expect("a session");
+        let refused = Some(Incoming::Client(ErrorCode::RoleNotPermitted));
+        for section in [km43::ConfigSection::Network, km43::ConfigSection::Cloud] {
+            let (inner, len) = get_config(section);
+            assert_eq!(
+                read_refused(&mut rig, &mut relay, MessageType::GetConfig, &inner[..len]),
+                refused,
+                "{section:?}"
+            );
+        }
+        let mut scan = [0u8; 8];
+        let len = km43::ScanRequest { refresh: false }
+            .encode(&mut scan)
+            .expect("fits");
+        assert_eq!(
+            read_refused(&mut rig, &mut relay, MessageType::WifiScan, &scan[..len]),
+            refused
+        );
+        // What is not private is still read.
+        let (inner, len) = get_config(km43::ConfigSection::IdentityAndSite);
+        assert_ne!(
+            read_refused(&mut rig, &mut relay, MessageType::GetConfig, &inner[..len]),
+            refused
+        );
+    }
+
+    #[test]
+    fn p_105_p_251_an_admin_reads_the_network_section_and_the_scan_list() {
+        let mut rig = Rig::new();
+        let _owner = enrolled_phone(&mut rig, 1, "owner", 1);
+        let mut admin = enrolled_phone(&mut rig, 2, "admin", 2);
+        admin.hello(&mut rig).expect("a session");
+        let (inner, len) = get_config(km43::ConfigSection::Network);
+        assert_eq!(
+            read_refused(&mut rig, &mut admin, MessageType::GetConfig, &inner[..len]),
+            None
+        );
+        let mut scan = [0u8; 8];
+        let len = km43::ScanRequest { refresh: false }
+            .encode(&mut scan)
+            .expect("fits");
+        assert_eq!(
+            read_refused(&mut rig, &mut admin, MessageType::WifiScan, &scan[..len]),
+            None
         );
     }
 
