@@ -132,6 +132,8 @@ pub(crate) fn keys(store: Store, epoch: Option<Epoch>) -> Keys {
         epoch_record: store.epoch,
         clients: store.clients,
         generator: Generator::new(store.drbg),
+        invites: o89_core::Invites::new(),
+        budgets: store.budgets,
     }
 }
 
