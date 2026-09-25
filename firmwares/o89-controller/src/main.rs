@@ -13,8 +13,10 @@
 //! rollcall; the voltage detector; the module rail back on, with `EN` held,
 //! before any bus; the store read off the FRAM; every output to its
 //! declared fail state; the rail task and the link; the recorder with the
-//! NOR; then the control tick. The other
-//! buses arrive with the milestones that name them. The `bench` build adds
+//! NOR; then the control tick. Every one of those runs on the control
+//! executor, from an interrupt above thread mode, and thread mode is left
+//! to key agreement alone (P-243). The other buses arrive with the
+//! milestones that name them. The `bench` build adds
 //! the one-shot proofs: a starvation on a boot the watchdog did not cause,
 //! and a panic on the boot that follows, so three boots in a row show the
 //! watchdog, the blame it leaves, the panic path and the site it leaves.
@@ -22,8 +24,14 @@
 #![no_std]
 #![no_main]
 
+mod agreement;
 mod board;
 mod clock;
+#[expect(
+    unsafe_code,
+    reason = "the control executor is polled from the interrupt started for it; the one call is under a SAFETY line"
+)]
+mod control;
 #[expect(
     unsafe_code,
     reason = "cortex-m-rt requires the hard fault handler to be an unsafe fn; it reads the frame it is handed and resets"
@@ -50,18 +58,18 @@ mod supervisor;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::I2c;
 use embassy_stm32::spi::Spi;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{i2c, spi};
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Timer};
 use o89_core::{
-    Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, Contact, CutsOnPart, CutsRecord, FailState,
-    Feedback, Identity, Keys, LastWords, Line, LinkText, Millis, Pull as DeclaredPull, Rail,
-    RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Secret, Store, Task,
+    Agreement, Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, ControllerKey, CutsOnPart,
+    CutsRecord, FailState, Feedback, Generator, Identity, Keys, LastWords, Line, LinkText, Millis,
+    Pull as DeclaredPull, Rail, RailSequencer, ResetCause, Revision, RtcClock, SETTLE, Secret,
+    Store, Task,
 };
 
 use crate::board::{Board, REVISION};
@@ -314,13 +322,17 @@ async fn main(spawner: Spawner) {
     });
 
     // 7. Every output this image drives, to its declared fail state. Held
-    // for the life of this task, which never returns; a bus takes its
-    // transmit line from here when it comes up.
-    let _run = Output::new(b.gen_run, driven(Line::Run), Speed::Low);
-    let _kick = Output::new(b.gen_kick, driven(Line::Kick), Speed::Low);
-    let _rs485_1_tx = Output::new(b.rs485_1.tx, driven(Line::Rs485Tx(Bus::One)), Speed::Low);
-    let _rs485_2_tx = Output::new(b.rs485_2.tx, driven(Line::Rs485Tx(Bus::Two)), Speed::Low);
-    let _rs485_3_tx = Output::new(b.rs485_3.tx, driven(Line::Rs485Tx(Bus::Three)), Speed::Low);
+    // by the control tick for the life of the part; a bus takes its
+    // transmit line from there when it comes up.
+    let held = control::Held {
+        run: Output::new(b.gen_run, driven(Line::Run), Speed::Low),
+        kick: Output::new(b.gen_kick, driven(Line::Kick), Speed::Low),
+        rs485_tx: [
+            Output::new(b.rs485_1.tx, driven(Line::Rs485Tx(Bus::One)), Speed::Low),
+            Output::new(b.rs485_2.tx, driven(Line::Rs485Tx(Bus::Two)), Speed::Low),
+            Output::new(b.rs485_3.tx, driven(Line::Rs485Tx(Bus::Three)), Speed::Low),
+        ],
+    };
     let status = Output::new(b.led_status, Level::Low, Speed::Low);
     let fault = Output::new(b.led_fault, Level::Low, Speed::Low);
     // The generator's FEEDBACK, read under the contract o89-core declares:
@@ -336,7 +348,6 @@ async fn main(spawner: Spawner) {
             DeclaredPull::None => Pull::None,
         },
     );
-    let mut contact: Option<Contact> = None;
     let selector = selector::Selector {
         auto: Input::new(b.sel_auto, Pull::Up),
         manual: Input::new(b.sel_manual, Pull::Up),
@@ -358,11 +369,14 @@ async fn main(spawner: Spawner) {
             "link: no boot count, so no boot_id (F-039); the module is powered and the link stays down"
         );
     }
+    // Every task that times anything, on the control executor above
+    // thread mode (P-243).
+    let tasks = control::start();
     supervisor::check_in(Task::Rail);
     // The rail is on the roll from the check-in above, so a task that did
     // not spawn is one that stops checking in: the watchdog resets the part.
     if let Ok(token) = rail::run(rail, Rail::new(sequencer, on_part)) {
-        spawner.spawn(token);
+        tasks.spawn(token);
     } else {
         defmt::error!("the rail task did not spawn; the watchdog will reset the part");
     }
@@ -370,12 +384,15 @@ async fn main(spawner: Spawner) {
     // The store splits here: the client protocol's records to the link task,
     // which keeps them, the ladder's cuts and the boot count to the recorder,
     // and the part itself to both, a transfer at a time.
-    let (keys, cuts) = match store {
+    // The worker holds the controller key and the label, and nothing else
+    // on this side does (P-235).
+    let (keys, cuts, worker) = match store {
         Some(Store {
             secret,
+            controller,
+            drbg,
             epoch: epoch_record,
             clients,
-            challenges,
             configuration,
             network,
             cuts,
@@ -386,15 +403,20 @@ async fn main(spawner: Spawner) {
                 configuration,
                 network,
                 secret: secret.present().copied(),
+                controller: controller.present().map(ControllerKey::public),
                 epoch,
                 epoch_record,
                 clients,
-                challenges,
+                generator: Generator::new(drbg),
             }),
             recorder::Cuts {
                 kept: Some(cuts),
                 boot: boots.present().copied(),
             },
+            secret
+                .present()
+                .zip(controller.present())
+                .map(|(secret, controller)| Agreement::new(secret, controller)),
         ),
         None => (
             None,
@@ -402,6 +424,7 @@ async fn main(spawner: Spawner) {
                 kept: None,
                 boot: None,
             },
+            None,
         ),
     };
     let fram = fram::share(fram);
@@ -417,7 +440,7 @@ async fn main(spawner: Spawner) {
         cts: b.module.cts,
     };
     if let Ok(token) = link::run(link_pins, identity.zip(keys), fram) {
-        spawner.spawn(token);
+        tasks.spawn(token);
     } else {
         defmt::error!("the link task did not spawn; the watchdog will reset the part");
     }
@@ -430,115 +453,28 @@ async fn main(spawner: Spawner) {
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
     if let Ok(token) = recorder::run(cuts, fram, nor, record.body(), calendar) {
-        spawner.spawn(token);
+        tasks.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");
     }
 
-    // 10. The control tick, 1 Hz. Nothing decides yet; it checks in.
+    // 10. The control tick, 1 Hz, holding every output.
     supervisor::check_in(Task::Control);
-    let mut ticker = Ticker::every(Duration::from_secs(1));
-    let mut samples = Ticker::every(Duration::from_millis(10));
-    #[cfg(feature = "bench")]
-    let mut proof = bench::Proof::new(words);
-    loop {
-        match select(ticker.next(), samples.next()).await {
-            Either::First(()) => {}
-            Either::Second(()) => {
-                selector.sample();
-                continue;
-            }
-        }
-        let seen = Feedback::contact(feedback.is_high());
-        if contact != Some(seen) {
-            defmt::info!("generator contact: {}", seen);
-            contact = Some(seen);
-        }
-        #[cfg(feature = "bench")]
-        match proof.tick() {
-            bench::Step::Run => {}
-            bench::Step::Starve => {
-                defmt::warn!(
-                    "watchdog proof: the control tick blocks the executor on purpose; the part resets in about 8 s and the next boot names it"
-                );
-                // A spin, not a yield: the whole thread executor is held,
-                // and only a supervisor above it can still name this task.
-                loop {
-                    cortex_m::asm::nop();
-                }
-            }
-            bench::Step::Panic => {
-                defmt::warn!(
-                    "panic proof: panicking on purpose; the part resets and the next boot names the site"
-                );
-                bench::panic_on_purpose();
-            }
-        }
-        supervisor::check_in(Task::Control);
-    }
-}
-
-/// The one-shot proofs that show the safety floor on the bench.
-#[cfg(feature = "bench")]
-mod bench {
-    use o89_core::LastWords;
-
-    /// Seconds of ordinary running before a proof.
-    const AFTER_TICKS: u32 = 15;
-
-    /// What the control tick does this second.
-    pub enum Step {
-        /// Check in as usual.
-        Run,
-        /// Stop checking in: the watchdog proof.
-        Starve,
-        /// Panic: the panic-path proof.
-        Panic,
+    if let Ok(token) = control::run(held, feedback, selector, words) {
+        tasks.spawn(token);
+    } else {
+        defmt::error!("the control tick did not spawn; the watchdog will reset the part");
     }
 
-    /// Which proof this boot runs, from what the previous run left: nothing
-    /// means this boot starves; a blame means the watchdog just fired, so
-    /// this boot panics; a panic site means the chain is done and this boot
-    /// runs. The last words rather than the reset cause, because a reset the
-    /// probe requests reads as a software reset, the same as the one after
-    /// a panic. The three records in a row are the evidence.
-    pub struct Proof {
-        step: Step,
-        ticks: u32,
-    }
-
-    impl Proof {
-        pub fn new(words: Option<LastWords>) -> Self {
-            let step = match words {
-                None => Step::Starve,
-                Some(LastWords::Starved(_)) => Step::Panic,
-                Some(LastWords::Panicked(_)) => Step::Run,
-            };
-            Self { step, ticks: 0 }
+    // 11. Key agreement, alone in thread mode, below every task above
+    // (P-243). A unit with no controller key has none, and nothing on the
+    // roll waits for it.
+    if let Some(worker) = worker {
+        supervisor::check_in(Task::Agreement);
+        if let Ok(token) = agreement::run(worker) {
+            spawner.spawn(token);
+        } else {
+            defmt::error!("the agreement worker did not spawn; the watchdog will reset the part");
         }
-
-        /// One second passed: the proof's step once its time has come, and
-        /// `Run` before.
-        pub fn tick(&mut self) -> Step {
-            self.ticks = self.ticks.saturating_add(1);
-            if self.ticks < AFTER_TICKS {
-                return Step::Run;
-            }
-            match self.step {
-                Step::Run => Step::Run,
-                Step::Starve => Step::Starve,
-                Step::Panic => Step::Panic,
-            }
-        }
-    }
-
-    /// The panic-path proof: the production handler writes the site to the
-    /// last words and resets, and the next boot reports it.
-    #[expect(
-        clippy::panic,
-        reason = "the one deliberate panic in the firmware, in the bench build alone, to prove the path a real one takes"
-    )]
-    pub fn panic_on_purpose() -> ! {
-        panic!("the panic proof");
     }
 }

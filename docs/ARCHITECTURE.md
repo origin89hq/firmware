@@ -62,12 +62,16 @@ internet-facing part: the one an attacker reaches first and the one being
 patched for years. TLS terminates there, and commands are authenticated
 end-to-end at the controller as well:
 
-- A device-unique secret in the controller's FRAM, never exposed to the comms
-  processor. No key crosses the link; both sides derive one, and what crosses
-  is a proof of knowledge.
-- Every write is signed, with a per-client monotonic counter. Authenticating
-  one write and not another is a locked door beside an open one.
-- Every response and every event carries a MAC too. A forged command has a
+- A controller key made at manufacture and a printed secret, both in the
+  controller's FRAM and never exposed to the comms processor. Pairing is a
+  Noise handshake under a key the label derives, and the client pins the
+  controller key the label's fingerprint vouches for; every session after it
+  is a Noise handshake against that key. No private key and no shared secret
+  crosses the link.
+- Every request after a handshake is sealed under keys only that handshake
+  produced, writes included. Authenticating one write and not another is a
+  locked door beside an open one.
+- Every response and every event is sealed too. A forged command has a
   physical consequence somebody eventually notices; a forged *reading* is
   simply believed, and a comms chip that can answer "bank at 80 %" when it is
   at 30 defeats the product's whole proposition.
@@ -75,8 +79,8 @@ end-to-end at the controller as well:
   as no message at all. Not a command that checks a flag: there is no such
   command in the protocol to find.
 
-That is the client–controller authentication: the keys, their derivation and
-the MACs are P-040–P-045, P-050–P-053 and P-085–P-088. It is not the link
+That is the client–controller authentication: the keys, the handshakes and the
+sealed transport are P-226–P-243, with P-044–P-045 and P-085–P-088. It is not the link
 between the two chips. While they are on one board that link carries no MAC
 and shares no key (L-020): a key the untrusted peer held would authenticate
 nothing, and a compromised comms processor is assumed throughout. L-024 is the
@@ -212,7 +216,7 @@ no inlining and usually a heap.
 | Devices: EPEver, PZEM, shunt, BMS | Enum dispatch | A closed set known at build time. Zero indirection, and the compiler catches a missing variant, which is the same reason there are no wildcard arms anywhere in this repository |
 | Transports | Trait for the byte pipe, one protocol above it | Only the framing differs |
 | Behaviours: generator, frost, schedule, load-shed | Concrete state machines | Extending means adding one, not swapping one. A trait here buys nothing and costs clarity |
-| Challenges | Derived, not a seam | The part has no RNG peripheral, so there is nothing behind a trait to vary (below) |
+| Randomness | Manufactured, not a seam | The part has no RNG peripheral: a generator whose state the station wrote, so there is nothing behind a trait to vary (below) |
 
 The distinction is open set against closed set. Peripherals and transports
 vary by target and by test, so they are traits. Devices and behaviours are
@@ -225,49 +229,55 @@ policy, so what is dropped when a queue is full is decided now rather than
 discovered at −30 °C. Telemetry drops. A safety event does not. The full
 coding rules are #3 §3, enforced by the manifests and the gate.
 
-### Where challenges come from
+### Where randomness comes from
 
 The STM32G0B1 has no RNG peripheral; `RNG` does not appear in the part's
-metadata at all. P-063's *a challenge MUST come from a CSPRNG* is answered by
-derivation: a challenge is `HKDF(device_secret, "km43/v1/challenge" | counter)`
-truncated to sixteen bytes, a PRF in counter mode, unpredictable to anybody
-who does not hold the printed secret, which is everybody the threat model
-cares about. The comms processor is hostile and does not hold it; somebody
-who does can pair anyway, so predicting a challenge buys them nothing. It has
-its own derivation label because a challenge is published in every
-`Discover`, and sharing a derivation with the pairing key would hand out the
-key the device rests on.
+metadata at all. Every challenge and every ephemeral key the controller uses
+is a draw from a deterministic generator whose thirty-two bytes of state the
+manufacturing station drew from its own CSPRNG and recorded nowhere (P-237).
+The controller key is made the same way, at the same time, and only its
+private half is stored; `CS` is derived when it is needed (P-235). A key
+minted from whatever a Cortex-M0+ scrapes together at power-on is a key
+nobody can vouch for, which is why neither is made on the part.
 
-**The counter is the whole of the security, and it must outlive a reset.** A
-counter that repeats re-mints a challenge that a recorded proof verifies
-against a second time. So it is written to FRAM before the challenge it names
-goes out, never after. That makes the CSPRNG depend on storage rather than on
-a peripheral, which is why it is not a seam. Physical entropy is not needed
-and not ruled out: the ADC's low bits are noisy, and stirring them in raises
-the cost of a stolen label without changing the argument.
+**The successor is on the part before the draw is used.** Each draw replaces
+the state with a one-way function of itself; `km43`'s `Drbg` writes the
+successor through the store, reads it back off the part, compares, and only
+then releases the draw, and the store reads the FRAM rather than the RAM copy
+(`drbg.rs`). A reset at the wrong moment therefore loses a draw and never
+repeats one: the same challenge twice is a recorded `Hello` accepted twice,
+and the same ephemeral twice is a session key given away. A state read out
+with a probe yields the draws after it and none before, so a session recorded
+before a capture stays sealed.
 
-A corrupt challenge counter refuses to mint. On the bench, `o89-dev store
-write-secret` (or `--replace`) stages a fresh secret through a firmware mailbox
-operation, then reboots and reads back completion before printing the label.
-An applied transaction retains its secret until the host flushes the label and
-acknowledges it. After a failed reboot or read-back, `o89-dev store write-secret
---resume` finishes the same transaction and verifies the active secret and counter
-before displaying the device id, printed secret, P-049 payload and QR. Pending or
-unacknowledged transactions refuse new writes, including `--replace`; an acknowledged
-transaction refuses resume. Output and FRAM acknowledgement cannot be atomic:
-a crash after output but before acknowledgement can repeat the same label on resume.
-No secret is saved on the host.
-The intent is a 49-byte body in two 61-byte slots appended after the existing
-FRAM map, leaving every existing record at its address. Before exposing a
-`Store`, boot writes the new secret, writes counter zero, commits the completed
-intent, and scrubs the previous intent slot. A cut before the intent lands keeps
-the old pair; a cut afterwards replays recovery before any session exists.
-Counter values under fresh secret material derive different challenges. Reusing
-the current secret is refused, and there is no counter-only reset operation.
-Unreadable intent is erased and reported at boot, keeping the current secret
-and counter unchanged; old-layout garbage in the appended region cannot stop
-setup. A refused recovery write yields no store or session keys, and a later
-boot retries valid pending intent or finishes discarding unreadable residue. Replacing the label orphans existing client keys.
+**It is never re-initialised.** A factory reset does not touch it, a boot that
+finds it damaged keeps it damaged, and a record that cannot be read back
+refuses every `Pair` and `Hello`, answers `Discover` with error 18 and raises
+condition 22 `entropy unavailable`; a bench repairs it by erasing the part, not
+by the firmware choosing a state. Bytes from elsewhere may be mixed in through
+the same one-way step, never in place of it.
+
+**Manufacture is one transaction.** `o89-dev store write-secret` draws the
+printed secret and, on a unit that holds neither, the controller key and the
+generator's first state, and stages them through a mailbox operation; the next
+boot writes each onto a record never written, marks the transaction applied
+with the fingerprint of the key the part holds, and only then returns a store.
+The host prints P-049's v2 label, `km43:2:<device_id>:<printed_secret>:<fp>`,
+from that applied record, so `--resume` never reads the key back, and it
+writes neither the key nor the seed anywhere. A transaction onto a unit that
+holds either is refused; `--replace` changes the printed secret alone and
+keeps the fingerprint. A cut before the intent lands keeps what the unit held;
+a cut after it replays the boot's writes, none of them twice. An intent that
+would leave no controller key is discarded whole and the boot goes on.
+Pending or unacknowledged transactions refuse new writes, and output and FRAM
+acknowledgement cannot be atomic: a crash after output but before
+acknowledgement can repeat the same label on resume. The intent keeps the
+secret and the fingerprint, never the key or the seed, once applied.
+`o89-dev store blank --yes` is the erase a bench repairs a part with: it zeroes
+the map, reads it back and reboots onto an unborn unit, which `write-secret`
+then gives a new key, generator and label. It is also how a part written under
+an earlier map is brought onto this one, since its old bytes read as a damaged
+key or generator.
 
 ### Embassy, and why the choice is cheap
 
@@ -298,7 +308,9 @@ Three rules come with it:
    cooperative executor must never be the only thing between a maintained
    contact and a tank running dry.
 2. **No task blocks, and every `await` has a deadline** or a documented
-   liveness argument. The failure mode of a cooperative executor is one task
+   liveness argument. Key agreement is the one computation that cannot
+   yield, a quarter of a second per X25519, and it is alone in thread mode
+   below every task that times anything (P-243, below). The failure mode of a cooperative executor is one task
    starving the rest, and it looks exactly like a dead controller.
 3. **The image is measured every time the gate runs**, the `.bin` against
    the 248 KB slot with a stated margin, and a change that moves it records
@@ -351,13 +363,15 @@ role; `BOARD-A.md` maps them to pins.
    every reset, so this path is all a reset adds to a cut (F-005), and the
    boot waits the rail's settling before the FRAM is touched, so that the
    switch-on of a cold boot never lands inside a write.
-6. **FRAM read**: the secret, the epoch, the client table with its
-   counters and the dedup table, the generator run reason, the panic
-   record, the boot count, the challenge counter, the byte budget, the
+6. **FRAM read**: the secret, the controller key, the generator's state,
+   the epoch, the eight slots with their generation marks and the dedup
+   table, the generator run reason, the panic record, the boot count, the
+   byte budget, the
    authorised comms release, the network master copy; the configuration
    sections when M5 adds them. One read into a `Store`, and the rules that
    tie one record to another applied where both are in hand: a fresh unit
-   gets its first epoch, a table under another epoch is cleared (F-026),
+   gets its first epoch, an epoch record behind a slot is raised to it and
+   the table is repaired as P-239 says (F-026),
    the boot count climbs, the last words are written down with it, and
    every window measured on the tick restarts at zero (P-121).
    The supervisor is not running yet, so this phase bounds itself: every
@@ -387,11 +401,24 @@ protocol's to the link task and the rest to the recorder, and the part to
 both behind one async mutex held for a single blocking transfer. A task
 never writes another's record, so the RAM copy each keeps is the part's.
 Nothing blocks; a bus that hangs is a task that misses its
-check-in, which is a reset, which is the fail state. The supervisor runs
-from its own interrupt above the thread executor, so a transfer that never
-returns and holds the executor is still a task named in the last words
-before the watchdog fires: the watchdog is the floor either way, the blame
-is what the next boot reads.
+check-in, which is a reset, which is the fail state.
+
+**Three executors, by priority.** Thread mode is the lowest priority a
+Cortex-M0+ has, so it holds the one job that computes for seconds at a
+time, key agreement (a `Hello` measured 2.46 s on board A), and nothing else
+(P-243). Every task that times
+anything, control, link, rail and recorder, runs on the control executor,
+driven by `USB_UCPD1_2` at `P12`, and preempts the worker whenever it has
+anything to do; the tasks there share it cooperatively as they always did.
+The supervisor runs from `CEC` at `P8`, above both, so a transfer that never
+returns and holds the control executor is still a task named in the last
+words before the watchdog fires: the watchdog is the floor either way, the
+blame is what the next boot reads. The time driver and every bus interrupt
+are above all three. The M0+ implements two priority bits and embassy-stm32
+names levels for four, so only `P0`, `P4`, `P8` and `P12` are real here; any
+other truncates to the highest, where nothing preempts anything, and a
+compile-time assertion refuses them. The worker is on the roll with a ten-second window, and
+checks in between jobs and every idle second.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
 fed from a timer interrupt is a watchdog that does not work.
@@ -640,8 +667,9 @@ enrolled clients; no separate "enrolled once" marker is kept.
 The deadline starts at boot, never link-up, and expiry does not reopen it. A power cut at an unattended, unpaired site
 opens it with nobody there. This exposure ends at the first enrolment: that
 Pair closes the window, and subsequent boots open nothing. Factory reset
-restores eligibility on the next boot under the new epoch. Proof verification
-is unchanged; a bad proof neither enrols nor closes the window. The window
+restores eligibility on the next boot under the new epoch. The pairing
+handshake is unchanged; a message 1 that does not open neither enrols nor
+closes the window. The window
 uses the same steady lamp and L-193 to L-195 reports, and grants no time-floor
 override. The selector gesture still works during and after it.
 
@@ -653,7 +681,7 @@ no outer-position or intermediate-Off leg may exceed three seconds:
 | --- | --- | --- |
 | Auto, Auto, Auto | 2 s | Open the 120 s pairing window |
 | Manual, Manual, Manual | 2 s | Arm one floor-crossing time write |
-| Auto, Manual, Auto | 10 s | Advance the epoch and clear clients, counters and dedup |
+| Auto, Manual, Auto | 10 s | Advance the epoch, then free every slot and empty the dedup table |
 
 The controller samples every 10 ms and accepts a position after 50 ms of
 unchanged samples. Both contacts low is unknown. Unknown input, a sample
@@ -683,38 +711,63 @@ task beside the link-local one, and host-tested the same way: frames and
 ticks in, answers and closes out. The link admits and frees connection rows
 on the comms processor's word through a `Rows` seam and drops every row with
 the link; the sessions decide what a row holds: at most one live challenge,
-minted when the row is accepted and again by a `Discover` that finds it
-spent or 120 seconds old, and at most one session, bound by a `Hello` whose
-proof verifies under the enrolment's key for the current epoch and replaced
-by the next one that does (P-076). The session's id is the row's handle. Only
-a frame whose MAC verified refreshes a session; fifteen quiet minutes, or
-eight failures inside a minute on the connection, close it through a
-`CloseConnection` the link tracks and retries, and the row goes when the
-comms processor answers. `Endpoint` is the one place a frame goes to one
-state machine or the other, by opcode, and the adapter and the simulator
-both drive it.
+drawn when the row is accepted and again by a `Discover` that finds it spent
+or 120 seconds old; at most one pairing handshake (P-229); and at most one
+session, bound by a `Hello` that proves the slot's key and replaced by the
+next one that does (P-076). The session's id is the row's handle. `Endpoint`
+is the one place a frame goes to one state machine or the other, by opcode,
+and the adapter and the simulator both drive it.
+
+**Key agreement never runs where a frame arrives** (P-243). What is cheap is
+done there, in P-226's order: the body and its suite, the challenge consumed,
+then the label's tag on pairing message 1 (an HKDF chain) or the admission
+tags of every occupied slot on a `Hello` (eight HMACs, P-238), then the
+window and P-240's table check, then the draw. A peer that fails any of them
+costs no DH and is answered at once: bare error 10 or 12, counted, or a
+refusal tagged under the label's refusal key, uncounted (P-241). What is
+left is a `Job`, owned and self-contained, one per row: pairing message 2,
+message 3 with the slot's admission key, or a `Hello`'s proof and answer.
+The link task hands one to the worker only when none is out, picking the
+next row after the last one served, and answers with its `Done` when it
+comes back. A result for a handshake abandoned since, by a second one on the
+row, the row going, 120 seconds, a failure or a factory reset, is recognised
+by its ticket and discarded. The worker holds the controller key and the
+label and writes nothing; every FRAM write a handshake needs, the draws and
+the slot, is the link task's, before the answer that depends on it.
+
+**At message 3 the slot lands before the answer names it** (P-064): the
+window read again, P-240 run again with the client key message 3 proved, the
+next challenge drawn, every session on the slot unbound, then the slot
+written as P-239 says. A slot that does not land is outcome 7: nothing
+enrolled, the window left open, condition 23. The pairing's keys seal the
+answer and are dropped with it; a pairing opens no session.
+
+**Every request after a `Hello` is sealed** (P-231), opened under the
+session's keys before anything is read. The opener holds P-022's window: a
+`req_id` it accepted already, or below the highest less `MAX_INFLIGHT`, is
+dropped unanswered, uncounted, and refreshes nothing. Only a request that
+opened refreshes the session (P-077); a tag that fails counts against the
+connection, and eight inside a minute close it (P-051). A session answers
+only while its slot still holds the enrolment it proved: a re-key or a
+reset unbinds it first, and a mask is read from the slot's current record.
+A write carries no client of its own and no counter; its session is the only
+statement of who sent it (km43 #134). A `Command` goes through `admit` in
+P-080's order: the dedup lookup, the in-flight entry landed, then the
+execution; a dedup write that fails is error 7 and nothing runs (P-079).
+Commands are reserved until an output has been granted authority.
+`GetConfig` opens before reading identity, network, or a behaviour's shadow
+flag. `SetConfig` checks the mask, then `check_version`, then section
+validation, then the inactive slot. Structure errors answer Error 1; invalid
+values answer SetConfigAck 3. Network reads use `NetworkRead`, which can
+report `psk_set` but cannot hold a passphrase. A write omitting `psk`
+retains it only for the byte-identical SSID.
 
 The link task keeps the records the client protocol writes, the epoch, the
-challenge counter and the client table, through its own lease on the FRAM;
-a mint is one FRAM transfer, so a challenge never waits behind a NOR erase
-in the recorder. The selector's factory reset is served there too, because
-the sessions derive under the epoch it retires: every session ends before
-the epoch moves, and keys derive afterwards under whatever the record then
-holds, nothing at all if the advance failed. Enrolment is gated by the gesture. Challenges are derived as above, with the
-counter written before the challenge leaves. A signed request is verified in
-P-080's order; the counter and the dedup entry are written in one FRAM
-transaction, and a write that fails fails closed (P-079). Between the MAC
-and the counter, each session holds the highest `req_id` it accepted and
-the four below it, and drops a request whose `req_id` it accepted already or
-that is below that window, unanswered, as P-022 requires. Commands are
-reserved until an output has been granted authority. `GetConfig` verifies its
-wrapper and request window before reading identity, network, or a behaviour's
-shadow flag. Signed `SetConfig` goes through `admit`: the counter lands first,
-then `check_version`, then section validation, then the inactive slot. A stale
-version or invalid body spends its authenticated counter without changing the
-section. Structure errors answer Error 1; invalid values answer SetConfigAck 3.
-Network reads use `NetworkRead`, which can report `psk_set` but cannot hold a
-passphrase. A write omitting `psk` retains it only for the byte-identical SSID.
+generator, the slots and the dedup table, through its own lease on the FRAM;
+a draw is two FRAM transfers, so a challenge never waits behind a NOR erase
+in the recorder. The selector's factory reset is served there too: every
+session ends and every handshake is abandoned before the epoch moves, and
+the slots are freed under the new one after it lands.
 
 ### The link
 
@@ -852,7 +905,7 @@ event queue, which refuses when full.
 
 | | Part | Holds | Layout |
 |---|---|---|---|
-| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the client table with masks and counters and the dedup table beside them in one record, because P-080 lands a counter and an in-flight entry in one transaction (P-081, P-105, P-121), the epoch (P-085), the challenge counter, the device secret, the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the bench secret replacement intent (122 bytes, appended after the configuration reservations) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
+| FRAM | FM24W256, 32 KB, I2C | Everything control-critical: configuration sections in A/B slots (P-102), the eight client slots, each a key record in two copies with a generation mark beside it (P-239), the dedup table under its epoch (P-080, P-121), the epoch (P-085), the generator's state (P-237), the device secret and the controller key (P-235), the generator run reason (origin89hq/hardware#18), the panic record, the boot counter, the rolling write-volume counter, the authorised comms release (L-170), the network master copy (L-130), the manufacturing transaction (appended after the configuration reservations) | A `const` map with a budget assertion; two slots per record, each `[magic \| seq \| body \| crc32]`, the magic cleared first and written last, the higher valid sequence current |
 | NOR | W25Q128, 16 MB, SPI | The event log ring and the 15-minute aggregates; later the last authorised comms image | The ring below, written against `embedded-storage-async`'s `NorFlash` |
 
 Different failure consequences, so different chips. FRAM must survive a
@@ -875,7 +928,7 @@ link.
 **A/B answers multi-word atomicity; the part answers power loss.** FRAM has
 no erase cycle and no write latency, so a single word survives a cut by
 itself; what it cannot do is make six words land together. Configuration and
-the client table live in A/B slots with a sequence number and a CRC; a write
+every client slot live in A/B slots with a sequence number and a CRC; a write
 goes to the slot that is not current, clears its magic first, lands the
 sequence, the body and the CRC, and writes the magic last, and the slot
 whose magic and CRC hold with the higher sequence is the record. The magic
@@ -908,29 +961,38 @@ version is unknowable; the validated replacement starts at version one. A
 local network replacement owes a push even when the module reports version one.
 
 **One record is one transaction, and that decides what shares a record.**
-The per-client counters and the dedup table are fields of the client table's
-record, not records of their own, because P-080 lands the new counter and
-the in-flight entry together or not at all, and two records cannot promise
-that. A signed request therefore rewrites the whole table, about 1.2 KB, in
-the time an I2C transaction takes; a phone sends a handful of those a second
-at most. The typed layer keeps the RAM copy of every record with the
-record's position on the part, and changes it only once the part has the
-change: a refused write leaves the controller knowing exactly what it
-accepted, which is P-079 as a structure rather than a discipline.
+Each client slot is a record of its own, because P-239 re-keys one slot at a
+time and a torn write must never reach another's. The dedup table is a record
+of its own, because a command's in-flight entry is the one thing P-080 lands
+before it executes, and nothing else has to land with it. The typed layer
+keeps the RAM copy of every record with the record's position on the part,
+and changes it only once the part has the change: a refused write leaves the
+controller knowing exactly what it accepted, which is P-079 as a structure
+rather than a discipline. Where a rule says *read back*, the epoch, a slot, a
+generation mark, the generator, the write is read back off the part and the
+handle holds what the read found.
 
-**A factory reset is crash-safe by a stamp, not by luck.** P-085 moves the
-epoch first and clears the table second, and a power cut between the two
-leaves eight rows whose keys no longer derive counting towards
-`table_full`. The table carries the epoch its rows were enrolled under, and
-a boot that reads a table under an earlier epoch than the epoch record
-holds clears it, finishing the reset (F-026). The permission to clear is a
-type that only the read-back of a new epoch, or that boot, can produce. The
-other direction is never a clearing: a table under a later epoch than the
-record means the record regressed, which this firmware does not do by its
-own hand, and clearing under the lower epoch would let the next enrolment
-derive a key the move was made to invalidate. The stamp is a second copy of
-a counter that only climbs, so the higher copy is the epoch and the boot
-raises the record to it.
+**A slot is re-keyed by writing it free first** (P-239). The mark is raised
+and read back, the slot is written free under that generation and read back,
+the slot's dedup entries are forgotten, and only then is the new record
+written and read back. FRAM commits byte by byte, so a record rewritten in
+place and cut between the label and the key would leave the old install's key
+under the new label; this way a cut at any byte leaves the old enrolment or a
+free slot. A generation is never issued twice under an epoch, so
+`(epoch, client_id, generation)` names one enrolment: a mark that cannot be
+read back makes the table corrupt, and the boot repairs it to empty under a
+new epoch, as a reset would.
+
+**A factory reset commits with one write** (P-085). A slot is occupied only
+if it reads, says occupied and was written under the current epoch, so the
+epoch landing is the reset: every slot is free from that moment, and freeing
+them one by one afterwards is housekeeping a cut cannot undo. The permission
+to clear is a type only the read-back of a new epoch produces. The other
+direction is never a clearing: a slot under a later epoch than the record
+means the record regressed, which this firmware does not do by its own hand,
+and the boot raises the record to it, because a slot's epoch is a second copy
+of a counter that only climbs (F-026). The dedup table carries its epoch too,
+and a boot clears it under any other.
 
 History at full resolution is a client's job. The controller keeps enough to
 survive a long disconnection, which is a different requirement from keeping
@@ -945,9 +1007,9 @@ store and the ring use, and lands the same sequence as its answer. So a
 write from the bench meets the voltage detector's refusal as the firmware's
 own would, and the bytes it writes are framed by this crate's own records
 on the host: the epoch and the secret a unit leaves the bench with are
-records the boot reads exactly as it reads its own. Secret replacement is
-the exception: mailbox version 4 stages it in the controller, then the tool
-requests a reset and verifies boot completed the secret and counter transaction.
+records the boot reads exactly as it reads its own. Manufacture is the
+exception: the mailbox stages the transaction in the controller, then the tool
+requests a reset and reads back the applied record before it prints a label.
 Other raw record writes retain their host-side encoding in `o89-core`. One request reads records rather than bytes: the ring's
 newest events are walked by the ring's own reader and handed back a page at
 a time, because the ring is the one thing that knows where it starts and
@@ -1216,9 +1278,10 @@ and no half-copied window; an interrupted copy is exactly the empty-flash
 window origin89hq/hardware#30 describes, which is why `embassy-boot`'s
 copy-based scheme is not used. The HAL erases and programs either bank but
 never writes option bytes on this part; the bootloader does that through the
-PAC in one audited function, one of the four `unsafe` sites in the firmware,
+PAC in one audited function, one of the five `unsafe` sites in the firmware,
 with the bootloader's jump into the application, the controller's hard-fault
-handler, and the poll of the supervisor's executor from its interrupt.
+handler, and the polls of the supervisor's and the control executor from
+their interrupts.
 
 The invariants that make A/B what it claims:
 

@@ -283,6 +283,7 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) 
         // The module is off, or being cut: nothing to say, the words to hear.
         // After a stall the module is still powered and the UART comes
         // straight back with nothing new to say.
+        drain_agreement(&mut machine.endpoint, &mut machine.fram).await;
         let first = if core::mem::take(&mut resume) {
             Some(Actions::NONE)
         } else {
@@ -519,6 +520,9 @@ async fn episode(
             break 'episode ended;
         }
         serve_reset(&mut endpoint.sessions, fram).await;
+        if let Some(ended) = serve_agreement(endpoint, fram, &mut tx, writer, &mut answer).await {
+            break 'episode ended;
+        }
         if let Some(ended) = service_tick(endpoint, &mut tx, writer, &mut answer).await {
             break 'episode ended;
         }
@@ -568,16 +572,32 @@ async fn on_frame(
     answer: &mut [u8],
     frame: &[u8],
 ) -> Option<Ended> {
-    let local = Local {
+    let step = endpoint
+        .frame(frame, Uptime.now(), &local(), fram, answer)
+        .await;
+    answer_step(endpoint, tx, writer, answer, &step).await
+}
+
+/// What the link task tells the sessions besides the frame.
+fn local() -> Local<'static> {
+    Local {
         model: MODEL,
         log: recorder::log_span(),
         // No clock before its slice.
         time_known: false,
         pairing_open: selector::pairing_open(),
-    };
-    let step = endpoint
-        .frame(frame, Uptime.now(), &local, fram, answer)
-        .await;
+    }
+}
+
+/// A step's answer and actions onto the wire, and what its note asks of
+/// the panel and the recorder.
+async fn answer_step(
+    endpoint: &mut Endpoint,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &[u8],
+    step: &o89_core::Step,
+) -> Option<Ended> {
     if let Some(Reply {
         note: Some(SessionNote::Paired(_)),
         ..
@@ -597,6 +617,55 @@ async fn on_frame(
         return Some(ended);
     }
     perform(&mut endpoint.link, tx, writer, &step.actions).await
+}
+
+/// Key agreement's turn (P-243): a result back from the worker answered,
+/// and the next job handed out if the worker is free. Every tick, so a
+/// result never waits on the worker's side for longer than one.
+async fn serve_agreement(
+    endpoint: &mut Endpoint,
+    fram: &mut Lease,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &mut [u8],
+) -> Option<Ended> {
+    if let Ok(done) = crate::agreement::DONE.try_receive() {
+        let step = endpoint
+            .completed(done, Uptime.now(), &local(), fram, answer)
+            .await;
+        if let Some(ended) = answer_step(endpoint, tx, writer, answer, &step).await {
+            return Some(ended);
+        }
+    }
+    hand_out(endpoint);
+    None
+}
+
+/// The next job to the worker, if one waits and the worker is free.
+fn hand_out(endpoint: &mut Endpoint) {
+    if let Some(job) = endpoint.next_job()
+        && let Err(TrySendError::Full(job)) = crate::agreement::JOBS.try_send(job)
+    {
+        // The sessions hand out one at a time, so this is a slot still
+        // occupied by a job the worker has not taken: put it back.
+        endpoint.unsent(job);
+    }
+}
+
+/// A result that came back while the module is off: nobody to answer, but
+/// the sessions have to hear it, or the worker is never free again.
+async fn drain_agreement(endpoint: &mut Endpoint, fram: &mut Lease) {
+    if let Ok(done) = crate::agreement::DONE.try_receive() {
+        let mut answer = [0u8; MAX_PAYLOAD];
+        let step = endpoint
+            .completed(done, Uptime.now(), &local(), fram, &mut answer)
+            .await;
+        if let Some(reply) = step.reply
+            && let Some(note) = reply.note
+        {
+            session_note(note);
+        }
+    }
 }
 
 /// A client's answer onto the wire, under the write deadline every frame
@@ -643,21 +712,30 @@ fn session_note(note: SessionNote) {
         }
         SessionNote::Unbound(conn) => defmt::info!("session: goodbye on {}", conn),
         SessionNote::NoChallenge => {
-            defmt::warn!("session: no challenge to give; the counter did not land");
+            defmt::warn!("session: no challenge to give; the unit is not provisioned");
         }
         SessionNote::TooLarge => defmt::error!("session: an answer did not fit its buffer"),
-        // Dropped unanswered, as P-022 requires.
-        SessionNote::OutOfWindow(why) => {
-            defmt::warn!("session: a verified request refused by its req_id: {}", why);
+        // P-237's `entropy unavailable`, until the concern table records it
+        // (#100).
+        SessionNote::EntropyUnavailable => {
+            defmt::error!("session: the generator did not read back; every Pair and Hello refused");
         }
-        // P-079's `counter write failed` concern, until the concern table
+        // P-064's `client table write failed`, until the concern table
         // records it (#100).
+        SessionNote::TableNotStored => {
+            defmt::error!("session: a slot did not land on the FRAM; the window stays open");
+        }
+        // P-079's `dedup write failed`, until the concern table records it
+        // (#100).
         SessionNote::NotKept => {
-            defmt::error!("session: a signed request's record did not land on the FRAM");
+            defmt::error!("session: a command's dedup entry did not land on the FRAM");
         }
         SessionNote::Unreadable
         | SessionNote::NoHandle
         | SessionNote::Refused(_)
+        | SessionNote::Queued(_)
+        | SessionNote::Dropped
+        | SessionNote::Stale
         | SessionNote::ClientError => defmt::debug!("session: {}", note),
     }
 }

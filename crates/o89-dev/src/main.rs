@@ -193,6 +193,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
+    /// Zero the whole FRAM map and reboot: the controller key, the
+    /// generator, the printed secret and every enrolment are gone, and the
+    /// unit needs `write-secret` and a new label. For a part written under
+    /// an earlier map, whose old bytes read as a damaged key or generator
+    /// that nothing else may write over.
+    Blank {
+        /// Say it in as many words: nothing brings the key back.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Write the epoch: refused unless above the one held, because a client
     /// table stamped with a later epoch would be left alone by the boot.
     WriteEpoch {
@@ -200,14 +210,16 @@ enum StoreCommand {
         epoch: u32,
     },
     /// Write the device secret: sixteen bytes of id and thirty-two of
-    /// printed secret from the operating system's generator. Reboots the
-    /// controller to reset its challenge counter, then verifies and shows the label once.
+    /// printed secret from the operating system's generator, and on a unit
+    /// with no controller key its controller key and generator seed, which
+    /// never leave this process except to the controller. Reboots the
+    /// controller to apply them, then verifies and shows the v2 label once.
     WriteSecret {
         /// The device id as thirty-two hex characters; generated when absent.
         #[arg(long)]
         device_id: Option<String>,
-        /// Replace a secret the part already holds, which orphans every
-        /// client enrolled under it.
+        /// Replace the printed secret of a unit that already has one; its
+        /// controller key, generator and enrolled clients stay.
         #[arg(long)]
         replace: bool,
         /// Recover the label from an interrupted secret write.
@@ -308,6 +320,7 @@ fn main() -> Result<()> {
         Command::Store { what } => match what {
             None => store::show(&mut link),
             Some(StoreCommand::WriteEpoch { epoch }) => store::write_epoch(&mut link, epoch),
+            Some(StoreCommand::Blank { yes }) => store::blank(&mut link, yes),
             Some(StoreCommand::WriteSecret {
                 device_id,
                 replace,

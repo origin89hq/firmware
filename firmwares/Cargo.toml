@@ -101,7 +101,19 @@ arithmetic_side_effects = "deny"
 # Upstream's 844c4e7b, after 0.6.0 and unreleased, reads the register only
 # when the ring has room and masks the receive interrupt until it does
 # (F-090). This pin goes back to a release when one carries that commit.
+#
+# Known and not reported upstream: `embassy-stm32` builds
+# `embassy-hal-internal` with `prio-bits-4` for every STM32, and the M0+
+# implements two. `Priority::P2` and `P3` are `0x20` and `0x30`, which the
+# NVIC truncates to 0, so only `P0`, `P4`, `P8` and `P12` are real here
+# (bench 2026-09-25). `supervisor.rs` asserts that at compile time; when this
+# pin moves, check whether upstream now selects the chip's own bit count.
 [patch.crates-io]
+# km43 at the asynchronous DRBG store (origin89hq/km43#136), with key
+# agreement (#130) and the retired write counter (#134) before it. 0.8.0
+# also carries roles, invites and vouching, which this firmware does not
+# implement yet (#178); the pin moves to that release with them.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "08040fa371f01b6e48ead0ed0bf5af960fb2aadc" }
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }

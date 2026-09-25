@@ -20,7 +20,6 @@ fn p_108_p_100_damaged_sections_read_zero_then_repair_through_signed_session() {
             announce(&mut bench, 1);
             let mut client = Client::on(1);
             let _ = client.open(&mut bench);
-            let key = client.key.take().expect("key");
             let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
             let len = match section {
                 ConfigSection::IdentityAndSite => {
@@ -48,11 +47,10 @@ fn p_108_p_100_damaged_sections_read_zero_then_repair_through_signed_session() {
                 }
             };
             let written = &body[..len];
-            for (counter, expected_version, outcome, version) in [
-                (1, 1, SetConfig::StaleVersion, 0),
-                (2, 0, SetConfig::Accepted, 1),
-            ] {
-                let payload = read_config(&mut client, &mut bench, section, &key);
+            for (expected_version, outcome, version) in
+                [(1, SetConfig::StaleVersion, 0), (0, SetConfig::Accepted, 1)]
+            {
+                let payload = read_config(&mut client, &mut bench, section);
                 let answer = ConfigAnswer::decode(&payload).expect("config answer, not BusyRetry");
                 assert_eq!(
                     (answer.section(), answer.version(), answer.body()),
@@ -75,12 +73,10 @@ fn p_108_p_100_damaged_sections_read_zero_then_repair_through_signed_session() {
                         expected_version,
                         body: written,
                     },
-                    counter,
-                    &key,
                 );
                 assert_eq!((ack.version, ack.outcome), (version, outcome));
             }
-            let payload = read_config(&mut client, &mut bench, section, &key);
+            let payload = read_config(&mut client, &mut bench, section);
             let answer = ConfigAnswer::decode(&payload).expect("config answer");
             assert_eq!(answer.version(), 1);
             if section == ConfigSection::Network {
@@ -102,55 +98,30 @@ fn p_108_p_100_damaged_sections_read_zero_then_repair_through_signed_session() {
     }
 }
 
-fn read_config(
-    client: &mut Client,
-    bench: &mut Bench,
-    section: ConfigSection,
-    key: &SessionKey,
-) -> Vec<u8> {
+fn read_config(client: &mut Client, bench: &mut Bench, section: ConfigSection) -> Vec<u8> {
     let mut request = [0; 160];
     let len = km43::GetConfigRequest { section }
         .encode(&mut request)
         .expect("get");
-    let mut frame = [0; 256];
-    let len = Tagged::over(client.header(MessageType::GetConfig), &request[..len], key)
-        .expect("tagged")
-        .write(&mut frame)
-        .expect("frame");
-    let answers = client.send(bench, &frame[..len]);
-    let verified =
-        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-            .expect("wrapper")
-            .verify(key)
-            .expect("MAC");
-    verified.payload().to_vec()
+    let frame = client.sealed(MessageType::GetConfig, &request[..len]);
+    let answers = client.send(bench, &frame);
+    client
+        .opened(answers.last().expect("answer"))
+        .expect("sealed")
+        .1
 }
 
 fn write_config(
     client: &mut Client,
     bench: &mut Bench,
     operation: SetConfigOperation<'_>,
-    counter: u64,
-    key: &SessionKey,
 ) -> SetConfigAck {
     let mut request = [0; 160];
     let len = operation.encode(&mut request).expect("operation");
-    let mut frame = [0; 256];
-    let len = Signed::over(
-        client.header(MessageType::SetConfig),
-        ClientId::new(1).expect("client"),
-        Counter(counter),
-        &request[..len],
-        key,
-    )
-    .expect("signed")
-    .write(&mut frame)
-    .expect("frame");
-    let answers = client.send(bench, &frame[..len]);
-    let verified =
-        Wrapper::decode(Envelope::decode(answers.last().expect("answer")).expect("envelope"))
-            .expect("wrapper")
-            .verify(key)
-            .expect("MAC");
-    SetConfigAck::decode(verified.payload()).expect("ack")
+    let frame = client.signed(MessageType::SetConfig, &request[..len]);
+    let answers = client.send(bench, &frame);
+    let (_, body) = client
+        .opened(answers.last().expect("answer"))
+        .expect("sealed");
+    SetConfigAck::decode(&body).expect("ack")
 }

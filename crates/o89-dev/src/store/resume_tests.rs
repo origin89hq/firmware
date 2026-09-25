@@ -1,24 +1,38 @@
 use super::*;
 use o89_core::{Address, Fram, SecretChange, Store};
 
+/// What a reboot request does to the fake part.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reboot {
+    /// The part boots on what it holds.
+    Boots,
+    /// The request fails and says so.
+    Fails,
+    /// The request comes back without the part having reset, as a lost
+    /// `Reboot` on a part already at boot 1 does.
+    Ignored,
+}
+
 struct FakeLink {
-    bytes: [u8; map::END.0 as usize],
-    fail_reboot: bool,
+    bytes: Vec<u8>,
+    reboot: Reboot,
     fail_readback: bool,
     reads_fail: bool,
     reboots: usize,
     stages: usize,
+    birth_stages: usize,
 }
 
 impl FakeLink {
     fn new() -> Self {
         Self {
-            bytes: [0; map::END.0 as usize],
-            fail_reboot: false,
+            bytes: vec![0; map::END.0 as usize],
+            reboot: Reboot::Boots,
             fail_readback: false,
             reads_fail: false,
             reboots: 0,
             stages: 0,
+            birth_stages: 0,
         }
     }
 
@@ -56,7 +70,7 @@ impl Fram for FakeLink {
 impl SecretLink for FakeLink {
     fn reboot(&mut self) -> Result<()> {
         self.reboots = self.reboots.checked_add(1).unwrap();
-        if self.fail_reboot {
+        if self.reboot == Reboot::Fails {
             bail!("reboot failed");
         }
         let (_, report) = block_on(Store::boot(self, None)).map_err(|_| anyhow!("boot failed"))?;
@@ -67,10 +81,31 @@ impl SecretLink for FakeLink {
         Ok(())
     }
 
-    fn stage_and_reboot(&mut self, secret: Secret, replace: bool) -> Result<()> {
+    fn reboot_blank(&mut self) -> Result<()> {
+        self.reboots = self.reboots.checked_add(1).unwrap();
+        if self.reboot == Reboot::Ignored {
+            return Ok(());
+        }
+        let (_, report) = block_on(Store::boot(self, None)).map_err(|_| anyhow!("boot failed"))?;
+        if report.boot != o89_core::BootCount::FIRST {
+            bail!("the boot count did not start over");
+        }
+        Ok(())
+    }
+
+    /// What the firmware's mailbox op does with the body the host sends.
+    fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()> {
         self.stages = self.stages.checked_add(1).unwrap();
-        block_on(o89_core::stage_secret(self, secret, replace))
-            .map_err(|_| anyhow!("stage failed"))?;
+        let Ok(SecretChange::Pending(secret, birth)) =
+            SecretChange::decode(body.try_into().unwrap())
+        else {
+            bail!("not a pending transaction");
+        };
+        if birth.is_some() {
+            self.birth_stages = self.birth_stages.checked_add(1).unwrap();
+        }
+        block_on(o89_core::stage_secret(self, secret, birth, replace))
+            .map_err(|why| anyhow!("stage failed: {why:?}"))?;
         self.reboot()
     }
 }
@@ -79,10 +114,36 @@ fn secret() -> Secret {
     Secret::new([1; 16], [2; 32]).unwrap()
 }
 
-fn assert_label(output: &[u8], secret: Secret) {
+fn birth() -> o89_core::Birth {
+    o89_core::Birth {
+        controller: ControllerKey::new([4; 32]).unwrap(),
+        drbg: DrbgState::new([5; 32]).unwrap(),
+    }
+}
+
+/// Stage `secret` as the firmware would receive it, then reboot.
+fn staged(link: &mut FakeLink, secret: Secret, birth: Option<o89_core::Birth>) {
+    link.stage_and_reboot(&SecretChange::Pending(secret, birth).encode(), false)
+        .unwrap();
+}
+
+/// The fingerprint of the controller key the part holds.
+fn held_fingerprint(link: &mut FakeLink) -> Fingerprint {
+    read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)
+        .unwrap()
+        .present()
+        .unwrap()
+        .fingerprint()
+}
+
+fn assert_label(output: &[u8], secret: Secret, fingerprint: Fingerprint) {
     let label = std::str::from_utf8(output).unwrap();
     let encoded = secret.encode();
-    let payload = pairing_payload(&secret.device_id_bytes(), encoded[16..].try_into().unwrap());
+    let payload = pairing_payload(
+        &secret.device_id_bytes(),
+        encoded[16..].try_into().unwrap(),
+        &fingerprint,
+    );
     assert!(label.contains(&format!(
         "device id      {}\n",
         hex::encode(secret.device_id_bytes())
@@ -101,17 +162,18 @@ fn assert_label(output: &[u8], secret: Secret) {
 #[test]
 fn resume_after_failed_reboot_prints_the_staged_secret_once() {
     let mut link = FakeLink::new();
-    link.fail_reboot = true;
+    link.reboot = Reboot::Fails;
     let mut output = Vec::new();
     let error = run_secret(&mut link, None, false, false, &mut output).unwrap_err();
     assert!(format!("{error:#}").contains("o89-dev store write-secret --resume"));
     assert!(output.is_empty());
-    let SecretChange::Pending(staged) = link.transaction() else {
-        panic!("pending")
+    let SecretChange::Pending(staged, Some(_)) = link.transaction() else {
+        panic!("pending, with the unit's birth")
     };
-    link.fail_reboot = false;
+    link.reboot = Reboot::Boots;
     run_secret(&mut link, None, false, true, &mut output).unwrap();
-    assert_label(&output, staged);
+    let fingerprint = held_fingerprint(&mut link);
+    assert_label(&output, staged, fingerprint);
     assert_eq!(link.stages, 1);
     assert!(matches!(link.transaction(), SecretChange::Complete));
     output.clear();
@@ -120,7 +182,7 @@ fn resume_after_failed_reboot_prints_the_staged_secret_once() {
 }
 
 #[test]
-fn resume_after_failed_readback_does_not_reboot_or_reset_the_counter() {
+fn p_237_resume_after_failed_readback_does_not_reboot_or_reseed_the_generator() {
     let mut link = FakeLink::new();
     link.fail_readback = true;
     let mut output = Vec::new();
@@ -128,25 +190,20 @@ fn resume_after_failed_readback_does_not_reboot_or_reset_the_counter() {
     assert!(format!("{error:#}").contains("o89-dev store write-secret --resume"));
     assert!(output.is_empty());
     link.reads_fail = false;
-    let SecretChange::Applied(applied) = link.transaction() else {
+    let SecretChange::Applied(applied, fingerprint) = link.transaction() else {
         panic!("applied")
     };
-    let (mut store, _) = block_on(Store::boot(&mut link, None)).unwrap();
-    assert_eq!(
-        block_on(store.challenges.mint(&mut link))
-            .unwrap()
-            .counter(),
-        1
-    );
+    // A draw after the boot moves the generator on; resuming must not put
+    // the first state back.
+    let (store, _) = block_on(Store::boot(&mut link, None)).unwrap();
+    let mut generator = o89_core::Generator::new(store.drbg);
+    let _ = block_on(generator.draw(&mut link)).unwrap();
+    let drawn = link.bytes.clone();
     resume_secret(&mut link, &mut output).unwrap();
-    assert_label(&output, applied);
+    assert_label(&output, applied, fingerprint);
     assert_eq!(link.reboots, 1);
-    assert_eq!(
-        block_on(store.challenges.mint(&mut link))
-            .unwrap()
-            .counter(),
-        2
-    );
+    let drbg_at = usize::from(map::DRBG.end().0);
+    assert_eq!(link.bytes[..drbg_at], drawn[..drbg_at]);
 }
 
 #[test]
@@ -164,11 +221,17 @@ fn new_writes_refuse_pending_and_applied_transactions_even_with_replace() {
     for applied in [false, true] {
         for replace in [false, true] {
             let mut link = FakeLink::new();
-            block_on(o89_core::stage_secret(&mut link, secret(), false)).unwrap();
+            block_on(o89_core::stage_secret(
+                &mut link,
+                secret(),
+                Some(birth()),
+                false,
+            ))
+            .unwrap();
             if applied {
                 link.reboot().unwrap();
             }
-            let before = link.bytes;
+            let before = link.bytes.clone();
             let mut output = Vec::new();
             let error =
                 run_secret(&mut link, Some("not hex"), replace, false, &mut output).unwrap_err();
@@ -185,12 +248,13 @@ fn new_writes_refuse_pending_and_applied_transactions_even_with_replace() {
 }
 
 #[test]
-fn resume_refuses_mismatched_applied_secret_or_unknown_counter() {
-    for damage_counter in [false, true] {
+fn resume_refuses_mismatched_applied_secret_or_unreadable_generator() {
+    for damage_generator in [false, true] {
         let mut link = FakeLink::new();
-        link.stage_and_reboot(secret(), false).unwrap();
-        if damage_counter {
-            link.bytes[32..72].fill(0x55);
+        staged(&mut link, secret(), Some(birth()));
+        if damage_generator {
+            let at = usize::from(map::EPOCH.end().0);
+            link.bytes[at..usize::from(map::DRBG.end().0)].fill(0x55);
         } else {
             let mut active = read::<Secret, SECRET_BYTES>(&mut link, map::DEVICE_SECRET).unwrap();
             block_on(active.write(&mut link, Secret::new([1; 16], [3; 32]).unwrap())).unwrap();
@@ -198,7 +262,28 @@ fn resume_refuses_mismatched_applied_secret_or_unknown_counter() {
         let mut output = Vec::new();
         assert!(resume_secret(&mut link, &mut output).is_err());
         assert!(output.is_empty());
-        assert!(matches!(link.transaction(), SecretChange::Applied(_)));
+        assert!(matches!(link.transaction(), SecretChange::Applied(..)));
+    }
+}
+
+#[test]
+fn p_236_resume_refuses_a_label_whose_controller_key_does_not_read_or_match() {
+    for replace_key in [false, true] {
+        let mut link = FakeLink::new();
+        staged(&mut link, secret(), Some(birth()));
+        if replace_key {
+            let mut held =
+                read::<ControllerKey, CONTROLLER_KEY_BYTES>(&mut link, map::CONTROLLER_KEY)
+                    .unwrap();
+            block_on(held.write(&mut link, ControllerKey::new([6; 32]).unwrap())).unwrap();
+        } else {
+            let at = usize::from(map::DEVICE_SECRET.end().0);
+            link.bytes[at..usize::from(map::CONTROLLER_KEY.end().0)].fill(0x55);
+        }
+        let mut output = Vec::new();
+        assert!(resume_secret(&mut link, &mut output).is_err());
+        assert!(output.is_empty(), "no label for a key the unit cannot use");
+        assert!(matches!(link.transaction(), SecretChange::Applied(..)));
     }
 }
 
@@ -214,12 +299,12 @@ fn failed_output_keeps_the_same_label_resumable() {
         }
     }
     let mut link = FakeLink::new();
-    link.stage_and_reboot(secret(), false).unwrap();
+    staged(&mut link, secret(), Some(birth()));
     assert!(resume_secret(&mut link, &mut BrokenOutput).is_err());
-    assert!(matches!(link.transaction(), SecretChange::Applied(_)));
+    assert!(matches!(link.transaction(), SecretChange::Applied(..)));
     let mut output = Vec::new();
     resume_secret(&mut link, &mut output).unwrap();
-    assert_label(&output, secret());
+    assert_label(&output, secret(), birth().controller.fingerprint());
 }
 
 #[test]
@@ -231,7 +316,8 @@ fn successful_write_prints_once_and_has_nothing_to_resume() {
         .unwrap()
         .present()
         .unwrap();
-    assert_label(&output, active);
+    let fingerprint = held_fingerprint(&mut link);
+    assert_label(&output, active, fingerprint);
     assert!(matches!(link.transaction(), SecretChange::Complete));
     output.clear();
     assert!(resume_secret(&mut link, &mut output).is_err());
@@ -251,7 +337,7 @@ fn unreadable_transactions_refuse_resume_and_new_writes_without_mutation() {
                 block_on(map::SECRET_CHANGE.write(&mut link, o89_core::Position::Start, &bytes))
                     .unwrap();
         }
-        let before = link.bytes;
+        let before = link.bytes.clone();
         for resume in [false, true] {
             let mut output = Vec::new();
             assert!(run_secret(&mut link, None, false, resume, &mut output).is_err());
@@ -276,9 +362,186 @@ fn failed_flush_does_not_acknowledge_the_label() {
         }
     }
     let mut link = FakeLink::new();
-    link.stage_and_reboot(secret(), false).unwrap();
+    staged(&mut link, secret(), Some(birth()));
     let mut output = FailedFlush(Vec::new());
     assert!(resume_secret(&mut link, &mut output).is_err());
-    assert!(matches!(link.transaction(), SecretChange::Applied(_)));
-    assert_label(&output.0, secret());
+    assert!(matches!(link.transaction(), SecretChange::Applied(..)));
+    assert_label(&output.0, secret(), birth().controller.fingerprint());
+}
+
+#[test]
+fn p_235_p_237_a_first_write_stages_a_controller_key_and_a_generator() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    assert!(born(&mut link).unwrap());
+    let label = std::str::from_utf8(&output).unwrap();
+    let fingerprint = held_fingerprint(&mut link);
+    assert!(label.contains(&hex::encode(fingerprint.as_bytes())));
+    // Nothing printed is the private key or the seed.
+    let key = read::<ControllerKey, CONTROLLER_KEY_BYTES>(&mut link, map::CONTROLLER_KEY)
+        .unwrap()
+        .present()
+        .unwrap()
+        .encode();
+    let seed = read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+        .unwrap()
+        .present()
+        .unwrap()
+        .encode();
+    assert!(!label.contains(&hex::encode(key)));
+    assert!(!label.contains(&hex::encode(seed)));
+}
+
+#[test]
+fn p_235_a_born_part_stages_no_birth_and_replace_keeps_the_fingerprint() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    let before = held_fingerprint(&mut link);
+    output.clear();
+    run_secret(&mut link, None, true, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    assert_eq!(held_fingerprint(&mut link), before);
+    let label = std::str::from_utf8(&output).unwrap();
+    assert!(label.contains(&hex::encode(before.as_bytes())));
+}
+
+#[test]
+fn p_235_replace_on_an_unborn_part_holding_a_secret_stages_its_birth() {
+    let mut link = FakeLink::new();
+    // A secret with no controller key: a unit this layout is new to.
+    let mut kept = read::<Secret, SECRET_BYTES>(&mut link, map::DEVICE_SECRET).unwrap();
+    block_on(kept.write(&mut link, secret())).unwrap();
+    let mut output = Vec::new();
+    // Without --replace the held secret is protected, as on any unit.
+    assert!(run_secret(&mut link, None, false, false, &mut output).is_err());
+    assert_eq!(link.stages, 0);
+    run_secret(&mut link, None, true, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    assert!(born(&mut link).unwrap());
+    let fingerprint = held_fingerprint(&mut link);
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains(&hex::encode(fingerprint.as_bytes()))
+    );
+}
+
+#[test]
+fn p_237_a_born_part_whose_generator_does_not_read_is_refused_before_anything_is_staged() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    let at = usize::from(map::EPOCH.end().0);
+    link.bytes[at..usize::from(map::DRBG.end().0)].fill(0x55);
+    let before = link.bytes.clone();
+    let stages = link.stages;
+    output.clear();
+    let error = run_secret(&mut link, None, true, false, &mut output).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the generator does not read back")
+    );
+    assert_eq!(link.stages, stages, "nothing was staged");
+    assert_eq!(link.bytes, before, "the label the unit has stays");
+    assert!(output.is_empty());
+}
+
+#[test]
+fn p_237_a_part_with_a_damaged_generator_is_born_and_never_reseeded() {
+    let mut link = FakeLink::new();
+    let at = usize::from(map::EPOCH.end().0);
+    link.bytes[at..usize::from(map::DRBG.end().0)].fill(0x55);
+    assert!(born(&mut link).unwrap());
+    let mut output = Vec::new();
+    // No secret and no key: stage refuses to print a label with nothing to pin.
+    assert!(run_secret(&mut link, None, false, false, &mut output).is_err());
+    assert_eq!(link.birth_stages, 0);
+    assert!(output.is_empty());
+}
+
+#[test]
+fn p_235_blank_without_yes_writes_nothing() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    let before = link.bytes.clone();
+    let reboots = link.reboots;
+    output.clear();
+    let error = run_blank(&mut link, false, &mut output).unwrap_err();
+    assert!(error.to_string().contains("Pass --yes"));
+    assert_eq!(link.bytes, before);
+    assert_eq!(link.reboots, reboots);
+    assert!(output.is_empty());
+}
+
+#[test]
+fn p_235_p_237_a_part_written_under_an_earlier_map_is_blanked_and_born_again() {
+    let mut link = FakeLink::new();
+    // Bytes no record of this map wrote: the key and the generator read damaged.
+    link.bytes.fill(0x55);
+    assert!(born(&mut link).unwrap());
+    let mut output = Vec::new();
+    assert!(run_secret(&mut link, None, false, false, &mut output).is_err());
+    assert_eq!(link.stages, 0, "nothing may write over a damaged key");
+
+    run_blank(&mut link, true, &mut output).unwrap();
+    assert_eq!(link.reboots, 1);
+    assert!(!born(&mut link).unwrap());
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains("write-secret")
+    );
+
+    output.clear();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    assert_eq!(link.birth_stages, 1);
+    let fingerprint = held_fingerprint(&mut link);
+    assert!(
+        std::str::from_utf8(&output)
+            .unwrap()
+            .contains(&hex::encode(fingerprint.as_bytes()))
+    );
+}
+
+#[test]
+fn p_235_a_blank_that_does_not_read_back_stops_before_the_reboot() {
+    let mut link = FakeLink::new();
+    link.bytes.fill(0x55);
+    link.reads_fail = true;
+    let mut output = Vec::new();
+    let error = run_blank(&mut link, true, &mut output).unwrap_err();
+    assert!(format!("{error:#}").contains("reading back"));
+    assert_eq!(link.reboots, 0);
+    assert!(output.is_empty());
+}
+
+#[test]
+fn p_235_a_provisioned_unit_blanks_to_an_unborn_one_whose_boot_count_starts_over() {
+    let mut link = FakeLink::new();
+    let mut output = Vec::new();
+    run_secret(&mut link, None, false, false, &mut output).unwrap();
+    assert!(born(&mut link).unwrap());
+    output.clear();
+    run_blank(&mut link, true, &mut output).unwrap();
+    assert!(!born(&mut link).unwrap());
+    let held = read::<Secret, SECRET_BYTES>(&mut link, map::DEVICE_SECRET).unwrap();
+    assert!(
+        held.present().is_none(),
+        "the printed secret went with the rest"
+    );
+}
+
+#[test]
+fn p_235_a_blank_whose_reboot_never_happened_is_not_reported_as_done() {
+    let mut link = FakeLink::new();
+    link.reboot = Reboot::Ignored;
+    let mut output = Vec::new();
+    let error = run_blank(&mut link, true, &mut output).unwrap_err();
+    assert!(format!("{error:#}").contains("did not boot"), "{error:#}");
+    assert!(output.is_empty());
 }

@@ -1,86 +1,77 @@
-//! The connection rows, the challenge each one holds, and the session a
-//! `Hello` binds onto it.
+//! The connection rows, the challenge each one holds, the pairing handshake
+//! it may be in, and the session a `Hello` binds onto it.
 //!
 //! **A row is allocated before it is bound** (P-076, L-062). The comms
 //! processor announces a transport and the controller gives it a row, and
 //! the row holds the connection's challenge from that moment (L-070); a
-//! `Hello` whose proof verifies binds a session onto it; `Goodbye` clears
-//! the binding and leaves the row to the transport that is still open;
-//! only the transport going, or the comms processor rebooting, frees the
-//! row (L-041). Eight rows, and a ninth announcement is refused rather than
-//! evicting one (L-061). The session's id is the row's handle: one number
-//! on the wire, and no mapping to disagree about.
+//! `Hello` that proves its slot's key binds a session onto it; `Goodbye`
+//! clears the binding and leaves the row to the transport that is still
+//! open; only the transport going, or the comms processor rebooting, frees
+//! the row (L-041). Eight rows, and a ninth announcement is refused rather
+//! than evicting one (L-061). The session's id is the row's handle.
 //!
-//! **A challenge is derived, never drawn** (P-063): the part has no RNG, so
-//! each one is the device secret's PRF over a counter the part has already
-//! written ([`Minted`]). One per row at most, single use, and dead at 120
-//! seconds or with its connection (P-060, P-061, P-062). A `Discover` is
-//! answered with the row's live one or a fresh one, never a dead one.
+//! **A challenge is a draw** from the generator (P-063, P-237), one per row
+//! at most, single use, and dead at 120 seconds or with its connection
+//! (P-060, P-061, P-062). A `Discover` is answered with the row's live one
+//! or a fresh one, never a dead one, and error 18 when there is none to
+//! give.
 //!
-//! **Only a frame that proved itself refreshes a session** (P-077): a
-//! wrapper whose MAC verified. What the controller sends, and what arrives
-//! and fails, do not; a failure counts against the connection, eight inside
-//! a minute sheds it, and a new `Hello` does not reset the count (P-051).
+//! **Nothing here computes a key agreement** (P-243). What is cheap is done
+//! as the frame arrives, in the order P-226 gives: the body, the suite, the
+//! challenge consumed, the label's tag on pairing message 1 or the slot's
+//! admission tag on a `Hello` (P-238), the window and the table, the draw.
+//! What is left is queued as an [`agreement::Job`](crate::Job), one per row,
+//! handed out one at a time and in turn, and its answer is sent when the
+//! [`Done`](crate::Done) comes back. A handshake is abandoned on any failure,
+//! on a second one on the same row, when the row goes, 120 seconds after
+//! pairing message 1, and on a factory reset (P-229); a result for one that
+//! was abandoned is discarded.
 //!
-//! **A verified request is then held to the session's `req_id` window**
-//! (P-022), before its counter is read or its body acted on: one the
-//! session accepted already, or one below the highest less `MAX_INFLIGHT`,
-//! is dropped without an answer or a refresh. It proved itself, so it is
-//! not a failure against the connection.
+//! **Pairing enrols inside the window only**, the one the selector opens
+//! (P-066), read at message 1 and again at message 3 (P-064). Refusals after
+//! message 1 carry the label's refusal tag, so the comms processor cannot
+//! forge one (P-241). At message 3 the slot P-240 picks is written as P-239
+//! says before the answer names it; one that does not land is outcome 7, the
+//! window left open (P-064).
+//!
+//! **Every request after a `Hello` is sealed** (P-231). It is opened under
+//! the session's keys, whose window drops a replayed or stale `req_id`
+//! unanswered and uncounted (P-022); only a request that opened refreshes the
+//! session (P-077), and a tag that fails counts against the connection
+//! (P-051). A write then goes through [`admit`], in P-080's order, under the
+//! client the session was bound to. No command kind has an argument schema
+//! yet (km43's DEFERRED entry 8), so a permitted command is answered
+//! `rejected`, its dedup entry discarded, and nothing reaches an output.
 //!
 //! Every answer is addressed to the frame it answers: the handle in
 //! `session_id`, the request's `req_id` echoed (P-026, L-182). Before a
 //! session exists, and whenever the controller holds no key for the one
 //! named, an error goes bare; once one exists, an answer to a frame that
-//! verified goes under its key (P-142). An unverified frame is never
-//! answered under a key: a tag over a `req_id` the comms processor chose
-//! is a response it could hold back and play against the client's real
-//! request later.
+//! opened goes sealed (P-142).
 //!
-//! **A `Command` goes through [`admit`]**, in P-080's order, under the
-//! session's key and the client it was bound to (P-084). No command kind
-//! has an argument schema yet (km43's DEFERRED entry 8), so what is
-//! permitted is answered `rejected` and nothing reaches an output: its
-//! counter is spent and its dedup entry discarded, as P-120 has for a
-//! command that did not run. A retry meeting an entry a reset left in
-//! flight runs again for the same reason: no output can already be where
-//! a command asked.
-//!
-//! **A `Pair` enrols only inside the pairing window** the selector opens
-//! (P-066), read when the frame is handled. Every answer to one is MAC'd
-//! under the pair key, refusals included, so the comms processor cannot
-//! forge a `window_closed` that sends somebody back to the panel (P-064).
-//! A row lands on the part before the answer says so, and an enrolment or
-//! a reclaim closes the window behind it (L-195).
-//!
-//! What this slice does not serve yet is refused with error 2, bare or
-//! under the key by the rule above: the three other signed requests,
-//! whose handlers call [`admit`] when they land, and the wrapped reads
-//! (theirs). Each is an arm of the exhaustive match below, which is where
-//! those slices land.
-//!
-//! cites: P-021, P-022, P-026, P-051, P-058, P-060, P-061, P-062, P-063, P-064,
-//! P-066, P-067, P-073, P-076, P-077, P-078, P-079, P-080, P-084, P-086,
-//! P-143, L-061, L-062, L-070, L-071, L-072, L-080, L-180, L-182, L-195
+//! cites: P-021, P-022, P-026, P-051, P-058, P-060, P-061, P-062, P-063,
+//! P-064, P-066, P-076, P-077, P-080, P-105, P-143, P-226, P-229, P-231,
+//! P-237, P-238, P-240, P-241, P-242, P-243, L-061, L-062, L-070, L-071,
+//! L-072, L-080, L-180, L-182, L-195
 
 use km43::{
-    CapabilityBit, Caps, ClientConnected, ClientDisconnected, ClientId, CloseReason, CommandAck,
-    Conn, EmptyBody, Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Handshake,
-    HandshakeError, Header, HelloClaim, HelloReport, Incoming, LinkEnvelope, LinkErrorCode, LogSeq,
-    MAX_AUTH_FAILURES, MAX_COMMAND_ACK_BYTES, MAX_HELLO_REPORT, MAX_SESSIONS, MAX_TIME_ACK_BYTES,
-    MessageType, Outcome, PairClaim, PairRequest, PairResponse, Refusal as Code, ReqId, SessionId,
-    SessionKey, SignedClaim, SignedError, StateSeq, Tagged, TimeAck, TimeOperation, Topology,
-    Version, Wrapper, WrapperError, WrapperKey,
+    Allocation, CapabilityBit, ClientConnected, ClientDisconnected, ClientId, ClientKind,
+    CloseReason, CommandAck, Conn, ControllerChannel, DeviceId, EmptyBody, EnrolAnswer,
+    EnrolAwaiting, Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Generation, Header,
+    HelloArrival, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
+    MAX_COMMAND_ACK_BYTES, MAX_PAYLOAD, MAX_SESSIONS, MAX_TIME_ACK_BYTES, MessageType, Outcome,
+    PairArrival, PairRefusal, Prologue, PrologueFields, PublicKey, Refusal as Code, ReqId, Sealed,
+    SessionId, SignedWrite, SlotView, TimeAck, TimeOperation, Version,
 };
 
+use crate::agreement::{Bytes, Computed, Done, Job, Report, ReportText, Task, Ticket};
 use crate::body::Kept;
-use crate::challenge::{CHALLENGE_BYTES, CHALLENGE_COUNTER_BYTES, ChallengeCounter};
-use crate::clients::{CLIENT_TABLE_BYTES, ClientTable, Label, Paired, TableFull};
+use crate::clients::{ClientLabel, Clients, Enrolment};
+use crate::drbg::{CHALLENGE_BYTES, Generator};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::{Compat, Rows};
-use crate::req_window::{OutOfWindow, ReqWindow};
-use crate::request::{Admission, Executed, Permit, Refusal, admit};
+use crate::request::{Admission, Executed, Permit, admit};
 use crate::secret::Secret;
 use crate::tick::{Millis, Tick};
 
@@ -91,6 +82,10 @@ pub const CONNECTIONS: usize = MAX_SESSIONS;
 
 /// A challenge dies this long after it was minted (P-062).
 pub const CHALLENGE_LIFE: Millis = Millis::from_millis(120_000);
+
+/// A pairing handshake is abandoned this long after message 1 was read
+/// (P-229).
+pub const PAIRING_LIFE: Millis = Millis::from_millis(120_000);
 
 /// A session dies this long after the last frame that proved itself
 /// (P-077).
@@ -106,28 +101,43 @@ pub const UNSPECIFIED: &str = "no command kind has an argument schema yet";
 /// reaches it sheds the connection.
 const FAILURES: usize = MAX_AUTH_FAILURES as usize;
 
-/// What the controller keeps for the client protocol, as the boot read it:
-/// the secret every key descends from, the epoch keys derive under and its
-/// record, the enrolled clients and the challenge counter. The records move
-/// only once the part has moved.
+/// The only suite there is (P-226), and so the one every slot holds.
+const SUITE: km43::Suite = km43::Suite::X25519ChachapolySha256;
+
+/// What the controller keeps for the client protocol, as the boot read it.
+/// The records move only once the part has moved.
 pub struct Keys {
     /// Versioned identity and behaviour sections.
     pub configuration: crate::Configuration,
     /// The authoritative network section.
     pub network: Kept<crate::Network, { crate::NETWORK_BYTES }>,
-    /// No secret is a unit that derives nothing: no challenge, no key.
+    /// The device id and the printed secret. None is a unit nobody
+    /// manufactured: nothing pairs and no challenge is given.
     pub secret: Option<Secret>,
-    /// No epoch is a boot that could not establish one, and derives nothing
-    /// (P-085). The boot's answer, which is not always what the record
-    /// holds: a record behind the table that could not be raised holds an
-    /// epoch nothing may derive under.
+    /// The controller key's public half, `CS`. None is a unit with no
+    /// controller key, which pairs nobody and admits nobody (P-235).
+    pub controller: Option<PublicKey>,
+    /// No epoch is a boot that could not establish one, and nothing enrols
+    /// or binds (P-085). The boot's answer, which is not always what the
+    /// record holds.
     pub epoch: Option<Epoch>,
     /// The epoch's record, which a factory reset advances.
     pub epoch_record: Kept<Epoch, EPOCH_BYTES>,
-    /// The enrolled clients and their counters.
-    pub clients: Kept<ClientTable, CLIENT_TABLE_BYTES>,
-    /// The counter every challenge is derived from.
-    pub challenges: Kept<ChallengeCounter, CHALLENGE_COUNTER_BYTES>,
+    /// The slots and the dedup table.
+    pub clients: Clients,
+    /// Every challenge and every ephemeral key (P-237).
+    pub generator: Generator,
+}
+
+impl Keys {
+    /// The mask of the enrolment a session is bound to, while it is still
+    /// the slot's: a slot re-keyed since grants its old session nothing.
+    fn mask(&self, binding: &Binding) -> Option<km43::ClientCapability> {
+        self.clients
+            .occupant(binding.client, self.epoch?)
+            .filter(|occupant| occupant.generation() == binding.generation)
+            .map(crate::clients::Occupant::mask)
+    }
 }
 
 /// What a `Discover` or a `Hello` reports that the rows do not hold.
@@ -144,7 +154,7 @@ pub struct Facts<'a> {
     pub log: LogSpan,
     /// `Hello` key 10.
     pub time_known: bool,
-    /// `Discover` key 6, and whether a `Pair` may enrol: the pairing window,
+    /// `Discover` key 6, and whether a pairing may enrol: the pairing window,
     /// read as this frame is handled and never cached (P-066).
     pub pairing_open: bool,
     /// The link as the handshake left it: `None` before it is done, when a
@@ -186,33 +196,42 @@ pub enum SessionNote {
     NoHandle,
     /// Refused with this code.
     Refused(u16),
+    /// Key agreement for this connection is queued; the answer goes when it
+    /// is done (P-243).
+    Queued(Conn),
     /// A session was bound on this handle.
     Bound(Conn),
-    /// A `Pair` enrolled or reclaimed this client: the window that allowed it
-    /// closes now (L-195).
+    /// A pairing enrolled or reclaimed this client: the window that allowed
+    /// it closes now (L-195).
     Paired(ClientId),
     /// A client's `Time`, for the recorder to decide and answer.
     TimeAsked(TimeAsked),
     /// The client said goodbye on this handle.
     Unbound(Conn),
-    /// A challenge could not be minted: the counter did not land, is at its
-    /// ceiling, is unreadable, or there is no secret to derive from.
+    /// No challenge could be given: the unit is not provisioned, or has no
+    /// epoch.
     NoChallenge,
+    /// The generator's state did not read back: every `Pair` and `Hello` is
+    /// refused, and P-237 raises condition 22 `entropy unavailable`.
+    EntropyUnavailable,
+    /// A slot did not land: `Enrol` answered outcome 7, the window left
+    /// open, and P-064 raises condition 23 `client table write failed`.
+    TableNotStored,
     /// An `Error` from a client, which is never answered.
     ClientError,
-    /// A signed request's record did not land: its counter, refused with
-    /// error 7 and nothing run, which P-079 raises as `counter write
+    /// A command's dedup entry did not land: refused with error 7 and
+    /// nothing run, which P-079 raises as condition 24 `dedup write
     /// failed`; or a command's outcome, whose entry is left for the state
     /// store.
     NotKept,
     /// The answer did not fit the buffer: a bug in a cap.
     TooLarge,
-    /// A request that verified under the session's key and was dropped
-    /// unanswered for its `req_id` (P-022): nothing acted, the counter was
-    /// not read, and the session was not refreshed. P-022 says it is not
-    /// answered, and an answer under the key would be a second genuine
-    /// response to a `(session_id, req_id)` already answered.
-    OutOfWindow(OutOfWindow),
+    /// A sealed request dropped unanswered for its `req_id`, replayed or
+    /// below the window (P-022): nothing acted, nothing was counted, and the
+    /// session was not refreshed.
+    Dropped,
+    /// A handshake result for one that was abandoned since (P-229).
+    Stale,
 }
 
 /// What the adapter does with one client frame.
@@ -241,6 +260,11 @@ impl Reply {
             close: None,
             note: Some(note),
         }
+    }
+
+    const fn with(mut self, note: SessionNote) -> Self {
+        self.note = Some(note);
+        self
     }
 }
 
@@ -286,16 +310,62 @@ enum Bound {
 }
 
 struct Binding {
-    /// The client that proved.
+    /// The slot that proved, and which enrolment of it.
     client: ClientId,
-    key: SessionKey,
+    generation: Generation,
+    /// The session's keys, and P-022's window on what it accepted.
+    channel: ControllerChannel,
     /// The last frame that proved itself (P-077).
     heard: Tick,
     /// Which binding this is, so an answer that took its time goes to the
     /// session that asked and to no later one on the same handle.
     serial: u32,
-    /// The `req_id`s this session accepted (P-022), gone with it.
-    window: ReqWindow,
+}
+
+/// What `PairOffer` said, kept from message 1 to the slot it is written
+/// into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Offer {
+    kind: ClientKind,
+    label: ClientLabel,
+}
+
+/// Where a row's pairing handshake is (P-229).
+enum Pairing {
+    /// None held.
+    None,
+    /// Message 1 opened; message 2 is being computed.
+    Replying { offer: Offer, since: Tick },
+    /// Message 2 sent; message 3 awaited.
+    Awaiting {
+        awaiting: EnrolAwaiting,
+        offer: Offer,
+        since: Tick,
+    },
+    /// Message 3 arrived and is being computed.
+    Enrolling { offer: Offer, since: Tick },
+}
+
+impl Pairing {
+    const fn since(&self) -> Option<Tick> {
+        match self {
+            Self::None => None,
+            Self::Replying { since, .. }
+            | Self::Awaiting { since, .. }
+            | Self::Enrolling { since, .. } => Some(*since),
+        }
+    }
+}
+
+/// A row's key agreement: waiting its turn, or being computed.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "no allocator: each of the eight rows holds its one job inline, a fixed and named cost"
+)]
+enum Work {
+    Idle,
+    Queued(Job),
+    Computing,
 }
 
 /// A client's `Time` the recorder is deciding.
@@ -354,6 +424,11 @@ struct Row {
     bound: Bound,
     /// When each failure inside the window happened (P-051).
     failures: [Option<Tick>; FAILURES],
+    pairing: Pairing,
+    work: Work,
+    /// Moves on every abandoned handshake, so a result that comes back for
+    /// one is recognised and discarded.
+    attempt: u32,
 }
 
 impl Row {
@@ -363,6 +438,17 @@ impl Row {
             challenge: Challenge::Owed,
             bound: Bound::Never,
             failures: [None; FAILURES],
+            pairing: Pairing::None,
+            work: Work::Idle,
+            attempt: 0,
+        }
+    }
+
+    const fn ticket(&self, req_id: ReqId) -> Ticket {
+        Ticket {
+            conn: self.conn,
+            attempt: self.attempt,
+            req_id,
         }
     }
 
@@ -384,7 +470,8 @@ impl Row {
     }
 
     /// Take the live challenge: consumed on presentation, whatever the
-    /// proof turns out to be (P-061). None when it is spent, owed or dead.
+    /// handshake turns out to be (P-061). None when it is spent, owed or
+    /// dead.
     fn take_challenge(&mut self, now: Tick) -> Option<[u8; CHALLENGE_BYTES]> {
         let taken = match self.challenge {
             Challenge::Live { bytes, minted } if alive(minted, now) => Some(bytes),
@@ -394,6 +481,14 @@ impl Row {
             self.challenge = Challenge::Spent;
         }
         taken
+    }
+
+    /// Abandon whatever handshake the row holds or is computing (P-229): a
+    /// result that comes back for it is discarded.
+    fn abandon(&mut self) {
+        self.attempt = self.attempt.wrapping_add(1);
+        self.pairing = Pairing::None;
+        self.work = Work::Idle;
     }
 }
 
@@ -413,6 +508,10 @@ pub struct Sessions {
     time: Option<AskedTime>,
     /// The last ticket handed to the recorder.
     tickets: u32,
+    /// The job out at the worker, if one is: at most one at a time (P-243).
+    computing: Option<Ticket>,
+    /// The row the last job came from; the next is looked for after it.
+    served: usize,
 }
 
 impl Sessions {
@@ -425,6 +524,8 @@ impl Sessions {
             bindings: 0,
             time: None,
             tickets: 0,
+            computing: None,
+            served: 0,
         }
     }
 
@@ -485,8 +586,8 @@ impl Sessions {
         }
     }
 
-    /// The transport went: the row, its challenge and any session on it go
-    /// with it (P-062, P-076).
+    /// The transport went: the row, its challenge, any handshake and any
+    /// session on it go with it (P-062, P-076, P-229).
     pub fn release(&mut self, conn: Conn) -> ClientDisconnected {
         match self
             .rows
@@ -507,14 +608,11 @@ impl Sessions {
         self.rows = [const { None }; CONNECTIONS];
     }
 
-    /// The physical factory reset (P-085): the epoch advanced and verified,
-    /// then the table cleared under it. The network clear and old-slot scrub land before the
-    /// epoch can advance. Every session ends first, whatever
-    /// comes of the writes, because each was keyed under the epoch this
-    /// retires; the rows stay with their transports, and a client that
-    /// pairs again under the new epoch `Hello`s on the same one. Keys derive
-    /// afterwards under what the record holds, which after a failure may be
-    /// nothing at all: that is the failure closed.
+    /// The physical factory reset (P-085): every session unbound and every
+    /// handshake abandoned first, whatever comes of the writes, then the
+    /// network cleared, then the epoch advanced and verified, then the slots
+    /// freed under it. The rows stay with their transports. After a
+    /// failure the epoch may be none at all, which is the failure closed.
     pub async fn factory_reset<F: Fram>(
         &mut self,
         fram: &mut F,
@@ -523,6 +621,7 @@ impl Sessions {
             if let Bound::Session(_) = row.bound {
                 row.bound = Bound::Ended;
             }
+            row.abandon();
         }
         match self.keys.network.held() {
             crate::Held::Present(held) => {
@@ -552,24 +651,22 @@ impl Sessions {
         }
         let reset = reset_clients(&mut self.keys.epoch_record, &mut self.keys.clients, fram).await;
         self.keys.epoch = self.keys.epoch_record.present().copied();
-        reset
+        reset.map(|_| ())
     }
 
-    /// Mint every challenge an accepted row owes, each written before it
-    /// exists (L-070, P-063). A mint that fails leaves the row owing, and
-    /// the connection's first `Discover` tries again.
+    /// Mint every challenge an accepted row owes, each a draw whose
+    /// successor is on the part (L-070, P-063). A mint that fails leaves the
+    /// row owing, and the connection's first `Discover` tries again.
     pub async fn settle<F: Fram>(&mut self, now: Tick, fram: &mut F) {
-        for index in 0..CONNECTIONS {
-            let owed = self
-                .rows
-                .get(index)
-                .and_then(Option::as_ref)
-                .is_some_and(|row| row.challenge == Challenge::Owed);
-            if !owed {
+        if !self.provisioned() {
+            return;
+        }
+        let Self { rows, keys, .. } = self;
+        for row in rows.iter_mut().flatten() {
+            if row.challenge != Challenge::Owed {
                 continue;
             }
-            let minted = self.mint(fram).await;
-            if let (Some(bytes), Some(Some(row))) = (minted, self.rows.get_mut(index)) {
+            if let Ok(bytes) = keys.generator.challenge(fram).await {
                 row.challenge = Challenge::Live { bytes, minted: now };
             }
         }
@@ -577,7 +674,8 @@ impl Sessions {
 
     /// Sessions whose last proven frame is fifteen minutes old are
     /// unbound, their keys destroyed, and their transports to be closed
-    /// (P-077). The row stays allocated until the transport goes.
+    /// (P-077). Pairing handshakes 120 seconds past message 1 are
+    /// abandoned (P-229). The row stays allocated until the transport goes.
     pub fn tick(&mut self, now: Tick) -> Expired {
         if self
             .time
@@ -587,6 +685,12 @@ impl Sessions {
         }
         let mut expired = [None; CONNECTIONS];
         for (row, out) in self.rows.iter_mut().flatten().zip(expired.iter_mut()) {
+            if row.pairing.since().is_some_and(|since| {
+                now.since(since)
+                    .is_none_or(|age| age.as_millis() >= PAIRING_LIFE.as_millis())
+            }) {
+                row.abandon();
+            }
             let idle = match &row.bound {
                 Bound::Session(binding) => now
                     .since(binding.heard)
@@ -599,6 +703,54 @@ impl Sessions {
             }
         }
         Expired(expired)
+    }
+
+    /// The next key agreement to compute, if none is out and one waits: the
+    /// first queued after the row served last, so connections take turns
+    /// (P-243). Hand it to the worker and bring its [`Done`] back to
+    /// [`Sessions::completed`].
+    pub fn next_job(&mut self) -> Option<Job> {
+        if self.computing.is_some() {
+            return None;
+        }
+        let start = self.served.saturating_add(1);
+        let order = (0..CONNECTIONS).map(|step| start.saturating_add(step) % CONNECTIONS);
+        for index in order {
+            let Some(Some(row)) = self.rows.get_mut(index) else {
+                continue;
+            };
+            if !matches!(row.work, Work::Queued(_)) {
+                continue;
+            }
+            let Work::Queued(job) = core::mem::replace(&mut row.work, Work::Computing) else {
+                continue;
+            };
+            self.served = index;
+            self.computing = Some(job.ticket());
+            return Some(job);
+        }
+        None
+    }
+
+    /// A job the adapter could not hand to the worker: back on its row to be
+    /// handed out again, and the worker counted free.
+    pub fn unsent(&mut self, job: Job) {
+        let ticket = job.ticket();
+        if self.computing == Some(ticket) {
+            self.computing = None;
+        }
+        if let Some(row) = self.row_mut(ticket.conn)
+            && row.attempt == ticket.attempt
+            && matches!(row.work, Work::Computing)
+        {
+            row.work = Work::Queued(job);
+        }
+    }
+
+    /// Whether a job is out at the worker.
+    #[must_use]
+    pub const fn is_computing(&self) -> bool {
+        self.computing.is_some()
     }
 
     /// A client's frame, relayed by the comms processor with the handle
@@ -649,9 +801,9 @@ impl Sessions {
         };
         match envelope.header().kind {
             MessageType::Discover => self.discover(to, now, facts, fram, dst).await,
-            MessageType::Hello => self.hello(to, envelope, now, facts, dst),
-            MessageType::Pair => self.pair(to, envelope, now, facts, fram, dst).await,
-            // Wrapped: verified before anything is read (P-051).
+            MessageType::Pair => self.pair(to, frame, now, facts, fram, dst).await,
+            MessageType::Enrol => self.enrol(to, frame, now, dst),
+            MessageType::Hello => self.hello(to, frame, now, facts, fram, dst).await,
             MessageType::Goodbye
             | MessageType::Inventory
             | MessageType::Readings
@@ -661,19 +813,16 @@ impl Sessions {
             | MessageType::ReadLog
             | MessageType::WifiScan
             | MessageType::WifiStatus
-            | MessageType::GetConfig => {
+            | MessageType::GetConfig
+            | MessageType::Command
+            | MessageType::Time
+            | MessageType::SetConfig
+            | MessageType::Firmware
+            | MessageType::Vouch => {
                 let agreed = facts.link.is_some_and(Compat::is_agreed);
-                self.wrapped_request(to, envelope, now, (wifi, agreed), dst)
+                self.sealed(to, envelope, now, (wifi, agreed), fram, dst)
+                    .await
             }
-            // Signed: its own MAC and counter, in P-080's order.
-            MessageType::Command => self.command(to, envelope, now, fram, dst).await,
-            MessageType::Time => self.time(to, envelope, now, fram, dst).await,
-            MessageType::SetConfig => self.set_config(to, envelope, now, fram, dst).await,
-            // Firmware remains unserved and spends no counter (P-143).
-            MessageType::Firmware => match self.bound_on(to, dst) {
-                Ok(()) => bare(to, Incoming::Client(ErrorCode::UnknownMessageType), dst),
-                Err(refused) => refused,
-            },
             // An error is never answered with another (P-031).
             MessageType::ErrorResponse => Reply::noted(SessionNote::ClientError),
             // What only the controller sends is not a request.
@@ -692,18 +841,117 @@ impl Sessions {
             | MessageType::FirmwareResponse
             | MessageType::TimeResponse
             | MessageType::PairResponse
+            | MessageType::EnrolResponse
             | MessageType::WifiScanResponse
             | MessageType::WifiStatusResponse
-            | MessageType::GoodbyeResponse => {
+            | MessageType::GoodbyeResponse
+            | MessageType::VouchResponse => {
                 bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst)
             }
         }
     }
 
+    /// A job came back from the worker. Its answer goes out only if the
+    /// handshake it belongs to is still the one its row is in; a slot is
+    /// written, and a challenge drawn, before an `Enrol 0x93` says so.
+    pub async fn completed<F: Fram>(
+        &mut self,
+        done: Done,
+        now: Tick,
+        facts: &Facts<'_>,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        let ticket = done.ticket();
+        if self.computing == Some(ticket) {
+            self.computing = None;
+        }
+        let current = self.row(ticket.conn).is_some_and(|row| {
+            row.attempt == ticket.attempt && matches!(row.work, Work::Computing)
+        });
+        if !current {
+            return Reply::noted(SessionNote::Stale);
+        }
+        let Some(row) = self.row_mut(ticket.conn) else {
+            return Reply::noted(SessionNote::Stale);
+        };
+        row.work = Work::Idle;
+        let to = Addressed {
+            conn: ticket.conn,
+            req_id: ticket.req_id,
+        };
+        match done.result {
+            Computed::Proceeded { awaiting, answer } => {
+                let Pairing::Replying { offer, since } = row.pairing else {
+                    row.abandon();
+                    return Reply::noted(SessionNote::Stale);
+                };
+                row.pairing = Pairing::Awaiting {
+                    awaiting,
+                    offer,
+                    since,
+                };
+                copied(answer.as_slice(), dst)
+            }
+            Computed::Enrolled { enrolling, admit } => {
+                let Pairing::Enrolling { offer, .. } = row.pairing else {
+                    row.abandon();
+                    return Reply::noted(SessionNote::Stale);
+                };
+                row.abandon();
+                self.enrolled(to, (enrolling, admit, offer), now, facts, fram, dst)
+                    .await
+            }
+            Computed::Bound {
+                channel,
+                answer,
+                client_id,
+                generation,
+            } => {
+                let still = self.keys.epoch.and_then(|epoch| {
+                    self.keys
+                        .clients
+                        .occupant(client_id, epoch)
+                        .filter(|occupant| occupant.generation() == generation)
+                });
+                if still.is_none() {
+                    // Re-keyed or reset while the `Hello` was computed: the
+                    // key it proved is no longer this slot's.
+                    return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst);
+                }
+                self.bindings = self.bindings.wrapping_add(1);
+                let serial = self.bindings;
+                let Some(row) = self.row_mut(ticket.conn) else {
+                    return Reply::noted(SessionNote::Stale);
+                };
+                row.bound = Bound::Session(Binding {
+                    client: client_id,
+                    generation,
+                    channel,
+                    heard: now,
+                    serial,
+                });
+                copied(answer.as_slice(), dst).with(SessionNote::Bound(ticket.conn))
+            }
+            Computed::PairFailed(why) => {
+                row.abandon();
+                let counted = why.counts();
+                match why.refusal() {
+                    Some(code) => self.refused(to, code, counted, now, dst),
+                    None => Reply::noted(SessionNote::Dropped),
+                }
+            }
+            Computed::HelloFailed(why) => self.refused(to, why.refusal(), why.counts(), now, dst),
+            Computed::Unwritable => {
+                row.abandon();
+                Reply::noted(SessionNote::TooLarge)
+            }
+        }
+    }
+
     /// `Discover 0x80` with the row's live challenge, minted now if it has
-    /// none (P-060). No challenge to give is error 7: the counter did not
-    /// land, and an answer without one would send the client to prove
-    /// against nothing.
+    /// none (P-060). No challenge to give is error 18: a unit not
+    /// provisioned, or a generator that did not read back.
     async fn discover<F: Fram>(
         &mut self,
         to: Addressed,
@@ -712,12 +960,13 @@ impl Sessions {
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
-        // Nothing derives without both: a unit with no secret, or a boot
-        // that could not establish an epoch (P-085).
-        let (Some(secret), Some(epoch)) = (self.keys.secret, self.keys.epoch) else {
-            let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-            reply.note = Some(SessionNote::NoChallenge);
-            return reply;
+        let (Some(secret), Some(epoch), true) = (
+            self.keys.secret,
+            self.keys.epoch,
+            self.keys.controller.is_some(),
+        ) else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::NoChallenge);
         };
         let live = match self.row(to.conn).map(|row| row.challenge) {
             Some(Challenge::Live { bytes, minted }) if alive(minted, now) => Some(bytes),
@@ -726,27 +975,21 @@ impl Sessions {
         let challenge = if let Some(bytes) = live {
             bytes
         } else {
-            let Some(bytes) = self.mint(fram).await else {
-                let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-                reply.note = Some(SessionNote::NoChallenge);
-                return reply;
+            let Ok(bytes) = self.keys.generator.challenge(fram).await else {
+                return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                    .with(SessionNote::EntropyUnavailable);
             };
-            // The old one is discarded with the write: one per row (P-060).
+            // The old one is discarded with the draw: one per row (P-060).
             if let Some(row) = self.row_mut(to.conn) {
                 row.challenge = Challenge::Live { bytes, minted: now };
             }
             bytes
         };
-        let provisioned = self
-            .keys
-            .clients
-            .present()
-            .is_some_and(|table| table.is_under(epoch) && table.enrolled() > 0);
         let written = km43::Discovery {
             version: Version::V1_0,
             device_id: secret.device_id_bytes(),
             model: facts.model,
-            provisioned,
+            provisioned: self.keys.clients.enrolled(epoch) > 0,
             pairing_open: facts.pairing_open,
             challenge,
             epoch,
@@ -755,28 +998,26 @@ impl Sessions {
         answered(written.ok())
     }
 
-    /// `Pair 0x0B`: the challenge consumed on presentation whatever the
-    /// answer (P-061), a new one minted to go back in `next_challenge`
-    /// (P-058), and every outcome MAC'd under the pair key so a refusal the
-    /// comms processor forges does not read (P-064, P-066). Enrolment needs
-    /// the window open when this frame is handled (P-066) and a proof that
-    /// checks out, and lands its row on the part before the answer says so:
-    /// reclaim by label first, then the lowest free slot, then `table_full`
-    /// (P-067, P-078, P-086). A proof that fails counts against the
-    /// connection like any other (P-051); a closed window or a full table,
-    /// which cost no proof, does not.
+    /// `Pair 0x0B`, message 1, in P-226's order: the body and its suite, the
+    /// challenge consumed, then the label's tag. A tag that fails is bare
+    /// error 10, counted (P-066). One that opens into a closed window, or a
+    /// table P-240 could not allocate from, is refused under the label's
+    /// refusal key, uncounted (P-241). Otherwise message 2 is queued (P-243).
     async fn pair<F: Fram>(
         &mut self,
         to: Addressed,
-        envelope: Envelope<'_>,
+        frame: &[u8],
         now: Tick,
         facts: &Facts<'_>,
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
-        let claim = match PairClaim::decode(envelope) {
-            Ok(claim) => claim,
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        let arrival = match Envelope::decode(frame)
+            .map_err(km43::PairError::from)
+            .and_then(PairArrival::decode)
+        {
+            Ok(arrival) => arrival,
+            Err(why) => return self.pair_refused(to, why, now, dst),
         };
         let Some(challenge) = self
             .row_mut(to.conn)
@@ -788,16 +1029,118 @@ impl Sessions {
                 dst,
             );
         };
-        // Nothing derives without both, so nothing can be MAC'd.
-        let (Some(secret), Some(epoch)) = (self.keys.secret, self.keys.epoch) else {
-            let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-            reply.note = Some(SessionNote::NoChallenge);
-            return reply;
+        // A new `Pair` abandons the handshake the row held (P-229).
+        if let Some(row) = self.row_mut(to.conn) {
+            row.abandon();
+        }
+        let Some((secret, epoch)) = self.ready() else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::NoChallenge);
         };
-        let Some(next_challenge) = self.mint(fram).await else {
-            let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-            reply.note = Some(SessionNote::NoChallenge);
-            return reply;
+        let label = secret.label();
+        let prologue = prologue(secret.device_id(), epoch, &challenge, to.conn);
+        let mut plain = [0u8; km43::MAX_PAIR_OFFER];
+        let offered = match arrival.open(&prologue, &label.pair_psk(), &mut plain) {
+            Ok(offered) => offered,
+            Err(why) => return self.pair_refused(to, why, now, dst),
+        };
+        let offer = offered.offer();
+        let Ok(client_label) = ClientLabel::new(offer.label) else {
+            return bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst);
+        };
+        let refusal = if !facts.pairing_open {
+            Some(PairRefusal::WindowClosed)
+        } else if !allocates(&self.keys.clients.views(epoch), offer.label) {
+            Some(PairRefusal::TableFull)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return answered(offered.refuse(refusal, &label.refusal_key(), dst).ok());
+        }
+        let kind = offer.client_kind;
+        let Ok(ephemeral) = self.keys.generator.draw(fram).await else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::EntropyUnavailable);
+        };
+        let Some(frame) = Bytes::copied(frame) else {
+            return bare(to, Incoming::Client(ErrorCode::PayloadTooLarge), dst);
+        };
+        let Some(row) = self.row_mut(to.conn) else {
+            return Reply::NOTHING;
+        };
+        row.pairing = Pairing::Replying {
+            offer: Offer {
+                kind,
+                label: client_label,
+            },
+            since: now,
+        };
+        row.work = Work::Queued(Job::new(
+            row.ticket(to.req_id),
+            Task::Proceed {
+                frame,
+                prologue,
+                ephemeral,
+            },
+        ));
+        Reply::noted(SessionNote::Queued(to.conn))
+    }
+
+    /// `Enrol 0x13`, message 3: queued if the row holds a handshake waiting
+    /// for it (P-243). On a row that holds none it is error 10, uncounted,
+    /// because nothing was computed to refuse it (P-229).
+    fn enrol(&mut self, to: Addressed, frame: &[u8], now: Tick, dst: &mut [u8]) -> Reply {
+        let Some(row) = self.row_mut(to.conn) else {
+            return Reply::NOTHING;
+        };
+        let pairing = core::mem::replace(&mut row.pairing, Pairing::None);
+        let Pairing::Awaiting {
+            awaiting,
+            offer,
+            since,
+        } = pairing
+        else {
+            row.abandon();
+            return bare(to, Incoming::Client(ErrorCode::AuthenticationFailed), dst);
+        };
+        let expired = now
+            .since(since)
+            .is_none_or(|age| age.as_millis() >= PAIRING_LIFE.as_millis());
+        let copy = Bytes::copied(frame);
+        let (false, Some(frame)) = (expired, copy) else {
+            row.abandon();
+            return bare(to, Incoming::Client(ErrorCode::AuthenticationFailed), dst);
+        };
+        row.pairing = Pairing::Enrolling { offer, since };
+        row.work = Work::Queued(Job::new(
+            row.ticket(to.req_id),
+            Task::Enrol { frame, awaiting },
+        ));
+        Reply::noted(SessionNote::Queued(to.conn))
+    }
+
+    /// Message 3 opened: the window read again, P-240 run again with the
+    /// client key, and the slot written as P-239 says before the answer
+    /// names it (P-064). The next challenge is drawn first, because every
+    /// outcome carries one (P-058).
+    async fn enrolled<F: Fram>(
+        &mut self,
+        to: Addressed,
+        opened: (km43::Enrolling, [u8; km43::KEY_BYTES], Offer),
+        now: Tick,
+        facts: &Facts<'_>,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Reply {
+        let (enrolling, admit, offer) = opened;
+        let Some((_, epoch)) = self.ready() else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::NoChallenge);
+        };
+        let Ok(next_challenge) = self.keys.generator.challenge(fram).await else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::EntropyUnavailable);
         };
         if let Some(row) = self.row_mut(to.conn) {
             row.challenge = Challenge::Live {
@@ -805,103 +1148,75 @@ impl Sessions {
                 minted: now,
             };
         }
-        let key = secret.device_secret().pair_key();
-        let attempt = claim.attempt(secret.device_id_bytes(), challenge);
-        let outcome = if facts.pairing_open {
-            match claim.verify(&key, &attempt) {
-                // A verified `Pair` that could not be recorded has no outcome
-                // to say so (origin89hq/km43#91), and a bare 7 needs a MAC a
-                // client will not find: it times out and tries again.
-                Ok(request) => match self.enrol(request, epoch, fram).await {
-                    Ok(outcome) => outcome,
-                    Err(Unenrolled::NotKept) => {
-                        let mut reply = bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-                        reply.note = Some(SessionNote::NotKept);
-                        return reply;
+        let client = enrolling.client();
+        let allocation = Allocation::choose(
+            &self.keys.clients.views(epoch),
+            &client,
+            offer.label.as_str(),
+        );
+        let (outcome, note) = if facts.pairing_open {
+            match allocation {
+                Allocation::SameKey(id) | Allocation::Free(id) | Allocation::Reclaim(id) => {
+                    // Every session on the slot goes before it is rewritten
+                    // (P-240), whether or not the write then lands.
+                    self.unbind(id);
+                    let enrolment = Enrolment {
+                        client,
+                        admit,
+                        suite: SUITE,
+                        kind: offer.kind,
+                        label: offer.label,
+                    };
+                    match self.keys.clients.enrol(id, enrolment, epoch, fram).await {
+                        Ok(generation) => (
+                            match allocation {
+                                Allocation::Free(_) => Outcome::Enrolled(id, generation),
+                                Allocation::SameKey(_)
+                                | Allocation::Reclaim(_)
+                                | Allocation::Full => Outcome::Reclaimed(id, generation),
+                            },
+                            Some(SessionNote::Paired(id)),
+                        ),
+                        Err(_) => (Outcome::NotStored, Some(SessionNote::TableNotStored)),
                     }
-                    Err(Unenrolled::OtherEpoch) => {
-                        return bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
-                    }
-                    Err(Unenrolled::Label) => {
-                        return bare(to, Incoming::Client(ErrorCode::MalformedFrame), dst);
-                    }
-                },
-                Err(bad) => bad.outcome(),
+                }
+                Allocation::Full => (Outcome::TableFull, None),
             }
         } else {
-            Outcome::WindowClosed
+            (Outcome::WindowClosed, None)
         };
-        let shed = outcome.failed_a_proof() && self.count_failure(to.conn, now);
-        let written = PairResponse {
-            outcome,
-            epoch,
-            next_challenge,
+        let written = enrolling.answer(
+            &EnrolAnswer {
+                outcome,
+                next_challenge,
+            },
+            dst,
+        );
+        let reply = answered(written.ok());
+        match note {
+            Some(note) => reply.with(note),
+            None => reply,
         }
-        .write(&key, &attempt, to.header(MessageType::PairResponse), dst);
-        let mut reply = answered(written.ok());
-        if let Some(client) = outcome.slot() {
-            reply.note = Some(SessionNote::Paired(client));
-        }
-        if shed {
-            reply.close = Some(Close {
-                conn: to.conn,
-                reason: CloseReason::AuthenticationFailures,
-            });
-        }
-        reply
     }
 
-    /// A verified `Pair` into the client table under `epoch`: the row on the
-    /// part, or why nothing was enrolled.
-    async fn enrol<F: Fram>(
-        &mut self,
-        request: PairRequest<'_>,
-        epoch: Epoch,
-        fram: &mut F,
-    ) -> Result<Outcome, Unenrolled> {
-        let label = Label::new(request.label).map_err(|_| Unenrolled::Label)?;
-        let Some(table) = self
-            .keys
-            .clients
-            .present()
-            .filter(|table| table.is_under(epoch))
-        else {
-            return Err(Unenrolled::OtherEpoch);
-        };
-        // A reclaim keeps the client's id and key and sets its counter to
-        // zero, so a session still bound to it would read a captured frame
-        // as fresh. Every one goes first, whether or not the row then lands
-        // (P-078).
-        if let Some(client) = table.holder(&label) {
-            self.unbind(client);
-        }
-        let paired = self
-            .keys
-            .clients
-            .update(fram, |table| table.pair(label, request.client_kind))
-            .await
-            .map_err(|_| Unenrolled::NotKept)?;
-        Ok(match paired {
-            Ok(Paired::Enrolled(client)) => Outcome::Enrolled(client),
-            Ok(Paired::Reclaimed(client)) => Outcome::Reclaimed(client),
-            Err(TableFull) => Outcome::TableFull,
-        })
-    }
-
-    /// `Hello 0x01`: the challenge consumed on presentation (P-061), the
-    /// proof checked under the key the enrolment derives under this epoch,
-    /// and on success a session bound on the row, replacing any bound
-    /// there (P-076), and answered under its new key.
-    fn hello(
+    /// `Hello 0x01`, in P-226's order and then P-238's: the body and its
+    /// suite, the challenge consumed, then the admission tag against every
+    /// occupied slot before any DH. No match is bare error 12, counted. A
+    /// match is queued for the proof and the answer (P-243).
+    async fn hello<F: Fram>(
         &mut self,
         to: Addressed,
-        envelope: Envelope<'_>,
+        frame: &[u8],
         now: Tick,
         facts: &Facts<'_>,
+        fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
-        let claim = match HelloClaim::decode(envelope) {
-            Ok(claim) => claim,
+        let arrival = match Envelope::decode(frame)
+            .map_err(km43::HelloError::from)
+            .and_then(HelloArrival::decode)
+        {
+            Ok(arrival) => arrival,
             Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
         };
         let Some(challenge) = self
@@ -914,86 +1229,66 @@ impl Sessions {
                 dst,
             );
         };
-        let client = claim.client_id();
-        let (Some(secret), Some(epoch)) = (self.keys.secret, self.keys.epoch) else {
-            return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst);
+        // One handshake computed per row: a new one supersedes the last.
+        if let Some(row) = self.row_mut(to.conn) {
+            row.abandon();
+        }
+        let Some((secret, epoch)) = self.ready() else {
+            return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst)
+                .with(SessionNote::NoChallenge);
         };
-        let Some(table) = self
+        let prologue = prologue(secret.device_id(), epoch, &challenge, to.conn);
+        let occupied = self
             .keys
             .clients
-            .present()
-            .filter(|table| table.is_under(epoch))
-        else {
-            return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst);
-        };
-        if table.row(client).is_none() {
-            return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst);
+            .occupied(epoch)
+            .map(|(id, occupant)| (id, occupant.admit_key()));
+        let mut keys: [Option<(ClientId, km43::AdmitKey)>; crate::clients::SLOTS] =
+            [const { None }; crate::clients::SLOTS];
+        for (slot, key) in keys.iter_mut().zip(occupied) {
+            *slot = Some(key);
         }
-        let counter = table.accepted(client).map_or(0, |counter| counter.0);
-        let enrolment = secret.device_secret().enrolment(epoch, client);
-        let client_nonce = claim.client_nonce();
-        let agreed = match claim.verify(&enrolment.client_key(), &challenge, Version::V1_0) {
-            Ok(accepted) => accepted.agreed,
-            Err(HandshakeError::MajorMismatch { .. }) => {
-                return bare(to, Incoming::Client(ErrorCode::ProtocolMajorMismatch), dst);
-            }
-            Err(HandshakeError::Proof(_)) => return self.failed(to, now, dst),
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
+        let admitted = arrival.admit(&prologue, keys.iter().flatten().map(|(id, key)| (*id, key)));
+        let slot = match admitted {
+            Ok(admitted) => admitted.slot(),
+            Err(why) => return self.refused(to, why.refusal(), why.counts(), now, dst),
         };
-        let session = SessionId::from(to.conn.get());
-        let key = enrolment.session_key(
-            &Handshake {
-                challenge,
-                client_nonce,
-            },
-            session,
-        );
-        let mut inner = [0u8; MAX_HELLO_REPORT];
-        let report = HelloReport {
-            version: agreed,
-            session,
-            fw_controller: facts.fw_controller,
-            fw_comms: facts.fw_comms,
-            capabilities: 1 << 8,
-            log_oldest_seq: facts.log.oldest,
-            log_newest_seq: facts.log.newest,
-            // The state store does not exist yet; its counter starts here.
-            state_seq: StateSeq(0),
+        let Some(occupant) = self.keys.clients.occupant(slot, epoch).copied() else {
+            return bare(to, Incoming::Client(ErrorCode::UnknownClient), dst);
+        };
+        let Ok(ephemeral) = self.keys.generator.draw(fram).await else {
+            return bare(to, Incoming::Client(ErrorCode::ChallengeUnavailable), dst)
+                .with(SessionNote::EntropyUnavailable);
+        };
+        let Some(frame) = Bytes::copied(frame) else {
+            return bare(to, Incoming::Client(ErrorCode::PayloadTooLarge), dst);
+        };
+        let report = Report {
+            session: SessionId::from(to.conn.get()),
+            fw_controller: report_text(facts.fw_controller),
+            fw_comms: report_text(facts.fw_comms),
+            log: facts.log,
             time_known: facts.time_known,
-            counter,
-            caps: Caps::THIS_CONTROLLER,
-            topology: Topology::THIS_CONTROLLER,
+            client_id: slot,
+            generation: occupant.generation(),
         };
-        let Ok(len) = report.encode(&mut inner) else {
-            return Reply::noted(SessionNote::TooLarge);
+        let admit = *occupant.admit_key().to_stored();
+        let Some(row) = self.row_mut(to.conn) else {
+            return Reply::NOTHING;
         };
-        let written = Tagged::over(
-            to.header(MessageType::HelloResponse),
-            inner.get(..len).unwrap_or(&[]),
-            &key,
-        )
-        .and_then(|tagged| tagged.write(dst));
-        let Ok(written) = written else {
-            return Reply::noted(SessionNote::TooLarge);
-        };
-        // Bound only once the answer exists: a session nobody can be told
-        // about is a row held for fifteen minutes for nothing.
-        self.bindings = self.bindings.wrapping_add(1);
-        let serial = self.bindings;
-        if let Some(row) = self.row_mut(to.conn) {
-            row.bound = Bound::Session(Binding {
-                client,
-                key,
-                heard: now,
-                serial,
-                window: ReqWindow::opened_by(to.req_id),
-            });
-        }
-        Reply {
-            answer: Some(written),
-            close: None,
-            note: Some(SessionNote::Bound(to.conn)),
-        }
+        row.work = Work::Queued(Job::new(
+            row.ticket(to.req_id),
+            Task::Hello {
+                frame,
+                prologue,
+                admit,
+                enrolled: occupant.client(),
+                suite: occupant.suite(),
+                ephemeral,
+                report,
+            },
+        ));
+        Reply::noted(SessionNote::Queued(to.conn))
     }
 
     /// Whether a session is bound on the row: none ever bound here is
@@ -1012,325 +1307,25 @@ impl Sessions {
         }
     }
 
-    /// A wrapped request on a session: verified before anything is read,
-    /// and only one that verifies refreshes the session (P-077); a failure
-    /// counts against the connection (P-051). `Goodbye` clears the binding
-    /// and leaves the row (P-076); the reads are the later slices'.
-    fn wrapped_request(
+    /// A sealed request on a session: opened under the session's keys before
+    /// anything is read, P-022's window applied by the opener, and only one
+    /// that opens refreshes the session (P-077). A tag that fails counts
+    /// against the connection (P-051); a `req_id` the window refuses is
+    /// dropped, unanswered and uncounted.
+    async fn sealed<F: Fram>(
         &mut self,
         to: Addressed,
         envelope: Envelope<'_>,
         now: Tick,
         link: (&mut crate::Wifi, bool),
+        fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
         if let Err(refused) = self.bound_on(to, dst) {
             return refused;
         }
         let kind = envelope.header().kind;
-        let Some(Row {
-            bound: Bound::Session(binding),
-            ..
-        }) = self.row(to.conn)
-        else {
-            return Reply::NOTHING;
-        };
-        let verified = Wrapper::decode(envelope).and_then(|wrapper| wrapper.verify(&binding.key));
-        let payload = match verified {
-            Ok(verified) => verified.payload(),
-            Err(WrapperError::Mac(_) | WrapperError::Missing(WrapperKey::Mac)) => {
-                return self.failed(to, now, dst);
-            }
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
-        };
-        let goodbye = kind == MessageType::Goodbye
-            && EmptyBody::decode(MessageType::Goodbye, payload).is_ok();
-        let Self { rows, keys, .. } = self;
-        let Some(Row {
-            bound: bound @ Bound::Session(_),
-            ..
-        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-        else {
-            return Reply::NOTHING;
-        };
-        if let Bound::Session(binding) = bound {
-            // After the MAC and before anything reads the body or refreshes
-            // the session (P-022, P-077); no wire answer, per the note.
-            if let Err(why) = binding.window.accept(to.req_id) {
-                return Reply::noted(SessionNote::OutOfWindow(why));
-            }
-            binding.heard = now;
-        }
-        if matches!(kind, MessageType::WifiScan | MessageType::WifiStatus) {
-            let Bound::Session(binding) = bound else {
-                return Reply::NOTHING;
-            };
-            return wifi_answer(to, binding, keys, link, (kind, payload, now), dst);
-        }
-        if kind == MessageType::GetConfig {
-            let Bound::Session(binding) = bound else {
-                return Reply::NOTHING;
-            };
-            return config_answer(to, binding, keys, payload, dst);
-        }
-        if kind != MessageType::Goodbye || !goodbye {
-            let code = if kind == MessageType::Goodbye {
-                ErrorCode::MalformedFrame
-            } else {
-                // Proven, and not served by this slice: error 2 under the
-                // key, which a verified request has earned.
-                ErrorCode::UnknownMessageType
-            };
-            return match bound {
-                Bound::Session(binding) => wrapped(to, &binding.key, code, dst),
-                Bound::Never | Bound::Ended => Reply::NOTHING,
-            };
-        }
-        let mut body = [0u8; 1];
-        let answer = match bound {
-            Bound::Session(binding) => EmptyBody
-                .encode(MessageType::GoodbyeResponse, &mut body)
-                .ok()
-                .and_then(|len| {
-                    Tagged::over(
-                        to.header(MessageType::GoodbyeResponse),
-                        body.get(..len).unwrap_or(&[]),
-                        &binding.key,
-                    )
-                    .ok()
-                })
-                .and_then(|tagged| tagged.write(dst).ok()),
-            Bound::Never | Bound::Ended => None,
-        };
-        // The binding goes and the key with it; the row stays with its
-        // transport (P-076).
-        *bound = Bound::Ended;
-        Reply {
-            answer,
-            close: None,
-            note: Some(SessionNote::Unbound(to.conn)),
-        }
-    }
-
-    /// `Command 0x08` on a session, through [`admit`] under the session's key
-    /// and the client it was bound to. A signed body that does not read is
-    /// answered bare, like any frame nothing verified; a MAC that fails
-    /// counts against the connection (P-051); everything past the MAC is
-    /// answered under the key. It refreshes the session (P-077) only when it
-    /// spent its counter, which is when a permit came back: a replay
-    /// verifies too, and so does a command refused before its counter
-    /// landed, whose bytes stay fresh for as long as the comms processor
-    /// cares to replay them and would keep an idle session alive.
-    async fn command<F: Fram>(
-        &mut self,
-        to: Addressed,
-        envelope: Envelope<'_>,
-        now: Tick,
-        fram: &mut F,
-        dst: &mut [u8],
-    ) -> Reply {
-        if let Err(refused) = self.bound_on(to, dst) {
-            return refused;
-        }
-        let claim = match SignedClaim::decode(envelope) {
-            Ok(claim) => claim,
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
-        };
-        let Self { rows, keys, .. } = self;
-        let Some(Row {
-            bound: Bound::Session(binding),
-            ..
-        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-        else {
-            return Reply::NOTHING;
-        };
-        let mut admission = admit(
-            claim,
-            &binding.key,
-            binding.client,
-            &mut binding.window,
-            &mut keys.clients,
-            fram,
-            now,
-        )
-        .await;
-        if let Admission::InFlight(retry) = admission {
-            // No output has authority yet, so none can already be where the
-            // command asked: the state store's answer is always to run it.
-            admission = retry.again(&mut keys.clients, fram, now).await;
-        }
-        let spent = matches!(admission, Admission::Execute(_));
-        let reply = match admission {
-            Admission::OutOfWindow(why) => Some(Reply::noted(SessionNote::OutOfWindow(why))),
-            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => None,
-            Admission::Refused(why) => {
-                let mut reply = refused_under(to, &binding.key, why.code(), dst);
-                if why.raises().is_some() {
-                    reply.note = Some(SessionNote::NotKept);
-                }
-                Some(reply)
-            }
-            Admission::Answered(ack) => Some(acked(to, &binding.key, ack, dst)),
-            Admission::Execute(Permit::Command(reservation)) => {
-                let finished = reservation
-                    .finished(&mut keys.clients, fram, Executed::Rejected, UNSPECIFIED)
-                    .await;
-                let mut reply = acked(to, &binding.key, finished.ack, dst);
-                if finished.recorded.is_err() {
-                    reply.note = Some(SessionNote::NotKept);
-                }
-                Some(reply)
-            }
-            // Only the three other signed types are written; a `Command` is
-            // never one.
-            Admission::Execute(Permit::Write(_)) => Some(wrapped(
-                to,
-                &binding.key,
-                ErrorCode::UnknownMessageType,
-                dst,
-            )),
-            // Settled by another retry between the two, and neither running
-            // nor recorded now: this one goes again.
-            Admission::InFlight(_) => Some(wrapped(to, &binding.key, ErrorCode::BusyRetry, dst)),
-        };
-        match reply {
-            Some(reply) => {
-                if spent {
-                    binding.heard = now;
-                }
-                reply
-            }
-            None => self.failed(to, now, dst),
-        }
-    }
-
-    /// Admit the signed write before its version or section body is examined.
-    async fn set_config<F: Fram>(
-        &mut self,
-        to: Addressed,
-        envelope: Envelope<'_>,
-        now: Tick,
-        fram: &mut F,
-        dst: &mut [u8],
-    ) -> Reply {
-        if let Err(refused) = self.bound_on(to, dst) {
-            return refused;
-        }
-        let claim = match SignedClaim::decode(envelope) {
-            Ok(claim) => claim,
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
-        };
-        let Self { rows, keys, .. } = self;
-        let Some(Row {
-            bound: Bound::Session(binding),
-            ..
-        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-        else {
-            return Reply::NOTHING;
-        };
-        let admission = admit(
-            claim,
-            &binding.key,
-            binding.client,
-            &mut binding.window,
-            &mut keys.clients,
-            fram,
-            now,
-        )
-        .await;
-        let write = match admission {
-            Admission::Execute(Permit::Write(write)) => write,
-            Admission::OutOfWindow(why) => return Reply::noted(SessionNote::OutOfWindow(why)),
-            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
-                return self.failed(to, now, dst);
-            }
-            Admission::Refused(why) => {
-                let mut reply = refused_under(to, &binding.key, why.code(), dst);
-                if why.raises().is_some() {
-                    reply.note = Some(SessionNote::NotKept);
-                }
-                return reply;
-            }
-            // Only a `Command` is reserved, answered from the table or left
-            // in flight; a `SetConfig` never is.
-            Admission::Execute(Permit::Command(_))
-            | Admission::Answered(_)
-            | Admission::InFlight(_) => {
-                return wrapped(to, &binding.key, ErrorCode::UnknownMessageType, dst);
-            }
-        };
-        binding.heard = now;
-        let operation = match km43::SetConfigOperation::decode(write.operation()) {
-            Ok(operation) => operation,
-            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
-        };
-        // Like Time, spend the admitted counter before checking the row's mask.
-        let required = km43::ClientCapability::WRITE_CONFIG.0
-            | if matches!(
-                operation.section,
-                km43::ConfigSection::Network | km43::ConfigSection::Cloud
-            ) {
-                km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
-            } else {
-                0
-            };
-        let authorised = keys
-            .clients
-            .present()
-            .and_then(|table| table.row(binding.client))
-            .is_some_and(|row| row.mask().0 & required == required);
-        let ack = if authorised {
-            match keys
-                .configuration
-                .set(operation, &mut keys.network, fram)
-                .await
-            {
-                Ok(ack) => ack,
-                Err(code) => return wrapped(to, &binding.key, code, dst),
-            }
-        } else {
-            km43::SetConfigAck {
-                section: operation.section,
-                version: keys.configuration.version(operation.section, &keys.network),
-                outcome: km43::SetConfig::Unauthorised,
-            }
-        };
-        let mut body = [0; km43::MAX_SET_CONFIG_ACK_BYTES];
-        let written = ack
-            .encode(&mut body)
-            .ok()
-            .and_then(|len| {
-                Tagged::over(
-                    to.header(MessageType::SetConfigResponse),
-                    body.get(..len)?,
-                    &binding.key,
-                )
-                .ok()
-            })
-            .and_then(|tagged| tagged.write(dst).ok());
-        answered(written)
-    }
-
-    /// `Time 0x0A` on a session, through [`admit`]: the counter spent before
-    /// anything else (P-080), then the operation handed to the recorder,
-    /// which owns the calendar and the floor, with a ticket. The answer
-    /// comes back through [`Sessions::time_answered`]. Refusals before the
-    /// recorder are answered as a `Command`'s are.
-    async fn time<F: Fram>(
-        &mut self,
-        to: Addressed,
-        envelope: Envelope<'_>,
-        now: Tick,
-        fram: &mut F,
-        dst: &mut [u8],
-    ) -> Reply {
-        if let Err(refused) = self.bound_on(to, dst) {
-            return refused;
-        }
-        let claim = match SignedClaim::decode(envelope) {
-            Ok(claim) => claim,
-            Err(why) => return bare(to, Incoming::from(why.refusal().code()), dst),
-        };
+        let mut plain = [0u8; MAX_PAYLOAD];
         let Self {
             rows,
             keys,
@@ -1345,71 +1340,100 @@ impl Sessions {
         else {
             return Reply::NOTHING;
         };
-        let admission = admit(
-            claim,
-            &binding.key,
-            binding.client,
-            &mut binding.window,
-            &mut keys.clients,
-            fram,
-            now,
-        )
-        .await;
-        let write = match admission {
-            Admission::Execute(Permit::Write(write)) => write,
-            Admission::OutOfWindow(why) => return Reply::noted(SessionNote::OutOfWindow(why)),
-            Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
-                return self.failed(to, now, dst);
-            }
-            Admission::Refused(why) => {
-                let mut reply = refused_under(to, &binding.key, why.code(), dst);
-                if why.raises().is_some() {
-                    reply.note = Some(SessionNote::NotKept);
-                }
-                return reply;
-            }
-            // Only a `Command` is reserved, answered from the table or left
-            // in flight; a `Time` never is.
-            Admission::Execute(Permit::Command(_))
-            | Admission::Answered(_)
-            | Admission::InFlight(_) => {
-                return wrapped(to, &binding.key, ErrorCode::UnknownMessageType, dst);
+        let opened = Sealed::decode(envelope)
+            .and_then(|sealed| sealed.open(&mut binding.channel.rx, &mut plain));
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(why) => {
+                let counted = why.counts();
+                return match why.refusal() {
+                    Some(code) => self.refused(to, code, counted, now, dst),
+                    None => Reply::noted(SessionNote::Dropped),
+                };
             }
         };
-        // The counter is spent: this frame proved itself and is fresh.
         binding.heard = now;
-        let operation = match TimeOperation::decode(write.operation()) {
-            Ok(operation) => operation,
-            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
-        };
-        if time.is_some() {
-            return wrapped(to, &binding.key, ErrorCode::BusyRetry, dst);
+        let payload = opened.inner();
+        let mask = keys.mask(binding);
+        match kind {
+            MessageType::Goodbye => {
+                let reply = goodbye(to, binding, payload, dst);
+                // The binding goes and the keys with it; the row stays with
+                // its transport (P-076). A body that did not read ends
+                // nothing.
+                if matches!(reply.note, Some(SessionNote::Unbound(_)))
+                    && let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
+                {
+                    row.bound = Bound::Ended;
+                }
+                reply
+            }
+            MessageType::WifiScan | MessageType::WifiStatus => {
+                wifi_answer(to, binding, (keys, mask), link, (kind, payload, now), dst)
+            }
+            MessageType::GetConfig => config_answer(to, binding, keys, payload, dst),
+            MessageType::Command => match signed(to, binding, &opened, dst) {
+                Ok(write) => command(to, binding, keys, write, fram, now, dst).await,
+                Err(refused) => refused,
+            },
+            MessageType::SetConfig => match signed(to, binding, &opened, dst) {
+                Ok(write) => set_config(to, binding, (keys, mask), write, fram, dst).await,
+                Err(refused) => refused,
+            },
+            MessageType::Time => match signed(to, binding, &opened, dst) {
+                Ok(write) => time_asked(to, binding, (time, tickets), mask, &write, now, dst),
+                Err(refused) => refused,
+            },
+            // Opened, and not served by this slice: error 2 under the
+            // session's keys, which an opened request has earned. Firmware
+            // is unserved (P-143); the reads are the later slices'.
+            MessageType::Inventory
+            | MessageType::Readings
+            | MessageType::Concerns
+            | MessageType::History
+            | MessageType::Subscribe
+            | MessageType::ReadLog
+            | MessageType::Firmware
+            // Not answered, and capability bit 9 says so (P-246): a client
+            // does not send it here (#181).
+            | MessageType::Vouch => {
+                sealed_error(to, binding, ErrorCode::UnknownMessageType, dst)
+            }
+            // `frame` routes only the types above here.
+            MessageType::Discover
+            | MessageType::DiscoverResponse
+            | MessageType::Hello
+            | MessageType::HelloResponse
+            | MessageType::InventoryResponse
+            | MessageType::ReadingsResponse
+            | MessageType::ConcernsResponse
+            | MessageType::HistoryResponse
+            | MessageType::SubscribeResponse
+            | MessageType::EventResponse
+            | MessageType::ReadLogResponse
+            | MessageType::WifiScanResponse
+            | MessageType::WifiStatusResponse
+            | MessageType::GetConfigResponse
+            | MessageType::SetConfigResponse
+            | MessageType::CommandResponse
+            | MessageType::FirmwareResponse
+            | MessageType::TimeResponse
+            | MessageType::Pair
+            | MessageType::PairResponse
+            | MessageType::Enrol
+            | MessageType::EnrolResponse
+            | MessageType::GoodbyeResponse
+            | MessageType::VouchResponse
+            | MessageType::ErrorResponse => {
+                sealed_error(to, binding, ErrorCode::MalformedFrame, dst)
+            }
         }
-        let authorised = keys
-            .clients
-            .present()
-            .and_then(|table| table.row(binding.client))
-            .is_some_and(|row| {
-                row.mask().0 & (1 << CapabilityBit::ClockSettableByClient as u16) != 0
-            });
-        *tickets = tickets.wrapping_add(1);
-        *time = Some(AskedTime {
-            ticket: *tickets,
-            to,
-            serial: binding.serial,
-            asked: now,
-        });
-        Reply::noted(SessionNote::TimeAsked(TimeAsked {
-            ticket: *tickets,
-            at: operation.at,
-            authorised,
-        }))
     }
 
     /// The recorder's answer to the `Time` it was handed as `ticket`,
-    /// written under the key of the session that asked. Nothing is written
-    /// for a ticket that is not the one waiting, or when that session has
-    /// ended or been bound again since: its client is not listening.
+    /// sealed for the session that asked. Nothing is written for a ticket
+    /// that is not the one waiting, or when that session has ended or been
+    /// bound again since: its client is not listening.
     pub fn time_answered(&mut self, ticket: u32, answer: TimeAnswer, dst: &mut [u8]) -> Reply {
         let Some(asked) = self.time.filter(|asked| asked.ticket == ticket) else {
             return Reply::NOTHING;
@@ -1418,7 +1442,11 @@ impl Sessions {
         let Some(Row {
             bound: Bound::Session(binding),
             ..
-        }) = self.row(asked.to.conn)
+        }) = self
+            .rows
+            .iter_mut()
+            .flatten()
+            .find(|row| row.conn == asked.to.conn)
         else {
             return Reply::NOTHING;
         };
@@ -1427,30 +1455,35 @@ impl Sessions {
         }
         let ack = match answer {
             TimeAnswer::Ack(ack) => ack,
-            TimeAnswer::Busy => return wrapped(asked.to, &binding.key, ErrorCode::BusyRetry, dst),
+            TimeAnswer::Busy => {
+                return sealed_error(asked.to, binding, ErrorCode::BusyRetry, dst);
+            }
         };
         let mut body = [0u8; MAX_TIME_ACK_BYTES];
-        let written = ack
-            .encode(&mut body)
-            .ok()
-            .and_then(|len| {
-                Tagged::over(
-                    asked.to.header(MessageType::TimeResponse),
-                    body.get(..len).unwrap_or(&[]),
-                    &binding.key,
-                )
+        let written = ack.encode(&mut body).ok().and_then(|len| {
+            let body = body.get(..len)?;
+            binding
+                .channel
+                .tx
+                .seal(asked.to.header(MessageType::TimeResponse), body, dst)
                 .ok()
-            })
-            .and_then(|tagged| tagged.write(dst).ok());
+        });
         answered(written)
     }
 
-    /// A proof or a MAC that did not verify: error 10, bare, and one more
-    /// failure against the connection; the one that reaches the threshold
-    /// ends any session on it and closes it (P-051).
-    fn failed(&mut self, to: Addressed, now: Tick, dst: &mut [u8]) -> Reply {
-        let shed = self.count_failure(to.conn, now);
-        let mut reply = bare(to, Incoming::Client(ErrorCode::BadMAC), dst);
+    /// A refusal answered bare, counted against the connection when the
+    /// peer failed a check it should have passed (P-051); the one that
+    /// reaches the threshold ends any session on it and closes it.
+    fn refused(
+        &mut self,
+        to: Addressed,
+        code: Code,
+        counted: bool,
+        now: Tick,
+        dst: &mut [u8],
+    ) -> Reply {
+        let shed = counted && self.count_failure(to.conn, now);
+        let mut reply = bare(to, Incoming::from(code.code()), dst);
         if shed {
             reply.close = Some(Close {
                 conn: to.conn,
@@ -1460,8 +1493,38 @@ impl Sessions {
         reply
     }
 
+    /// A pairing message that did not read or did not open: its handshake
+    /// abandoned (P-229), and answered as km43 says, counted when it says.
+    fn pair_refused(
+        &mut self,
+        to: Addressed,
+        why: km43::PairError,
+        now: Tick,
+        dst: &mut [u8],
+    ) -> Reply {
+        if let Some(row) = self.row_mut(to.conn) {
+            row.abandon();
+        }
+        match why.refusal() {
+            Some(code) => self.refused(to, code, why.counts(), now, dst),
+            None => Reply::noted(SessionNote::Dropped),
+        }
+    }
+
+    /// The secret and the epoch, when the unit can pair and admit at all: a
+    /// controller key and a generator to draw from as well (P-235, P-237).
+    fn ready(&self) -> Option<(Secret, Epoch)> {
+        self.keys.controller?;
+        Some((self.keys.secret?, self.keys.epoch?))
+    }
+
+    /// Whether the unit has what a challenge is given for.
+    const fn provisioned(&self) -> bool {
+        self.keys.secret.is_some() && self.keys.epoch.is_some() && self.keys.controller.is_some()
+    }
+
     /// End every session bound to `client`, leaving the rows to their
-    /// transports (P-076).
+    /// transports (P-076, P-240).
     fn unbind(&mut self, client: ClientId) {
         for row in self.rows.iter_mut().flatten() {
             if matches!(&row.bound, Bound::Session(binding) if binding.client == client) {
@@ -1477,19 +1540,10 @@ impl Sessions {
             let shed = row.failed(now);
             if shed {
                 row.bound = Bound::Ended;
+                row.abandon();
             }
             shed
         })
-    }
-
-    /// The next challenge, its counter on the part before it exists. None
-    /// without a secret and an epoch: a challenge nobody can prove against
-    /// would spend a counter for nothing.
-    async fn mint<F: Fram>(&mut self, fram: &mut F) -> Option<[u8; CHALLENGE_BYTES]> {
-        let secret = self.keys.secret?;
-        self.keys.epoch?;
-        let minted = self.keys.challenges.mint(fram).await.ok()?;
-        Some(minted.challenge(&secret.device_secret()))
     }
 
     fn row(&self, conn: Conn) -> Option<&Row> {
@@ -1519,19 +1573,6 @@ impl Rows for Sessions {
     }
 }
 
-/// Why a verified `Pair` enrolled nothing. Each is answered differently and
-/// only one is a part that failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unenrolled {
-    /// The row did not land: the FRAM refused the write.
-    NotKept,
-    /// The table is not one this epoch's keys derive for: a factory reset
-    /// the boot has not finished, and no write was tried.
-    OtherEpoch,
-    /// A label the table cannot hold, which km43's decoder refuses first.
-    Label,
-}
-
 /// Where an answer goes: the handle in `session_id`, the request echoed
 /// (P-026, L-182).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1548,6 +1589,47 @@ impl Addressed {
             req_id: self.req_id,
         }
     }
+}
+
+/// P-227's prologue as the controller builds it for this connection.
+fn prologue(
+    device_id: DeviceId,
+    epoch: Epoch,
+    challenge: &[u8; CHALLENGE_BYTES],
+    conn: Conn,
+) -> Prologue {
+    Prologue::new(&PrologueFields {
+        suite: SUITE,
+        version: Version::V1_0,
+        device_id,
+        epoch,
+        challenge,
+        handle: SessionId::from(conn.get()),
+    })
+}
+
+/// P-241's condition for message 2: P-240's step 2 or 3 would allocate. At
+/// message 1 there is no client key, so step 1 cannot be run.
+fn allocates(slots: &[SlotView<'_>], label: &str) -> bool {
+    slots.iter().any(|slot| match slot.held {
+        None => true,
+        Some((_, held)) => held.as_bytes() == label.as_bytes(),
+    })
+}
+
+fn report_text(text: &str) -> ReportText {
+    // `Facts` carries link texts, which are already within the cap; one that
+    // is not is reported as nothing rather than cut mid-character.
+    ReportText::new(text).unwrap_or(ReportText::EMPTY)
+}
+
+/// An answer the worker wrote, copied into the adapter's buffer.
+fn copied(answer: &[u8], dst: &mut [u8]) -> Reply {
+    let written = dst.get_mut(..answer.len()).map(|room| {
+        room.copy_from_slice(answer);
+        answer.len()
+    });
+    answered(written)
 }
 
 const fn answered(len: Option<usize>) -> Reply {
@@ -1567,9 +1649,7 @@ fn bare(to: Addressed, code: Incoming, dst: &mut [u8]) -> Reply {
     let written = ErrorBody { code, detail: "" }
         .write(to.header(MessageType::ErrorResponse), dst)
         .ok();
-    let mut reply = answered(written);
-    reply.note = Some(SessionNote::Refused(wire(code)));
-    reply
+    answered(written).with(SessionNote::Refused(wire(code)))
 }
 
 /// Error 1 at `0, 0` for a frame whose four elements did not read
@@ -1590,42 +1670,53 @@ fn unreadable(dst: &mut [u8]) -> Reply {
         dst,
     )
     .ok();
-    let mut reply = answered(written);
+    let reply = answered(written);
     if reply.answer.is_some() {
-        reply.note = Some(SessionNote::Unreadable);
+        reply.with(SessionNote::Unreadable)
+    } else {
+        reply
     }
-    reply
 }
 
-/// A refusal of a request that verified: under the key, as P-142 has for
-/// every client code; a link-local one, which none of these is, bare.
-fn refused_under(to: Addressed, key: &SessionKey, code: Code, dst: &mut [u8]) -> Reply {
+/// A refusal of a request that opened: sealed, as P-142 has for every
+/// client code; a link-local one, which none of these is, bare.
+fn refused_under(to: Addressed, binding: &mut Binding, code: Code, dst: &mut [u8]) -> Reply {
     match code {
-        Code::Client(code) => wrapped(to, key, code, dst),
+        Code::Client(code) => sealed_error(to, binding, code, dst),
         Code::LinkLocal(code) => bare(to, Incoming::LinkLocal(code), dst),
     }
 }
 
-/// `Ack 0x88` under the session's key.
-fn acked(to: Addressed, key: &SessionKey, ack: CommandAck<'_>, dst: &mut [u8]) -> Reply {
+/// A write that opened and did not read as one: its refusal sealed, or
+/// nothing where km43 says silence.
+fn signed_refused(
+    to: Addressed,
+    binding: &mut Binding,
+    code: Option<Code>,
+    dst: &mut [u8],
+) -> Reply {
+    match code {
+        Some(code) => refused_under(to, binding, code, dst),
+        None => Reply::noted(SessionNote::Dropped),
+    }
+}
+
+/// `Ack 0x88`, sealed.
+fn acked(to: Addressed, binding: &mut Binding, ack: CommandAck<'_>, dst: &mut [u8]) -> Reply {
     let mut body = [0u8; MAX_COMMAND_ACK_BYTES];
-    let written = ack
-        .encode(&mut body)
-        .ok()
-        .and_then(|len| {
-            Tagged::over(
-                to.header(MessageType::CommandResponse),
-                body.get(..len).unwrap_or(&[]),
-                key,
-            )
+    let written = ack.encode(&mut body).ok().and_then(|len| {
+        let body = body.get(..len)?;
+        binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::CommandResponse), body, dst)
             .ok()
-        })
-        .and_then(|tagged| tagged.write(dst).ok());
+    });
     answered(written)
 }
 
-/// An `Error 0xFF` under the session's key, for a request that verified.
-fn wrapped(to: Addressed, key: &SessionKey, code: ErrorCode, dst: &mut [u8]) -> Reply {
+/// An `Error 0xFF`, sealed, for a request that opened.
+fn sealed_error(to: Addressed, binding: &mut Binding, code: ErrorCode, dst: &mut [u8]) -> Reply {
     let mut body = [0u8; 16];
     let written = ErrorBody {
         code: Incoming::Client(code),
@@ -1634,17 +1725,14 @@ fn wrapped(to: Addressed, key: &SessionKey, code: ErrorCode, dst: &mut [u8]) -> 
     .encode(&mut body)
     .ok()
     .and_then(|len| {
-        Tagged::over(
-            to.header(MessageType::ErrorResponse),
-            body.get(..len).unwrap_or(&[]),
-            key,
-        )
-        .ok()
-    })
-    .and_then(|tagged| tagged.write(dst).ok());
-    let mut reply = answered(written);
-    reply.note = Some(SessionNote::Refused(code as u16));
-    reply
+        let body = body.get(..len)?;
+        binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::ErrorResponse), body, dst)
+            .ok()
+    });
+    answered(written).with(SessionNote::Refused(code as u16))
 }
 
 const fn wire(code: Incoming) -> u16 {
@@ -1655,16 +1743,193 @@ const fn wire(code: Incoming) -> u16 {
     }
 }
 
+/// `Command 0x08` that opened, through [`admit`] under the client the
+/// session was bound to.
+async fn command<F: Fram>(
+    to: Addressed,
+    binding: &mut Binding,
+    keys: &mut Keys,
+    write: SignedWrite<'_>,
+    fram: &mut F,
+    now: Tick,
+    dst: &mut [u8],
+) -> Reply {
+    let dedups = keys.clients.commands_mut();
+    let mut admission = admit(write, binding.client, dedups, fram, now).await;
+    if let Admission::InFlight(retry) = admission {
+        // No output has authority yet, so none can already be where the
+        // command asked: the state store's answer is always to run it.
+        admission = retry.again(keys.clients.commands_mut(), fram, now).await;
+    }
+    match admission {
+        Admission::Refused(why) => {
+            let reply = refused_under(to, binding, why.code(), dst);
+            if why.raises().is_some() {
+                reply.with(SessionNote::NotKept)
+            } else {
+                reply
+            }
+        }
+        Admission::Answered(ack) => acked(to, binding, ack, dst),
+        Admission::Execute(Permit::Command(reservation)) => {
+            let finished = reservation
+                .finished(
+                    keys.clients.commands_mut(),
+                    fram,
+                    Executed::Rejected,
+                    UNSPECIFIED,
+                )
+                .await;
+            let reply = acked(to, binding, finished.ack, dst);
+            if finished.recorded.is_err() {
+                reply.with(SessionNote::NotKept)
+            } else {
+                reply
+            }
+        }
+        // `admit` hands a `Command` a reservation, never a plain write.
+        Admission::Execute(Permit::Write(_)) => {
+            sealed_error(to, binding, ErrorCode::UnknownMessageType, dst)
+        }
+        // Settled by another retry between the two, and neither running
+        // nor recorded now: this one goes again.
+        Admission::InFlight(_) => sealed_error(to, binding, ErrorCode::BusyRetry, dst),
+    }
+}
+
+/// A write out of a request that opened, or its refusal (P-053).
+fn signed<'a>(
+    to: Addressed,
+    binding: &mut Binding,
+    opened: &km43::Opened<'a>,
+    dst: &mut [u8],
+) -> Result<SignedWrite<'a>, Reply> {
+    SignedWrite::read(opened).map_err(|why| signed_refused(to, binding, why.refusal(), dst))
+}
+
+/// `Goodbye 0x0C` that opened: answered, and the caller unbinds.
+fn goodbye(to: Addressed, binding: &mut Binding, payload: &[u8], dst: &mut [u8]) -> Reply {
+    if EmptyBody::decode(MessageType::Goodbye, payload).is_err() {
+        return sealed_error(to, binding, ErrorCode::MalformedFrame, dst);
+    }
+    let mut body = [0u8; 1];
+    let answer = EmptyBody
+        .encode(MessageType::GoodbyeResponse, &mut body)
+        .ok()
+        .and_then(|len| {
+            let body = body.get(..len)?;
+            binding
+                .channel
+                .tx
+                .seal(to.header(MessageType::GoodbyeResponse), body, dst)
+                .ok()
+        });
+    Reply {
+        answer,
+        close: None,
+        note: Some(SessionNote::Unbound(to.conn)),
+    }
+}
+
+/// `Time 0x0A` that opened: handed to the recorder, which owns the
+/// calendar and the floor, with a ticket; the answer comes back through
+/// [`Sessions::time_answered`]. One at a time (P-118).
+fn time_asked(
+    to: Addressed,
+    binding: &mut Binding,
+    asking: (&mut Option<AskedTime>, &mut u32),
+    mask: Option<km43::ClientCapability>,
+    write: &SignedWrite<'_>,
+    now: Tick,
+    dst: &mut [u8],
+) -> Reply {
+    let (time, tickets) = asking;
+    let operation = match TimeOperation::decode(write.operation()) {
+        Ok(operation) => operation,
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
+    };
+    if time.is_some() {
+        return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
+    }
+    let authorised =
+        mask.is_some_and(|mask| mask.0 & (1 << CapabilityBit::ClockSettableByClient as u16) != 0);
+    *tickets = tickets.wrapping_add(1);
+    *time = Some(AskedTime {
+        ticket: *tickets,
+        to,
+        serial: binding.serial,
+        asked: now,
+    });
+    Reply::noted(SessionNote::TimeAsked(TimeAsked {
+        ticket: *tickets,
+        at: operation.at,
+        authorised,
+    }))
+}
+
+/// `SetConfig 0x07` that opened: the mask, then the version, then the
+/// section (P-100, P-105).
+async fn set_config<F: Fram>(
+    to: Addressed,
+    binding: &mut Binding,
+    keys: (&mut Keys, Option<km43::ClientCapability>),
+    write: SignedWrite<'_>,
+    fram: &mut F,
+    dst: &mut [u8],
+) -> Reply {
+    let (keys, mask) = keys;
+    let operation = match km43::SetConfigOperation::decode(write.operation()) {
+        Ok(operation) => operation,
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
+    };
+    let required = km43::ClientCapability::WRITE_CONFIG.0
+        | if matches!(
+            operation.section,
+            km43::ConfigSection::Network | km43::ConfigSection::Cloud
+        ) {
+            km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0
+        } else {
+            0
+        };
+    let authorised = mask.is_some_and(|mask| mask.0 & required == required);
+    let ack = if authorised {
+        match keys
+            .configuration
+            .set(operation, &mut keys.network, fram)
+            .await
+        {
+            Ok(ack) => ack,
+            Err(code) => return sealed_error(to, binding, code, dst),
+        }
+    } else {
+        km43::SetConfigAck {
+            section: operation.section,
+            version: keys.configuration.version(operation.section, &keys.network),
+            outcome: km43::SetConfig::Unauthorised,
+        }
+    };
+    let mut body = [0; km43::MAX_SET_CONFIG_ACK_BYTES];
+    let written = ack.encode(&mut body).ok().and_then(|len| {
+        let body = body.get(..len)?;
+        binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::SetConfigResponse), body, dst)
+            .ok()
+    });
+    answered(written)
+}
+
 fn config_answer(
     to: Addressed,
-    binding: &Binding,
+    binding: &mut Binding,
     keys: &Keys,
     payload: &[u8],
     dst: &mut [u8],
 ) -> Reply {
     let request = match km43::GetConfigRequest::decode(payload) {
         Ok(request) => request,
-        Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
     let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
     let len = match keys
@@ -1672,47 +1937,40 @@ fn config_answer(
         .answer(request.section, &keys.network, &mut body)
     {
         Ok(len) => len,
-        Err(code) => return wrapped(to, &binding.key, code, dst),
+        Err(code) => return sealed_error(to, binding, code, dst),
     };
-    let written = body
-        .get(..len)
-        .and_then(|body| {
-            Tagged::over(
-                to.header(MessageType::GetConfigResponse),
-                body,
-                &binding.key,
-            )
+    let written = body.get(..len).and_then(|body| {
+        binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::GetConfigResponse), body, dst)
             .ok()
-        })
-        .and_then(|tagged| tagged.write(dst).ok());
+    });
     answered(written)
 }
 
 fn wifi_answer(
     to: Addressed,
-    binding: &Binding,
-    keys: &Keys,
+    binding: &mut Binding,
+    keys: (&Keys, Option<km43::ClientCapability>),
     link: (&mut crate::Wifi, bool),
     request: (MessageType, &[u8], Tick),
     dst: &mut [u8],
 ) -> Reply {
+    let (keys, mask) = keys;
     let (wifi, agreed) = link;
     let (kind, payload, now) = request;
     let section = match keys.network.held() {
         crate::Held::Present(network) => network.version(),
         crate::Held::Absent | crate::Held::Corrupt | crate::Held::Malformed(_) => 0,
     };
-    let mut body = [0; km43::MAX_PAYLOAD];
+    let mut body = [0; MAX_PAYLOAD];
     let (response, encoded) = if kind == MessageType::WifiScan {
         let asked = match km43::ScanRequest::decode(payload) {
             Ok(asked) => asked,
-            Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+            Err(why) => return refused_under(to, binding, why.refusal(), dst),
         };
-        let authorised = keys
-            .clients
-            .present()
-            .and_then(|table| table.row(binding.client))
-            .is_some_and(|row| row.mask().0 & 2 != 0);
+        let authorised = mask.is_some_and(|mask| mask.0 & 2 != 0);
         let refused = if asked.refresh {
             wifi.refresh(authorised, section != 0, agreed, now)
         } else {
@@ -1724,7 +1982,7 @@ fn wifi_answer(
         )
     } else {
         if let Err(why) = EmptyBody::decode(MessageType::WifiStatus, payload) {
-            return refused_under(to, &binding.key, why.refusal(), dst);
+            return refused_under(to, binding, why.refusal(), dst);
         }
         (
             MessageType::WifiStatusResponse,
@@ -1733,12 +1991,11 @@ fn wifi_answer(
     };
     let len = match encoded {
         Ok(len) => len,
-        Err(why) => return refused_under(to, &binding.key, why.refusal(), dst),
+        Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
     answered(
         body.get(..len)
-            .and_then(|body| Tagged::over(to.header(response), body, &binding.key).ok())
-            .and_then(|tagged| tagged.write(dst).ok()),
+            .and_then(|body| binding.channel.tx.seal(to.header(response), body, dst).ok()),
     )
 }
 
@@ -1748,35 +2005,37 @@ mod tests {
 
     use embassy_futures::block_on;
     use km43::{
-        Attempt, ClientKind, CommandKind, CommandOperation, Counter, DeviceId, DeviceSecret,
-        ErrorBody as Body, HelloInner, Hint, MAX_PAYLOAD, PairAckClaim, PrintedSecret, Session,
-        Signed,
+        ClientChannel, CommandKind, CommandOperation, EnrolPending, Entropy, Fingerprint,
+        HelloOffer, HelloPending, Label, MAX_FRAME, PairOffer, PairPending, PairReply,
+        PrintedSecret, Signed, StaticKey,
     };
 
     use super::*;
-    use crate::clients::Label;
-    use crate::epoch::Clearing;
+    use crate::agreement::Agreement;
+    use crate::body::Kept;
+    use crate::drbg::DrbgState;
     use crate::fram::{Address, FRAM_BYTES, Refused};
-    use crate::map::{CHALLENGE_COUNTER, CLIENT_TABLE, EPOCH};
+    use crate::map;
+    use crate::secret::ControllerKey;
 
     const DEVICE: [u8; 16] = [7; 16];
     const PRINTED: [u8; 32] = [9; 32];
+    const CONTROLLER: [u8; 32] = [5; 32];
+    const SEED: [u8; 32] = [3; 32];
 
-    /// Up to the end of the client table, which is as far as this reaches.
-    const PART_BYTES: usize = crate::map::END.0 as usize;
+    const PART_BYTES: usize = map::END.0 as usize;
     const _: () = assert!(PART_BYTES <= FRAM_BYTES);
 
+    /// The part in an array: a supply that can fall, and the generator's
+    /// record alone made to lose its writes.
     struct Part {
         bytes: [u8; PART_BYTES],
         falling: bool,
-        /// Refuse writes to the client table's record only, as a part that
+        drbg_lost: bool,
+        /// Refuse writes to the slots and their marks only, as a part that
         /// failed mid-way through an enrolment would.
         table_refused: bool,
     }
-
-    /// Where the client table's record starts: its two slots end the part.
-    const TABLE_STARTS: usize =
-        CLIENT_TABLE.end().0 as usize - 2 * crate::fram::slot_bytes(CLIENT_TABLE_BYTES);
 
     impl Fram for Part {
         type Error = ();
@@ -1792,27 +2051,33 @@ mod tests {
             at: Address,
             bytes: &[u8],
         ) -> impl Future<Output = Result<(), Refused<()>>> {
-            let outcome =
-                if self.falling || (self.table_refused && usize::from(at.0) >= TABLE_STARTS) {
-                    Err(Refused::SupplyFalling)
-                } else {
-                    let start = usize::from(at.0);
+            let start = usize::from(at.0);
+            // The generator's record starts where the epoch's ends.
+            let drbg = usize::from(map::EPOCH.end().0);
+            let in_drbg = (drbg..usize::from(map::DRBG.end().0)).contains(&start);
+            let table = usize::from(map::NETWORK.end().0)..usize::from(map::COMMANDS.end().0);
+            let outcome = if self.falling || (self.table_refused && table.contains(&start)) {
+                Err(Refused::SupplyFalling)
+            } else {
+                if !(self.drbg_lost && in_drbg) {
                     self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
-                    Ok(())
-                };
+                }
+                Ok(())
+            };
             core::future::ready(outcome)
         }
     }
 
     /// A frame, without an allocator.
-    struct Bytes {
-        buf: [u8; MAX_PAYLOAD],
+    #[derive(Clone, Copy)]
+    struct Frame {
+        buf: [u8; MAX_FRAME],
         len: usize,
     }
 
-    impl Bytes {
+    impl Frame {
         const EMPTY: Self = Self {
-            buf: [0; MAX_PAYLOAD],
+            buf: [0; MAX_FRAME],
             len: 0,
         };
 
@@ -1824,7 +2089,13 @@ mod tests {
         }
     }
 
-    impl core::ops::Deref for Bytes {
+    impl core::fmt::Debug for Frame {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "Frame({} bytes)", self.len)
+        }
+    }
+
+    impl core::ops::Deref for Frame {
         type Target = [u8];
 
         fn deref(&self) -> &[u8] {
@@ -1836,2248 +2107,1138 @@ mod tests {
         Conn::new(n).expect("a nonzero handle")
     }
 
-    fn epoch(raw: u32) -> Epoch {
-        Epoch::new(raw).expect("a nonzero epoch")
+    fn label() -> Label {
+        Label::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
     }
 
-    fn device() -> DeviceSecret {
-        DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new(PRINTED))
+    fn fingerprint() -> Fingerprint {
+        ControllerKey::new(CONTROLLER)
+            .expect("entropy")
+            .fingerprint()
     }
 
-    const FACTS: Facts<'static> = Facts {
-        model: "origin89 controller",
-        fw_controller: "0.1.0+gabcdef01",
-        fw_comms: "0.1.0-sim+g89abcdef",
-        log: LogSpan {
-            oldest: LogSeq(3),
-            newest: LogSeq(41),
-        },
-        time_known: false,
-        pairing_open: false,
-        link: Some(Compat::Agreed(Version::V1_0)),
-    };
-
-    /// A unit under epoch `under` with one client enrolled at slot 1 under
-    /// epoch 1, its counter at `counter`, and a part to write to.
+    /// A manufactured unit: secret, controller key and generator on the
+    /// part, and the sessions over what a boot would read.
     struct Rig {
         part: Part,
         sessions: Sessions,
+        agreement: Agreement,
+        wifi: crate::Wifi,
         now: Tick,
-        req: u32,
+        pairing_open: bool,
     }
 
     impl Rig {
         fn new() -> Self {
-            Self::under(epoch(1))
+            Self::built(true)
         }
 
-        fn under(current: Epoch) -> Self {
+        fn unprovisioned() -> Self {
+            Self::built(false)
+        }
+
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the whole map, as the boot reads it; a test thread's stack holds it"
+        )]
+        fn built(provisioned: bool) -> Self {
             let mut part = Part {
-                bytes: [0; PART_BYTES],
+                bytes: [0xFF; PART_BYTES],
                 falling: false,
+                drbg_lost: false,
                 table_refused: false,
             };
-            let mut table = ClientTable::cleared(&Clearing::found_at_boot(epoch(1)));
-            let _ = table.pair(Label::new("phone").expect("fits"), ClientKind::App);
-            let mut clients = block_on(Kept::read(CLIENT_TABLE, &mut part)).expect("reads");
-            block_on(clients.write(&mut part, table)).expect("lands");
-            let challenges = block_on(Kept::read(CHALLENGE_COUNTER, &mut part)).expect("reads");
-            let mut epoch_record = block_on(Kept::read(EPOCH, &mut part)).expect("reads");
-            block_on(epoch_record.write(&mut part, current)).expect("lands");
+            let secret = Secret::new(DEVICE, PRINTED).expect("entropy");
+            let controller = ControllerKey::new(CONTROLLER).expect("entropy");
+            if provisioned {
+                let mut kept = block_on(Kept::read(map::DEVICE_SECRET, &mut part)).expect("reads");
+                block_on(kept.write(&mut part, secret)).expect("secret");
+                let mut kept = block_on(Kept::read(map::CONTROLLER_KEY, &mut part)).expect("reads");
+                block_on(kept.write(&mut part, controller)).expect("key");
+                let mut kept = block_on(Kept::read(map::DRBG, &mut part)).expect("reads");
+                block_on(kept.write(&mut part, DrbgState::new(SEED).expect("entropy")))
+                    .expect("seed");
+            }
+            let mut epoch_record =
+                block_on(Kept::<Epoch, EPOCH_BYTES>::read(map::EPOCH, &mut part)).expect("reads");
+            block_on(epoch_record.write(&mut part, Epoch::FIRST)).expect("epoch");
+            let mut clients = block_on(Clients::read(&mut part)).expect("reads");
+            let _ = block_on(clients.booted(&mut epoch_record, &mut part)).expect("repairs");
             let keys = Keys {
-                configuration: block_on(crate::Configuration::read(&mut part))
-                    .expect("read config"),
-                network: block_on(Kept::read(crate::map::NETWORK, &mut part))
-                    .expect("read network"),
-                secret: Some(Secret::new(DEVICE, PRINTED).expect("entropy")),
-                epoch: Some(current),
+                configuration: block_on(crate::Configuration::read(&mut part)).expect("reads"),
+                network: block_on(Kept::read(map::NETWORK, &mut part)).expect("reads"),
+                secret: provisioned.then_some(secret),
+                controller: provisioned.then(|| controller.public()),
+                epoch: Some(Epoch::FIRST),
                 epoch_record,
                 clients,
-                challenges,
+                generator: Generator::new(
+                    block_on(Kept::read(map::DRBG, &mut part)).expect("reads"),
+                ),
             };
             Self {
                 part,
                 sessions: Sessions::new(keys),
-                now: Tick::from_millis(10_000),
-                req: 0,
+                agreement: Agreement::new(&secret, &controller),
+                wifi: crate::Wifi::EMPTY,
+                now: Tick::ZERO,
+                pairing_open: true,
+            }
+        }
+
+        fn facts(&self) -> Facts<'static> {
+            Facts {
+                model: "test",
+                fw_controller: "0.1.0",
+                fw_comms: "0.1.0",
+                log: LogSpan {
+                    oldest: LogSeq(0),
+                    newest: LogSeq(0),
+                },
+                time_known: false,
+                pairing_open: self.pairing_open,
+                link: Some(Compat::Agreed(Version::V1_0)),
             }
         }
 
         fn at(&mut self, millis: u64) {
-            self.now = self.now.after(Millis::from_millis(millis)).expect("fits");
+            self.now = Tick::from_millis(millis);
         }
 
-        fn counter(&self) -> u64 {
-            self.sessions
-                .keys()
-                .challenges
-                .present()
-                .map_or(0, ChallengeCounter::last)
-        }
-
-        fn connect(&mut self, handle: u16) -> ClientConnected {
-            let outcome = self.sessions.admit(conn(handle));
+        fn connect(&mut self, handle: u16) {
+            assert_eq!(self.sessions.admit(conn(handle)), ClientConnected::Accepted);
             block_on(self.sessions.settle(self.now, &mut self.part));
-            outcome
         }
 
-        fn next_req(&mut self) -> ReqId {
-            self.req = self.req.checked_add(1).expect("fewer than 2^32 requests");
-            ReqId(self.req)
-        }
-
-        /// Send `frame` and hand back the reply and the answer's bytes.
-        fn send(&mut self, frame: &[u8]) -> (Reply, Bytes) {
-            self.send_with(frame, &FACTS)
-        }
-
-        fn send_with(&mut self, frame: &[u8], facts: &Facts<'_>) -> (Reply, Bytes) {
-            let mut dst = [0u8; MAX_PAYLOAD];
-            let mut wifi = crate::Wifi::EMPTY;
+        fn send(&mut self, frame: &[u8]) -> (Reply, Frame) {
+            let facts = self.facts();
+            let mut dst = [0u8; MAX_FRAME];
             let reply = block_on(self.sessions.frame(
                 frame,
                 self.now,
-                (facts, &mut wifi),
+                (&facts, &mut self.wifi),
                 &mut self.part,
                 &mut dst,
             ));
-            let bytes = reply
-                .answer
-                .map_or(Bytes::EMPTY, |len| Bytes::of(&dst[..len]));
-            (reply, bytes)
+            (reply, Frame::of(&dst[..reply.answer.unwrap_or(0)]))
         }
 
-        /// A request of `kind` with an empty body on `handle`.
-        fn empty(&mut self, handle: u16, kind: MessageType) -> Bytes {
-            let req_id = self.next_req();
-            let mut dst = [0u8; 64];
-            let cbor = Header {
-                kind,
-                session: SessionId::from(handle),
-                req_id,
-            }
-            .write(0, &mut dst)
-            .expect("fits");
-            let len = cbor.finish().expect("fits");
-            Bytes::of(&dst[..len])
-        }
-
-        /// `Discover` on `handle`, and the challenge it answered with.
-        fn discover(&mut self, handle: u16) -> [u8; 16] {
-            let frame = self.empty(handle, MessageType::Discover);
-            let (_, answer) = self.send(&frame);
-            let envelope = Envelope::decode(&answer).expect("an envelope");
-            assert_eq!(envelope.header().session, SessionId::from(handle), "P-026");
-            let discovery = km43::Discovery::decode(envelope).expect("a Discover answer");
-            discovery.challenge
-        }
-
-        /// A `Hello` from `client` proving over `challenge` with `secret`
-        /// under `under`, speaking `version`.
-        #[expect(clippy::too_many_arguments, reason = "a test fixture")]
-        fn hello_frame(
-            &mut self,
-            handle: u16,
-            client: u32,
-            challenge: [u8; 16],
-            secret: &DeviceSecret,
-            under: Epoch,
-            version: Version,
-            nonce: [u8; 16],
-        ) -> Bytes {
-            let req_id = self.next_req();
-            let id = ClientId::new(client).expect("a slot");
-            let enrolment = secret.enrolment(under, id);
-            let mut inner = [0u8; 128];
-            let request = HelloInner {
-                version,
-                client_id: id,
-                client_version: "sim/1",
-                client_nonce: nonce,
-            }
-            .prove(&enrolment.client_key(), &challenge, &mut inner)
-            .expect("proves");
-            let mut dst = [0u8; 256];
-            let len = request
-                .write(
-                    Header {
-                        kind: MessageType::Hello,
-                        session: SessionId::from(handle),
-                        req_id,
-                    },
-                    &mut dst,
-                )
-                .expect("fits");
-            Bytes::of(&dst[..len])
-        }
-
-        /// A proper `Hello` from client 1 on `handle`, over its live
-        /// challenge; the session key the client derives.
-        fn hello(&mut self, handle: u16) -> (Reply, Bytes, SessionKey) {
-            let challenge = self.discover(handle);
-            let nonce = [handle.to_le_bytes()[0]; 16];
-            let frame = self.hello_frame(
-                handle,
-                1,
-                challenge,
-                &device(),
-                epoch(1),
-                Version::V1_0,
-                nonce,
-            );
-            let (reply, answer) = self.send(&frame);
-            let key = device()
-                .enrolment(epoch(1), ClientId::new(1).expect("a slot"))
-                .session_key(
-                    &Handshake {
-                        challenge,
-                        client_nonce: nonce,
-                    },
-                    SessionId::from(handle),
+        /// Run the next queued key agreement, as the worker would.
+        fn compute(&mut self) -> Option<(Reply, Frame)> {
+            let job = self.sessions.next_job()?;
+            let done = self.agreement.run(job);
+            let facts = self.facts();
+            let mut dst = [0u8; MAX_FRAME];
+            let reply =
+                block_on(
+                    self.sessions
+                        .completed(done, self.now, &facts, &mut self.part, &mut dst),
                 );
-            (reply, answer, key)
+            Some((reply, Frame::of(&dst[..reply.answer.unwrap_or(0)])))
         }
 
-        /// A wrapped request of `kind` under `key`, empty inner body.
-        fn wrapped(&mut self, handle: u16, kind: MessageType, key: &SessionKey) -> Bytes {
-            let req_id = self.next_req();
-            let mut dst = [0u8; 128];
-            let len = Tagged::over(
-                Header {
-                    kind,
-                    session: SessionId::from(handle),
-                    req_id,
-                },
-                &[0xa0],
-                key,
-            )
-            .expect("wraps")
-            .write(&mut dst)
-            .expect("fits");
-            Bytes::of(&dst[..len])
+        /// Send a handshake frame and compute what it queued.
+        fn exchange(&mut self, frame: &[u8]) -> (Reply, Frame) {
+            let (reply, answer) = self.send(frame);
+            if reply.note
+                != Some(SessionNote::Queued(conn(u16::from(
+                    Envelope::decode(frame)
+                        .map_or(SessionId::None, |envelope| envelope.header().session),
+                ))))
+            {
+                return (reply, answer);
+            }
+            self.compute().expect("a job was queued")
         }
     }
 
-    impl Rig {
-        /// A `Command` on `handle` claiming `client`, carrying `counter` and
-        /// the operation `cmd_id`/`kind`, signed under `key`.
-        fn command(
-            &mut self,
-            handle: u16,
-            client: u32,
-            counter: u64,
-            (cmd_id, kind): (u32, CommandKind),
-            key: &SessionKey,
-        ) -> Bytes {
-            let req_id = self.next_req();
-            let mut op = [0u8; 16];
-            let len = CommandOperation {
-                cmd_id,
+    /// A client on one connection, built from `km43`'s client half.
+    struct Phone {
+        handle: u16,
+        req: u32,
+        draws: u8,
+        challenge: Option<[u8; CHALLENGE_BYTES]>,
+        epoch: Epoch,
+        enrolment: Option<km43::Enrolment>,
+        channel: Option<ClientChannel>,
+    }
+
+    impl Phone {
+        fn on(handle: u16) -> Self {
+            Self {
+                handle,
+                req: 0,
+                draws: 0,
+                challenge: None,
+                epoch: Epoch::FIRST,
+                enrolment: None,
+                channel: None,
+            }
+        }
+
+        fn header(&mut self, kind: MessageType) -> Header {
+            self.req = self.req.wrapping_add(1);
+            Header {
                 kind,
-                args: &[0xa0],
-            }
-            .encode(&mut op)
-            .expect("fits");
-            let mut dst = [0u8; 128];
-            let len = Signed::over(
-                Header {
-                    kind: MessageType::Command,
-                    session: SessionId::from(handle),
-                    req_id,
-                },
-                ClientId::new(client).expect("a slot"),
-                Counter(counter),
-                &op[..len],
-                key,
-            )
-            .expect("signs")
-            .write(&mut dst)
-            .expect("fits");
-            Bytes::of(&dst[..len])
-        }
-
-        /// The highest counter the table holds for client 1.
-        fn accepted(&self) -> Option<Counter> {
-            self.sessions
-                .keys()
-                .clients
-                .present()
-                .and_then(|table| table.accepted(ClientId::new(1).expect("a slot")))
-        }
-    }
-
-    #[test]
-    fn p_216_p_218_p_219_both_wifi_reads_are_wrapped_and_spend_no_counter() {
-        let mut hello = Rig::new();
-        let _ = hello.connect(1);
-        let (_, answer, key) = hello.hello(1);
-        let (_, body) = under(&answer, &key);
-        let mut reader = km43::CborReader::new(&body);
-        let mut capabilities = None;
-        for _ in 0..reader.map().expect("map") {
-            if reader.u32().expect("key") == 6 {
-                capabilities = Some(reader.u32().expect("capabilities"));
-            } else {
-                reader.skip().expect("field");
+                session: SessionId::from(self.handle),
+                req_id: ReqId(self.req),
             }
         }
-        assert_eq!(capabilities, Some(1 << 8));
-        let (mut rig, key) = config_client(ClientKind::App, None);
-        let before = rig.accepted();
-        let mut body = [0; 32];
-        let len = km43::ScanRequest { refresh: true }
-            .encode(&mut body)
-            .expect("request");
-        let mut bytes = [0; 128];
-        let len = Tagged::over(
-            Header {
-                kind: MessageType::WifiScan,
-                session: SessionId::from(1),
-                req_id: rig.next_req(),
-            },
-            &body[..len],
-            &key,
-        )
-        .expect("wrapped")
-        .write(&mut bytes)
-        .expect("frame");
-        let (_, answer) = rig.send(&bytes[..len]);
-        let (header, body) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::WifiScanResponse);
-        assert_eq!(
-            km43::ScanAnswer::decode(&body).expect("scan").refused(),
-            Some(km43::ScanRefusal::RadioOff)
-        );
-        let request = rig.wrapped(1, MessageType::WifiStatus, &key);
-        let (_, answer) = rig.send(&request);
-        let (header, body) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::WifiStatusResponse);
-        assert_eq!(
-            km43::WifiStatus::decode(&body).expect("status"),
-            km43::WifiStatus {
-                section: 0,
-                report: None
+
+        fn entropy(&mut self) -> Entropy {
+            self.draws = self.draws.wrapping_add(1);
+            let mut bytes = [0u8; 32];
+            bytes[0] = u8::try_from(self.handle).expect("a small handle");
+            bytes[1] = self.draws;
+            bytes[31] = 0x40;
+            Entropy::new(bytes)
+        }
+
+        fn prologue(&self) -> Prologue {
+            prologue(
+                DeviceId::new(DEVICE),
+                self.epoch,
+                self.challenge.as_ref().expect("a challenge to present"),
+                conn(self.handle),
+            )
+        }
+
+        fn discover(&mut self, rig: &mut Rig) -> Reply {
+            let mut dst = [0u8; 64];
+            let len = self
+                .header(MessageType::Discover)
+                .write(0, &mut dst)
+                .expect("fits")
+                .finish()
+                .expect("fits");
+            let (reply, answer) = rig.send(&dst[..len]);
+            if let Ok(discovery) = Envelope::decode(&answer).and_then(|envelope| {
+                km43::Discovery::decode(envelope).map_err(|_| EnvelopeError::WrongLength)
+            }) {
+                self.challenge = Some(discovery.challenge);
+                self.epoch = discovery.epoch;
             }
-        );
-        assert_eq!(rig.accepted(), before);
-    }
-
-    const START: (u32, CommandKind) = (42, CommandKind::StartGenerator);
-
-    /// The payload of an answer under `key`, and its header.
-    fn under(answer: &[u8], key: &SessionKey) -> (Header, Bytes) {
-        let envelope = Envelope::decode(answer).expect("an envelope");
-        let header = envelope.header();
-        let verified = Wrapper::decode(envelope)
-            .and_then(|wrapper| wrapper.verify(key))
-            .expect("under the session's key");
-        (header, Bytes::of(verified.payload()))
-    }
-
-    /// The code of an error under `key`.
-    fn code_under(answer: &[u8], key: &SessionKey) -> Incoming {
-        let (header, payload) = under(answer, key);
-        assert_eq!(header.kind, MessageType::ErrorResponse);
-        ErrorBody::authenticated(&payload)
-            .expect("an error body")
-            .code
-    }
-
-    /// The code of a bare error, read as a client reads one: a code the
-    /// registry marks MAC'd does not read.
-    fn hint(answer: &[u8]) -> Option<u16> {
-        let envelope = Envelope::decode(answer).ok()?;
-        let hint: Hint<'_> = Body::from_envelope(envelope).ok()?;
-        Some(wire(hint.code()))
-    }
-
-    /// The code key 1 of a bare error carries, whatever a client makes of it.
-    fn raw_code(answer: &[u8]) -> Option<u16> {
-        let envelope = Envelope::decode(answer).ok()?;
-        if envelope.header().kind != MessageType::ErrorResponse {
-            return None;
-        }
-        let mut body = envelope.into_body();
-        (body.key().ok()? == 1).then_some(())?;
-        body.u16().ok()
-    }
-
-    fn header(answer: &[u8]) -> Header {
-        Envelope::decode(answer).expect("an envelope").header()
-    }
-
-    fn other_key() -> SessionKey {
-        DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]))
-            .enrolment(epoch(1), ClientId::new(1).expect("a slot"))
-            .session_key(
-                &Handshake {
-                    challenge: [0; 16],
-                    client_nonce: [0; 16],
-                },
-                SessionId::from(1),
-            )
-    }
-
-    #[test]
-    fn p_080_a_command_is_verified_counted_and_answered_rejected_under_the_key() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.command(1, 1, 1, START, &key);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(reply.close, None);
-        assert_eq!(reply.note, None);
-        let (header, payload) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::CommandResponse);
-        assert_eq!(header.req_id, ReqId(rig.req), "P-026");
-        assert_eq!(
-            CommandAck::decode(&payload),
-            Ok(CommandAck {
-                cmd_id: 42,
-                outcome: km43::Command::Rejected,
-                detail: UNSPECIFIED,
-            })
-        );
-        // The counter is spent on the part, and no entry stays behind for
-        // a command that did not run (P-120).
-        assert_eq!(rig.accepted(), Some(Counter(1)));
-        let reread = block_on(Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(
-            CLIENT_TABLE,
-            &mut rig.part,
-        ))
-        .expect("reads");
-        let table = reread.present().expect("a table");
-        assert_eq!(
-            table.accepted(ClientId::new(1).expect("a slot")),
-            Some(Counter(1))
-        );
-        assert_eq!(table.dedup().live(rig.now), 0);
-        // So a retry, with the next counter, is not a duplicate of anything.
-        let frame = rig.command(1, 1, 2, START, &key);
-        let (_, answer) = rig.send(&frame);
-        let (_, payload) = under(&answer, &key);
-        assert_eq!(
-            CommandAck::decode(&payload).map(|ack| ack.outcome),
-            Ok(km43::Command::Rejected)
-        );
-    }
-
-    /// Conformance 8 at the session: the same bytes again are refused by the
-    /// counter, under the key, and do not keep the session alive.
-    #[test]
-    fn p_080_a_command_reusing_its_counter_is_11_under_the_key_and_refreshes_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.command(1, 1, 1, START, &key);
-        let _ = rig.send(&frame);
-        rig.at(SESSION_IDLE.as_millis() - 1_000);
-        // Signed again under a new req_id, with the counter already spent:
-        // past the window, and refused at the counter.
-        let again = rig.command(1, 1, 1, START, &key);
-        let (reply, answer) = rig.send(&again);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::CounterNotFresh)
-        );
-        assert_eq!(reply.close, None);
-        assert_eq!(rig.accepted(), Some(Counter(1)));
-        // The replay was the last frame, and the session still ends on the
-        // time the genuine one set.
-        rig.at(1_000);
-        let expired = rig.sessions.tick(rig.now);
-        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
-    }
-
-    #[test]
-    fn p_022_a_verified_command_replayed_on_its_session_is_dropped_unanswered() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.command(1, 1, 1, START, &key);
-        let (_, answer) = rig.send(&frame);
-        assert!(!answer.is_empty(), "the genuine one is answered");
-        let part = rig.part.bytes;
-        rig.at(SESSION_IDLE.as_millis() - 1_000);
-        // Eight replays: no answer to play against the client, nothing
-        // written, no failure counted, and no refresh.
-        for n in 1..=8 {
-            let (reply, answer) = rig.send(&frame);
-            assert_eq!(
-                reply.note,
-                Some(SessionNote::OutOfWindow(OutOfWindow::Replayed)),
-                "{n}"
-            );
-            assert!(answer.is_empty(), "{n}");
-            assert_eq!(reply.close, None, "{n}");
-        }
-        assert!(rig.part.bytes == part, "nothing written");
-        assert_eq!(rig.accepted(), Some(Counter(1)));
-        rig.at(1_000);
-        let expired = rig.sessions.tick(rig.now);
-        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
-    }
-
-    #[test]
-    fn p_022_a_wrapped_request_replayed_or_below_the_window_is_dropped_unanswered() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        // Signed first and held back while the client moves on five.
-        let withheld = rig.wrapped(1, MessageType::Readings, &key);
-        let sent: [Bytes; 5] =
-            core::array::from_fn(|_| rig.wrapped(1, MessageType::Readings, &key));
-        for frame in &sent {
-            let (_, answer) = rig.send(frame);
-            assert_eq!(
-                code_under(&answer, &key),
-                Incoming::Client(ErrorCode::UnknownMessageType)
-            );
-        }
-        let (reply, answer) = rig.send(&withheld);
-        assert_eq!(
-            reply.note,
-            Some(SessionNote::OutOfWindow(OutOfWindow::BelowWindow))
-        );
-        assert!(answer.is_empty());
-        let (reply, answer) = rig.send(&sent[4]);
-        assert_eq!(
-            reply.note,
-            Some(SessionNote::OutOfWindow(OutOfWindow::Replayed))
-        );
-        assert!(answer.is_empty());
-        assert!(rig.sessions.is_bound(conn(1)));
-    }
-
-    #[test]
-    fn p_022_wrapped_requests_reordered_inside_the_window_are_each_answered_once() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frames: [Bytes; 4] =
-            core::array::from_fn(|_| rig.wrapped(1, MessageType::Readings, &key));
-        for at in [3, 0, 2, 1] {
-            let (_, answer) = rig.send(&frames[at]);
-            assert_eq!(
-                code_under(&answer, &key),
-                Incoming::Client(ErrorCode::UnknownMessageType),
-                "{at}"
-            );
-        }
-        for frame in &frames {
-            let (reply, answer) = rig.send(frame);
-            assert_eq!(
-                reply.note,
-                Some(SessionNote::OutOfWindow(OutOfWindow::Replayed))
-            );
-            assert!(answer.is_empty());
-        }
-    }
-
-    #[test]
-    fn p_022_the_window_goes_with_the_binding_and_a_new_session_starts_its_own() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.wrapped(1, MessageType::Readings, &key);
-        let _ = rig.send(&frame);
-        let goodbye = rig.wrapped(1, MessageType::Goodbye, &key);
-        let _ = rig.send(&goodbye);
-        // A frame of the ended session is refused by the session check,
-        // never read against a window that no longer exists.
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(9));
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.wrapped(1, MessageType::Readings, &key);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::UnknownMessageType)
-        );
-    }
-
-    /// A command refused before its counter lands leaves the counter where it
-    /// was, so the same bytes stay fresh and the comms processor can replay
-    /// them as often as it likes. None of those refresh the session.
-    #[test]
-    fn p_077_a_command_refused_before_its_counter_lands_refreshes_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let req_id = rig.next_req();
-        let mut dst = [0u8; 128];
-        let len = Signed::over(
-            Header {
-                kind: MessageType::Command,
-                session: SessionId::from(1),
-                req_id,
-            },
-            ClientId::new(1).expect("a slot"),
-            Counter(1),
-            &[0x07],
-            &key,
-        )
-        .expect("signs")
-        .write(&mut dst)
-        .expect("fits");
-        let unreadable = Bytes::of(&dst[..len]);
-        let naming_another = rig.command(1, 2, 1, START, &key);
-        rig.at(SESSION_IDLE.as_millis() - 2_000);
-        for frame in [&unreadable, &naming_another] {
-            let (_, answer) = rig.send(frame);
-            assert!(matches!(code_under(&answer, &key), Incoming::Client(_)));
-            rig.at(500);
-        }
-        assert_eq!(rig.accepted(), Some(Counter(0)), "nothing was spent");
-        rig.at(1_000);
-        let expired = rig.sessions.tick(rig.now);
-        assert_eq!(expired.iter().map(|close| close.conn).next(), Some(conn(1)));
-    }
-
-    #[test]
-    fn p_077_a_command_that_verified_refreshes_the_session() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        rig.at(SESSION_IDLE.as_millis() - 1_000);
-        let frame = rig.command(1, 1, 1, START, &key);
-        let _ = rig.send(&frame);
-        rig.at(1_000);
-        assert_eq!(rig.sessions.tick(rig.now).iter().next(), None);
-        assert!(rig.sessions.is_bound(conn(1)));
-    }
-
-    #[test]
-    fn p_051_a_command_under_another_key_is_10_bare_and_counts_against_the_connection() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, _) = rig.hello(1);
-        for n in 1..FAILURES {
-            let frame = rig.command(1, 1, 1, START, &other_key());
-            let (reply, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(10), "failure {n}");
-            assert_eq!(reply.close, None, "failure {n}");
-        }
-        let frame = rig.command(1, 1, 1, START, &other_key());
-        let (reply, _) = rig.send(&frame);
-        assert_eq!(
-            reply.close,
-            Some(Close {
-                conn: conn(1),
-                reason: CloseReason::AuthenticationFailures
-            })
-        );
-        assert_eq!(rig.accepted(), Some(Counter(0)), "no forged frame moved it");
-    }
-
-    #[test]
-    fn p_084_a_command_naming_another_client_is_12_under_the_key_and_moves_no_counter() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.command(1, 2, u64::MAX, START, &key);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::UnknownClient)
-        );
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-    }
-
-    #[test]
-    fn p_079_a_command_whose_counter_does_not_land_is_7_under_the_key_and_noted() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        rig.part.falling = true;
-        let frame = rig.command(1, 1, 1, START, &key);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::BusyRetry)
-        );
-        assert_eq!(reply.note, Some(SessionNote::NotKept));
-        assert_eq!(rig.accepted(), Some(Counter(0)), "RAM is where the part is");
-        // The supply recovers and the client's retry runs, with the next
-        // counter.
-        rig.part.falling = false;
-        let frame = rig.command(1, 1, 2, START, &key);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(reply.note, None);
-        let (header, _) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::CommandResponse);
-        assert_eq!(rig.accepted(), Some(Counter(2)));
-    }
-
-    /// A reset between reserving and finishing: the entry says only that the
-    /// command started. No output has authority, so the state store's answer
-    /// is to run it again, and it is answered as a fresh command would be.
-    #[test]
-    fn p_080_a_retry_meeting_an_entry_a_reset_left_in_flight_runs_again() {
-        let mut rig = Rig::new();
-        let (op, len) = {
-            let mut op = [0u8; 16];
-            let len = CommandOperation {
-                cmd_id: START.0,
-                kind: START.1,
-                args: &[0xa0],
-            }
-            .encode(&mut op)
-            .expect("fits");
-            (op, len)
-        };
-        let client = ClientId::new(1).expect("a slot");
-        let reserved = block_on(rig.sessions.keys.clients.update(&mut rig.part, |table| {
-            table.admit(
-                client,
-                Counter(1),
-                START.0,
-                crate::dedup::Fingerprint::of(&op[..len]),
-                Tick::ZERO,
-            )
-        }));
-        assert!(matches!(reserved, Ok(crate::clients::Admitted::Fresh(_))));
-        let mut clients = block_on(Kept::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
-        let _ = block_on(clients.booted(&mut rig.part, epoch(1)));
-        rig.sessions.keys.clients = clients;
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.command(1, 1, 2, START, &key);
-        let (_, answer) = rig.send(&frame);
-        let (header, payload) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::CommandResponse);
-        assert_eq!(
-            CommandAck::decode(&payload).map(|ack| ack.outcome),
-            Ok(km43::Command::Rejected)
-        );
-        assert_eq!(rig.accepted(), Some(Counter(2)));
-        let table = rig.sessions.keys().clients.present().expect("a table");
-        assert_eq!(table.dedup().live(rig.now), 0, "the entry is settled");
-    }
-
-    impl Rig {
-        /// A signed `Time` on `handle` from `client` setting `at`.
-        fn time_frame(
-            &mut self,
-            handle: u16,
-            client: u32,
-            counter: u64,
-            at: u64,
-            key: &SessionKey,
-        ) -> Bytes {
-            let req_id = self.next_req();
-            let mut op = [0u8; 16];
-            let len = km43::TimeOperation { at }.encode(&mut op).expect("fits");
-            let mut dst = [0u8; 128];
-            let len = Signed::over(
-                Header {
-                    kind: MessageType::Time,
-                    session: SessionId::from(handle),
-                    req_id,
-                },
-                ClientId::new(client).expect("a slot"),
-                Counter(counter),
-                &op[..len],
-                key,
-            )
-            .expect("signs")
-            .write(&mut dst)
-            .expect("fits");
-            Bytes::of(&dst[..len])
+            reply
         }
 
-        /// Hand `answer` back for `ticket`, and the bytes it wrote.
-        fn answer_time(&mut self, ticket: u32, answer: TimeAnswer) -> (Reply, Bytes) {
-            let mut dst = [0u8; MAX_PAYLOAD];
-            let reply = self.sessions.time_answered(ticket, answer, &mut dst);
-            let bytes = reply
-                .answer
-                .map_or(Bytes::EMPTY, |len| Bytes::of(&dst[..len]));
-            (reply, bytes)
+        /// Discover as setup: the unit answers with a challenge and notes
+        /// nothing, or the test stops here rather than later and elsewhere.
+        fn challenged(&mut self, rig: &mut Rig) {
+            let reply = self.discover(rig);
+            assert!(reply.answer.is_some(), "Discover was answered");
+            assert_eq!(reply.note, None);
+            assert!(self.challenge.is_some(), "the answer carried a challenge");
         }
-    }
 
-    const SET_AT: u64 = 1_800_000_000_000;
-
-    fn asked(reply: &Reply) -> TimeAsked {
-        match reply.note {
-            Some(SessionNote::TimeAsked(asked)) => asked,
-            other => panic!("handed to the recorder, not {other:?}"),
-        }
-    }
-
-    #[test]
-    fn p_110_a_client_time_spends_its_counter_and_is_handed_to_the_recorder() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, answer) = rig.send(&frame);
-        assert!(answer.is_empty(), "answered later, by the recorder");
-        let asked = asked(&reply);
-        assert_eq!(asked.at, SET_AT);
-        assert!(asked.authorised, "an app may set the clock");
-        assert_eq!(
-            rig.accepted(),
-            Some(Counter(1)),
-            "spent before anything else"
-        );
-        let req_id = ReqId(rig.req);
-        let ack = TimeAck::new(km43::Time::Accepted, Some(SET_AT)).expect("an ack");
-        let (_, answer) = rig.answer_time(asked.ticket, TimeAnswer::Ack(ack));
-        let (header, payload) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::TimeResponse);
-        assert_eq!(header.req_id, req_id, "P-026");
-        assert_eq!(TimeAck::decode(&payload), Ok(ack));
-        // Answered once: the same ticket again writes nothing.
-        let (_, again) = rig.answer_time(asked.ticket, TimeAnswer::Ack(ack));
-        assert!(again.is_empty());
-    }
-
-    #[test]
-    fn p_118_a_second_time_while_one_is_decided_is_7_and_a_busy_answer_is_7_under_the_key() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let first = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, _) = rig.send(&first);
-        let ticket = asked(&reply).ticket;
-        let second = rig.time_frame(1, 1, 2, SET_AT, &key);
-        let (reply, answer) = rig.send(&second);
-        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::BusyRetry)
-        );
-        let (_, answer) = rig.answer_time(ticket, TimeAnswer::Busy);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::BusyRetry)
-        );
-        // The slot is free again.
-        let third = rig.time_frame(1, 1, 3, SET_AT, &key);
-        let (reply, _) = rig.send(&third);
-        assert_ne!(asked(&reply).ticket, ticket);
-    }
-
-    /// The answer takes its time; the client that asked may be gone. It goes
-    /// to the session that asked and to no later one on the same handle.
-    #[test]
-    fn a_time_answer_reaches_only_the_session_that_asked() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        let ticket = asked(&reply).ticket;
-        let ack = TimeAck::new(km43::Time::Rejected, None).expect("an ack");
-        // A wrong ticket is nobody's.
-        let (_, answer) = rig.answer_time(ticket.wrapping_add(1), TimeAnswer::Ack(ack));
-        assert!(answer.is_empty());
-        // The client says goodbye and hellos again on the same handle.
-        let bye = rig.wrapped(1, MessageType::Goodbye, &key);
-        let _ = rig.send(&bye);
-        let _ = rig.hello(1);
-        let (_, answer) = rig.answer_time(ticket, TimeAnswer::Ack(ack));
-        assert!(answer.is_empty(), "the new session did not ask");
-    }
-
-    /// One definition of when a waiting `Time` is forgotten, used by the
-    /// session to free its slot and by the recorder to never act on it after.
-    #[test]
-    fn a_time_is_expired_from_the_limit_on_and_on_a_tick_that_went_backwards() {
-        let asked = Tick::from_millis(5_000);
-        assert!(!time_expired(asked, asked));
-        let limit = asked.after(TIME_ANSWER_LIMIT).expect("fits");
-        assert!(!time_expired(
-            asked,
-            Tick::from_millis(limit.as_millis() - 1)
-        ));
-        assert!(time_expired(asked, limit));
-        assert!(
-            time_expired(asked, Tick::from_millis(4_999)),
-            "no age to trust"
-        );
-    }
-
-    #[test]
-    fn a_time_the_recorder_never_answers_is_forgotten_and_the_next_is_taken() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        let lost = asked(&reply).ticket;
-        rig.at(TIME_ANSWER_LIMIT.as_millis() - 1);
-        let _ = rig.sessions.tick(rig.now);
-        let frame = rig.time_frame(1, 1, 2, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        assert_eq!(reply.note, Some(SessionNote::Refused(7)), "still waiting");
-        rig.at(1);
-        let _ = rig.sessions.tick(rig.now);
-        let frame = rig.time_frame(1, 1, 3, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        let taken = asked(&reply).ticket;
-        assert_ne!(taken, lost);
-        let ack = TimeAck::new(km43::Time::Rejected, None).expect("an ack");
-        let (_, answer) = rig.answer_time(lost, TimeAnswer::Ack(ack));
-        assert!(answer.is_empty(), "the forgotten one answers nothing");
-    }
-
-    /// The cloud's mask does not reach the clock (P-105): handed on as
-    /// unauthorised, so the answer can carry the clock the controller keeps.
-    #[test]
-    fn p_105_a_client_whose_mask_does_not_reach_the_clock_is_asked_as_unauthorised() {
-        let mut rig = Rig::new();
-        let cloud = Label::new("cloud").expect("fits");
-        let paired = block_on(
-            rig.sessions
-                .keys
-                .clients
-                .update(&mut rig.part, |table| table.pair(cloud, ClientKind::Cloud)),
-        );
-        assert!(matches!(paired, Ok(Ok(Paired::Enrolled(_)))));
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let frame = rig.hello_frame(1, 2, challenge, &device(), epoch(1), Version::V1_0, [4; 16]);
-        let _ = rig.send(&frame);
-        let key = device()
-            .enrolment(epoch(1), ClientId::new(2).expect("a slot"))
-            .session_key(
-                &Handshake {
-                    challenge,
-                    client_nonce: [4; 16],
-                },
-                SessionId::from(1),
-            );
-        let frame = rig.time_frame(1, 2, 1, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        assert!(!asked(&reply).authorised);
-    }
-
-    #[test]
-    fn a_client_time_under_another_key_is_10_and_one_reusing_its_counter_is_11() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let forged = rig.time_frame(1, 1, 1, SET_AT, &other_key());
-        let (reply, answer) = rig.send(&forged);
-        assert_eq!(hint(&answer), Some(10));
-        assert_eq!(reply.close, None);
-        let frame = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, _) = rig.send(&frame);
-        let ack = TimeAck::new(km43::Time::Accepted, Some(SET_AT)).expect("an ack");
-        let _ = rig.answer_time(asked(&reply).ticket, TimeAnswer::Ack(ack));
-        let again = rig.time_frame(1, 1, 1, SET_AT, &key);
-        let (reply, answer) = rig.send(&again);
-        assert_eq!(reply.note, Some(SessionNote::Refused(11)));
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::CounterNotFresh)
-        );
-    }
-
-    impl Rig {
-        fn config_frame(
-            &mut self,
-            counter: u64,
-            expected: u32,
-            body: &[u8],
-            key: &SessionKey,
-        ) -> Bytes {
-            let mut operation = [0; 128];
-            let len = km43::SetConfigOperation {
-                section: km43::ConfigSection::IdentityAndSite,
-                expected_version: expected,
-                body,
-            }
-            .encode(&mut operation)
-            .expect("operation");
-            let mut frame = [0; 256];
-            let len = Signed::over(
-                Header {
-                    kind: MessageType::SetConfig,
-                    session: SessionId::from(1),
-                    req_id: self.next_req(),
-                },
-                ClientId::new(1).expect("client"),
-                Counter(counter),
-                &operation[..len],
-                key,
-            )
-            .expect("signed")
-            .write(&mut frame)
-            .expect("frame");
-            Bytes::of(&frame[..len])
-        }
-        fn get_config(&mut self, key: &SessionKey) -> (Reply, Bytes) {
-            let mut body = [0; km43::MAX_GET_CONFIG_BYTES];
-            let len = km43::GetConfigRequest {
-                section: km43::ConfigSection::IdentityAndSite,
-            }
-            .encode(&mut body)
-            .expect("body");
-            let mut frame = [0; 128];
-            let len = Tagged::over(
-                Header {
-                    kind: MessageType::GetConfig,
-                    session: SessionId::from(1),
-                    req_id: self.next_req(),
-                },
-                &body[..len],
-                key,
-            )
-            .expect("wrapper")
-            .write(&mut frame)
-            .expect("frame");
-            self.send(&Bytes::of(&frame[..len]))
-        }
-    }
-
-    fn config_client(kind: ClientKind, mask: Option<u16>) -> (Rig, SessionKey) {
-        use crate::Body;
-        let mut rig = Rig::new();
-        let _ = block_on(rig.sessions.keys.clients.update(&mut rig.part, |table| {
-            table.pair(Label::new("phone").expect("label"), kind)
-        }))
-        .expect("persist")
-        .expect("pair");
-        if let Some(mask) = mask {
-            let mut bytes = rig.sessions.keys.clients.present().expect("table").encode();
-            let offset = 4 + 1 + 1 + km43::MAX_LABEL;
-            bytes[offset..offset + 2].copy_from_slice(&mask.to_le_bytes());
-            let table = ClientTable::decode(&bytes).expect("table");
-            block_on(rig.sessions.keys.clients.write(&mut rig.part, table)).expect("persist mask");
-        }
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        (rig, key)
-    }
-
-    fn config_section_frame(
-        rig: &mut Rig,
-        section: km43::ConfigSection,
-        body: &[u8],
-        key: &SessionKey,
-    ) -> Bytes {
-        let mut operation = [0; 192];
-        let len = km43::SetConfigOperation {
-            section,
-            expected_version: 0,
-            body,
-        }
-        .encode(&mut operation)
-        .expect("operation");
-        let mut frame = [0; 256];
-        let len = Signed::over(
-            Header {
-                kind: MessageType::SetConfig,
-                session: SessionId::from(1),
-                req_id: rig.next_req(),
-            },
-            ClientId::new(1).expect("client"),
-            Counter(1),
-            &operation[..len],
-            key,
-        )
-        .expect("signed")
-        .write(&mut frame)
-        .expect("frame");
-        Bytes::of(&frame[..len])
-    }
-
-    fn network_write_body() -> Bytes {
-        let mut bytes = [0; 192];
-        let len = km43::NetworkWrite {
-            join: Some(km43::JoinWrite {
-                ssid: km43::Ssid::new("cabin").expect("ssid"),
-                psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
-            }),
-            country: km43::Country::new("CA").expect("country"),
-            hostname: km43::Hostname::new("origin89").expect("hostname"),
-        }
-        .encode(&mut bytes)
-        .expect("network");
-        Bytes::of(&bytes[..len])
-    }
-
-    #[test]
-    fn p_105_cloud_network_and_cloud_writes_are_refused_under_the_session_key() {
-        for section in [km43::ConfigSection::Network, km43::ConfigSection::Cloud] {
-            let (mut rig, key) = config_client(ClientKind::Cloud, None);
-            let before = rig.part.bytes;
-            let frame = config_section_frame(&mut rig, section, &network_write_body(), &key);
-            let (_, answer) = rig.send(&frame);
-            let (header, body) = under(&answer, &key);
-            assert_eq!(header.kind, MessageType::SetConfigResponse);
-            assert_eq!(
-                km43::SetConfigAck::decode(&body).expect("ack").outcome,
-                km43::SetConfig::Unauthorised
-            );
-            assert_eq!(
-                rig.accepted(),
-                Some(Counter(1)),
-                "refusal still spends the counter"
-            );
-            let start = usize::from(crate::map::COMMS_RELEASE.end().0);
-            let end = usize::from(crate::map::NETWORK.end().0);
-            assert_eq!(&rig.part.bytes[start..end], &before[start..end]);
-        }
-    }
-
-    #[test]
-    fn p_105_cloud_identity_and_behaviour_writes_succeed() {
-        for (section, body) in [
-            (
-                km43::ConfigSection::IdentityAndSite,
-                &[0xa1, 1, 0x61, b'a'][..],
-            ),
-            (
-                km43::ConfigSection::GeneratorBehaviour,
-                &[0xa1, 1, 0xf5][..],
-            ),
-        ] {
-            let (mut rig, key) = config_client(ClientKind::Cloud, None);
-            let frame = config_section_frame(&mut rig, section, body, &key);
-            let (_, answer) = rig.send(&frame);
-            let (_, body) = under(&answer, &key);
-            assert_eq!(
-                km43::SetConfigAck::decode(&body).expect("ack").outcome,
-                km43::SetConfig::Accepted
-            );
-        }
-    }
-
-    #[test]
-    fn p_105_without_write_config_every_section_is_refused() {
-        for section in [
-            km43::ConfigSection::IdentityAndSite,
-            km43::ConfigSection::Channels,
-            km43::ConfigSection::BusesAndDevices,
-            km43::ConfigSection::GeneratorBehaviour,
-            km43::ConfigSection::FrostBehaviour,
-            km43::ConfigSection::ScheduleBehaviour,
-            km43::ConfigSection::LoadShedBehaviour,
-            km43::ConfigSection::Network,
-            km43::ConfigSection::Cloud,
-        ] {
-            let (mut rig, key) = config_client(
-                ClientKind::App,
-                Some(km43::ClientCapability::WRITE_NETWORK_AND_CLOUD.0),
-            );
-            let frame = config_section_frame(&mut rig, section, &[0xa1, 1, 0x61, b'a'], &key);
-            let (_, answer) = rig.send(&frame);
-            let (header, body) = under(&answer, &key);
-            assert_eq!(header.kind, MessageType::SetConfigResponse);
-            assert_eq!(
-                km43::SetConfigAck::decode(&body).expect("ack").outcome,
-                km43::SetConfig::Unauthorised
-            );
-        }
-    }
-
-    #[test]
-    fn p_105_app_network_write_succeeds() {
-        let (mut rig, key) = config_client(ClientKind::App, None);
-        let frame = config_section_frame(
-            &mut rig,
-            km43::ConfigSection::Network,
-            &network_write_body(),
-            &key,
-        );
-        let (_, answer) = rig.send(&frame);
-        let (_, body) = under(&answer, &key);
-        assert_eq!(
-            km43::SetConfigAck::decode(&body).expect("ack").outcome,
-            km43::SetConfig::Accepted
-        );
-        assert_eq!(
-            rig.sessions
-                .keys
-                .network
-                .present()
-                .expect("network")
-                .version(),
-            1
-        );
-    }
-
-    #[test]
-    fn p_108_get_config_is_wrapped_and_tracks_the_committed_section() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let (_, answer) = rig.get_config(&key);
-        let (header, body) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::GetConfigResponse);
-        assert_eq!(
-            km43::ConfigAnswer::decode(&body).expect("answer").version(),
-            0
-        );
-        let frame = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
-        let (_, answer) = rig.send(&frame);
-        let (_, body) = under(&answer, &key);
-        assert_eq!(
-            km43::SetConfigAck::decode(&body).expect("ack").outcome,
-            km43::SetConfig::Accepted
-        );
-        let (_, answer) = rig.get_config(&key);
-        let (_, body) = under(&answer, &key);
-        let answer = km43::ConfigAnswer::decode(&body).expect("config");
-        assert_eq!(answer.version(), 1);
-        assert_eq!(answer.body(), Some(&[0xa1, 1, 0x61, b'a'][..]));
-    }
-
-    #[test]
-    fn p_101_config_reports_structure_and_value_errors_after_the_counter() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let malformed = rig.config_frame(1, 0, &[0xa0], &key);
-        let (_, answer) = rig.send(&malformed);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::MalformedFrame)
-        );
-        assert_eq!(rig.accepted(), Some(Counter(1)));
-        let invalid = rig.config_frame(2, 0, &[0xa1, 1, 0x60], &key);
-        let (_, answer) = rig.send(&invalid);
-        let (_, body) = under(&answer, &key);
-        assert_eq!(
-            km43::SetConfigAck::decode(&body).expect("ack").outcome,
-            km43::SetConfig::Invalid
-        );
-        assert_eq!(rig.accepted(), Some(Counter(2)));
-    }
-
-    #[test]
-    fn p_079_config_with_bad_mac_or_refused_counter_cannot_write_a_section() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let forged = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &other_key());
-        let (_, answer) = rig.send(&forged);
-        assert_eq!(hint(&answer), Some(10));
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-        rig.part.table_refused = true;
-        let write = rig.config_frame(1, 0, &[0xa1, 1, 0x61, b'a'], &key);
-        let (_, answer) = rig.send(&write);
-        assert_eq!(
-            code_under(&answer, &key),
-            Incoming::Client(ErrorCode::BusyRetry)
-        );
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-        let (_, answer) = rig.get_config(&key);
-        let (_, body) = under(&answer, &key);
-        assert_eq!(
-            km43::ConfigAnswer::decode(&body).expect("config").body(),
-            None
-        );
-    }
-
-    #[test]
-    fn p_100_signed_config_spends_counter_before_version_and_validation() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let mut operation = [0; 64];
-        let len = km43::SetConfigOperation {
-            section: km43::ConfigSection::IdentityAndSite,
-            expected_version: 1,
-            body: &[0xa0],
-        }
-        .encode(&mut operation)
-        .expect("operation");
-        let mut frame = [0; 256];
-        let len = Signed::over(
-            Header {
-                kind: MessageType::SetConfig,
-                session: SessionId::from(1),
-                req_id: rig.next_req(),
-            },
-            ClientId::new(1).expect("client"),
-            Counter(1),
-            &operation[..len],
-            &key,
-        )
-        .expect("signed")
-        .write(&mut frame)
-        .expect("frame");
-        let (_, answer) = rig.send(&Bytes::of(&frame[..len]));
-        assert_eq!(rig.accepted(), Some(Counter(1)));
-        let (header, body) = under(&answer, &key);
-        assert_eq!(header.kind, MessageType::SetConfigResponse);
-        assert_eq!(
-            km43::SetConfigAck::decode(&body).expect("ack").outcome,
-            km43::SetConfig::StaleVersion
-        );
-    }
-
-    #[test]
-    fn a_signed_request_not_served_yet_is_2_and_spends_no_counter() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, _) = rig.hello(1);
-        let frame = rig.empty(1, MessageType::Firmware);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(2));
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-    }
-
-    const OPEN: Facts<'static> = Facts {
-        pairing_open: true,
-        ..FACTS
-    };
-
-    fn pair_key() -> km43::PairKey {
-        device().pair_key()
-    }
-
-    impl Rig {
-        /// A `Pair` from `label` of `kind` on `handle`, proved under `key`
-        /// over `challenge`, and the attempt its answer is MAC'd over.
+        /// Pairing message 1 under `label`, as a client holding it writes it.
         fn pair_frame(
             &mut self,
-            handle: u16,
-            (label, kind): (&str, ClientKind),
-            challenge: [u8; 16],
-            key: &km43::PairKey,
-        ) -> (Bytes, Attempt) {
-            let req_id = self.next_req();
-            let attempt = Attempt {
-                device_id: DEVICE,
-                challenge,
-                client_nonce: [handle.to_le_bytes()[0] ^ 0x5a; 16],
-            };
-            let mut dst = [0u8; 256];
-            let len = PairRequest {
-                client_kind: kind,
-                label,
-            }
-            .write(
-                key,
-                &attempt,
-                Header {
-                    kind: MessageType::Pair,
-                    session: SessionId::from(handle),
-                    req_id,
+            under: &Label,
+            name: &str,
+            kind: ClientKind,
+        ) -> (PairPending, Frame) {
+            let mut dst = [0u8; MAX_FRAME];
+            let entropy = self.entropy();
+            let header = self.header(MessageType::Pair);
+            let (pending, len) = PairPending::start(
+                &self.prologue(),
+                SUITE,
+                under,
+                entropy,
+                &PairOffer {
+                    version: Version::V1_0,
+                    client_version: "test",
+                    client_kind: kind,
+                    label: name,
                 },
+                header,
                 &mut dst,
             )
-            .expect("fits");
-            (Bytes::of(&dst[..len]), attempt)
+            .expect("message 1");
+            (pending, Frame::of(&dst[..len]))
         }
 
-        /// The labels enrolled, by slot.
-        fn enrolled(&self) -> usize {
-            self.sessions
-                .keys()
-                .clients
-                .present()
-                .map_or(0, ClientTable::enrolled)
+        /// A whole pairing: message 1, message 2 checked against the label's
+        /// fingerprint, message 3 under `key`, and the answer read. The
+        /// enrolment is kept before message 3 goes, as P-064 requires.
+        fn pair(
+            &mut self,
+            rig: &mut Rig,
+            name: &str,
+            kind: ClientKind,
+            key: StaticKey,
+        ) -> Result<EnrolAnswer, PairRefusal> {
+            self.challenged(rig);
+            let (pending, frame) = self.pair_frame(&label(), name, kind);
+            let (_, answer) = rig.exchange(&frame);
+            let envelope = Envelope::decode(&answer).expect("Pair 0x8B");
+            let reply = pending
+                .read(envelope, &label(), &fingerprint())
+                .expect("a reply the label vouches for");
+            let proceeding = match reply {
+                PairReply::Proceed(proceeding) => proceeding,
+                PairReply::Refused(refusal) => return Err(refusal),
+            };
+            let mut dst = [0u8; MAX_FRAME];
+            let header = self.header(MessageType::Enrol);
+            let (enrol, len) = proceeding
+                .finish(&key, header, &mut dst)
+                .expect("message 3");
+            self.enrolment = Some(km43::Enrolment::new(
+                DeviceId::new(DEVICE),
+                proceeding_controller(),
+                key,
+                SUITE,
+                self.epoch,
+            ));
+            let (_, answer) = rig.exchange(&dst[..len]);
+            let answer = read_enrol(enrol, &answer);
+            self.challenge = Some(answer.next_challenge);
+            Ok(answer)
+        }
+
+        /// A `Hello` against the kept enrolment and the live challenge.
+        fn hello_frame(&mut self) -> (HelloPending, Frame) {
+            let mut dst = [0u8; MAX_FRAME];
+            let entropy = self.entropy();
+            let header = self.header(MessageType::Hello);
+            let (pending, len) = HelloPending::start(
+                &self.prologue(),
+                self.enrolment.as_ref().expect("enrolled"),
+                entropy,
+                &HelloOffer {
+                    version: Version::V1_0,
+                    client_version: "test",
+                },
+                header,
+                &mut dst,
+            )
+            .expect("message 1");
+            (pending, Frame::of(&dst[..len]))
+        }
+
+        #[expect(
+            clippy::result_large_err,
+            reason = "a test helper: the refusal's whole frame is what the caller reads"
+        )]
+        fn hello(&mut self, rig: &mut Rig) -> Result<km43::HelloReport<'static>, Frame> {
+            let (pending, frame) = self.hello_frame();
+            let (_, answer) = rig.exchange(&frame);
+            let Ok(envelope) = Envelope::decode(&answer) else {
+                return Err(answer);
+            };
+            if envelope.header().kind != MessageType::HelloResponse {
+                return Err(answer);
+            }
+            let mut plain = [0u8; MAX_PAYLOAD];
+            let session = pending
+                .finish(
+                    self.enrolment.as_ref().expect("enrolled"),
+                    envelope,
+                    &mut plain,
+                )
+                .expect("message 2 opens");
+            let report = *session.report();
+            let (client_id, generation) = (report.client_id, report.generation);
+            self.channel = Some(session.into_channel());
+            Ok(km43::HelloReport {
+                fw_controller: "",
+                fw_comms: "",
+                client_id,
+                generation,
+                ..report_shape(report)
+            })
+        }
+
+        /// A sealed request under the session.
+        fn sealed(&mut self, kind: MessageType, inner: &[u8]) -> Frame {
+            let mut dst = [0u8; MAX_FRAME];
+            let channel = self.channel.as_mut().expect("a session");
+            let (req, len) = channel
+                .tx
+                .seal(kind, SessionId::from(self.handle), inner, &mut dst)
+                .expect("sealed");
+            self.req = req.0;
+            Frame::of(&dst[..len])
+        }
+
+        fn signed(&mut self, kind: MessageType, operation: &[u8]) -> Frame {
+            let mut dst = [0u8; MAX_FRAME];
+            let channel = self.channel.as_mut().expect("a session");
+            let (_, len) = Signed::new(kind, operation)
+                .expect("a write")
+                .seal(&mut channel.tx, SessionId::from(self.handle), &mut dst)
+                .expect("sealed");
+            Frame::of(&dst[..len])
+        }
+
+        /// Open an answer under the session: its type and inner body.
+        fn open(&mut self, answer: &[u8]) -> (MessageType, Frame) {
+            let channel = self.channel.as_mut().expect("a session");
+            let envelope = Envelope::decode(answer).expect("an envelope");
+            let kind = envelope.header().kind;
+            let mut plain = [0u8; MAX_PAYLOAD];
+            let opened = Sealed::decode(envelope)
+                .and_then(|sealed| sealed.open(&mut channel.rx, &mut plain))
+                .expect("opens under the session");
+            (kind, Frame::of(opened.inner()))
         }
     }
 
-    /// The `Pair 0x8B` in `answer`, verified as the client verifies it.
-    fn pair_ack(answer: &[u8], attempt: &Attempt) -> PairResponse {
+    /// Message 2, read and checked against the label as a client does.
+    fn proceeds(pending: PairPending, answer: &[u8]) -> km43::PairProceeding {
+        let read = pending.read(
+            Envelope::decode(answer).expect("0x8B"),
+            &label(),
+            &fingerprint(),
+        );
+        match read {
+            Ok(PairReply::Proceed(proceeding)) => proceeding,
+            Ok(PairReply::Refused(refusal)) => panic!("refused: {refusal:?}"),
+            Err(why) => panic!("message 2 did not read: {why:?}"),
+        }
+    }
+
+    fn proceeding_controller() -> PublicKey {
+        ControllerKey::new(CONTROLLER).expect("entropy").public()
+    }
+
+    fn report_shape(report: km43::HelloReport<'_>) -> km43::HelloReport<'static> {
+        km43::HelloReport {
+            fw_controller: "",
+            fw_comms: "",
+            ..report
+        }
+    }
+
+    fn read_enrol(pending: EnrolPending, answer: &[u8]) -> EnrolAnswer {
+        let mut plain = [0u8; MAX_PAYLOAD];
+        pending
+            .read(Envelope::decode(answer).expect("Enrol 0x93"), &mut plain)
+            .expect("sealed under the pairing's keys")
+    }
+
+    fn client_key(n: u8) -> StaticKey {
+        let mut bytes = [n; 32];
+        bytes[31] = 0x41;
+        StaticKey::generate(Entropy::new(bytes))
+    }
+
+    /// The code key 1 of a bare `Error 0xFF` carries.
+    fn bare_code(answer: &[u8]) -> u16 {
         let envelope = Envelope::decode(answer).expect("an envelope");
-        assert_eq!(envelope.header().kind, MessageType::PairResponse);
-        PairAckClaim::decode(envelope)
-            .expect("a pair ack")
-            .verify(&pair_key(), attempt, epoch(1))
-            .expect("MAC'd under the pair key, refusals included (P-064)")
+        assert_eq!(envelope.header().kind, MessageType::ErrorResponse);
+        let mut body = envelope.into_body();
+        assert_eq!(body.key().expect("a key"), 1);
+        body.u16().expect("a code")
     }
 
-    const LAPTOP: (&str, ClientKind) = ("laptop", ClientKind::Cli);
-
-    #[test]
-    fn p_066_a_pair_with_no_window_open_is_window_closed_under_the_mac_and_enrols_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        for _ in 0..=FAILURES {
-            let challenge = rig.discover(1);
-            let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
-            let (reply, answer) = rig.send(&frame);
-            assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::WindowClosed);
-            assert_eq!(reply.note, None);
-            // Refusing to look at a proof costs nothing and counts nothing.
-            assert_eq!(reply.close, None);
-        }
-        assert_eq!(rig.enrolled(), 1);
-    }
-
-    #[test]
-    fn p_086_inside_the_window_a_new_label_is_enrolled_at_the_lowest_free_slot_and_closes_it() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        let two = ClientId::new(2).expect("a slot");
-        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::Enrolled(two));
-        assert_eq!(reply.note, Some(SessionNote::Paired(two)), "L-195");
-        // On the part, at counter zero (P-065), before the answer said so.
-        let reread = block_on(Kept::<ClientTable, CLIENT_TABLE_BYTES>::read(
-            CLIENT_TABLE,
-            &mut rig.part,
-        ))
-        .expect("reads");
-        let table = reread.present().expect("a table");
-        let row = table.row(two).expect("the laptop's row");
-        assert_eq!(row.label().as_bytes(), b"laptop");
-        assert_eq!(row.kind(), ClientKind::Cli);
-        assert_eq!(row.counter(), Counter(0));
-        // And it can say hello under the key its slot derives.
-        let challenge = rig.discover(1);
-        let frame = rig.hello_frame(1, 2, challenge, &device(), epoch(1), Version::V1_0, [3; 16]);
-        let (reply, _) = rig.send(&frame);
-        assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))));
-    }
-
-    #[test]
-    fn p_078_the_same_label_reclaims_its_row_with_the_counter_back_to_zero() {
-        let mut rig = Rig::new();
-        let one = ClientId::new(1).expect("a slot");
-        let moved = block_on(
-            rig.sessions
-                .keys
-                .clients
-                .update(&mut rig.part, |table| table.accept(one, Counter(340))),
-        );
-        assert!(matches!(moved, Ok(crate::clients::Check::Ahead)));
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let (frame, attempt) =
-            rig.pair_frame(1, ("phone", ClientKind::App), challenge, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::Reclaimed(one));
-        assert_eq!(reply.note, Some(SessionNote::Paired(one)));
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-        assert_eq!(rig.enrolled(), 1);
-    }
-
-    /// Without unbinding, the reset counter is a replay hole: a command the
-    /// comms processor captured on a live session verifies under that
-    /// session's key and is ahead of a counter just set to zero.
-    #[test]
-    fn p_078_a_reclaim_unbinds_every_session_of_that_client_before_the_row_is_rewritten() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let captured = rig.command(1, 1, 5, START, &key);
-        let (_, answer) = rig.send(&captured);
-        assert_eq!(header(&answer).kind, MessageType::CommandResponse);
-        assert_eq!(rig.accepted(), Some(Counter(5)));
-        // The phone is reinstalled and pairs again, on another connection.
-        let _ = rig.connect(2);
-        let challenge = rig.discover(2);
-        let (frame, attempt) =
-            rig.pair_frame(2, ("phone", ClientKind::App), challenge, &pair_key());
-        let (_, answer) = rig.send_with(&frame, &OPEN);
+    fn enrolled_phone(rig: &mut Rig, handle: u16, name: &str, key: u8) -> Phone {
+        rig.connect(handle);
+        let mut phone = Phone::on(handle);
+        let answer = phone
+            .pair(rig, name, ClientKind::App, client_key(key))
+            .expect("proceeds");
         assert!(matches!(
-            pair_ack(&answer, &attempt).outcome,
-            Outcome::Reclaimed(_)
+            answer.outcome,
+            Outcome::Enrolled(..) | Outcome::Reclaimed(..)
         ));
-        assert_eq!(rig.accepted(), Some(Counter(0)));
-        assert!(
-            !rig.sessions.is_bound(conn(1)),
-            "unbound before the rewrite"
-        );
-        // The captured command, replayed on the old session: refused as a
-        // session that ended, and the counter stays where the reclaim put it.
-        let (_, answer) = rig.send(&captured);
-        assert_eq!(hint(&answer), Some(9));
-        assert_eq!(rig.accepted(), Some(Counter(0)));
+        phone
     }
 
     #[test]
-    fn p_067_a_full_table_is_table_full_unless_the_label_reclaims() {
+    fn p_060_discover_answers_with_the_rows_live_challenge_and_the_same_one_again() {
         let mut rig = Rig::new();
-        for n in 2..=8u8 {
-            let label = [b'c', b'0' + n];
-            let label = Label::new(core::str::from_utf8(&label).expect("ascii")).expect("fits");
-            let paired = block_on(
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        assert_eq!(phone.discover(&mut rig).note, None);
+        let first = phone.challenge;
+        phone.challenged(&mut rig);
+        assert_eq!(phone.challenge, first);
+        assert!(first.is_some());
+    }
+
+    #[test]
+    fn p_060_p_235_a_unit_nobody_manufactured_answers_discover_with_18() {
+        let mut rig = Rig::unprovisioned();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        let mut dst = [0u8; 64];
+        let len = phone
+            .header(MessageType::Discover)
+            .write(0, &mut dst)
+            .expect("fits")
+            .finish()
+            .expect("fits");
+        let (reply, answer) = rig.send(&dst[..len]);
+        assert_eq!(bare_code(&answer), ErrorCode::ChallengeUnavailable as u16);
+        assert_eq!(reply.note, Some(SessionNote::NoChallenge));
+    }
+
+    #[test]
+    fn p_237_a_generator_that_does_not_read_back_gives_no_challenge_and_no_ephemeral() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        // The challenge was a draw; the next draw's successor will not land.
+        rig.part.drbg_lost = true;
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(bare_code(&answer), ErrorCode::ChallengeUnavailable as u16);
+        assert_eq!(reply.note, Some(SessionNote::EntropyUnavailable));
+        assert!(rig.sessions.next_job().is_none(), "nothing was queued");
+        let reply = phone.discover(&mut rig);
+        assert_eq!(reply.note, Some(SessionNote::EntropyUnavailable));
+    }
+
+    #[test]
+    fn p_064_p_240_a_label_holder_in_the_window_is_enrolled_at_the_lowest_free_slot() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        let answer = phone
+            .pair(&mut rig, "phone", ClientKind::App, client_key(1))
+            .expect("proceeds");
+        let first = ClientId::new(1).expect("a slot");
+        assert_eq!(answer.outcome, Outcome::Enrolled(first, Generation::FIRST));
+        let occupant = rig
+            .sessions
+            .keys
+            .clients
+            .occupant(first, Epoch::FIRST)
+            .expect("written before the answer named it");
+        assert!(occupant.client().matches(&client_key(1).public()));
+        assert_eq!(occupant.label().as_str(), "phone");
+        assert_eq!(
+            occupant.mask(),
+            km43::ClientCapability::granted(ClientKind::App)
+        );
+    }
+
+    #[test]
+    fn p_064_p_222_the_next_challenge_opens_a_hello_on_the_same_transport() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        let report = phone.hello(&mut rig).expect("a session");
+        assert_eq!(report.client_id, ClientId::new(1).expect("a slot"));
+        assert_eq!(report.generation, Generation::FIRST);
+        assert!(rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_241_a_closed_window_is_refused_under_the_refusal_key_and_not_counted() {
+        let mut rig = Rig::new();
+        rig.pairing_open = false;
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        let refused = phone
+            .pair(&mut rig, "phone", ClientKind::App, client_key(1))
+            .err();
+        assert_eq!(refused, Some(PairRefusal::WindowClosed));
+        assert!(rig.sessions.next_job().is_none(), "no DH was queued");
+        let row = rig.sessions.row(conn(1)).expect("a row");
+        assert_eq!(row.failures.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn p_241_p_067_a_full_table_with_no_such_label_is_refused_before_any_dh() {
+        let mut rig = Rig::new();
+        for n in 1..=8u8 {
+            let id = ClientId::new(u32::from(n)).expect("a slot");
+            let mut name = [b'a'; 1];
+            name[0] = b'a' + n;
+            let enrolment = Enrolment {
+                client: client_key(n).public(),
+                admit: [n; 32],
+                suite: SUITE,
+                kind: ClientKind::App,
+                label: ClientLabel::new(core::str::from_utf8(&name).expect("ascii"))
+                    .expect("short"),
+            };
+            block_on(
                 rig.sessions
                     .keys
                     .clients
-                    .update(&mut rig.part, |table| table.pair(label, ClientKind::App)),
-            );
-            assert!(matches!(paired, Ok(Ok(Paired::Enrolled(_)))));
+                    .enrol(id, enrolment, Epoch::FIRST, &mut rig.part),
+            )
+            .expect("lands");
         }
-        assert_eq!(rig.enrolled(), 8);
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        assert_eq!(pair_ack(&answer, &attempt).outcome, Outcome::TableFull);
-        assert_eq!(reply.note, None);
-        assert_eq!(reply.close, None);
-        let challenge = rig.discover(1);
-        let (frame, attempt) =
-            rig.pair_frame(1, ("phone", ClientKind::App), challenge, &pair_key());
-        let (_, answer) = rig.send_with(&frame, &OPEN);
-        assert!(matches!(
-            pair_ack(&answer, &attempt).outcome,
-            Outcome::Reclaimed(_)
-        ));
-    }
-
-    #[test]
-    fn p_051_a_pair_proof_that_fails_is_bad_proof_under_the_mac_and_counts_against_the_connection()
-    {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let wrong =
-            DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32])).pair_key();
-        for n in 1..=FAILURES {
-            let challenge = rig.discover(1);
-            let (frame, attempt) = rig.pair_frame(1, LAPTOP, challenge, &wrong);
-            let (reply, answer) = rig.send_with(&frame, &OPEN);
-            assert_eq!(
-                pair_ack(&answer, &attempt).outcome,
-                Outcome::BadProof,
-                "{n}"
-            );
-            assert_eq!(reply.note, None);
-            let shed = n == FAILURES;
-            assert_eq!(reply.close.is_some(), shed, "failure {n}");
-        }
-        assert_eq!(rig.enrolled(), 1);
-    }
-
-    /// The challenge is spent on presentation, whatever the answer, and the
-    /// one handed back in `next_challenge` is the row's live one: a retry
-    /// proves over it without another `Discover` (P-058), and a proof over
-    /// the spent one fails against the live one (P-061).
-    #[test]
-    fn p_061_a_pair_spends_its_challenge_and_answers_with_the_next() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let first = rig.discover(1);
-        let (frame, attempt) = rig.pair_frame(1, LAPTOP, first, &pair_key());
-        let (_, answer) = rig.send(&frame);
-        let next = pair_ack(&answer, &attempt).next_challenge;
-        assert_ne!(next, first);
-        // Over the one handed back, with no Discover between: enrolled.
-        let (frame, attempt) = rig.pair_frame(1, LAPTOP, next, &pair_key());
-        let (_, answer) = rig.send_with(&frame, &OPEN);
-        let enrolled = pair_ack(&answer, &attempt);
-        assert!(matches!(enrolled.outcome, Outcome::Enrolled(_)));
-        // Over the first, long spent: the controller proves it against its
-        // live challenge, and the proof fails.
-        let (frame, attempt) = rig.pair_frame(1, ("tablet", ClientKind::App), first, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        let as_the_controller_saw_it = Attempt {
-            challenge: enrolled.next_challenge,
-            ..attempt
-        };
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        let refused = phone
+            .pair(&mut rig, "stranger", ClientKind::App, client_key(20))
+            .err();
+        assert_eq!(refused, Some(PairRefusal::TableFull));
+        // The same label reclaims instead, through message 2.
+        rig.connect(2);
+        let mut owner = Phone::on(2);
+        let answer = owner
+            .pair(&mut rig, "c", ClientKind::App, client_key(21))
+            .expect("proceeds");
+        let slot = ClientId::new(2).expect("a slot");
         assert_eq!(
-            pair_ack(&answer, &as_the_controller_saw_it).outcome,
-            Outcome::BadProof
+            answer.outcome,
+            Outcome::Reclaimed(slot, Generation::new(2).expect("nonzero"))
         );
-        assert_eq!(reply.note, None);
-        assert_eq!(rig.enrolled(), 2);
-    }
-
-    /// A table under an earlier epoch is one a factory reset left behind and
-    /// the boot has not cleared: nothing is enrolled into it, and the refusal
-    /// does not read as a FRAM that failed, because none did.
-    #[test]
-    fn a_pair_into_a_table_under_another_epoch_enrols_nothing_and_blames_no_write() {
-        let mut rig = Rig::under(epoch(2));
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let (frame, _) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        assert_eq!(raw_code(&answer), Some(7));
-        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
-        assert_eq!(rig.enrolled(), 1);
     }
 
     #[test]
-    fn p_066_discover_says_whether_the_window_is_open() {
+    fn p_066_a_wrong_label_is_bare_10_counted_and_queues_nothing() {
         let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        for facts in [FACTS, OPEN] {
-            let frame = rig.empty(1, MessageType::Discover);
-            let (_, answer) = rig.send_with(&frame, &facts);
-            let discovery =
-                km43::Discovery::decode(Envelope::decode(&answer).expect("an envelope"))
-                    .expect("a Discover answer");
-            assert_eq!(discovery.pairing_open, facts.pairing_open);
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let wrong = Label::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
+        let (_, frame) = phone.pair_frame(&wrong, "phone", ClientKind::App);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(bare_code(&answer), ErrorCode::AuthenticationFailed as u16);
+        assert_eq!(reply.note, Some(SessionNote::Refused(0x0a)));
+        assert!(rig.sessions.next_job().is_none());
+        let row = rig.sessions.row(conn(1)).expect("a row");
+        assert_eq!(row.failures.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn p_061_the_challenge_is_consumed_even_by_a_pair_that_fails() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let wrong = Label::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
+        let (_, frame) = phone.pair_frame(&wrong, "phone", ClientKind::App);
+        let _ = rig.send(&frame);
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(
+            bare_code(&answer),
+            ErrorCode::StaleChallengeReconnectAndRetry as u16
+        );
+    }
+
+    #[test]
+    fn p_229_an_enrol_on_a_row_holding_no_handshake_is_10_and_uncounted() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        let mut dst = [0u8; 128];
+        let header = phone.header(MessageType::Enrol);
+        let mut cbor = header.write(1, &mut dst).expect("fits");
+        cbor.key(1).expect("fits");
+        cbor.bytes(&[0u8; 64]).expect("fits");
+        let len = cbor.finish().expect("fits");
+        let (_, answer) = rig.send(&dst[..len]);
+        assert_eq!(bare_code(&answer), ErrorCode::AuthenticationFailed as u16);
+        let row = rig.sessions.row(conn(1)).expect("a row");
+        assert_eq!(row.failures.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn p_229_a_second_pair_abandons_the_first_and_its_result_is_discarded() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let first = rig.sessions.next_job().expect("queued");
+        // A second attempt on the same connection before the first is done.
+        phone.challenged(&mut rig);
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let done = rig.agreement.run(first);
+        let facts = rig.facts();
+        let mut dst = [0u8; MAX_FRAME];
+        let stale =
+            block_on(
+                rig.sessions
+                    .completed(done, rig.now, &facts, &mut rig.part, &mut dst),
+            );
+        assert_eq!(stale.answer, None);
+        assert_eq!(stale.note, Some(SessionNote::Stale));
+        let (reply, _) = rig.compute().expect("the second one is next");
+        assert!(reply.answer.is_some());
+    }
+
+    #[test]
+    fn p_229_a_pairing_is_abandoned_120_seconds_after_message_1() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let (pending, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (_, answer) = rig.exchange(&frame);
+        let proceeding = proceeds(pending, &answer);
+        rig.at(120_000);
+        let _ = rig.sessions.tick(rig.now);
+        let mut dst = [0u8; MAX_FRAME];
+        let header = phone.header(MessageType::Enrol);
+        let (_, len) = proceeding
+            .finish(&client_key(1), header, &mut dst)
+            .expect("message 3");
+        let (_, answer) = rig.send(&dst[..len]);
+        assert_eq!(bare_code(&answer), ErrorCode::AuthenticationFailed as u16);
+        assert_eq!(rig.sessions.keys.clients.enrolled(Epoch::FIRST), 0);
+    }
+
+    #[test]
+    fn p_229_a_result_for_a_connection_that_dropped_is_discarded() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let _ = rig.send(&frame);
+        let job = rig.sessions.next_job().expect("queued");
+        assert_eq!(rig.sessions.release(conn(1)), ClientDisconnected::Released);
+        let done = rig.agreement.run(job);
+        let facts = rig.facts();
+        let mut dst = [0u8; MAX_FRAME];
+        let reply =
+            block_on(
+                rig.sessions
+                    .completed(done, rig.now, &facts, &mut rig.part, &mut dst),
+            );
+        assert_eq!(reply.note, Some(SessionNote::Stale));
+        assert!(!rig.sessions.is_computing(), "the worker is free again");
+    }
+
+    #[test]
+    fn p_240_the_same_key_pairing_again_takes_its_own_slot_back_under_a_new_generation() {
+        let mut rig = Rig::new();
+        let _first = enrolled_phone(&mut rig, 1, "phone", 1);
+        let _other = enrolled_phone(&mut rig, 2, "tablet", 2);
+        rig.connect(3);
+        let mut again = Phone::on(3);
+        let answer = again
+            .pair(&mut rig, "renamed", ClientKind::App, client_key(1))
+            .expect("proceeds");
+        assert_eq!(
+            answer.outcome,
+            Outcome::Reclaimed(
+                ClientId::new(1).expect("a slot"),
+                Generation::new(2).expect("nonzero")
+            )
+        );
+        assert_eq!(rig.sessions.keys.clients.enrolled(Epoch::FIRST), 2);
+    }
+
+    #[test]
+    fn p_240_a_reclaim_by_label_revokes_the_old_install_and_unbinds_it() {
+        let mut rig = Rig::new();
+        let mut old = enrolled_phone(&mut rig, 1, "phone", 1);
+        old.hello(&mut rig).expect("a session");
+        // Fill the rest, so the same label is reclaimed rather than a free slot.
+        for n in 2..=8u8 {
+            let id = ClientId::new(u32::from(n)).expect("a slot");
+            let enrolment = Enrolment {
+                client: client_key(n).public(),
+                admit: [n; 32],
+                suite: SUITE,
+                kind: ClientKind::App,
+                label: ClientLabel::new("other").expect("short"),
+            };
+            block_on(
+                rig.sessions
+                    .keys
+                    .clients
+                    .enrol(id, enrolment, Epoch::FIRST, &mut rig.part),
+            )
+            .expect("lands");
         }
+        rig.connect(2);
+        let mut new = Phone::on(2);
+        let answer = new
+            .pair(&mut rig, "phone", ClientKind::App, client_key(30))
+            .expect("proceeds");
+        assert!(matches!(answer.outcome, Outcome::Reclaimed(..)));
+        assert!(
+            !rig.sessions.is_bound(conn(1)),
+            "the old session went first"
+        );
+        old.challenged(&mut rig);
+        let refused = old.hello(&mut rig).expect_err("refused");
+        assert_eq!(bare_code(&refused), ErrorCode::UnknownClient as u16);
     }
 
     #[test]
-    fn a_pair_whose_row_does_not_land_enrols_nothing_and_is_busy() {
+    fn p_064_a_slot_that_does_not_land_is_not_stored_and_the_window_stays_open() {
         let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let (pending, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (_, answer) = rig.exchange(&frame);
+        let proceeding = proceeds(pending, &answer);
+        let mut dst = [0u8; MAX_FRAME];
+        let header = phone.header(MessageType::Enrol);
+        let (enrol, len) = proceeding
+            .finish(&client_key(1), header, &mut dst)
+            .expect("message 3");
         rig.part.table_refused = true;
-        let (frame, _) = rig.pair_frame(1, LAPTOP, challenge, &pair_key());
-        let (reply, answer) = rig.send_with(&frame, &OPEN);
-        assert_eq!(raw_code(&answer), Some(7));
-        assert_eq!(reply.note, Some(SessionNote::NotKept));
-        assert_eq!(rig.enrolled(), 1, "RAM is where the part is");
-        // A falling supply stops the challenge's mint before anything else.
+        let (reply, answer) = rig.exchange(&dst[..len]);
         rig.part.table_refused = false;
-        rig.part.falling = true;
-        let (frame, _) = rig.pair_frame(1, LAPTOP, [0; 16], &pair_key());
-        let (_, answer) = rig.send_with(&frame, &OPEN);
-        assert!(raw_code(&answer).is_some());
-        assert_eq!(rig.enrolled(), 1);
+        assert_eq!(reply.note, Some(SessionNote::TableNotStored));
+        let answer = read_enrol(enrol, &answer);
+        assert_eq!(answer.outcome, Outcome::NotStored);
+        assert_eq!(rig.sessions.keys.clients.enrolled(Epoch::FIRST), 0);
+        // Not `Paired`: the adapter leaves the window open, and the client
+        // pairs again from the challenge the answer carried.
+        phone.challenge = Some(answer.next_challenge);
+        let (_, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+    }
+
+    #[test]
+    fn p_238_a_hello_whose_tag_matches_no_slot_is_12_counted_and_queues_nothing() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut stranger = Phone::on(1);
+        stranger.challenged(&mut rig);
+        stranger.enrolment = Some(km43::Enrolment::new(
+            DeviceId::new(DEVICE),
+            proceeding_controller(),
+            client_key(9),
+            SUITE,
+            Epoch::FIRST,
+        ));
+        let (_, frame) = stranger.hello_frame();
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(bare_code(&answer), ErrorCode::UnknownClient as u16);
+        assert_eq!(reply.note, Some(SessionNote::Refused(0x0c)));
+        assert!(rig.sessions.next_job().is_none(), "no DH for a stranger");
+        let row = rig.sessions.row(conn(1)).expect("a row");
+        assert_eq!(row.failures.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn p_242_an_enrol_answer_the_relay_dropped_still_leaves_a_hello_that_names_the_slot() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let (pending, frame) = phone.pair_frame(&label(), "phone", ClientKind::App);
+        let (_, answer) = rig.exchange(&frame);
+        let proceeding = proceeds(pending, &answer);
+        let mut dst = [0u8; MAX_FRAME];
+        let header = phone.header(MessageType::Enrol);
+        let key = client_key(4);
+        let (_, len) = proceeding
+            .finish(&key, header, &mut dst)
+            .expect("message 3");
+        phone.enrolment = Some(km43::Enrolment::new(
+            DeviceId::new(DEVICE),
+            proceeding_controller(),
+            key,
+            SUITE,
+            Epoch::FIRST,
+        ));
+        let _dropped = rig.exchange(&dst[..len]);
+        phone.challenged(&mut rig);
+        let report = phone.hello(&mut rig).expect("the slot was written");
+        assert_eq!(report.client_id, ClientId::new(1).expect("a slot"));
+    }
+
+    #[test]
+    fn p_239_a_hello_computed_while_its_slot_was_re_keyed_binds_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        let (_, frame) = phone.hello_frame();
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        // Another install takes the slot while the `Hello` waits its turn.
+        let enrolment = Enrolment {
+            client: client_key(2).public(),
+            admit: [2; 32],
+            suite: SUITE,
+            kind: ClientKind::App,
+            label: ClientLabel::new("phone").expect("short"),
+        };
+        let slot = ClientId::new(1).expect("a slot");
+        block_on(
+            rig.sessions
+                .keys
+                .clients
+                .enrol(slot, enrolment, Epoch::FIRST, &mut rig.part),
+        )
+        .expect("lands");
+        let (_, answer) = rig.compute().expect("computed");
+        assert_eq!(bare_code(&answer), ErrorCode::UnknownClient as u16);
+        assert!(!rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_243_one_key_agreement_at_a_time_and_connections_take_turns() {
+        let mut rig = Rig::new();
+        let mut phones = [
+            enrolled_phone(&mut rig, 1, "one", 1),
+            enrolled_phone(&mut rig, 2, "two", 2),
+            enrolled_phone(&mut rig, 3, "three", 3),
+        ];
+        for phone in &mut phones {
+            let (_, frame) = phone.hello_frame();
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(answer.len, 0, "nothing is computed where the frame arrived");
+            assert_eq!(reply.note, Some(SessionNote::Queued(conn(phone.handle))));
+        }
+        let first = rig.sessions.next_job().expect("one is handed out");
+        assert!(rig.sessions.next_job().is_none(), "never two at once");
+        let served = first.ticket().conn;
+        let done = rig.agreement.run(first);
+        let facts = rig.facts();
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = block_on(
+            rig.sessions
+                .completed(done, rig.now, &facts, &mut rig.part, &mut dst),
+        );
+        let second = rig.sessions.next_job().expect("the next one").ticket().conn;
+        assert_ne!(second, served);
+    }
+
+    #[test]
+    fn p_246_vouch_is_refused_with_error_2_and_capability_bit_9_is_never_set() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        let report = phone.hello(&mut rig).expect("a session");
+        assert_eq!(
+            report.capabilities & (1 << 9),
+            0,
+            "bit 9 would promise Vouch"
+        );
+        let frame = phone.sealed(MessageType::Vouch, &[0xa0]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, payload) = phone.open(&answer);
+        assert_eq!(kind, MessageType::ErrorResponse);
+        // Key 1 is the code: 2, unknown message type, under the session's keys.
+        assert_eq!(payload.as_ref().get(1..3), Some(&[0x01, 0x02][..]));
+        assert!(rig.sessions.is_bound(conn(1)), "a refusal ends nothing");
+    }
+
+    #[test]
+    fn p_076_a_hello_binds_and_a_sealed_goodbye_ends_the_session_and_keeps_the_row() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let frame = phone.sealed(MessageType::Goodbye, &[0xa0]);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Unbound(conn(1))));
+        let (kind, _) = phone.open(&answer);
+        assert_eq!(kind, MessageType::GoodbyeResponse);
+        assert!(!rig.sessions.is_bound(conn(1)));
+        assert_eq!(rig.sessions.allocated(), 1);
+    }
+
+    #[test]
+    fn p_022_p_077_a_replayed_request_is_dropped_unanswered_uncounted_and_refreshes_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let frame = phone.sealed(MessageType::WifiStatus, &[0xa0]);
+        let (reply, _) = rig.send(&frame);
+        assert!(reply.answer.is_some());
+        rig.at(60_000);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Dropped));
+        assert_eq!(answer.len, 0);
+        let row = rig.sessions.row(conn(1)).expect("a row");
+        assert_eq!(row.failures.iter().flatten().count(), 0);
+        let Bound::Session(binding) = &row.bound else {
+            panic!("still bound");
+        };
+        assert_eq!(binding.heard, Tick::ZERO, "the replay refreshed nothing");
+    }
+
+    #[test]
+    fn p_051_a_tag_that_fails_is_bare_10_counted_and_eight_shed_the_connection() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let mut last = Reply::NOTHING;
+        for _ in 0..FAILURES {
+            let mut frame = phone.sealed(MessageType::WifiStatus, &[0xa0]);
+            let tail = frame.len - 1;
+            frame.buf[tail] ^= 1;
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(bare_code(&answer), ErrorCode::AuthenticationFailed as u16);
+            last = reply;
+        }
+        assert_eq!(
+            last.close,
+            Some(Close {
+                conn: conn(1),
+                reason: CloseReason::AuthenticationFailures,
+            })
+        );
+        assert!(!rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_143_a_session_request_before_any_hello_is_4_and_after_one_ended_is_9() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        let mut dst = [0u8; 64];
+        let len = phone
+            .header(MessageType::WifiStatus)
+            .write(0, &mut dst)
+            .expect("fits")
+            .finish()
+            .expect("fits");
+        let (_, answer) = rig.send(&dst[..len]);
+        assert_eq!(bare_code(&answer), ErrorCode::HelloRequiredFirst as u16);
+        phone.hello(&mut rig).expect("a session");
+        let frame = phone.sealed(MessageType::Goodbye, &[0xa0]);
+        let _ = rig.send(&frame);
+        let frame = phone.sealed(MessageType::WifiStatus, &[0xa0]);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(bare_code(&answer), ErrorCode::SessionExpired as u16);
+    }
+
+    #[test]
+    fn p_080_a_permitted_command_is_answered_rejected_sealed_and_remembers_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let mut op = [0u8; 64];
+        let len = CommandOperation {
+            cmd_id: 7,
+            kind: CommandKind::StartGenerator,
+            args: &[0xa0],
+        }
+        .encode(&mut op)
+        .expect("fits");
+        let frame = phone.signed(MessageType::Command, &op[..len]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, body) = phone.open(&answer);
+        assert_eq!(kind, MessageType::CommandResponse);
+        let ack = CommandAck::decode(&body).expect("an ack");
+        assert_eq!(ack.outcome, km43::Command::Rejected);
+        assert_eq!(ack.detail, UNSPECIFIED);
+        let dedup = rig
+            .sessions
+            .keys
+            .clients
+            .commands()
+            .present()
+            .expect("held");
+        assert!(!dedup.dedup().holds(ClientId::new(1).expect("a slot")));
+    }
+
+    #[test]
+    fn p_105_a_cloud_client_is_refused_a_network_write_inside_the_sealed_answer() {
+        let mut rig = Rig::new();
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone
+            .pair(&mut rig, "relay", ClientKind::Cloud, client_key(1))
+            .expect("proceeds");
+        phone.hello(&mut rig).expect("a session");
+        let mut operation = [0u8; 64];
+        let len = km43::SetConfigOperation {
+            section: km43::ConfigSection::Network,
+            expected_version: 0,
+            body: &[0xa0],
+        }
+        .encode(&mut operation)
+        .expect("fits");
+        let frame = phone.signed(MessageType::SetConfig, &operation[..len]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, body) = phone.open(&answer);
+        assert_eq!(kind, MessageType::SetConfigResponse);
+        assert_eq!(
+            km43::SetConfigAck::decode(&body).expect("ack").outcome,
+            km43::SetConfig::Unauthorised
+        );
+    }
+
+    #[test]
+    fn p_110_a_client_time_is_handed_to_the_recorder_and_answered_sealed() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let mut op = [0u8; 32];
+        let len = km43::TimeOperation {
+            at: 1_700_000_000_000,
+        }
+        .encode(&mut op)
+        .expect("fits");
+        let frame = phone.signed(MessageType::Time, &op[..len]);
+        let (reply, _) = rig.send(&frame);
+        let Some(SessionNote::TimeAsked(asked)) = reply.note else {
+            panic!("handed to the recorder");
+        };
+        assert!(asked.authorised);
+        let mut dst = [0u8; MAX_FRAME];
+        let reply = rig
+            .sessions
+            .time_answered(asked.ticket, TimeAnswer::Busy, &mut dst);
+        let (kind, _) = phone.open(&dst[..reply.answer.expect("answered")]);
+        assert_eq!(kind, MessageType::ErrorResponse);
+    }
+
+    #[test]
+    fn p_085_p_229_a_factory_reset_unbinds_abandons_and_leaves_every_slot_free() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        rig.connect(2);
+        let mut pairing = Phone::on(2);
+        pairing.challenged(&mut rig);
+        let (_, frame) = pairing.pair_frame(&label(), "tablet", ClientKind::App);
+        let _ = rig.send(&frame);
+        block_on(rig.sessions.factory_reset(&mut rig.part)).expect("resets");
+        assert!(!rig.sessions.is_bound(conn(1)));
+        assert!(
+            rig.sessions.next_job().is_none(),
+            "the handshake was abandoned"
+        );
+        let epoch = rig.sessions.keys.epoch.expect("advanced");
+        assert_eq!(epoch.get(), 2);
+        assert_eq!(rig.sessions.keys.clients.enrolled(epoch), 0);
+        phone.challenged(&mut rig);
+        let refused = phone.hello(&mut rig).expect_err("refused");
+        assert_eq!(bare_code(&refused), ErrorCode::UnknownClient as u16);
     }
 
     #[test]
     fn l_061_a_ninth_connection_is_refused_and_no_row_is_evicted() {
         let mut rig = Rig::new();
         for handle in 1..=8 {
-            assert_eq!(rig.connect(handle), ClientConnected::Accepted);
+            rig.connect(handle);
         }
-        assert_eq!(rig.connect(9), ClientConnected::RefusedTableFull);
+        assert_eq!(
+            rig.sessions.admit(conn(9)),
+            ClientConnected::RefusedTableFull
+        );
         assert_eq!(rig.sessions.allocated(), 8);
-        // Every one of the eight still answers on its own handle.
-        for handle in 1..=8 {
-            let _ = rig.discover(handle);
-        }
-        // Freed, a row takes the next transport.
-        assert_eq!(rig.sessions.release(conn(3)), ClientDisconnected::Released);
-        assert_eq!(rig.connect(9), ClientConnected::Accepted);
     }
 
     #[test]
-    fn l_080_a_handle_in_use_is_refused_and_taken_again_only_once_released() {
+    fn l_062_a_frame_on_a_handle_never_announced_is_259() {
         let mut rig = Rig::new();
-        assert_eq!(rig.connect(5), ClientConnected::Accepted);
-        let (_, _, _) = rig.hello(5);
-        assert_eq!(rig.connect(5), ClientConnected::RefusedHandleInUse);
-        assert!(rig.sessions.is_bound(conn(5)), "the refusal left the row");
-        assert_eq!(rig.sessions.release(conn(5)), ClientDisconnected::Released);
-        assert_eq!(
-            rig.sessions.release(conn(5)),
-            ClientDisconnected::UnknownHandle
-        );
-        // Taken again, it is a new row: no session and no old challenge.
-        assert_eq!(rig.connect(5), ClientConnected::Accepted);
-        assert!(!rig.sessions.is_bound(conn(5)));
-    }
-
-    #[test]
-    fn p_026_a_pre_session_answer_carries_the_handle_it_arrived_on() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(0x0102);
-        let frame = rig.empty(0x0102, MessageType::Discover);
-        let (_, answer) = rig.send(&frame);
-        let header = header(&answer);
-        assert_eq!(header.kind, MessageType::DiscoverResponse);
-        assert_eq!(header.session, SessionId::from(0x0102));
-        assert_eq!(header.req_id, ReqId(rig.req));
-        // A refusal before any session is addressed the same way.
-        let frame = rig.hello_frame(
-            0x0102,
-            5,
-            [0; 16],
-            &device(),
-            epoch(1),
-            Version::V1_0,
-            [1; 16],
-        );
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(
-            header_of(&answer),
-            (SessionId::from(0x0102), ReqId(rig.req))
-        );
-    }
-
-    fn header_of(answer: &[u8]) -> (SessionId, ReqId) {
-        let header = header(answer);
-        (header.session, header.req_id)
-    }
-
-    #[test]
-    fn l_062_a_frame_on_a_handle_never_announced_is_259_with_its_pair_echoed() {
-        let mut rig = Rig::new();
-        let frame = rig.empty(42, MessageType::Discover);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(0x103));
-        assert_eq!(header(&answer).session, SessionId::from(42));
-        assert_eq!(header(&answer).req_id, ReqId(rig.req));
-        assert_eq!(reply.close, None);
-        assert_eq!(rig.counter(), 0, "nothing was minted for it");
-    }
-
-    #[test]
-    fn l_070_an_accepted_connection_holds_a_challenge_its_counter_on_the_part() {
-        let mut rig = Rig::new();
-        assert_eq!(rig.connect(1), ClientConnected::Accepted);
-        assert_eq!(rig.counter(), 1, "minted at accept, before any Discover");
-        let challenge = rig.discover(1);
-        assert_eq!(challenge, device().challenge(1));
-        assert_eq!(rig.counter(), 1, "the Discover took the one already held");
-        // A refused announcement mints nothing.
-        for handle in 2..=9 {
-            let _ = rig.connect(handle);
-        }
-        assert_eq!(rig.counter(), 8);
-    }
-
-    #[test]
-    fn p_060_each_connection_has_its_own_challenge_and_discover_repeats_the_live_one() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let _ = rig.connect(2);
-        let one = rig.discover(1);
-        let two = rig.discover(2);
-        assert_ne!(one, two);
-        rig.at(119_000);
-        assert_eq!(rig.discover(1), one, "still live at 119 s");
-        assert_eq!(rig.counter(), 2);
-    }
-
-    #[test]
-    fn p_062_a_challenge_is_dead_at_120_seconds_and_discover_mints_another() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let first = rig.discover(1);
-        rig.at(120_000);
-        // A Hello over the dead one is 14, never a proof checked against it.
-        let frame = rig.hello_frame(1, 1, first, &device(), epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(14));
-        assert!(!rig.sessions.is_bound(conn(1)));
-        let second = rig.discover(1);
-        assert_ne!(first, second);
-        assert_eq!(rig.counter(), 2);
-    }
-
-    #[test]
-    fn p_062_a_challenge_goes_with_its_connection() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let held = rig.discover(1);
-        let _ = rig.sessions.release(conn(1));
-        // The handle again, after its release: a new row and a new
-        // challenge, which a proof over the old one does not verify against.
-        let _ = rig.connect(1);
-        let frame = rig.hello_frame(1, 1, held, &device(), epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10));
-        assert!(!rig.sessions.is_bound(conn(1)));
-        assert_ne!(rig.discover(1), held);
-    }
-
-    #[test]
-    fn p_061_a_challenge_is_consumed_by_the_first_hello_even_one_that_fails() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let wrong = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
-        let frame = rig.hello_frame(1, 1, challenge, &wrong, epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10));
-        // The right proof over the same challenge, now spent.
-        let frame = rig.hello_frame(1, 1, challenge, &device(), epoch(1), Version::V1_0, [2; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(14));
-        assert!(!rig.sessions.is_bound(conn(1)));
-        // Discover hands out a fresh one, and that one works.
-        let (reply, _, _) = rig.hello(1);
-        assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))));
-    }
-
-    #[test]
-    fn p_063_a_challenge_leaves_only_once_its_counter_is_on_the_part() {
-        let mut rig = Rig::new();
-        rig.part.falling = true;
-        assert_eq!(rig.connect(1), ClientConnected::Accepted);
-        assert_eq!(rig.counter(), 0);
-        let frame = rig.empty(1, MessageType::Discover);
-        let (reply, answer) = rig.send(&frame);
-        // Busy, with no challenge in it. Error 7 is MAC'd, so a client
-        // discards this bare one and times out: the one refusal the
-        // capacities table names, and km43's gap (km43#82), not this code's.
-        assert_eq!(raw_code(&answer), Some(7));
-        assert_eq!(hint(&answer), None);
-        assert_eq!(reply.note, Some(SessionNote::NoChallenge));
-        rig.part.falling = false;
-        assert_eq!(rig.discover(1), device().challenge(1));
-        assert_eq!(rig.counter(), 1);
-    }
-
-    #[test]
-    fn p_063_a_unit_with_no_epoch_derives_no_challenge() {
-        let mut rig = Rig::new();
-        rig.sessions.keys.epoch = None;
-        let _ = rig.connect(1);
-        let frame = rig.empty(1, MessageType::Discover);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(raw_code(&answer), Some(7));
-        assert_eq!(
-            rig.counter(),
-            0,
-            "no counter spent on a challenge nobody can use"
-        );
-        let frame = rig.hello_frame(1, 1, [0; 16], &device(), epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(14));
-    }
-
-    #[test]
-    fn p_076_a_verified_hello_binds_a_session_the_client_opens_under_the_same_key() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(3);
-        let challenge = rig.discover(3);
-        let nonce = [5; 16];
-        let frame = rig.hello_frame(3, 1, challenge, &device(), epoch(1), Version::V1_0, nonce);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(reply.note, Some(SessionNote::Bound(conn(3))));
-        let enrolment = device().enrolment(epoch(1), ClientId::new(1).expect("a slot"));
-        let session = Session::open(
-            Envelope::decode(&answer).expect("an envelope"),
-            &enrolment,
-            &Handshake {
-                challenge,
-                client_nonce: nonce,
-            },
-            Version::V1_0,
-        )
-        .expect("the client opens it");
-        let report = session.report();
-        assert_eq!(
-            report.session,
-            SessionId::from(3),
-            "the handle is the session"
-        );
-        assert_eq!(report.caps, Caps::THIS_CONTROLLER, "P-005");
-        assert_eq!(report.fw_comms, FACTS.fw_comms);
-        assert_eq!(report.log_newest_seq, LogSeq(41));
-        assert_eq!(report.counter, 0);
-        assert_eq!(rig.sessions.proven(conn(3)), ClientId::new(1));
-    }
-
-    #[test]
-    fn p_076_a_verified_hello_on_a_bound_row_replaces_the_binding_and_its_key() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, old) = rig.hello(1);
-        let (reply, _, new) = rig.hello(1);
-        assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))), "not error 8");
-        assert_eq!(rig.sessions.bound(), 1);
-        let frame = rig.wrapped(1, MessageType::Goodbye, &old);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10), "the old key is gone");
-        let frame = rig.wrapped(1, MessageType::Goodbye, &new);
-        let (reply, _) = rig.send(&frame);
-        assert_eq!(reply.note, Some(SessionNote::Unbound(conn(1))));
-    }
-
-    #[test]
-    fn p_076_goodbye_clears_the_binding_and_leaves_the_row_for_another_hello() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.wrapped(1, MessageType::Goodbye, &key);
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(reply.note, Some(SessionNote::Unbound(conn(1))));
-        // The answer is a Goodbye 0x8C under the key it ended.
-        let envelope = Envelope::decode(&answer).expect("an envelope");
-        assert_eq!(envelope.header().kind, MessageType::GoodbyeResponse);
-        let verified = Wrapper::decode(envelope)
-            .and_then(|wrapper| wrapper.verify(&key))
-            .expect("under the session's key");
-        assert!(EmptyBody::decode(MessageType::GoodbyeResponse, verified.payload()).is_ok());
-        assert_eq!(rig.sessions.allocated(), 1, "the row stays");
-        assert_eq!(rig.sessions.bound(), 0);
-        let frame = rig.wrapped(1, MessageType::Readings, &key);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(9));
-        let (reply, _, _) = rig.hello(1);
-        assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))));
-    }
-
-    #[test]
-    fn p_143_a_session_request_before_any_hello_is_4_and_after_one_ended_is_9() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        for kind in [
-            MessageType::Readings,
-            MessageType::Command,
-            MessageType::Goodbye,
-        ] {
-            let frame = rig.empty(1, kind);
-            let (_, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(4), "{kind:?}");
-        }
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.wrapped(1, MessageType::Goodbye, &key);
-        let _ = rig.send(&frame);
-        for kind in [MessageType::Readings, MessageType::Command] {
-            let frame = rig.empty(1, kind);
-            let (_, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(9), "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn p_057_a_hello_under_a_wrong_secret_or_a_stale_epoch_binds_nothing() {
-        // Under a secret this unit was not born with.
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let wrong = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
-        let frame = rig.hello_frame(1, 1, challenge, &wrong, epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10));
-        assert!(!rig.sessions.is_bound(conn(1)));
-        // A client keyed under epoch 1 at a unit reset to epoch 2, whose
-        // table the reset re-stamped with the row still in it.
-        let mut rig = Rig::under(epoch(2));
-        let mut table = ClientTable::cleared(&Clearing::found_at_boot(epoch(2)));
-        let _ = table.pair(Label::new("phone").expect("fits"), ClientKind::App);
-        block_on(rig.sessions.keys.clients.write(&mut rig.part, table)).expect("lands");
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let frame = rig.hello_frame(1, 1, challenge, &device(), epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10));
-        assert!(!rig.sessions.is_bound(conn(1)));
-    }
-
-    #[test]
-    fn p_085_a_table_left_under_an_earlier_epoch_enrols_nobody() {
-        let mut rig = Rig::under(epoch(2));
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let frame = rig.hello_frame(1, 1, challenge, &device(), epoch(2), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(12));
-    }
-
-    #[test]
-    fn p_085_a_factory_reset_ends_every_session_and_no_key_from_before_it_verifies() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let _ = rig.connect(2);
-        let (_, _, key) = rig.hello(1);
-        block_on(rig.sessions.factory_reset(&mut rig.part)).expect("both writes land");
-        assert_eq!(rig.sessions.keys().epoch, Some(epoch(2)));
-        assert_eq!(rig.sessions.bound(), 0);
-        assert_eq!(rig.sessions.allocated(), 2, "the transports stay");
-        let frame = rig.wrapped(1, MessageType::Readings, &key);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(9), "the old session is gone");
-        // The phone's enrolment is gone with the table: its Hello, keyed
-        // under either epoch, names a slot nobody holds.
-        for under in [epoch(1), epoch(2)] {
-            let challenge = rig.discover(2);
-            let frame = rig.hello_frame(2, 1, challenge, &device(), under, Version::V1_0, [3; 16]);
-            let (_, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(12), "{under:?}");
-        }
-    }
-
-    #[test]
-    fn p_085_a_reset_whose_network_erase_is_refused_ends_every_session_and_derives_nothing_new() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, _) = rig.hello(1);
-        rig.part.falling = true;
-        assert!(matches!(
-            block_on(rig.sessions.factory_reset(&mut rig.part)),
-            Err(ResetFailed::Network(crate::Refused::SupplyFalling))
-        ));
-        assert_eq!(
-            rig.sessions.bound(),
-            0,
-            "ended before the write, whatever it did"
-        );
-        assert_eq!(
-            rig.sessions.keys().epoch,
-            Some(epoch(1)),
-            "the record never moved"
-        );
-    }
-
-    #[test]
-    fn a_hello_naming_a_slot_nobody_holds_is_12() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let frame = rig.hello_frame(1, 2, challenge, &device(), epoch(1), Version::V1_0, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(12));
-    }
-
-    #[test]
-    fn p_073_a_major_mismatch_is_3_and_binds_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let challenge = rig.discover(1);
-        let two = Version { major: 2, minor: 0 };
-        let frame = rig.hello_frame(1, 1, challenge, &device(), epoch(1), two, [1; 16]);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(3));
-        assert!(!rig.sessions.is_bound(conn(1)));
-    }
-
-    #[test]
-    fn p_051_eight_failures_inside_a_minute_shed_the_connection_and_a_hello_resets_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        for _ in 0..4 {
-            let frame = rig.wrapped(1, MessageType::Goodbye, &other_key());
-            let _ = rig.send(&frame);
-        }
-        // No session yet: those were error 4, not failures. Bind one.
-        let (_, _, _) = rig.hello(1);
-        for n in 1..=7 {
-            rig.at(1_000);
-            let frame = rig.wrapped(1, MessageType::Readings, &other_key());
-            let (reply, answer) = rig.send(&frame);
-            assert_eq!(hint(&answer), Some(10));
-            assert_eq!(reply.close, None, "failure {n}");
-            if n == 4 {
-                // A fresh Hello in the middle resets nothing.
-                let (reply, _, _) = rig.hello(1);
-                assert_eq!(reply.note, Some(SessionNote::Bound(conn(1))));
-            }
-        }
-        let frame = rig.wrapped(1, MessageType::Readings, &other_key());
-        let (reply, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(10));
-        assert_eq!(
-            reply.close,
-            Some(Close {
-                conn: conn(1),
-                reason: CloseReason::AuthenticationFailures
-            })
-        );
-        assert!(!rig.sessions.is_bound(conn(1)), "the session went with it");
-    }
-
-    #[test]
-    fn p_051_failures_older_than_a_minute_are_forgotten() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, _) = rig.hello(1);
-        // Nine seconds apart: seven inside any minute, never eight.
-        for _ in 0..20 {
-            rig.at(9_000);
-            let frame = rig.wrapped(1, MessageType::Readings, &other_key());
-            let (reply, _) = rig.send(&frame);
-            assert_eq!(reply.close, None, "never eight inside a minute");
-        }
-    }
-
-    #[test]
-    fn p_057_a_hello_proof_that_fails_counts_against_the_connection() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let wrong = DeviceSecret::new(DeviceId::new(DEVICE), PrintedSecret::new([1; 32]));
-        let mut last = None;
-        for _ in 0..8 {
-            let challenge = rig.discover(1);
-            let frame = rig.hello_frame(1, 1, challenge, &wrong, epoch(1), Version::V1_0, [1; 16]);
-            last = rig.send(&frame).0.close;
-        }
-        assert_eq!(
-            last.map(|close| close.reason),
-            Some(CloseReason::AuthenticationFailures)
-        );
-    }
-
-    #[test]
-    fn p_077_only_a_verified_inbound_frame_refreshes_a_session() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let _ = rig.connect(2);
-        let (_, _, one) = rig.hello(1);
-        let (_, _, _) = rig.hello(2);
-        rig.at(14 * 60 * 1_000);
-        // One proves itself; two only receives a failure of somebody else's.
-        let frame = rig.wrapped(1, MessageType::Readings, &one);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(header(&answer).kind, MessageType::ErrorResponse);
-        let frame = rig.wrapped(2, MessageType::Readings, &other_key());
-        let _ = rig.send(&frame);
-        rig.at(60 * 1_000);
-        let expired = rig.sessions.tick(rig.now);
-        let mut closes = expired.iter();
-        assert_eq!(
-            closes.next(),
-            Some(Close {
-                conn: conn(2),
-                reason: CloseReason::SessionExpired
-            })
-        );
-        assert_eq!(closes.next(), None);
-        assert!(rig.sessions.is_bound(conn(1)));
-        assert_eq!(
-            rig.sessions.allocated(),
-            2,
-            "the row waits for its transport"
-        );
-        let frame = rig.empty(2, MessageType::Readings);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(9));
-        // Expired once, closed once.
-        assert_eq!(rig.sessions.tick(rig.now).iter().count(), 0);
-    }
-
-    #[test]
-    fn p_142_a_verified_request_not_served_is_refused_under_the_key_and_an_unverified_one_bare() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, key) = rig.hello(1);
-        let frame = rig.wrapped(1, MessageType::Inventory, &key);
-        let (_, answer) = rig.send(&frame);
-        let envelope = Envelope::decode(&answer).expect("an envelope");
-        let verified = Wrapper::decode(envelope)
-            .and_then(|wrapper| wrapper.verify(&key))
-            .expect("under the key");
-        let body = ErrorBody::authenticated(verified.payload()).expect("an error body");
-        assert_eq!(body.code, Incoming::Client(ErrorCode::UnknownMessageType));
-        // A signed request whose body does not read is answered bare.
-        let frame = rig.empty(1, MessageType::Command);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(1));
-    }
-
-    #[test]
-    fn l_041_every_row_goes_with_the_comms_processor() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let _ = rig.connect(2);
-        let (_, _, key) = rig.hello(1);
-        rig.sessions.drop_all();
-        assert_eq!(rig.sessions.allocated(), 0);
-        let frame = rig.wrapped(1, MessageType::Goodbye, &key);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(0x103));
-    }
-
-    #[test]
-    fn l_101_the_count_is_rows_bound_or_not() {
-        let mut rig = Rig::new();
-        assert_eq!(rig.sessions.allocated(), 0);
-        let _ = rig.connect(1);
-        let _ = rig.connect(2);
-        let (_, _, _) = rig.hello(1);
-        assert_eq!((rig.sessions.allocated(), rig.sessions.bound()), (2, 1));
-    }
-
-    #[test]
-    fn l_180_a_client_frame_before_the_link_is_up_is_258_to_its_client() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let frame = rig.empty(1, MessageType::Discover);
-        let facts = Facts {
-            link: None,
-            ..FACTS
-        };
-        let (_, answer) = rig.send_with(&frame, &facts);
-        assert_eq!(hint(&answer), Some(0x102));
-        assert_eq!(header(&answer).session, SessionId::from(1));
-    }
-
-    #[test]
-    fn p_021_a_client_frame_with_no_handle_is_not_answered() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let frame = rig.empty(0, MessageType::Discover);
-        let (reply, answer) = rig.send(&frame);
-        assert!(answer.is_empty());
-        assert_eq!(reply.note, Some(SessionNote::NoHandle));
-    }
-
-    /// Error 1 at `0, 0`, noted as unreadable.
-    fn assert_unreadable(reply: &Reply, answer: &[u8]) {
-        assert_eq!(reply.note, Some(SessionNote::Unreadable));
-        assert_eq!(reply.close, None);
-        assert_eq!(hint(answer), Some(ErrorCode::MalformedFrame as u16));
-        let header = header(answer);
-        assert_eq!(header.kind, MessageType::ErrorResponse);
-        assert_eq!((header.session, header.req_id), (SessionId::None, ReqId(0)));
-    }
-
-    #[test]
-    fn p_028_a_five_element_goodbye_is_refused_with_error_1_at_zero_zero_and_unbinds_nothing() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let (_, _, _) = rig.hello(1);
-        let goodbye = rig.empty(1, MessageType::Goodbye);
-        let mut five = [0u8; 64];
-        five[..goodbye.len()].copy_from_slice(&goodbye);
-        assert_eq!(five[0], 0x84);
-        five[0] = 0x85;
-        let (reply, answer) = rig.send(&five[..=goodbye.len()]);
-        assert_unreadable(&reply, &answer);
-        assert!(rig.sessions.is_bound(conn(1)));
-        assert_eq!((rig.sessions.allocated(), rig.sessions.bound()), (1, 1));
-    }
-
-    #[test]
-    fn p_025_a_frame_that_is_no_envelope_is_refused_with_error_1_at_zero_zero() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let counter = rig.counter();
-        // Three elements, an array of four cut short, a map, nothing.
-        for frame in [&[0x83, 0x00, 0x01, 0x01][..], &[0x84, 0x00], &[0xa0], &[]] {
-            let (reply, answer) = rig.send(frame);
-            assert_unreadable(&reply, &answer);
-        }
-        assert_eq!(rig.counter(), counter);
-        assert_eq!(rig.sessions.allocated(), 1);
-    }
-
-    #[test]
-    fn p_028_an_unreadable_frame_is_refused_before_the_link_or_any_row_is_asked() {
-        let mut rig = Rig::new();
-        let facts = Facts {
-            link: None,
-            ..FACTS
-        };
-        let (reply, answer) = rig.send_with(&[0x85, 0x00, 0x01, 0x01, 0xa0, 0x00], &facts);
-        assert_unreadable(&reply, &answer);
-        assert_eq!(rig.sessions.allocated(), 0);
-    }
-
-    #[test]
-    fn p_031_an_error_from_a_client_is_never_answered() {
-        let mut rig = Rig::new();
-        let _ = rig.connect(1);
+        let mut phone = Phone::on(5);
         let mut dst = [0u8; 64];
-        let len = ErrorBody {
-            code: Incoming::Client(ErrorCode::BusyRetry),
-            detail: "",
-        }
-        .write(
-            Header {
-                kind: MessageType::ErrorResponse,
-                session: SessionId::from(1),
-                req_id: ReqId(9),
-            },
-            &mut dst,
-        )
-        .expect("fits");
-        let (reply, answer) = rig.send(&dst[..len]);
-        assert!(answer.is_empty());
-        assert_eq!(reply.note, Some(SessionNote::ClientError));
+        let len = phone
+            .header(MessageType::Discover)
+            .write(0, &mut dst)
+            .expect("fits")
+            .finish()
+            .expect("fits");
+        let (_, answer) = rig.send(&dst[..len]);
+        assert_eq!(bare_code(&answer), LinkErrorCode::UnknownHandle as u16);
     }
 
     #[test]
-    fn p_143_a_type_nobody_allocated_is_2_and_a_response_type_is_1() {
+    fn p_062_a_challenge_is_dead_at_120_seconds_and_discover_draws_another() {
         let mut rig = Rig::new();
-        let _ = rig.connect(1);
-        let mut dst = [0u8; 16];
-        // [0x3f, 1, 7, {}]: a request opcode nobody allocated.
-        dst[..5].copy_from_slice(&[0x84, 0x18, 0x3f, 0x01, 0x07]);
-        dst[5] = 0xa0;
-        let (_, answer) = rig.send(&dst[..6]);
-        assert_eq!(hint(&answer), Some(2));
-        assert_eq!(header(&answer).req_id, ReqId(7));
-        let frame = rig.empty(1, MessageType::ReadingsResponse);
-        let (_, answer) = rig.send(&frame);
-        assert_eq!(hint(&answer), Some(1));
+        rig.connect(1);
+        let mut phone = Phone::on(1);
+        phone.challenged(&mut rig);
+        let first = phone.challenge;
+        rig.at(120_000);
+        phone.challenged(&mut rig);
+        assert_ne!(phone.challenge, first);
     }
 }

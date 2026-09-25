@@ -16,28 +16,29 @@
 //! [`Feedback`] is read under, the FRAM [`Record`] with the [`map`] that
 //! places every one of them in the part, and the [`Store`] of what the
 //! part holds: the epoch with the [`Clearing`] a factory reset has to
-//! earn, the [`ClientTable`] with its counters and the [`Dedup`] table
-//! beside them, the challenge counter with the [`Minted`] a challenge
-//! cannot leave without, the run reason with the [`Declared`] an output
-//! cannot move without, the secret, the panic record, the boot count, the
-//! log's byte budget, the authorised comms release and the network master
-//! copy. Then the link to the comms processor, the connection rows and the
-//! [`Sessions`] bound onto them, and the [`Endpoint`] that sends each frame
-//! to one or the other; and the signed-request path over the client table,
-//! whose [`Permit`] is the only way an operation reaches a handler, issued
-//! once the part holds the counter. The behaviours arrive with the
-//! milestones that name them.
+//! earn, the [`Clients`] slots with the [`Dedup`] table beside them, the
+//! [`Generator`] every challenge and ephemeral key is drawn from, the run
+//! reason with the [`Declared`] an output cannot move without, the secret
+//! and the controller key, the panic record, the boot count, the log's byte
+//! budget, the authorised comms release and the network master copy. Then
+//! the link to the comms processor, the connection rows and the
+//! [`Sessions`] bound onto them, with the [`Job`]s of key agreement an
+//! [`Agreement`] runs off the control loop, and the [`Endpoint`] that sends
+//! each frame to one or the other; and the signed-request path, whose
+//! [`Permit`] is the only way an operation reaches a handler. The behaviours
+//! arrive with the milestones that name them.
 
 #![no_std]
 
+mod agreement;
 mod body;
 mod boot_count;
 mod calendar;
-mod challenge;
 mod clients;
 mod clock_journal;
 mod configuration;
 mod dedup;
+mod drbg;
 mod endpoint;
 mod epoch;
 mod fail_state;
@@ -59,7 +60,6 @@ mod rail_turn;
 mod readout;
 mod record;
 mod release;
-mod req_window;
 mod request;
 mod reset;
 mod revision;
@@ -74,14 +74,15 @@ mod tick;
 mod wall_clock;
 mod write_volume;
 
+pub use agreement::{Agreement, Done, HANDSHAKE_ANSWER, HANDSHAKE_FRAME, Job, ReportText, Ticket};
 pub use body::*;
 pub use boot_count::*;
 pub use calendar::*;
-pub use challenge::*;
 pub use clients::*;
 pub use clock_journal::*;
 pub use configuration::*;
 pub use dedup::*;
+pub use drbg::*;
 pub use endpoint::*;
 pub use epoch::*;
 pub use fail_state::*;
@@ -100,7 +101,6 @@ pub use rail_turn::*;
 pub use readout::*;
 pub use record::*;
 pub use release::*;
-pub use req_window::*;
 pub use request::*;
 pub use reset::*;
 pub use revision::*;

@@ -16,8 +16,8 @@
 //! as its response last. Nothing is read by either side while the other is
 //! writing it, because each waits for the other's sequence to move.
 //!
-//! Secret replacement is staged by the firmware and completed at boot, before
-//! sessions exist, so no old secret can use a reset challenge counter.
+//! Manufacture is staged by the firmware and completed at boot, before any
+//! session exists, so no session ever sees half a unit's identity.
 //! One operation reads records rather than bytes: [`Op::ReadRing`] walks the
 //! event ring with the ring's own reader, because the ring is the one thing
 //! that knows where it starts and ends, and a host walking 3712 blocks a
@@ -46,9 +46,11 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"O89M");
 /// same number: 3 is where `EraseNorBlock` stopped erasing the ring's own
 /// blocks (#78), and a newer host that took a version 2 part's erase for
 /// a refusing one would recreate the hole it exists to prevent. Version 4
-/// adds firmware-owned secret replacement: older tools must not write a secret
-/// alone and leave its challenge counter unrepaired.
-pub const VERSION: u32 = 4;
+/// added firmware-owned secret replacement. Version 5 carries the whole
+/// manufacturing transaction, the controller key and the generator's first
+/// state with the secret: an older tool would stage 48 bytes the firmware no
+/// longer reads as one.
+pub const VERSION: u32 = 5;
 
 /// Bytes of data a request or an answer carries: enough for the client
 /// table's record in one write.
@@ -141,9 +143,13 @@ pub enum Op {
     ReadRing,
     /// Erase the ring's oldest block, answered as a [`DropAnswer`].
     DropOldest,
-    /// Stage a secret replacement; `ARG0` is 0 for first provisioning, 1 for
-    /// replacement, and data is a Secret body. The host then requests Reboot
-    /// and verifies that boot applied the secret and its fresh counter.
+    /// Stage a manufacturing transaction; `ARG0` is 0 for first
+    /// provisioning, 1 for replacing the secret, and data is an encoded
+    /// `SecretChange::Pending`, `SECRET_CHANGE_BYTES` long: the secret and, on
+    /// a unit's first transaction only, the controller key and the
+    /// generator's first state. The firmware clears the data area once it has
+    /// read it. The host then requests Reboot and reads back the applied
+    /// transaction, whose fingerprint the label prints.
     WriteSecret,
 }
 

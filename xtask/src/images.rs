@@ -71,7 +71,9 @@ const IMAGES: &[Image] = &[
         target: CORTEX_M0,
         kind: Kind::RawBinary,
         budget: 248 * KIB,
-        margin: 24 * KIB,
+        // 24 KB until key agreement took the image to 242,336 bytes;
+        // winning the room back is #175.
+        margin: 8 * KIB,
     },
     Image {
         package: "o89-comms",

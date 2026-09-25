@@ -14,14 +14,16 @@ use std::num::NonZeroU16;
 
 use embassy_futures::block_on;
 use km43::{
-    ClientKind, FrameReader, FrameWriter, LinkMessageType, LogSeq, MAX_FRAME, MAX_PAYLOAD,
-    Received, ReqId, SessionId, Version,
+    ClientId, ClientKind, DeviceId, Entropy, Epoch, FrameReader, FrameWriter, LinkMessageType,
+    LogSeq, MAX_FRAME, MAX_PAYLOAD, Received, ReqId, SessionId, StaticKey, Suite, Version,
 };
 use o89_core::{
-    Action, Actions, BootCount, BootId, CUT_AFTER, Compat, DEAD_AFTER, DropReason, Endpoint,
-    Gesture, Identity, Keep, Keys, Label, Link, LinkEvent, LinkText, Local, LogSpan, Millis,
-    NotKept, Note, Outgoing, PairingWindow, Rail, RailEvent, RailLine, RailRequest, RailSequencer,
-    RailThroughReset, Recovery, Revision, Secret, SessionNote, Sessions, Store, Tick,
+    Action, Actions, Agreement, Birth, BootCount, BootId, CUT_AFTER, ClientLabel, Compat,
+    ControllerKey, DEAD_AFTER, DrbgState, DropReason, Endpoint, Enrolment, Generator, Gesture,
+    Identity, Job, Keep, Keys, Link, LinkEvent, LinkText, Local, LogSpan, Millis, NotKept, Note,
+    Outgoing, PairingWindow, Rail, RailEvent, RailLine, RailRequest, RailSequencer,
+    RailThroughReset, Recovery, Revision, Secret, SessionNote, Sessions, Step, Store, Tick,
+    stage_secret,
 };
 
 use crate::{
@@ -44,32 +46,116 @@ pub(crate) const DEVICE: [u8; 16] = [7; 16];
 /// The printed secret.
 pub(crate) const PRINTED: [u8; 32] = [9; 32];
 
-/// A unit as its first boot leaves it, with its secret written and one
-/// client, a phone, enrolled at slot 1: the store booted on the part, and
-/// the four records the sessions take from it, as `main` hands them over.
-pub(crate) fn unit() -> (SimFram, Keys) {
+/// The controller key's private half, as the station drew it.
+pub(crate) const CONTROLLER: [u8; 32] = [5; 32];
+/// The generator's first state, as the station drew it.
+pub(crate) const SEED: [u8; 32] = [3; 32];
+
+/// How long the simulated worker takes over one job: a `Hello`'s worth at
+/// 64 MHz (P-243).
+pub(crate) const COMPUTE: Millis = Millis::from_millis(1_500);
+
+/// The unit's device id and printed secret.
+pub(crate) fn secret() -> Secret {
+    Secret::new(DEVICE, PRINTED).expect("entropy")
+}
+
+/// The unit's controller key.
+pub(crate) fn controller() -> ControllerKey {
+    ControllerKey::new(CONTROLLER).expect("entropy")
+}
+
+/// A client install's static key, one per `n`.
+pub(crate) fn client_key(n: u8) -> StaticKey {
+    let mut bytes = [n; 32];
+    bytes[31] = 0x41;
+    StaticKey::generate(Entropy::new(bytes))
+}
+
+/// The worker the unit runs its key agreement on.
+pub(crate) fn agreement() -> Agreement {
+    Agreement::new(&secret(), &controller())
+}
+
+/// What slot `n` holds when install `n` is enrolled there under `label`:
+/// its key, and the admission key the controller computes from it (P-238).
+pub(crate) fn enrolment(n: u8, label: &str, kind: ClientKind) -> Enrolment {
+    let client = client_key(n).public();
+    let admit = controller()
+        .key()
+        .admit_key(DeviceId::new(DEVICE), &client)
+        .expect("a contributory key");
+    Enrolment {
+        client,
+        admit: *admit.to_stored(),
+        suite: Suite::X25519ChachapolySha256,
+        kind,
+        label: ClientLabel::new(label).expect("fits"),
+    }
+}
+
+/// A unit the station manufactured: its secret, its controller key and its
+/// generator staged and applied by the boot that followed (P-235, P-237).
+pub(crate) fn manufactured() -> SimFram {
     let mut part = SimFram::fresh();
-    let (mut store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
-    let secret = Secret::new(DEVICE, PRINTED).expect("entropy");
-    block_on(store.secret.write(&mut part, secret)).expect("lands");
-    let label = Label::new("phone").expect("fits");
-    let paired = block_on(
-        store
-            .clients
-            .update(&mut part, |table| table.pair(label, ClientKind::App)),
-    )
-    .expect("lands");
-    assert!(paired.is_ok(), "slot 1 enrolled");
-    let keys = Keys {
+    let birth = Birth {
+        controller: controller(),
+        drbg: DrbgState::new(SEED).expect("entropy"),
+    };
+    block_on(stage_secret(&mut part, secret(), Some(birth), false)).expect("staged");
+    let _ = block_on(Store::boot(&mut part, None)).expect("applied");
+    // The station printed the label and said so.
+    let mut transaction = block_on(o89_core::Kept::<
+        o89_core::SecretChange,
+        { o89_core::SECRET_CHANGE_BYTES },
+    >::read(o89_core::map::SECRET_CHANGE, &mut part))
+    .expect("reads");
+    block_on(transaction.write(&mut part, o89_core::SecretChange::Complete)).expect("acknowledged");
+    part
+}
+
+/// What the sessions take from a store, as `main` hands it over.
+pub(crate) fn keys(store: Store, epoch: Option<Epoch>) -> Keys {
+    Keys {
         configuration: store.configuration,
         network: store.network,
         secret: store.secret.present().copied(),
-        epoch: report.epoch.epoch(),
+        controller: store.controller.present().map(ControllerKey::public),
+        epoch,
         epoch_record: store.epoch,
         clients: store.clients,
-        challenges: store.challenges,
-    };
-    (part, keys)
+        generator: Generator::new(store.drbg),
+    }
+}
+
+/// The keys a boot reads off `part`.
+pub(crate) fn reread(part: &mut SimFram) -> Option<Keys> {
+    let (store, report) = block_on(Store::boot(part, None)).ok()?;
+    Some(keys(store, report.epoch.epoch()))
+}
+
+/// A manufactured unit with one client, a phone, enrolled at slot 1 under
+/// install 1's key: the store booted on the part, and what the sessions
+/// take from it.
+pub(crate) fn unit() -> (SimFram, Keys) {
+    let mut part = manufactured();
+    let (mut store, report) = block_on(Store::boot(&mut part, None)).expect("the part answers");
+    let epoch = report.epoch.epoch().expect("an epoch");
+    let slot = ClientId::new(1).expect("a slot");
+    block_on(store.clients.enrol(
+        slot,
+        enrolment(1, "phone", ClientKind::App),
+        epoch,
+        &mut part,
+    ))
+    .expect("lands");
+    (part, keys(store, Some(epoch)))
+}
+
+/// How many slots the sessions hold occupied under their epoch.
+pub(crate) fn enrolled(sessions: &Sessions) -> usize {
+    let keys = sessions.keys();
+    keys.epoch.map_or(0, |epoch| keys.clients.enrolled(epoch))
 }
 
 fn boot_count(n: u32) -> BootCount {
@@ -120,6 +206,12 @@ pub(crate) struct Bench {
     refusals: u32,
     /// What the comms processor's module has been told to be.
     module_booted: bool,
+    /// The worker, and the job it holds with the tick it is done at: one at
+    /// a time, as the adapter's link task hands them over (P-243).
+    agreement: Agreement,
+    pub(crate) computing: Option<(Tick, Job)>,
+    /// How long the worker takes over a job.
+    pub(crate) compute: Millis,
     /// Whether the ladder's cuts land on the FRAM when the adapter keeps
     /// them before a cut (F-017).
     keeps_land: bool,
@@ -157,15 +249,7 @@ impl Bench {
             ..identity()
         };
         let mut bench = Self::stating(identity, Revision::A, caps, Tick::from_millis(1_000));
-        bench.endpoint.sessions = Sessions::new(Keys {
-            configuration: store.configuration,
-            network: store.network,
-            secret: store.secret.present().copied(),
-            epoch: report.epoch.epoch(),
-            epoch_record: store.epoch,
-            clients: store.clients,
-            challenges: store.challenges,
-        });
+        bench.endpoint.sessions = Sessions::new(keys(store, report.epoch.epoch()));
         bench.fram = part;
         bench
     }
@@ -199,6 +283,9 @@ impl Bench {
             run: 0,
             refusals: 0,
             module_booted: false,
+            agreement: agreement(),
+            computing: None,
+            compute: COMPUTE,
             keeps_land: true,
             window: PairingWindow::new(),
         };
@@ -214,30 +301,101 @@ impl Bench {
     pub(crate) fn boot_clients(&mut self, revision: Revision) {
         let (store, report) = block_on(Store::boot(&mut self.fram, None)).expect("store read");
         self.window = PairingWindow::at_power_on(revision, report.enrolment, self.now);
-        self.endpoint.sessions = Sessions::new(Keys {
-            configuration: store.configuration,
-            network: store.network,
-            secret: store.secret.present().copied(),
-            epoch: report.epoch.epoch(),
-            epoch_record: store.epoch,
-            clients: store.clients,
-            challenges: store.challenges,
-        });
+        self.endpoint.sessions = Sessions::new(keys(store, report.epoch.epoch()));
+        // The worker's job went with the old sessions.
+        self.computing = None;
     }
 
-    /// A device secret and durably empty table, read on the next power-on.
+    /// A manufactured unit whose table is durably empty, read on the next
+    /// power-on.
     pub(crate) fn first_enrolment(caps: Capabilities) -> Self {
         let mut bench = Self::on_at(Revision::A, caps, Tick::ZERO);
-        bench.fram = SimFram::fresh();
-        let (mut store, _) = block_on(Store::boot(&mut bench.fram, None)).expect("store");
-        block_on(
-            store
-                .secret
-                .write(&mut bench.fram, Secret::new(DEVICE, PRINTED).unwrap()),
-        )
-        .unwrap();
+        bench.fram = manufactured();
         bench.boot_clients(Revision::A);
         bench
+    }
+
+    /// Whether the worker holds a job.
+    pub(crate) fn computing(&self) -> bool {
+        self.computing.is_some()
+    }
+
+    /// The worker's turn, as the adapter's link task takes it every tick: a
+    /// job that is done answered, and the next one handed over.
+    fn serve_agreement(&mut self) {
+        // Bounded: one job per row at most is queued, and each turn either
+        // finishes one or stops.
+        for _ in 0..=o89_core::CONNECTIONS {
+            if self.computing.is_none() {
+                let Some(job) = self.endpoint.next_job() else {
+                    return;
+                };
+                let ready = self.now.after(self.compute).expect("fits");
+                self.computing = Some((ready, job));
+            }
+            let due = self
+                .computing
+                .as_ref()
+                .is_some_and(|(ready, _)| self.now.since(*ready).is_some());
+            if !due {
+                return;
+            }
+            let (_, job) = self.computing.take().expect("held");
+            let done = self.agreement.run(job);
+            let mut dst = [0u8; MAX_PAYLOAD];
+            let local = self.local();
+            let step =
+                block_on(
+                    self.endpoint
+                        .completed(done, self.now, &local, &mut self.fram, &mut dst),
+                );
+            let actions = self.stepped(step, &mut dst);
+            self.perform(&actions);
+        }
+    }
+
+    fn local(&self) -> Local<'static> {
+        Local {
+            model: MODEL,
+            log: LOG,
+            time_known: self.calendar.is_some(),
+            pairing_open: self.window.is_open(self.now),
+        }
+    }
+
+    /// What one step of the sessions asked of the adapter: a `Time` to the
+    /// recorder, the window closed on an enrolment, the answer framed for
+    /// the pump. The link's actions come back to perform after it.
+    fn stepped(&mut self, mut step: Step, dst: &mut [u8]) -> Actions {
+        if let Some(o89_core::Reply {
+            note: Some(SessionNote::TimeAsked(asked)),
+            ..
+        }) = step.reply
+        {
+            let answer = self.client_time(asked);
+            step.reply = Some(
+                self.endpoint
+                    .sessions
+                    .time_answered(asked.ticket, answer, dst),
+            );
+        }
+        if let Some(o89_core::Reply {
+            note: Some(SessionNote::Paired(_)),
+            ..
+        }) = step.reply
+        {
+            // As the adapter does: one press, one enrolment.
+            self.window.close();
+        }
+        if let Some(len) = step.reply.and_then(|reply| reply.answer) {
+            let mut framed = [0u8; MAX_FRAME];
+            let len = self
+                .writer
+                .write(&dst[..len], &mut framed)
+                .expect("an answer frames");
+            self.answers.push(framed[..len].to_vec());
+        }
+        step.actions
     }
 
     /// The module is powered and booting: the run the reader held is thrown
@@ -300,6 +458,7 @@ impl Bench {
             self.ticked.push((now, actions));
         }
         self.perform(&actions);
+        self.serve_agreement();
     }
 
     /// Perform actions, pumping what the peer answers back through the
@@ -419,42 +578,14 @@ impl Bench {
                         time_known: self.calendar.is_some(),
                         pairing_open: self.window.is_open(self.now),
                     };
-                    let mut step = block_on(self.endpoint.frame(
+                    let step = block_on(self.endpoint.frame(
                         frame,
                         self.now,
                         &local,
                         &mut self.fram,
                         &mut dst,
                     ));
-                    if let Some(o89_core::Reply {
-                        note: Some(SessionNote::TimeAsked(asked)),
-                        ..
-                    }) = step.reply
-                    {
-                        let answer = self.client_time(asked);
-                        step.reply = Some(self.endpoint.sessions.time_answered(
-                            asked.ticket,
-                            answer,
-                            &mut dst,
-                        ));
-                    }
-                    if let Some(o89_core::Reply {
-                        note: Some(SessionNote::Paired(_)),
-                        ..
-                    }) = step.reply
-                    {
-                        // As the adapter does: one press, one enrolment.
-                        self.window.close();
-                    }
-                    if let Some(len) = step.reply.and_then(|reply| reply.answer) {
-                        let mut framed = [0u8; MAX_FRAME];
-                        let len = self
-                            .writer
-                            .write(&dst[..len], &mut framed)
-                            .expect("an answer frames");
-                        self.answers.push(framed[..len].to_vec());
-                    }
-                    out.push(step.actions);
+                    out.push(self.stepped(step, &mut dst));
                 }
                 Received::Dropped(_) | Received::Abandoned => {
                     self.refusals = self.refusals.saturating_add(1);
@@ -1889,15 +2020,8 @@ fn l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions() {
             .expect("network");
         block_on(record.write(&mut bench.fram, network)).expect("persist");
         let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
-        bench.endpoint.sessions = o89_core::Sessions::new(Keys {
-            configuration: store.configuration,
-            network: store.network,
-            secret: store.secret.present().copied(),
-            epoch: report.epoch.epoch(),
-            epoch_record: store.epoch,
-            clients: store.clients,
-            challenges: store.challenges,
-        });
+        bench.endpoint.sessions =
+            o89_core::Sessions::new(crate::link::keys(store, report.epoch.epoch()));
         bench.run_for(Millis::from_millis(2000));
         assert_eq!(
             bench
@@ -1930,15 +2054,8 @@ fn network_bench() -> Bench {
         .expect("network");
     block_on(record.write(&mut bench.fram, network)).expect("persist");
     let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
-    bench.endpoint.sessions = o89_core::Sessions::new(Keys {
-        configuration: store.configuration,
-        network: store.network,
-        secret: store.secret.present().copied(),
-        epoch: report.epoch.epoch(),
-        epoch_record: store.epoch,
-        clients: store.clients,
-        challenges: store.challenges,
-    });
+    bench.endpoint.sessions =
+        o89_core::Sessions::new(crate::link::keys(store, report.epoch.epoch()));
     bench.run_for(Millis::from_millis(2000));
     bench
 }
@@ -2047,15 +2164,7 @@ fn p_085_healthy_network_reset_scrubs_both_slots_after_reboot() {
             .expect("read");
             block_on(kept.write(&mut bench.fram, network)).expect("second slot");
             let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
-            bench.endpoint.sessions = Sessions::new(Keys {
-                configuration: store.configuration,
-                network: store.network,
-                secret: store.secret.present().copied(),
-                epoch: report.epoch.epoch(),
-                epoch_record: store.epoch,
-                clients: store.clients,
-                challenges: store.challenges,
-            });
+            bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
         }
         block_on(bench.endpoint.sessions.factory_reset(&mut bench.fram)).expect("reset");
         bench.fram.reboot();
@@ -2156,15 +2265,7 @@ fn l_133_a_written_zero_version_record_never_sends_an_unwritten_clear() {
     .expect("read");
     block_on(record.write(&mut bench.fram, o89_core::Network::NONE)).expect("written zero");
     let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
-    bench.endpoint.sessions = Sessions::new(Keys {
-        configuration: store.configuration,
-        network: store.network,
-        secret: store.secret.present().copied(),
-        epoch: report.epoch.epoch(),
-        epoch_record: store.epoch,
-        clients: store.clients,
-        challenges: store.challenges,
-    });
+    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
     bench.run_for(Millis::from_millis(2000));
     assert!(
         !bench
@@ -2217,15 +2318,7 @@ fn l_135_healthy_reset_cut_at_every_byte_scrubs_credentials_before_epoch_and_on_
     for cut in 0..=steps {
         let mut part = seed.clone();
         let (store, report) = block_on(o89_core::Store::boot(&mut part, None)).expect("boot");
-        let mut sessions = o89_core::Sessions::new(Keys {
-            configuration: store.configuration,
-            network: store.network,
-            secret: store.secret.present().copied(),
-            epoch: report.epoch.epoch(),
-            epoch_record: store.epoch,
-            clients: store.clients,
-            challenges: store.challenges,
-        });
+        let mut sessions = o89_core::Sessions::new(crate::link::keys(store, report.epoch.epoch()));
         part.reboot();
         part.cut_after(cut);
         let result = block_on(sessions.factory_reset(&mut part));
@@ -2250,15 +2343,7 @@ fn l_135_healthy_reset_cut_at_every_byte_scrubs_credentials_before_epoch_and_on_
             assert_eq!(network.credentials(), None, "cut {cut}");
             assert_network_reservation_scrubbed(&mut part);
         }
-        let mut sessions = Sessions::new(Keys {
-            configuration: store.configuration,
-            network: store.network,
-            secret: store.secret.present().copied(),
-            epoch: report.epoch.epoch(),
-            epoch_record: store.epoch,
-            clients: store.clients,
-            challenges: store.challenges,
-        });
+        let mut sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
         block_on(sessions.factory_reset(&mut part)).expect("retry reset");
         part.reboot();
         let (store, report) = block_on(Store::boot(&mut part, None)).expect("reboot retry");
@@ -2301,15 +2386,7 @@ fn p_085_damaged_network_reset_erases_both_slots_before_revoking_clients() {
             sessions.keys().network.held(),
             o89_core::Held::Absent
         ));
-        assert_eq!(
-            sessions
-                .keys()
-                .clients
-                .present()
-                .expect("clients")
-                .enrolled(),
-            0
-        );
+        assert_eq!(enrolled(&sessions), 0);
         assert_eq!(sessions.keys().epoch, km43::Epoch::new(2));
         let start = usize::from(o89_core::map::COMMS_RELEASE.end().0);
         let end = usize::from(o89_core::map::NETWORK.end().0);
@@ -2317,7 +2394,12 @@ fn p_085_damaged_network_reset_erases_both_slots_before_revoking_clients() {
         let (store, report) = block_on(Store::boot(&mut part, None)).expect("reboot");
         assert!(matches!(store.network.held(), o89_core::Held::Absent));
         assert_eq!(report.epoch.epoch(), km43::Epoch::new(2));
-        assert_eq!(store.clients.present().expect("clients").enrolled(), 0);
+        assert_eq!(
+            store
+                .clients
+                .enrolled(report.epoch.epoch().expect("an epoch")),
+            0
+        );
     }
 }
 
@@ -2332,30 +2414,14 @@ fn p_085_damaged_network_reset_cut_at_every_byte_can_be_retried_without_old_cred
         for cut in 0..=steps {
             let mut part = seed.clone();
             let (store, report) = block_on(Store::boot(&mut part, None)).expect("boot");
-            let mut sessions = Sessions::new(Keys {
-                configuration: store.configuration,
-                network: store.network,
-                secret: store.secret.present().copied(),
-                epoch: report.epoch.epoch(),
-                epoch_record: store.epoch,
-                clients: store.clients,
-                challenges: store.challenges,
-            });
+            let mut sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
             part.reboot();
             part.cut_after(cut);
             let result = block_on(sessions.factory_reset(&mut part));
             if cut < 344 {
                 assert!(result.is_err(), "erase failure must stop reset at {cut}");
                 assert_eq!(sessions.keys().epoch, Some(km43::Epoch::FIRST));
-                assert_eq!(
-                    sessions
-                        .keys()
-                        .clients
-                        .present()
-                        .expect("clients")
-                        .enrolled(),
-                    1
-                );
+                assert_eq!(enrolled(&sessions), 1);
             }
             part.reboot();
             let (store, report) = block_on(Store::boot(&mut part, None)).expect("recover");
@@ -2364,31 +2430,20 @@ fn p_085_damaged_network_reset_cut_at_every_byte_can_be_retried_without_old_cred
                     matches!(store.network.held(), o89_core::Held::Absent),
                     "cut {cut}"
                 );
-                assert_eq!(store.clients.present().expect("clients").enrolled(), 0);
+                assert_eq!(
+                    store
+                        .clients
+                        .enrolled(report.epoch.epoch().expect("an epoch")),
+                    0
+                );
             }
-            let mut sessions = Sessions::new(Keys {
-                configuration: store.configuration,
-                network: store.network,
-                secret: store.secret.present().copied(),
-                epoch: report.epoch.epoch(),
-                epoch_record: store.epoch,
-                clients: store.clients,
-                challenges: store.challenges,
-            });
+            let mut sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
             block_on(sessions.factory_reset(&mut part)).expect("retry reset");
             assert!(
                 matches!(sessions.keys().network.held(), o89_core::Held::Absent),
                 "retry {cut}"
             );
-            assert_eq!(
-                sessions
-                    .keys()
-                    .clients
-                    .present()
-                    .expect("clients")
-                    .enrolled(),
-                0
-            );
+            assert_eq!(enrolled(&sessions), 0);
             let start = usize::from(o89_core::map::COMMS_RELEASE.end().0);
             let end = usize::from(o89_core::map::NETWORK.end().0);
             assert!(
@@ -2436,15 +2491,8 @@ fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_ver
     ))
     .expect("replacement");
     assert_eq!(ack.outcome, km43::SetConfig::Accepted);
-    bench.endpoint.sessions = Sessions::new(Keys {
-        configuration: store.configuration,
-        network: store.network,
-        secret: store.secret.present().copied(),
-        epoch: store.epoch.present().copied(),
-        epoch_record: store.epoch,
-        clients: store.clients,
-        challenges: store.challenges,
-    });
+    let epoch = store.epoch.present().copied();
+    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, epoch));
     bench.run_for(Millis::from_millis(2000));
     assert!(
         bench

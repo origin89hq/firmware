@@ -473,6 +473,16 @@ impl Link {
     /// before the reset, and may be lost to it; the boot count afterwards
     /// says whether the part came back.
     pub fn reboot(&mut self) -> Result<()> {
+        self.reboot_then(|before, after| after > before)
+    }
+
+    /// Reboot a part whose FRAM was just blanked: its boot count starts
+    /// over, so the reboot shows as the first boot a blank store records.
+    pub fn reboot_blank(&mut self) -> Result<()> {
+        self.reboot_then(|_, after| after == 1)
+    }
+
+    fn reboot_then(&mut self, came_back: impl FnOnce(u32, u32) -> bool) -> Result<()> {
         let before = self.ping()?;
         match self.request(Op::Reboot, 0, 0, &[]) {
             Ok(answer) => answer.ok("reboot").map(|_| ())?,
@@ -482,8 +492,10 @@ impl Link {
         self.check()
             .context("the part did not come back with a mailbox")?;
         let after = self.ping()?;
-        if after <= before {
-            bail!("the boot count went from {before} to {after}: the part did not reboot");
+        if !came_back(before, after) {
+            bail!(
+                "the boot count went from {before} to {after}: the part did not reboot as expected"
+            );
         }
         println!("rebooted: boot {before} to {after}");
         Ok(())
