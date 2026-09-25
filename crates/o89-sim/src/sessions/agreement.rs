@@ -447,3 +447,66 @@ fn p_066_a_foreign_label_never_reaches_the_worker_even_inside_the_window() {
     }
     assert!(bench.window.is_open(bench.now));
 }
+
+#[test]
+fn p_243_p_244_a_vouch_computes_on_the_worker_while_the_link_beats_and_verifies() {
+    // Capabilities: none; the worker takes five seconds over the one DH.
+    let mut bench = linked();
+    bench.compute = Millis::from_millis(5_000);
+    announce(&mut bench, 1);
+    let mut client = Client::on(1);
+    let _ = client.open(&mut bench);
+    let verifier = km43::StaticKey::generate(km43::Entropy::new([0x5A; 32]));
+    let nonce = km43::VouchNonce::new([0xB0; 16]);
+    let binding = km43::AccountBinding::new([0xD0; 32]);
+    let mut body = [0u8; 96];
+    let len = km43::VouchRequest {
+        verifier: verifier.public(),
+        nonce,
+        binding,
+    }
+    .encode(&mut body)
+    .expect("fits");
+    let frame = client.sealed(MessageType::Vouch, &body[..len]);
+    let before = (beats(&bench).len(), bench.comms.to_client(1).len());
+    let bytes = bench.comms.relay(&frame, bench.now).expect("relays");
+    bench.feed(&bytes);
+    bench.run_for(Millis::from_millis(4_000));
+    assert!(bench.computing(), "the vouch is out at the worker");
+    assert_eq!(bench.comms.to_client(1).len(), before.1, "not answered yet");
+    assert!(beats(&bench).len() > before.0, "the link beat meanwhile");
+    bench.run_for(Millis::from_millis(1_500));
+    assert!(!bench.computing());
+    let answers = bench.comms.to_client(1);
+    let (header, inner) = client
+        .opened(answers.last().expect("answered"))
+        .expect("sealed under the session");
+    assert_eq!(header.kind, MessageType::VouchResponse);
+    let km43::VouchAnswer::Vouched {
+        epoch,
+        client_id,
+        generation,
+        tag,
+    } = km43::VouchAnswer::decode(&inner).expect("a vouch body")
+    else {
+        panic!("a contributory verifier key was refused");
+    };
+    let issued = km43::VouchIssue {
+        device_id: km43::DeviceId::new(DEVICE),
+        epoch,
+        nonce,
+        binding,
+    };
+    let claim = km43::VouchClaim {
+        controller: crate::link::controller().public(),
+        client_id,
+        generation,
+        tag,
+    };
+    assert_eq!(epoch, km43::Epoch::FIRST);
+    assert!(
+        issued
+            .verify(&verifier, Some(&fingerprint()), &claim)
+            .is_ok()
+    );
+}

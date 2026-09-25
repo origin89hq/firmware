@@ -726,7 +726,12 @@ window and P-240's table check, then the draw. A peer that fails any of them
 costs no DH and is answered at once: bare error 10 or 12, counted, or a
 refusal tagged under the label's refusal key, uncounted (P-241). What is
 left is a `Job`, owned and self-contained, one per row: pairing message 2,
-message 3 with the slot's admission key, or a `Hello`'s proof and answer.
+message 3 with the slot's admission key, a `Hello`'s proof and answer, or a
+`Vouch`'s one DH with the verifier's key (P-244). A `Vouch` is read where it
+opened, carries the epoch and the slot of the session that asked, and is
+sealed for that session when it comes back, or for nobody if it ended
+meanwhile; a row whose job is taken refuses a `Vouch` with error 7 rather
+than evict either one.
 The link task hands one to the worker only when none is out, picking the
 next row after the last one served, and answers with its `Done` when it
 comes back. A result for a handshake abandoned since, by a second one on the

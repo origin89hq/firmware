@@ -43,6 +43,12 @@
 //! yet (km43's DEFERRED entry 8), so a permitted command is answered
 //! `rejected`, its dedup entry discarded, and nothing reaches an output.
 //!
+//! **A `Vouch` is a job like a handshake** (P-243, P-244): read where it
+//! opened, queued on the row with the epoch and the slot of the session that
+//! asked, computed by the worker, and sealed for that session when it comes
+//! back, or for nobody if it has ended since. A row already holding a
+//! handshake or a job refuses it with error 7 rather than drop either.
+//!
 //! Every answer is addressed to the frame it answers: the handle in
 //! `session_id`, the request's `req_id` echoed (P-026, L-182). Before a
 //! session exists, and whenever the controller holds no key for the one
@@ -51,7 +57,7 @@
 //!
 //! cites: P-021, P-022, P-026, P-051, P-058, P-060, P-061, P-062, P-063,
 //! P-064, P-066, P-076, P-077, P-080, P-105, P-143, P-226, P-229, P-231,
-//! P-237, P-238, P-240, P-241, P-242, P-243, L-061, L-062, L-070, L-071,
+//! P-237, P-238, P-240, P-241, P-242, P-243, P-244, P-245, L-061, L-062, L-070, L-071,
 //! L-072, L-080, L-180, L-182, L-195
 
 use km43::{
@@ -61,7 +67,7 @@ use km43::{
     HelloArrival, Incoming, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
     MAX_COMMAND_ACK_BYTES, MAX_PAYLOAD, MAX_SESSIONS, MAX_TIME_ACK_BYTES, MessageType, Outcome,
     PairArrival, PairRefusal, Prologue, PrologueFields, PublicKey, Refusal as Code, ReqId, Sealed,
-    SessionId, SignedWrite, SlotView, TimeAck, TimeOperation, Version,
+    SessionId, SignedWrite, SlotView, TimeAck, TimeOperation, Version, VouchAnswer, VouchRequest,
 };
 
 use crate::agreement::{Bytes, Computed, Done, Job, Report, ReportText, Task, Ticket};
@@ -481,6 +487,52 @@ impl Row {
             self.challenge = Challenge::Spent;
         }
         taken
+    }
+
+    /// `Vouch 0x14`, opened on the session bound here: queued for the
+    /// worker with the epoch and the session's slot, since the request names
+    /// neither (P-244). A body that does not read is error 1; a row whose one
+    /// job is taken, by a handshake or by another `Vouch`, is error 7, and
+    /// neither is evicted.
+    fn vouch(
+        &mut self,
+        to: Addressed,
+        epoch: Option<Epoch>,
+        payload: &[u8],
+        dst: &mut [u8],
+    ) -> Reply {
+        let ticket = self.ticket(to.req_id);
+        let Self {
+            bound: Bound::Session(binding),
+            pairing,
+            work,
+            ..
+        } = self
+        else {
+            return Reply::NOTHING;
+        };
+        let request = match VouchRequest::decode(payload) {
+            Ok(request) => request,
+            Err(why) => return refused_under(to, binding, why.refusal(), dst),
+        };
+        if !matches!(pairing, Pairing::None) || !matches!(work, Work::Idle) {
+            return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
+        }
+        // A factory reset ends every session before the epoch can go, so a
+        // bound session with none is a bug: nothing to vouch for.
+        let Some(epoch) = epoch else {
+            return sealed_error(to, binding, ErrorCode::UnknownClient, dst);
+        };
+        *work = Work::Queued(Job::new(
+            ticket,
+            Task::Vouch {
+                request,
+                epoch,
+                bound: (binding.client, binding.generation),
+                serial: binding.serial,
+            },
+        ));
+        Reply::noted(SessionNote::Queued(to.conn))
     }
 
     /// Abandon whatever handshake the row holds or is computing (P-229): a
@@ -942,6 +994,14 @@ impl Sessions {
                 }
             }
             Computed::HelloFailed(why) => self.refused(to, why.refusal(), why.counts(), now, dst),
+            Computed::Vouched { answer, serial } => match &mut row.bound {
+                Bound::Session(binding) if binding.serial == serial => {
+                    vouched(to, binding, &answer, dst)
+                }
+                // Ended or bound again since: the client that asked holds
+                // no keys to open it with.
+                Bound::Session(_) | Bound::Never | Bound::Ended => Reply::noted(SessionNote::Stale),
+            },
             Computed::Unwritable => {
                 row.abandon();
                 Reply::noted(SessionNote::TooLarge)
@@ -1333,11 +1393,10 @@ impl Sessions {
             tickets,
             ..
         } = self;
-        let Some(Row {
-            bound: Bound::Session(binding),
-            ..
-        }) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-        else {
+        let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn) else {
+            return Reply::NOTHING;
+        };
+        let Bound::Session(binding) = &mut row.bound else {
             return Reply::NOTHING;
         };
         let opened = Sealed::decode(envelope)
@@ -1361,9 +1420,7 @@ impl Sessions {
                 // The binding goes and the keys with it; the row stays with
                 // its transport (P-076). A body that did not read ends
                 // nothing.
-                if matches!(reply.note, Some(SessionNote::Unbound(_)))
-                    && let Some(row) = rows.iter_mut().flatten().find(|row| row.conn == to.conn)
-                {
+                if matches!(reply.note, Some(SessionNote::Unbound(_))) {
                     row.bound = Bound::Ended;
                 }
                 reply
@@ -1384,6 +1441,7 @@ impl Sessions {
                 Ok(write) => time_asked(to, binding, (time, tickets), mask, &write, now, dst),
                 Err(refused) => refused,
             },
+            MessageType::Vouch => row.vouch(to, keys.epoch, payload, dst),
             // Opened, and not served by this slice: error 2 under the
             // session's keys, which an opened request has earned. Firmware
             // is unserved (P-143); the reads are the later slices'.
@@ -1393,10 +1451,7 @@ impl Sessions {
             | MessageType::History
             | MessageType::Subscribe
             | MessageType::ReadLog
-            | MessageType::Firmware
-            // Not answered, and capability bit 9 says so (P-246): a client
-            // does not send it here (#181).
-            | MessageType::Vouch => {
+            | MessageType::Firmware => {
                 sealed_error(to, binding, ErrorCode::UnknownMessageType, dst)
             }
             // `frame` routes only the types above here.
@@ -1710,6 +1765,26 @@ fn acked(to: Addressed, binding: &mut Binding, ack: CommandAck<'_>, dst: &mut [u
             .channel
             .tx
             .seal(to.header(MessageType::CommandResponse), body, dst)
+            .ok()
+    });
+    answered(written)
+}
+
+/// The widest `Vouch 0x94` body: a five-pair map, the outcome, three `u32`
+/// at five bytes each, and P-041's sixteen-byte tag behind its one-byte
+/// head. The tag's width is spelled out because `km43::TAG_BYTES` is two
+/// constants to a glob import, and naming it is refused.
+const VOUCH_ANSWER_BYTES: usize = 1 + (1 + 1) + 3 * (1 + 5) + (1 + 1 + 16);
+
+/// `Vouch 0x94`, sealed for the session that asked.
+fn vouched(to: Addressed, binding: &mut Binding, answer: &VouchAnswer, dst: &mut [u8]) -> Reply {
+    let mut body = [0u8; VOUCH_ANSWER_BYTES];
+    let written = answer.encode(&mut body).ok().and_then(|len| {
+        let body = body.get(..len)?;
+        binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::VouchResponse), body, dst)
             .ok()
     });
     answered(written)
@@ -2998,23 +3073,211 @@ mod tests {
         assert_ne!(second, served);
     }
 
+    const NONCE: km43::VouchNonce = km43::VouchNonce::new([0xB0; 16]);
+    const BINDING: km43::AccountBinding = km43::AccountBinding::new([0xD0; 32]);
+
+    fn verifier() -> StaticKey {
+        let mut bytes = [0xA5; 32];
+        bytes[31] = 0x42;
+        StaticKey::generate(Entropy::new(bytes))
+    }
+
+    /// `Vouch 0x14`'s body for `verifier`, the nonce and the binding.
+    fn vouch_body(verifier: PublicKey) -> ([u8; 96], usize) {
+        let mut body = [0u8; 96];
+        let len = km43::VouchRequest {
+            verifier,
+            nonce: NONCE,
+            binding: BINDING,
+        }
+        .encode(&mut body)
+        .expect("fits");
+        (body, len)
+    }
+
+    /// A `Vouch` for [`verifier`] on the phone's session.
+    fn vouch_frame(phone: &mut Phone) -> Frame {
+        let (body, len) = vouch_body(verifier().public());
+        phone.sealed(MessageType::Vouch, &body[..len])
+    }
+
+    /// `Vouch 0x94`, opened under the phone's session.
+    fn vouch_answer(phone: &mut Phone, answer: &[u8]) -> km43::VouchAnswer {
+        let (kind, body) = phone.open(answer);
+        assert_eq!(kind, MessageType::VouchResponse);
+        km43::VouchAnswer::decode(&body).expect("a vouch body")
+    }
+
+    /// The code key 1 of a sealed `Error 0xFF` carries.
+    fn sealed_code(phone: &mut Phone, answer: &[u8]) -> u8 {
+        let (kind, payload) = phone.open(answer);
+        assert_eq!(kind, MessageType::ErrorResponse);
+        assert_eq!(payload.get(1), Some(&0x01), "key 1 first");
+        *payload.get(2).expect("a code under 24")
+    }
+
     #[test]
-    fn p_246_vouch_is_refused_with_error_2_and_capability_bit_9_is_never_set() {
+    fn p_244_p_243_a_vouch_is_computed_by_the_worker_and_verifies_for_the_verifier() {
         let mut rig = Rig::new();
         let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
         let report = phone.hello(&mut rig).expect("a session");
+        // P-246 is retired in km43 0.8.0: bit 9 announces nothing.
+        assert_eq!(report.capabilities & (1 << 9), 0);
+        let frame = vouch_frame(&mut phone);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        assert_eq!(answer.len, 0, "no DH where the frame arrived");
+        let (reply, answer) = rig.compute().expect("the vouch was queued");
+        assert!(reply.answer.is_some());
+        let km43::VouchAnswer::Vouched {
+            epoch,
+            client_id,
+            generation,
+            tag,
+        } = vouch_answer(&mut phone, &answer)
+        else {
+            panic!("refused a contributory verifier key");
+        };
+        assert_eq!(epoch, Epoch::FIRST);
         assert_eq!(
-            report.capabilities & (1 << 9),
-            0,
-            "bit 9 would promise Vouch"
+            (client_id, generation),
+            (report.client_id, report.generation)
         );
-        let frame = phone.sealed(MessageType::Vouch, &[0xa0]);
-        let (_, answer) = rig.send(&frame);
-        let (kind, payload) = phone.open(&answer);
-        assert_eq!(kind, MessageType::ErrorResponse);
-        // Key 1 is the code: 2, unknown message type, under the session's keys.
-        assert_eq!(payload.as_ref().get(1..3), Some(&[0x01, 0x02][..]));
+        let issued = km43::VouchIssue {
+            device_id: DeviceId::new(DEVICE),
+            epoch: Epoch::FIRST,
+            nonce: NONCE,
+            binding: BINDING,
+        };
+        let claim = km43::VouchClaim {
+            controller: proceeding_controller(),
+            client_id,
+            generation,
+            tag,
+        };
+        let vouched = issued
+            .verify(&verifier(), Some(&fingerprint()), &claim)
+            .expect("the verifier accepts it");
+        assert_eq!(vouched.statement().client_id, report.client_id);
+        // Another account's binding does not verify under the same tag.
+        let other = km43::VouchIssue {
+            binding: km43::AccountBinding::new([0xD1; 32]),
+            ..issued
+        };
+        assert_eq!(
+            other
+                .verify(&verifier(), Some(&fingerprint()), &claim)
+                .err(),
+            Some(km43::VouchRefusal::TagMismatch)
+        );
+        assert!(rig.sessions.is_bound(conn(1)));
+        assert!(!rig.sessions.is_computing());
+    }
+
+    #[test]
+    fn p_245_a_low_order_verifier_key_is_answered_bad_verifier_under_the_session() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let (body, len) = vouch_body(PublicKey::from_bytes([0; 32]));
+        let frame = phone.sealed(MessageType::Vouch, &body[..len]);
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let (_, answer) = rig.compute().expect("queued");
+        assert!(matches!(
+            vouch_answer(&mut phone, &answer),
+            km43::VouchAnswer::BadVerifier
+        ));
         assert!(rig.sessions.is_bound(conn(1)), "a refusal ends nothing");
+    }
+
+    #[test]
+    fn p_244_a_vouch_body_that_does_not_read_is_sealed_1_and_queues_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let frame = phone.sealed(MessageType::Vouch, &[0xa0]);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Refused(1)));
+        assert_eq!(sealed_code(&mut phone, &answer), 1);
+        assert!(rig.sessions.next_job().is_none());
+        assert!(rig.sessions.is_bound(conn(1)));
+    }
+
+    #[test]
+    fn p_243_a_second_vouch_on_a_row_whose_job_is_taken_is_sealed_7_and_evicts_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let first = vouch_frame(&mut phone);
+        let (reply, _) = rig.send(&first);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let second = vouch_frame(&mut phone);
+        let (reply, answer) = rig.send(&second);
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
+        assert_eq!(sealed_code(&mut phone, &answer), 7);
+        let (_, answer) = rig.compute().expect("the first is still queued");
+        assert!(matches!(
+            vouch_answer(&mut phone, &answer),
+            km43::VouchAnswer::Vouched { .. }
+        ));
+        // Out at the worker counts too.
+        let (reply, _) = rig.send(&vouch_frame(&mut phone));
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let job = rig.sessions.next_job().expect("handed out");
+        let (reply, _) = rig.send(&vouch_frame(&mut phone));
+        assert_eq!(reply.note, Some(SessionNote::Refused(7)));
+        assert_eq!(job.ticket().conn, conn(1));
+    }
+
+    #[test]
+    fn p_243_a_vouch_takes_its_turn_with_the_handshakes_of_other_connections() {
+        let mut rig = Rig::new();
+        let mut vouching = enrolled_phone(&mut rig, 1, "one", 1);
+        vouching.hello(&mut rig).expect("a session");
+        let mut greeting = enrolled_phone(&mut rig, 2, "two", 2);
+        let (reply, _) = rig.send(&vouch_frame(&mut vouching));
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let (_, hello) = greeting.hello_frame();
+        let (reply, _) = rig.send(&hello);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(2))));
+        let first = rig.sessions.next_job().expect("one is handed out");
+        assert!(rig.sessions.next_job().is_none(), "never two at once");
+        let served = first.ticket().conn;
+        let done = rig.agreement.run(first);
+        let facts = rig.facts();
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = block_on(
+            rig.sessions
+                .completed(done, rig.now, &facts, &mut rig.part, &mut dst),
+        );
+        let second = rig.sessions.next_job().expect("the other one");
+        assert_ne!(second.ticket().conn, served);
+        assert!([conn(1), conn(2)].contains(&served));
+    }
+
+    #[test]
+    fn p_244_a_vouch_whose_session_ended_while_it_computed_is_sent_to_nobody() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        phone.hello(&mut rig).expect("a session");
+        let (reply, _) = rig.send(&vouch_frame(&mut phone));
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
+        let job = rig.sessions.next_job().expect("out at the worker");
+        let goodbye = phone.sealed(MessageType::Goodbye, &[0xa0]);
+        let (reply, _) = rig.send(&goodbye);
+        assert_eq!(reply.note, Some(SessionNote::Unbound(conn(1))));
+        let done = rig.agreement.run(job);
+        let facts = rig.facts();
+        let mut dst = [0u8; MAX_FRAME];
+        let reply =
+            block_on(
+                rig.sessions
+                    .completed(done, rig.now, &facts, &mut rig.part, &mut dst),
+            );
+        assert_eq!(reply.answer, None);
+        assert_eq!(reply.note, Some(SessionNote::Stale));
+        assert!(!rig.sessions.is_computing(), "the worker is free again");
     }
 
     #[test]
