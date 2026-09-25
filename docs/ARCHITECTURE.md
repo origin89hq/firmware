@@ -1645,11 +1645,9 @@ version, including a lower L-133 push, starts with no outcome. Old numeric
 versions are not a history; an earlier configuration says nothing about the
 credentials now installed under that number.
 
-For a written country-only configuration, the provisioning AP runs in AP+station
-mode with a dormant station: no SSID and no call to connect. The pinned radio
-cannot scan in AP-only mode. This permits an explicitly requested scan before
-there is a station session while retaining the AP's sockets and BLE's separate
-progress checks. Each scan has a four-second deadline; timeout produces a failed
+For a written country-only configuration, the station interface comes up
+without joining: no SSID and no call to connect. This permits an explicitly
+requested scan before there is a network to join. Each scan has a four-second deadline; timeout produces a failed
 result and ends the session so driver teardown stops an uncertain scan before
 another join or scan. An unwritten configuration never starts either active or
 passive scans. The recovery download window remains ahead of radio initialization.
