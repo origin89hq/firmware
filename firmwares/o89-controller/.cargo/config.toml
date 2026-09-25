@@ -7,4 +7,6 @@
 target = "thumbv6m-none-eabi"
 
 [target.thumbv6m-none-eabi]
-runner = "../frozen-watchdog.sh probe-rs run --chip STM32G0B1RETx"
+# `--no-catch-reset`: a reset is ordinary here, a watchdog's or the
+# firmware's own, and a caught one ends the run with the core held (#155).
+runner = "../frozen-watchdog.sh probe-rs run --chip STM32G0B1RETx --no-catch-reset"

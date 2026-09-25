@@ -23,7 +23,7 @@ use o89_core::mailbox::{
 };
 use o89_core::{Address, Dropped, FRAM_BYTES, Fram, Refused};
 use probe_rs::probe::list::Lister;
-use probe_rs::{MemoryInterface, Permissions, Session};
+use probe_rs::{MemoryInterface, Permissions, Session, VectorCatchCondition};
 
 /// The controller, as probe-rs names it.
 const TARGET: &str = "STM32G0B1RETx";
@@ -31,6 +31,31 @@ const TARGET: &str = "STM32G0B1RETx";
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How often the answer is looked for.
 const POLL: Duration = Duration::from_millis(5);
+/// The reset vector as the core fetches it after a reset: the second word
+/// of whichever bank the boot address maps at zero.
+const RESET_VECTOR: u64 = 0x0000_0004;
+
+/// Where a halted core stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halted {
+    /// On the first instruction of the reset handler, where the reset
+    /// vector catch stops it.
+    AtReset,
+    /// Anywhere else: a fault, a breakpoint or a debugger's halt.
+    At(u32),
+}
+
+impl Halted {
+    /// Where a core halted at `pc` stands, given the `vector` it resets to,
+    /// whose low bit only marks Thumb.
+    fn at(pc: u32, vector: u32) -> Self {
+        if pc == vector & !1 {
+            Self::AtReset
+        } else {
+            Self::At(pc)
+        }
+    }
+}
 
 /// A probe attached to a controller whose firmware serves the mailbox.
 pub struct Link {
@@ -128,8 +153,58 @@ impl Link {
             lease: 0,
             renewed: None,
         };
+        link.release()?;
         link.check()?;
         Ok(link)
+    }
+
+    /// Disarm the vector catches an earlier probe session left, and let go
+    /// of a core one of them holds at its reset (#155).
+    ///
+    /// `probe-rs attach` and `probe-rs run` arm the reset and hard-fault
+    /// catches and leave them armed when they end, and only a power-on
+    /// reset clears them. Every later reset, the firmware's `Reboot` among
+    /// them, then stops the core on its first instruction until something
+    /// runs it. A core halted anywhere else is left as it is: the halt is
+    /// evidence.
+    fn release(&mut self) -> Result<()> {
+        let mut core = self.session.core(0)?;
+        core.disable_vector_catch(VectorCatchCondition::All)
+            .context("disarming the vector catches")?;
+        if !core.core_halted()? {
+            return Ok(());
+        }
+        let pc: u32 = core
+            .read_core_reg(core.program_counter())
+            .context("reading the halted core's PC")?;
+        let vector = core.read_word_32(RESET_VECTOR)?;
+        match Halted::at(pc, vector) {
+            Halted::AtReset => {
+                // The magic the last run left in RAM would answer at once;
+                // the firmware clears it first thing anyway.
+                core.write_word_32(field(offset::MAGIC), 0)?;
+                core.run().context("running the core held at its reset")?;
+                eprintln!("note: the core was held at its reset by a vector catch; it runs now");
+                // The session stays until the firmware serves the mailbox:
+                // its end rewrites RCC_APBENR1, and one landing inside the
+                // boot took back the PWR clock the firmware had just
+                // enabled, leaving it spinning on DBP with no watchdog yet
+                // (#155). Bounded by the deadline: every turn sleeps.
+                let started = Instant::now();
+                while core.read_word_32(field(offset::MAGIC))? != MAGIC {
+                    if started.elapsed() > DEADLINE {
+                        bail!(
+                            "the core runs from its reset but served no mailbox within {DEADLINE:?}"
+                        );
+                    }
+                    sleep(POLL);
+                }
+                Ok(())
+            }
+            Halted::At(pc) => bail!(
+                "the core is halted at {pc:#010x}, not by the reset catch; `just attach-controller` shows why"
+            ),
+        }
     }
 
     fn check(&mut self) -> Result<()> {
@@ -428,5 +503,36 @@ impl Fram for Link {
         bytes: &[u8],
     ) -> impl Future<Output = Result<(), Refused<anyhow::Error>>> {
         ready(self.write_fram(at.0, bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Halted;
+
+    #[test]
+    fn a_core_on_its_reset_handler_is_the_reset_catch() {
+        assert_eq!(Halted::at(0x0800_00c0, 0x0800_00c1), Halted::AtReset);
+    }
+
+    #[test]
+    fn a_vector_without_its_thumb_bit_still_names_the_handler() {
+        assert_eq!(Halted::at(0x0800_00c0, 0x0800_00c0), Halted::AtReset);
+    }
+
+    #[test]
+    fn a_core_one_instruction_past_its_reset_is_left_halted() {
+        assert_eq!(
+            Halted::at(0x0800_00c2, 0x0800_00c1),
+            Halted::At(0x0800_00c2)
+        );
+    }
+
+    #[test]
+    fn an_erased_vector_never_releases_a_halted_core() {
+        assert_eq!(
+            Halted::at(0x0800_00c0, 0xffff_ffff),
+            Halted::At(0x0800_00c0)
+        );
     }
 }

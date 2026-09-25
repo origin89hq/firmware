@@ -1,6 +1,8 @@
 //! `firmwares/frozen-watchdog.sh`, run against a fake `probe-rs` that logs
 //! its arguments: the IWDG freeze a controller flash sets is cleared however
-//! the flash ends, and a flash never runs with the freeze unset (#125).
+//! the flash ends, and a flash never runs with the freeze unset (#125); the
+//! vector catches a probe session leaves armed are disarmed before the
+//! command and after it (#155).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const FREEZE: &str = "write --chip STM32G0B1RETx b32 0x40015808 0x1000";
 const THAW: &str = "write --chip STM32G0B1RETx b32 0x40015808 0";
+const DISARM: &str = "write --chip STM32G0B1RETx b32 0xE000EDFC 0";
 
 /// A directory holding the fake `probe-rs` and the log of its calls.
 struct Bench {
@@ -83,7 +86,10 @@ fn a_flash_runs_between_the_freeze_and_the_thaw() {
     let bench = Bench::new("order");
     let status = bench.run("", &["probe-rs", "download", "image"]);
     assert!(status.success());
-    assert_eq!(bench.calls(), [FREEZE, "download image", THAW]);
+    assert_eq!(
+        bench.calls(),
+        [DISARM, FREEZE, "download image", THAW, DISARM]
+    );
 }
 
 #[test]
@@ -91,7 +97,10 @@ fn a_failed_flash_still_thaws_the_watchdog_and_keeps_its_status() {
     let bench = Bench::new("failed");
     let status = bench.run("image", &["probe-rs", "download", "image"]);
     assert_eq!(status.code(), Some(3));
-    assert_eq!(bench.calls(), [FREEZE, "download image", THAW]);
+    assert_eq!(
+        bench.calls(),
+        [DISARM, FREEZE, "download image", THAW, DISARM]
+    );
 }
 
 #[test]
@@ -99,7 +108,7 @@ fn a_freeze_that_fails_flashes_nothing() {
     let bench = Bench::new("no-freeze");
     let status = bench.run("0x1000", &["probe-rs", "download", "image"]);
     assert!(!status.success());
-    assert_eq!(bench.calls(), [FREEZE]);
+    assert_eq!(bench.calls(), [DISARM, FREEZE]);
 }
 
 #[test]
@@ -107,7 +116,26 @@ fn a_thaw_that_fails_fails_a_flash_that_worked() {
     let bench = Bench::new("no-thaw");
     let status = bench.run("0x40015808 0", &["probe-rs", "download", "image"]);
     assert_eq!(status.code(), Some(1));
-    assert_eq!(bench.calls(), [FREEZE, "download image", THAW]);
+    assert_eq!(
+        bench.calls(),
+        [DISARM, FREEZE, "download image", THAW, DISARM]
+    );
+}
+
+#[test]
+fn a_reset_runs_only_once_the_vector_catches_are_disarmed() {
+    let bench = Bench::new("reset");
+    let status = bench.run("", &["probe-rs", "reset"]);
+    assert!(status.success());
+    assert_eq!(bench.calls(), [DISARM, FREEZE, "reset", THAW, DISARM]);
+}
+
+#[test]
+fn a_disarm_that_fails_runs_nothing() {
+    let bench = Bench::new("no-disarm");
+    let status = bench.run("0xE000EDFC 0", &["probe-rs", "reset"]);
+    assert!(!status.success());
+    assert_eq!(bench.calls(), [DISARM]);
 }
 
 /// Signals the script while its command runs, as `probe-rs run` does until
@@ -142,7 +170,10 @@ fn a_terminated_run_is_stopped_before_the_watchdog_thaws() {
     let (code, took, calls) = interrupt("terminated", "-TERM");
     assert_eq!(code, Some(143));
     assert!(took < Duration::from_secs(5), "the script waited {took:?}");
-    assert_eq!(calls, [FREEZE, "run image", "stopped", THAW]);
+    assert_eq!(
+        calls,
+        [DISARM, FREEZE, "run image", "stopped", THAW, DISARM]
+    );
 }
 
 #[test]
@@ -150,5 +181,8 @@ fn an_interrupted_run_is_stopped_before_the_watchdog_thaws() {
     let (code, took, calls) = interrupt("interrupted", "-INT");
     assert_eq!(code, Some(130));
     assert!(took < Duration::from_secs(5), "the script waited {took:?}");
-    assert_eq!(calls, [FREEZE, "run image", "stopped", THAW]);
+    assert_eq!(
+        calls,
+        [DISARM, FREEZE, "run image", "stopped", THAW, DISARM]
+    );
 }
