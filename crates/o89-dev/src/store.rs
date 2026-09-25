@@ -205,6 +205,17 @@ fn run_blank(
         }
     }
     link.reboot_blank()?;
+    // The ping's count cannot tell a reboot from a lost request on a part
+    // already at boot 1; the part can. Nothing writes the count but a boot,
+    // and the blank left it zero, so only a boot on the blanked store puts
+    // the first count there.
+    let boots = read::<BootCount, BOOT_COUNT_BYTES>(link, map::BOOT_COUNT)?;
+    if boots.present() != Some(&BootCount::FIRST) {
+        bail!(
+            "the part did not boot on the blanked store: its boot count reads {:?}",
+            boots.held()
+        );
+    }
     if born(link)? {
         bail!("the rebooted unit still holds a controller key or a generator");
     }

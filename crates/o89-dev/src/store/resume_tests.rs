@@ -1,9 +1,21 @@
 use super::*;
 use o89_core::{Address, Fram, SecretChange, Store};
 
+/// What a reboot request does to the fake part.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reboot {
+    /// The part boots on what it holds.
+    Boots,
+    /// The request fails and says so.
+    Fails,
+    /// The request comes back without the part having reset, as a lost
+    /// `Reboot` on a part already at boot 1 does.
+    Ignored,
+}
+
 struct FakeLink {
     bytes: Vec<u8>,
-    fail_reboot: bool,
+    reboot: Reboot,
     fail_readback: bool,
     reads_fail: bool,
     reboots: usize,
@@ -15,7 +27,7 @@ impl FakeLink {
     fn new() -> Self {
         Self {
             bytes: vec![0; map::END.0 as usize],
-            fail_reboot: false,
+            reboot: Reboot::Boots,
             fail_readback: false,
             reads_fail: false,
             reboots: 0,
@@ -58,7 +70,7 @@ impl Fram for FakeLink {
 impl SecretLink for FakeLink {
     fn reboot(&mut self) -> Result<()> {
         self.reboots = self.reboots.checked_add(1).unwrap();
-        if self.fail_reboot {
+        if self.reboot == Reboot::Fails {
             bail!("reboot failed");
         }
         let (_, report) = block_on(Store::boot(self, None)).map_err(|_| anyhow!("boot failed"))?;
@@ -71,6 +83,9 @@ impl SecretLink for FakeLink {
 
     fn reboot_blank(&mut self) -> Result<()> {
         self.reboots = self.reboots.checked_add(1).unwrap();
+        if self.reboot == Reboot::Ignored {
+            return Ok(());
+        }
         let (_, report) = block_on(Store::boot(self, None)).map_err(|_| anyhow!("boot failed"))?;
         if report.boot != o89_core::BootCount::FIRST {
             bail!("the boot count did not start over");
@@ -147,7 +162,7 @@ fn assert_label(output: &[u8], secret: Secret, fingerprint: Fingerprint) {
 #[test]
 fn resume_after_failed_reboot_prints_the_staged_secret_once() {
     let mut link = FakeLink::new();
-    link.fail_reboot = true;
+    link.reboot = Reboot::Fails;
     let mut output = Vec::new();
     let error = run_secret(&mut link, None, false, false, &mut output).unwrap_err();
     assert!(format!("{error:#}").contains("o89-dev store write-secret --resume"));
@@ -155,7 +170,7 @@ fn resume_after_failed_reboot_prints_the_staged_secret_once() {
     let SecretChange::Pending(staged, Some(_)) = link.transaction() else {
         panic!("pending, with the unit's birth")
     };
-    link.fail_reboot = false;
+    link.reboot = Reboot::Boots;
     run_secret(&mut link, None, false, true, &mut output).unwrap();
     let fingerprint = held_fingerprint(&mut link);
     assert_label(&output, staged, fingerprint);
@@ -519,4 +534,14 @@ fn p_235_a_provisioned_unit_blanks_to_an_unborn_one_whose_boot_count_starts_over
         held.present().is_none(),
         "the printed secret went with the rest"
     );
+}
+
+#[test]
+fn p_235_a_blank_whose_reboot_never_happened_is_not_reported_as_done() {
+    let mut link = FakeLink::new();
+    link.reboot = Reboot::Ignored;
+    let mut output = Vec::new();
+    let error = run_blank(&mut link, true, &mut output).unwrap_err();
+    assert!(format!("{error:#}").contains("did not boot"), "{error:#}");
+    assert!(output.is_empty());
 }
