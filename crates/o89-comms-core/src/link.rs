@@ -668,7 +668,7 @@ impl Link {
     ) -> Option<Frame> {
         let req_id = envelope.req_id();
         match kind {
-            LinkMessageType::WifiScan => self.scan_requested(envelope),
+            LinkMessageType::WifiScan => self.scan_requested(envelope, now),
             LinkMessageType::WifiScanResultAck | LinkMessageType::WifiStateAck => {
                 self.wifi_answered(kind, envelope, now);
                 None
@@ -802,16 +802,20 @@ impl Link {
         Some(Frame::PairingWindowAck { req_id, revision })
     }
 
-    fn scan_requested(&mut self, envelope: LinkEnvelope<'_>) -> Option<Frame> {
+    fn scan_requested(&mut self, envelope: LinkEnvelope<'_>, now: Tick) -> Option<Frame> {
         let req_id = envelope.req_id();
         let order = km43::ScanOrder::decode(envelope).ok()?;
         let country = self
             .credential()
             .and_then(|credential| credential.change().ok())
             .is_some_and(|change| !matches!(change, km43::NetChange::ClearUnwritten));
+        // Wi-Fi is off while the pairing window is open (F-043): a scan
+        // accepted now would run only after it closes, past the
+        // controller's deadline for the result.
+        let radio = country && self.pairing_window(now).is_none();
         Some(Frame::WifiScanAck {
             req_id,
-            outcome: self.wifi.scan(order, req_id, country),
+            outcome: self.wifi.scan(order, req_id, radio),
         })
     }
 
@@ -1252,6 +1256,53 @@ mod tests {
         assert_eq!(link.retry_offer(at(2012)), None);
         assert!(
             matches!(link.wifi_request(at(2012)),Some(Frame::WifiState {report,..}) if report==final_report)
+        );
+    }
+
+    #[test]
+    fn f_043_a_scan_asked_while_the_pairing_window_is_open_is_refused_radio_off() {
+        let mut link = linked_at_boot();
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Clear {
+                version: 1,
+                country: "CA",
+                hostname: "origin89",
+            })
+            .expect("metadata"),
+        ));
+        let mut buf = [0u8; 256];
+        let _ = link.received(report(&mut buf, ReqId(8), 1, 60_000, 0), at(1_000));
+        let order = km43::ScanOrder {
+            scan: core::num::NonZeroU32::MIN,
+        };
+        let mut bytes = [0; 256];
+        let len = order
+            .write(
+                link_header(LinkMessageType::WifiScan, ReqId(80)),
+                &mut bytes,
+            )
+            .expect("order");
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(2_000)
+            ),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::RefusedRadioOff,
+            })
+        );
+        assert_eq!(link.wifi.take_scan(), None, "nothing queued for later");
+        // Once the window has run out, the same order starts.
+        assert_eq!(
+            link.received(
+                LinkEnvelope::decode(&bytes[..len]).expect("envelope"),
+                at(61_000)
+            ),
+            Some(Frame::WifiScanAck {
+                req_id: ReqId(80),
+                outcome: km43::WifiScan::Started,
+            })
         );
     }
 
