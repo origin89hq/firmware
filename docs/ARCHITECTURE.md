@@ -1453,7 +1453,8 @@ on it only from the controller UART once its own link is up (L-194) and
 keeps the lifetime on its own clock from receipt. The radio's plan
 (`o89_comms_core::Plan`) reads the network record alone: a `set` record
 runs the station, a `clear` that kept a country brings the station
-interface up without joining so a client can still scan, and a change of
+interface up without joining once a client's scan is accepted, and keeps
+Wi-Fi off before that so a phone can connect over BLE (#166), and a change of
 record restarts the Wi-Fi session.
 Advertising is transport availability, not permission to pair; the
 controller checks its window when it processes `Pair`. Cloud stays out of V1.
@@ -1564,7 +1565,8 @@ runner and NTP run concurrently within one Wi-Fi session, so a failed
 association does not hold up the UART or BLE tasks. Each reports
 progress before the link feeds the watchdog. An unwritten clear keeps
 Wi-Fi off; a written clear retains the country, and the radio scans under
-it without joining. While the pairing window is open Wi-Fi stays off
+it without joining once a client asks for a scan, until no client is left
+connected and the result is settled (#166). While the pairing window is open Wi-Fi stays off
 altogether (F-043).
 
 On esp-radio 1.0.0-beta.1 BLE and a running station do not share the radio.
@@ -1579,7 +1581,10 @@ is the only transition the radio makes in place, and any session that ends,
 a changed record, a changed plan or a stuck scan, reboots the module
 through its recovery window into the new plan, after the station's mDNS
 goodbye. A window opened while the station runs costs that reboot; the
-window at boot does not, because Wi-Fi waits for its report.
+window at boot does not, because Wi-Fi waits for its report. With no network
+cached, a scan starts the station only once its client is connected over
+BLE; whether that connection survives the station starting and scanning is
+not yet measured (#166).
 The radio and its RTOS use a fixed 72 KiB heap; credential storage and application networking buffers do not allocate. The IP stack's
 socket set is fixed, and smoltcp panics, resetting the module, when a
 socket arrives at a full one, so the budget is a sum of named slots in
@@ -1645,8 +1650,12 @@ version, including a lower L-133 push, starts with no outcome. Old numeric
 versions are not a history; an earlier configuration says nothing about the
 credentials now installed under that number.
 
-For a written country-only configuration, the station interface comes up
-without joining: no SSID and no call to connect. This permits an explicitly
+For a written country-only configuration, Wi-Fi stays off until a scan is
+accepted, so a phone can open its BLE connection (#166); the station
+interface then comes up without joining: no SSID and no call to connect.
+It stays up while any client is connected or the result waits for its
+acknowledgement, and the module then reboots into Wi-Fi off, since
+stopping a started station in place leaves BLE silent. This permits an explicitly
 requested scan before there is a network to join. Each scan has a four-second deadline; timeout produces a failed
 result and ends the session so driver teardown stops an uncertain scan before
 another join or scan. An unwritten configuration never starts either active or

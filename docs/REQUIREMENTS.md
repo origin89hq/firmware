@@ -297,6 +297,9 @@ address with the window closed. A phone already connected
 keeps its connection, so the app can hand over to Wi-Fi. Once joined, a
 client finds the controller over mDNS (P-224); a changed router, passphrase
 or address leaves the station unjoined, and BLE is back for recovery.
+With no network cached, Wi-Fi stays off until a connected client's scan is
+accepted, because on the pinned radio a phone cannot open a BLE connection
+beside a running station (#166).
 Source: [#147](https://github.com/origin89hq/firmware/issues/147), L-194,
 L-195. M4.
 
@@ -531,8 +534,10 @@ unfinished accepted scan as failed. The core reports `no_ip` after four seconds
 associated without IPv4, continues trying, and reports `lost` on association
 loss. The DHCP client resends DISCOVER after two seconds, so one lost
 DISCOVER is resent before `no_ip` is reported. A country-only configuration
-brings the station interface up without joining, so scanning works without
-attempting a station association.
+keeps Wi-Fi off until a scan is accepted, then brings the station interface
+up without joining, so scanning works without attempting a station
+association; it stays up while a client remains connected or the result is
+outstanding, and the module then reboots with Wi-Fi off (F-044).
 
 Source: [firmware #138](https://github.com/origin89hq/firmware/issues/138),
 [#143](https://github.com/origin89hq/firmware/issues/143), KM43 L-200 to
