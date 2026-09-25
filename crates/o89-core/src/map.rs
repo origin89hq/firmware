@@ -9,6 +9,7 @@
 //! line is the assertion: a map that does not fit does not build.
 
 use crate::boot_count::BOOT_COUNT_BYTES;
+use crate::budget::BUDGET_BYTES;
 use crate::clients::{KEY_RECORD_BYTES, MARK_BYTES, SLOTS};
 use crate::dedup::COMMANDS_BYTES;
 use crate::drbg::DRBG_BYTES;
@@ -134,8 +135,23 @@ pub(crate) const SECRET_CHANGE_START: Address = LOAD_SHED_CONFIG.end();
 pub const SECRET_CHANGE: Record<{ crate::SECRET_CHANGE_BYTES }> =
     Record::at(magic(*b"SROT"), SECRET_CHANGE_START);
 
+/// Each slot's proposal budget (P-254), a record of its own beside the
+/// slot's key record and never inside it: it is written on every proposal,
+/// and a cut during one must tear at most the budget.
+pub const BUDGETS: [Record<BUDGET_BYTES>; SLOTS] = [
+    BUDGET_1, BUDGET_2, BUDGET_3, BUDGET_4, BUDGET_5, BUDGET_6, BUDGET_7, BUDGET_8,
+];
+const BUDGET_1: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD1"), SECRET_CHANGE.end());
+const BUDGET_2: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD2"), BUDGET_1.end());
+const BUDGET_3: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD3"), BUDGET_2.end());
+const BUDGET_4: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD4"), BUDGET_3.end());
+const BUDGET_5: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD5"), BUDGET_4.end());
+const BUDGET_6: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD6"), BUDGET_5.end());
+const BUDGET_7: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD7"), BUDGET_6.end());
+const BUDGET_8: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD8"), BUDGET_7.end());
+
 /// The first address nothing in the map uses.
-pub const END: Address = SECRET_CHANGE.end();
+pub const END: Address = BUDGET_8.end();
 
 // The budget: the whole map, both slots of every record, inside the part.
 const _: () = assert!((END.0 as usize) <= FRAM_BYTES);
@@ -168,8 +184,12 @@ mod tests {
         // A 32-byte body is a 44-byte slot.
         assert_eq!(DRBG.end(), Address(32 + 88));
         assert_eq!(
-            usize::from(END.0) - usize::from(LOAD_SHED_CONFIG.end().0),
+            usize::from(SECRET_CHANGE.end().0) - usize::from(LOAD_SHED_CONFIG.end().0),
             2 * slot_bytes(crate::SECRET_CHANGE_BYTES)
+        );
+        assert_eq!(
+            usize::from(END.0) - usize::from(SECRET_CHANGE.end().0),
+            SLOTS * 2 * slot_bytes(BUDGET_BYTES)
         );
         assert_eq!(
             usize::from(GENERATION_MARK_1.end().0) - usize::from(NETWORK.end().0),
