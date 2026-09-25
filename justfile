@@ -164,12 +164,13 @@ run-comms-devkit:
 # Read the defmt log of whatever the controller is running, without flashing
 # or resetting it: the way to read a boot record after a reset the probe did
 # not cause. `elf` is the image on the part, for the log's strings. A reset
-# during the attach runs through, rather than ending it with the core held
-# at its reset vector (#155).
+# or a hard fault during the attach runs through the firmware as it would
+# unattached, rather than ending it with the core held (#155); the runners
+# keep the hard-fault catch, which `run-controller-bench-halting` needs.
 #
 # Read the controller's log without flashing or resetting it.
 attach-controller elf=controller_elf:
-    firmwares/frozen-watchdog.sh probe-rs attach --chip {{chip}} --no-catch-reset {{elf}}
+    firmwares/frozen-watchdog.sh probe-rs attach --chip {{chip}} --no-catch-reset --no-catch-hardfault {{elf}}
 
 # Reset the controller through the probe. Effect: a pin-class reset; the
 # boot record on the next attach says so.
