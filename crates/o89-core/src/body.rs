@@ -76,6 +76,21 @@ pub enum Unchanged<E> {
     Refused(Refused<E>),
 }
 
+/// Why a verified write is not on the part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a write that did not read back is one nothing may rest on"]
+pub enum Unverified<E> {
+    /// The write did not happen, or failed part-way.
+    Refused(Refused<E>),
+    /// The write went out and the read-back failed on the bus: what the
+    /// part holds is not known, and the handle says `Corrupt`.
+    ReadBack(E),
+    /// The read-back found something other than what was written. What it
+    /// found is what the handle now holds.
+    Disagreed,
+}
+
 /// A record and its decoded value, kept together so the one in RAM is
 /// always the one on the part.
 ///
@@ -110,6 +125,16 @@ impl<T: Body<N>, const N: usize> Kept<T, N> {
         })
     }
 
+    /// A handle on `record` before it is read: holds nothing, and is read
+    /// in place by the one caller that builds an array of them.
+    pub(crate) const fn unread(record: Record<N>) -> Self {
+        Self {
+            record,
+            position: Position::Start,
+            held: Held::Absent,
+        }
+    }
+
     /// The record this keeps.
     #[must_use]
     pub const fn record(&self) -> Record<N> {
@@ -140,6 +165,48 @@ impl<T: Body<N>, const N: usize> Kept<T, N> {
         self.position = written.position;
         self.held = Held::Present(value);
         Ok(())
+    }
+
+    /// Write `value`, then read the record back off the part, and succeed
+    /// only if the part holds exactly `value`. What the rules that need a
+    /// read-back mean by one: the epoch (P-085), a slot and its generation
+    /// mark (P-239), the generator's state (P-237).
+    ///
+    /// After this returns, whatever it returns, the handle holds what the
+    /// read found, never what was meant to land.
+    pub async fn write_verified<F: Fram>(
+        &mut self,
+        fram: &mut F,
+        value: T,
+    ) -> Result<(), Unverified<F::Error>>
+    where
+        T: PartialEq,
+    {
+        let body = value.encode();
+        let written = self.record.write(fram, self.position, &body).await;
+        let read = Self::read(self.record, fram).await;
+        match (written, read) {
+            (Err(refused), Ok(found)) => {
+                *self = found;
+                Err(Unverified::Refused(refused))
+            }
+            (Err(refused), Err(_)) => Err(Unverified::Refused(refused)),
+            (Ok(written), Err(bus)) => {
+                // The next write still goes to the other copy.
+                self.position = written.position;
+                self.held = Held::Corrupt;
+                Err(Unverified::ReadBack(bus))
+            }
+            (Ok(_), Ok(found)) => {
+                let agrees = found.present() == Some(&value);
+                *self = found;
+                if agrees {
+                    Ok(())
+                } else {
+                    Err(Unverified::Disagreed)
+                }
+            }
+        }
     }
 
     /// Remove the previous slot's bytes while retaining the current record.
@@ -316,6 +383,11 @@ mod tests {
         bytes: [u8; 128],
         falling: bool,
         writes: usize,
+        /// Every read refused on the bus.
+        fail_reads: bool,
+        /// After this many writes, flip the byte at this offset: damage
+        /// between a write and its read-back.
+        flip: Option<(usize, usize)>,
     }
 
     impl Part {
@@ -324,6 +396,8 @@ mod tests {
                 bytes: [0; 128],
                 falling: false,
                 writes: 0,
+                fail_reads: false,
+                flip: None,
             }
         }
     }
@@ -332,6 +406,9 @@ mod tests {
         type Error = ();
 
         fn read(&mut self, at: Address, into: &mut [u8]) -> impl Future<Output = Result<(), ()>> {
+            if self.fail_reads {
+                return core::future::ready(Err(()));
+            }
             let start = usize::from(at.0);
             into.copy_from_slice(&self.bytes[start..][..into.len()]);
             core::future::ready(Ok(()))
@@ -348,6 +425,11 @@ mod tests {
                 self.writes = self.writes.saturating_add(1);
                 let start = usize::from(at.0);
                 self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
+                if let Some((after, at)) = self.flip
+                    && self.writes == after
+                {
+                    self.bytes[at] ^= 0x01;
+                }
                 Ok(())
             };
             core::future::ready(outcome)
@@ -455,5 +537,64 @@ mod tests {
         let nothing = block_on(kept.update(&mut part, |count| count.0 = 5));
         assert_eq!(nothing, Err(Unchanged::NothingHeld));
         assert_eq!(kept.held(), &Held::Absent);
+    }
+
+    #[test]
+    fn p_085_a_verified_write_that_reads_back_is_what_the_handle_holds() {
+        let mut part = Part::fresh();
+        let mut kept = block_on(Kept::<Count, 4>::read(COUNT, &mut part)).expect("reads");
+        assert_eq!(block_on(kept.write_verified(&mut part, Count(5))), Ok(()));
+        assert_eq!(kept.present(), Some(&Count(5)));
+        // Again, onto the other slot: the second write agrees as well.
+        assert_eq!(block_on(kept.write_verified(&mut part, Count(6))), Ok(()));
+        let found = block_on(Kept::<Count, 4>::read(COUNT, &mut part)).expect("reads");
+        assert_eq!(found.present(), Some(&Count(6)));
+    }
+
+    #[test]
+    fn p_085_a_refused_verified_write_leaves_the_handle_on_what_the_part_holds() {
+        let mut part = Part::fresh();
+        let mut kept = block_on(Kept::<Count, 4>::read(COUNT, &mut part)).expect("reads");
+        block_on(kept.write(&mut part, Count(1))).expect("the supply is fine");
+        part.falling = true;
+        assert_eq!(
+            block_on(kept.write_verified(&mut part, Count(2))),
+            Err(Unverified::Refused(Refused::SupplyFalling))
+        );
+        assert_eq!(kept.present(), Some(&Count(1)));
+    }
+
+    #[test]
+    fn p_085_a_read_back_the_bus_refuses_is_corrupt_and_the_next_write_goes_to_the_other_slot() {
+        let mut part = Part::fresh();
+        let mut kept = block_on(Kept::<Count, 4>::read(COUNT, &mut part)).expect("reads");
+        block_on(kept.write(&mut part, Count(1))).expect("slot A");
+        part.fail_reads = true;
+        assert_eq!(
+            block_on(kept.write_verified(&mut part, Count(2))),
+            Err(Unverified::ReadBack(()))
+        );
+        assert_eq!(kept.held(), &Held::Corrupt);
+        // Count(2) landed in slot B; the next write goes back to A and is
+        // the newer record, so nothing that landed is overwritten.
+        part.fail_reads = false;
+        assert_eq!(block_on(kept.write_verified(&mut part, Count(3))), Ok(()));
+        assert_eq!(u32::from_le_bytes([part.bytes[16 + 8], 0, 0, 0]), 2);
+        assert_eq!(part.bytes[8], 3);
+    }
+
+    #[test]
+    fn p_085_bytes_damaged_between_the_write_and_the_read_back_disagree() {
+        let mut part = Part::fresh();
+        let mut kept = block_on(Kept::<Count, 4>::read(COUNT, &mut part)).expect("reads");
+        block_on(kept.write(&mut part, Count(1))).expect("slot A");
+        // The body of slot B is flipped by the last transaction of the write.
+        part.flip = Some((part.writes + 5, 16 + 8));
+        assert_eq!(
+            block_on(kept.write_verified(&mut part, Count(2))),
+            Err(Unverified::Disagreed)
+        );
+        // What the read found is slot A's record: the handle says so.
+        assert_eq!(kept.present(), Some(&Count(1)));
     }
 }

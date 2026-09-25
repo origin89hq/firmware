@@ -8,15 +8,16 @@
 //! pets the part, which resets about eight seconds later with the blame in
 //! RAM for the next boot to read (F-007, F-008).
 //!
-//! **It runs from an interrupt, above the thread executor.** The tasks it
-//! judges are cooperative, and a bus transfer that never returns blocks
+//! **It runs from an interrupt, above every executor it judges.** The tasks
+//! it judges are cooperative, and a bus transfer that never returns blocks
 //! the executor they share; a supervisor on that executor would then never
 //! run, the watchdog would still reset the part, and the boot after would
 //! have no name to blame. From its own interrupt the supervisor keeps
 //! running through a blocked executor, so the watchdog is the floor and
 //! the blame is still written. The line is `CEC`, which nothing on this
-//! board drives, at the lowest interrupt priority, so the time driver and
-//! every bus come first and the supervisor never delays them.
+//! board drives, at `P2`: above the control executor at `P3` and key
+//! agreement in thread mode below it, and below the time driver and every
+//! bus, which it never delays.
 
 use core::cell::Cell;
 
@@ -42,13 +43,13 @@ fn CEC() {
     unsafe { EXECUTOR.on_interrupt() }
 }
 
-/// Start the supervisor on its own executor, above the thread executor.
+/// Start the supervisor on its own executor, above the control executor.
 pub fn start(
     wdg: IndependentWatchdog<'static, IWDG>,
     status: Output<'static>,
     fault: Output<'static>,
 ) -> Result<(), SpawnError> {
-    interrupt::CEC.set_priority(Priority::P3);
+    interrupt::CEC.set_priority(Priority::P2);
     let spawner = EXECUTOR.start(interrupt::CEC);
     spawner.spawn(run(wdg, status, fault)?);
     Ok(())

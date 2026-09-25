@@ -9,8 +9,9 @@
 //! line is the assertion: a map that does not fit does not build.
 
 use crate::boot_count::BOOT_COUNT_BYTES;
-use crate::challenge::CHALLENGE_COUNTER_BYTES;
-use crate::clients::CLIENT_TABLE_BYTES;
+use crate::clients::{KEY_RECORD_BYTES, MARK_BYTES, SLOTS};
+use crate::dedup::COMMANDS_BYTES;
+use crate::drbg::DRBG_BYTES;
 use crate::epoch::EPOCH_BYTES;
 use crate::fram::{Address, FRAM_BYTES, Record};
 use crate::network::NETWORK_BYTES;
@@ -18,20 +19,18 @@ use crate::panic_record::PANIC_RECORD_BYTES;
 use crate::rail::CUTS_RECORD_BYTES;
 use crate::release::COMMS_RELEASE_BYTES;
 use crate::run_reason::RUN_REASON_BYTES;
-use crate::secret::SECRET_BYTES;
+use crate::secret::{CONTROLLER_KEY_BYTES, SECRET_BYTES};
 use crate::write_volume::WRITE_VOLUME_BYTES;
 
 /// The epoch: a `u32` that only ever increments (P-085).
 pub const EPOCH: Record<EPOCH_BYTES> = Record::at(magic(*b"EPOC"), Address(0));
 
-/// The challenge counter, written before the challenge it names leaves: a
-/// `u64`, the width the derivation takes (F-041).
-pub const CHALLENGE_COUNTER: Record<CHALLENGE_COUNTER_BYTES> =
-    Record::at(magic(*b"CHAL"), EPOCH.end());
+/// The random bit generator's state, advanced and read back before every
+/// draw is used (P-237).
+pub const DRBG: Record<DRBG_BYTES> = Record::at(magic(*b"DRBG"), EPOCH.end());
 
 /// The boot count.
-pub const BOOT_COUNT: Record<BOOT_COUNT_BYTES> =
-    Record::at(magic(*b"BOOT"), CHALLENGE_COUNTER.end());
+pub const BOOT_COUNT: Record<BOOT_COUNT_BYTES> = Record::at(magic(*b"BOOT"), DRBG.end());
 
 /// The rolling 24-hour write-volume counter: the count and its window
 /// (F-024).
@@ -41,8 +40,13 @@ pub const WRITE_VOLUME: Record<WRITE_VOLUME_BYTES> = Record::at(magic(*b"VOLU"),
 /// device id and the thirty-two of the printed secret (P-038, P-044).
 pub const DEVICE_SECRET: Record<SECRET_BYTES> = Record::at(magic(*b"SECR"), WRITE_VOLUME.end());
 
+/// The controller key's private half, written at manufacture and never
+/// again (P-235).
+pub const CONTROLLER_KEY: Record<CONTROLLER_KEY_BYTES> =
+    Record::at(magic(*b"CKEY"), DEVICE_SECRET.end());
+
 /// Why the generator is running, written before the output moves (F-022).
-pub const RUN_REASON: Record<RUN_REASON_BYTES> = Record::at(magic(*b"RUNR"), DEVICE_SECRET.end());
+pub const RUN_REASON: Record<RUN_REASON_BYTES> = Record::at(magic(*b"RUNR"), CONTROLLER_KEY.end());
 
 /// The panic record: the boot it happened at and what the last words
 /// carry, kept past a power cut.
@@ -57,17 +61,56 @@ pub const COMMS_RELEASE: Record<COMMS_RELEASE_BYTES> =
 /// its version, the credentials, the country and the hostname.
 pub const NETWORK: Record<NETWORK_BYTES> = Record::at(magic(*b"NETW"), COMMS_RELEASE.end());
 
-/// The client table: every enrolled client's label, kind, mask and counter,
-/// and the dedup table beside them, in one record because P-080 lands a
-/// counter and an in-flight entry in one transaction (P-081, P-105,
+/// Each slot's key record, two copies with a sequence number and a CRC
+/// (P-239).
+pub const CLIENT_KEYS: [Record<KEY_RECORD_BYTES>; SLOTS] = [
+    CLIENT_KEY_1,
+    CLIENT_KEY_2,
+    CLIENT_KEY_3,
+    CLIENT_KEY_4,
+    CLIENT_KEY_5,
+    CLIENT_KEY_6,
+    CLIENT_KEY_7,
+    CLIENT_KEY_8,
+];
+const CLIENT_KEY_1: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY1"), NETWORK.end());
+const CLIENT_KEY_2: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY2"), CLIENT_KEY_1.end());
+const CLIENT_KEY_3: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY3"), CLIENT_KEY_2.end());
+const CLIENT_KEY_4: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY4"), CLIENT_KEY_3.end());
+const CLIENT_KEY_5: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY5"), CLIENT_KEY_4.end());
+const CLIENT_KEY_6: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY6"), CLIENT_KEY_5.end());
+const CLIENT_KEY_7: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY7"), CLIENT_KEY_6.end());
+const CLIENT_KEY_8: Record<KEY_RECORD_BYTES> = Record::at(magic(*b"KEY8"), CLIENT_KEY_7.end());
+
+/// Each slot's generation mark: the highest generation it has issued,
+/// raised and read back before the slot is re-keyed (P-239).
+pub const GENERATION_MARKS: [Record<MARK_BYTES>; SLOTS] = [
+    GENERATION_MARK_1,
+    GENERATION_MARK_2,
+    GENERATION_MARK_3,
+    GENERATION_MARK_4,
+    GENERATION_MARK_5,
+    GENERATION_MARK_6,
+    GENERATION_MARK_7,
+    GENERATION_MARK_8,
+];
+const GENERATION_MARK_1: Record<MARK_BYTES> = Record::at(magic(*b"GEN1"), CLIENT_KEY_8.end());
+const GENERATION_MARK_2: Record<MARK_BYTES> = Record::at(magic(*b"GEN2"), GENERATION_MARK_1.end());
+const GENERATION_MARK_3: Record<MARK_BYTES> = Record::at(magic(*b"GEN3"), GENERATION_MARK_2.end());
+const GENERATION_MARK_4: Record<MARK_BYTES> = Record::at(magic(*b"GEN4"), GENERATION_MARK_3.end());
+const GENERATION_MARK_5: Record<MARK_BYTES> = Record::at(magic(*b"GEN5"), GENERATION_MARK_4.end());
+const GENERATION_MARK_6: Record<MARK_BYTES> = Record::at(magic(*b"GEN6"), GENERATION_MARK_5.end());
+const GENERATION_MARK_7: Record<MARK_BYTES> = Record::at(magic(*b"GEN7"), GENERATION_MARK_6.end());
+const GENERATION_MARK_8: Record<MARK_BYTES> = Record::at(magic(*b"GEN8"), GENERATION_MARK_7.end());
+
+/// The dedup table, under the epoch its entries were made in (P-080,
 /// P-121).
-pub const CLIENT_TABLE: Record<CLIENT_TABLE_BYTES> = Record::at(magic(*b"CLNT"), NETWORK.end());
+pub const COMMANDS: Record<COMMANDS_BYTES> = Record::at(magic(*b"CMDS"), GENERATION_MARK_8.end());
 
 /// The recovery ladder's cuts of the last hour, kept before the rail goes
 /// off so a controller reset does not lower the count L-112 is judged on
-/// (F-017). Before the configuration sections, which nothing has written
-/// yet, so that adding it moved nothing a part holds.
-pub const RECENT_CUTS: Record<CUTS_RECORD_BYTES> = Record::at(magic(*b"LADR"), CLIENT_TABLE.end());
+/// (F-017).
+pub const RECENT_CUTS: Record<CUTS_RECORD_BYTES> = Record::at(magic(*b"LADR"), COMMANDS.end());
 
 /// The site configuration section (P-102).
 pub const SITE_CONFIG: Record<2048> = Record::at(magic(*b"SITE"), RECENT_CUTS.end());
@@ -86,7 +129,8 @@ pub const LOAD_SHED_CONFIG: Record<1024> = Record::at(magic(*b"SHED"), SCHEDULE_
 
 pub(crate) const SECRET_CHANGE_START: Address = LOAD_SHED_CONFIG.end();
 
-/// Bench secret replacement intent, appended without moving existing records.
+/// The manufacturing transaction: the secret, and on a unit's first one the
+/// controller key and the generator's first state, applied at the next boot.
 pub const SECRET_CHANGE: Record<{ crate::SECRET_CHANGE_BYTES }> =
     Record::at(magic(*b"SROT"), SECRET_CHANGE_START);
 
@@ -121,14 +165,19 @@ mod tests {
         // eight-byte body is a 20-byte slot.
         assert_eq!(slot_bytes(4), 16);
         assert_eq!(EPOCH.end(), Address(32));
-        assert_eq!(CHALLENGE_COUNTER.end(), Address(72));
+        // A 32-byte body is a 44-byte slot.
+        assert_eq!(DRBG.end(), Address(32 + 88));
         assert_eq!(
             usize::from(END.0) - usize::from(LOAD_SHED_CONFIG.end().0),
-            122
+            2 * slot_bytes(crate::SECRET_CHANGE_BYTES)
+        );
+        assert_eq!(
+            usize::from(GENERATION_MARK_1.end().0) - usize::from(NETWORK.end().0),
+            SLOTS * 2 * slot_bytes(KEY_RECORD_BYTES) + 2 * slot_bytes(MARK_BYTES)
         );
         assert_eq!(
             usize::from(RECENT_CUTS.end().0),
-            usize::from(CLIENT_TABLE.end().0) + 2 * slot_bytes(CUTS_RECORD_BYTES)
+            usize::from(COMMANDS.end().0) + 2 * slot_bytes(CUTS_RECORD_BYTES)
         );
         assert_eq!(
             usize::from(SITE_CONFIG.end().0),
@@ -140,15 +189,32 @@ mod tests {
     fn f_020_every_magic_is_distinct_and_none_is_zero() {
         let magics = [
             magic(*b"EPOC"),
-            magic(*b"CHAL"),
+            magic(*b"DRBG"),
             magic(*b"BOOT"),
             magic(*b"VOLU"),
             magic(*b"SECR"),
+            magic(*b"CKEY"),
             magic(*b"RUNR"),
             magic(*b"PANI"),
             magic(*b"RELS"),
             magic(*b"NETW"),
-            magic(*b"CLNT"),
+            magic(*b"KEY1"),
+            magic(*b"KEY2"),
+            magic(*b"KEY3"),
+            magic(*b"KEY4"),
+            magic(*b"KEY5"),
+            magic(*b"KEY6"),
+            magic(*b"KEY7"),
+            magic(*b"KEY8"),
+            magic(*b"GEN1"),
+            magic(*b"GEN2"),
+            magic(*b"GEN3"),
+            magic(*b"GEN4"),
+            magic(*b"GEN5"),
+            magic(*b"GEN6"),
+            magic(*b"GEN7"),
+            magic(*b"GEN8"),
+            magic(*b"CMDS"),
             magic(*b"SITE"),
             magic(*b"GENR"),
             magic(*b"FRST"),

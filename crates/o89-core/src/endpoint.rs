@@ -7,13 +7,16 @@
 //! goes to the [`Sessions`] (L-002, P-021). The two share the rows: the
 //! link admits and frees them on the comms processor's word, the sessions
 //! decide what each row holds, and a close either one wants goes out as
-//! the link's request. The adapter and the simulator both drive this, so
-//! the composition is written once.
+//! the link's request. Key agreement leaves through [`Endpoint::next_job`]
+//! and comes back through [`Endpoint::completed`], so whoever computes it
+//! does so off the executor that calls this (P-243). The adapter and the
+//! simulator both drive this, so the composition is written once.
 //!
-//! cites: L-002
+//! cites: L-002, P-243
 
 use km43::LinkEnvelope;
 
+use crate::agreement::{Done, Job};
 use crate::fram::Fram;
 use crate::link::{Actions, Link};
 use crate::session::{Facts, LogSpan, Reply, Sessions};
@@ -85,19 +88,44 @@ impl Endpoint {
         }
         let controller_fw = self.link.identity().fw;
         let peer = self.link.peer().copied();
-        let facts = Facts {
-            model: local.model,
-            fw_controller: controller_fw.as_str(),
-            fw_comms: peer.as_ref().map_or("", |peer| peer.fw.as_str()),
-            log: local.log,
-            time_known: local.time_known,
-            pairing_open: local.pairing_open,
-            link: self.link.compat(),
-        };
+        let facts = facts(&self.link, local, controller_fw.as_str(), peer.as_ref());
         let reply = self
             .sessions
             .frame(frame, now, (&facts, &mut self.link.wifi), fram, dst)
             .await;
+        self.answered(reply, now)
+    }
+
+    /// The next key agreement to compute, if the worker is free and one
+    /// waits (P-243).
+    pub fn next_job(&mut self) -> Option<Job> {
+        self.sessions.next_job()
+    }
+
+    /// A job the adapter could not hand to the worker, put back.
+    pub fn unsent(&mut self, job: Job) {
+        self.sessions.unsent(job);
+    }
+
+    /// A key agreement came back from the worker: its answer, if its
+    /// handshake is still the one its connection is in.
+    pub async fn completed<F: Fram>(
+        &mut self,
+        done: Done,
+        now: Tick,
+        local: &Local<'_>,
+        fram: &mut F,
+        dst: &mut [u8],
+    ) -> Step {
+        let controller_fw = self.link.identity().fw;
+        let peer = self.link.peer().copied();
+        let facts = facts(&self.link, local, controller_fw.as_str(), peer.as_ref());
+        let reply = self.sessions.completed(done, now, &facts, fram, dst).await;
+        self.answered(reply, now)
+    }
+
+    /// A client's answer, and the close it asked for as the link's request.
+    fn answered(&mut self, reply: Reply, now: Tick) -> Step {
         let actions = match reply.close {
             Some(close) => self.link.close(close.conn, close.reason, now),
             None => Actions::NONE,
@@ -126,6 +154,24 @@ impl Endpoint {
                 .close_into(close.conn, close.reason, now, &mut actions);
         }
         actions
+    }
+}
+
+/// What the sessions are told that neither half holds on its own.
+fn facts<'a>(
+    link: &Link,
+    local: &Local<'a>,
+    fw_controller: &'a str,
+    peer: Option<&'a crate::link::Peer>,
+) -> Facts<'a> {
+    Facts {
+        model: local.model,
+        fw_controller,
+        fw_comms: peer.map_or("", |peer| peer.fw.as_str()),
+        log: local.log,
+        time_known: local.time_known,
+        pairing_open: local.pairing_open,
+        link: link.compat(),
     }
 }
 

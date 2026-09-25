@@ -200,14 +200,16 @@ enum StoreCommand {
         epoch: u32,
     },
     /// Write the device secret: sixteen bytes of id and thirty-two of
-    /// printed secret from the operating system's generator. Reboots the
-    /// controller to reset its challenge counter, then verifies and shows the label once.
+    /// printed secret from the operating system's generator, and on a unit
+    /// with no controller key its controller key and generator seed, which
+    /// never leave this process except to the controller. Reboots the
+    /// controller to apply them, then verifies and shows the v2 label once.
     WriteSecret {
         /// The device id as thirty-two hex characters; generated when absent.
         #[arg(long)]
         device_id: Option<String>,
-        /// Replace a secret the part already holds, which orphans every
-        /// client enrolled under it.
+        /// Replace the printed secret of a unit that already has one; its
+        /// controller key, generator and enrolled clients stay.
         #[arg(long)]
         replace: bool,
         /// Recover the label from an interrupted secret write.

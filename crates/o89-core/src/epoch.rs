@@ -1,26 +1,23 @@
 //! The epoch: the one number on this device that can invalidate key
 //! material, and the order a factory reset moves it in.
 //!
-//! Every client key derives from the epoch and the slot, so an epoch that
-//! moves makes every key under the old one useless (P-085). A factory reset
-//! increments it, persists it, reads it back and verifies it, and only then
-//! clears the client table — the order is the load-bearing half. A power cut
-//! between the two steps leaves an epoch that is too high, which only
-//! over-invalidates: the worst case is a phone that has to be paired again.
-//! The reverse order leaves a cleared table at a stale epoch, and the next
-//! enrolment mints `client_id 1` under the same key a stolen phone holds.
+//! Every slot records the epoch it was written under, and a slot from an
+//! earlier epoch is free (P-239), so the epoch write is a factory reset's
+//! single commit (P-085): it is incremented, persisted, read back and
+//! verified, and the moment it has landed every enrolment under the old one
+//! is gone, whatever happens to the housekeeping after it. A power cut
+//! before it leaves the unit as it was; after it, slots that still hold
+//! their old keys and match nothing.
 //!
-//! The order is a type here. [`Clearing`] is what the client table's
-//! `cleared` constructor takes, and the only way to hold one is to have
-//! written the new epoch and read it back, or to be a boot that found the
-//! table stamped with an epoch the part no longer holds — a reset that was
-//! cut, being finished.
+//! The order is a type here. [`Clearing`] is what clearing the table takes,
+//! and the only way to hold one is to have written the new epoch and read
+//! it back.
 //!
-//! cites: P-085
+//! cites: P-085, P-239
 
 use km43::Epoch;
 
-use crate::body::{Body, Kept, Malformed};
+use crate::body::{Body, Kept, Malformed, Unverified};
 use crate::fram::{Fram, Refused};
 
 /// The bytes the epoch takes in its record: one `u32`.
@@ -41,13 +38,10 @@ impl Body<EPOCH_BYTES> for Epoch {
 /// Permission to clear the client table under an epoch the part holds.
 ///
 /// There is no public constructor. One comes out of [`Kept::advance`] after
-/// the new epoch was written, read back and agreed, and one comes out of a
-/// boot that found the table stamped with another epoch than the record
-/// holds, which is a factory reset cut between its two writes and is
-/// finished by clearing the table under the epoch that landed.
+/// the new epoch was written, read back and agreed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[must_use = "a clearing nobody performs leaves eight rows enrolled under an epoch that no longer derives their keys"]
+#[must_use = "a clearing nobody performs leaves old keys on the part, matched by nothing but still there"]
 pub struct Clearing {
     epoch: Epoch,
 }
@@ -57,14 +51,6 @@ impl Clearing {
     #[must_use]
     pub const fn epoch(&self) -> Epoch {
         self.epoch
-    }
-
-    /// A boot found the table under another epoch than the part holds:
-    /// the reset that moved the epoch was cut before it cleared the table,
-    /// and the boot finishes it. Crate-private because only the boot's
-    /// comparison of the two records can honestly say this.
-    pub(crate) const fn found_at_boot(epoch: Epoch) -> Self {
-        Self { epoch }
     }
 }
 
@@ -109,15 +95,14 @@ impl Kept<Epoch, EPOCH_BYTES> {
             .checked_add(1)
             .and_then(Epoch::new)
             .ok_or(EpochFailed::AtTheCeiling)?;
-        self.write(fram, next).await.map_err(EpochFailed::Write)?;
-        *self = Self::read(self.record(), fram)
+        self.write_verified(fram, next)
             .await
-            .map_err(EpochFailed::ReadBack)?;
-        if self.present() == Some(&next) {
-            Ok(Clearing { epoch: next })
-        } else {
-            Err(EpochFailed::Disagreed)
-        }
+            .map_err(|why| match why {
+                Unverified::Refused(refused) => EpochFailed::Write(refused),
+                Unverified::ReadBack(bus) => EpochFailed::ReadBack(bus),
+                Unverified::Disagreed => EpochFailed::Disagreed,
+            })?;
+        Ok(Clearing { epoch: next })
     }
 }
 
@@ -130,23 +115,26 @@ pub enum ResetFailed<E> {
     Network(Refused<E>),
     /// Epoch advance or verification failed; the client table was not cleared.
     Epoch(EpochFailed<E>),
-    /// The epoch advanced, but the table did not clear. Boot finishes it.
-    Clients(Refused<E>),
+    /// The epoch advanced, so every slot is free, but the housekeeping
+    /// after it did not finish: old keys stay on the part, matched by
+    /// nothing, until the next reset or re-key writes over them.
+    Clients(crate::NotStored<E>),
 }
 
-/// Advance and verify the epoch, then clear clients, counters and dedup in
-/// their single record. Session owners must drop their bindings before
-/// permitting another request after this operation.
+/// Advance and verify the epoch, then free every slot and empty the dedup
+/// table under it. Session owners drop their bindings and abandon their
+/// handshakes before this runs.
 pub async fn reset_clients<F: Fram>(
     epoch: &mut Kept<Epoch, EPOCH_BYTES>,
-    clients: &mut Kept<crate::ClientTable, { crate::CLIENT_TABLE_BYTES }>,
+    clients: &mut crate::Clients,
     fram: &mut F,
-) -> Result<(), ResetFailed<F::Error>> {
+) -> Result<Epoch, ResetFailed<F::Error>> {
     let clearing = epoch.advance(fram).await.map_err(ResetFailed::Epoch)?;
     clients
-        .write(fram, crate::ClientTable::cleared(&clearing))
+        .cleared(&clearing, fram)
         .await
-        .map_err(ResetFailed::Clients)
+        .map_err(ResetFailed::Clients)?;
+    Ok(clearing.epoch())
 }
 
 #[cfg(test)]

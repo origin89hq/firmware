@@ -9,7 +9,7 @@
 //! gesture. Debounce requires 50 ms of unchanged samples. No sequence is a
 //! prefix of another, and a completed sequence produces exactly one event.
 
-use crate::{ClientTable, Held, Millis, Revision, Tick};
+use crate::{Millis, Repaired, Revision, Tick};
 
 /// Stable time required before accepting a selector position.
 pub const SELECTOR_DEBOUNCE: Millis = Millis::from_millis(50);
@@ -352,17 +352,22 @@ pub enum EnrolmentAtBoot {
 }
 
 impl EnrolmentAtBoot {
-    /// Capture the read, before the store's recovery can replace the table.
-    pub fn from_clients(clients: &Held<ClientTable>) -> Self {
-        match clients {
-            Held::Present(table) => {
-                if table.enrolled() == 0 {
+    /// What the boot's read of the table says: readable with nothing to
+    /// repair, and empty or not; anything the boot had to write, or could
+    /// not repair, is not evidence of an empty table (P-066). `None` is a
+    /// boot with no epoch, or whose repair failed.
+    pub const fn from_table(repaired: Option<Repaired>, enrolled: usize) -> Self {
+        match repaired {
+            Some(Repaired::Nothing) => {
+                if enrolled == 0 {
                     Self::Empty
                 } else {
                     Self::Enrolled
                 }
             }
-            Held::Absent | Held::Corrupt | Held::Malformed(_) => Self::Unavailable,
+            Some(Repaired::Initialised | Repaired::Freed | Repaired::Rebuilt(_)) | None => {
+                Self::Unavailable
+            }
         }
     }
 }
@@ -487,13 +492,9 @@ mod tests {
     use super::*;
     use SelectorPosition::{Auto, Manual, Off};
 
-    fn empty_table() -> ClientTable {
-        ClientTable::cleared(&crate::Clearing::found_at_boot(km43::Epoch::FIRST))
-    }
-
     #[test]
     fn f_091_p_066_revision_a_empty_boot_opens_for_120_seconds() {
-        let evidence = EnrolmentAtBoot::from_clients(&Held::Present(empty_table()));
+        let evidence = EnrolmentAtBoot::from_table(Some(Repaired::Nothing), 0);
         let panel = Panel::at_power_on(Revision::A, evidence, Tick::from_millis(5_000));
         assert!(panel.pairing_open(Tick::from_millis(5_000)));
         assert!(panel.pairing_open(Tick::from_millis(124_999)));
@@ -508,11 +509,7 @@ mod tests {
 
     #[test]
     fn f_091_p_066_one_enrolled_client_keeps_boot_closed() {
-        let mut table = empty_table();
-        let _ = table
-            .pair(crate::Label::new("phone").unwrap(), km43::ClientKind::App)
-            .unwrap();
-        let evidence = EnrolmentAtBoot::from_clients(&Held::Present(table));
+        let evidence = EnrolmentAtBoot::from_table(Some(Repaired::Nothing), 1);
         let panel = Panel::at_power_on(Revision::A, evidence, Tick::ZERO);
         assert!(!panel.pairing_open(Tick::ZERO));
         assert_eq!(panel.pairing_deadline(Tick::ZERO), None);
@@ -526,13 +523,14 @@ mod tests {
     }
 
     #[test]
-    fn f_091_p_066_absent_corrupt_and_malformed_are_not_empty() {
-        for held in [
-            Held::Absent,
-            Held::Corrupt,
-            Held::Malformed(crate::Malformed { at: 0 }),
+    fn f_091_p_066_a_table_the_boot_wrote_or_could_not_repair_is_not_empty() {
+        for repaired in [
+            Some(Repaired::Initialised),
+            Some(Repaired::Freed),
+            Some(Repaired::Rebuilt(km43::Epoch::FIRST)),
+            None,
         ] {
-            let evidence = EnrolmentAtBoot::from_clients(&held);
+            let evidence = EnrolmentAtBoot::from_table(repaired, 0);
             assert_eq!(evidence, EnrolmentAtBoot::Unavailable);
             assert!(
                 !Panel::at_power_on(Revision::A, evidence, Tick::ZERO).pairing_open(Tick::ZERO)

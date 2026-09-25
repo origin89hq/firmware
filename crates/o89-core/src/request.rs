@@ -1,22 +1,18 @@
-//! Signed requests in P-080's order: the MAC, the session's client, the
-//! session's `req_id` window (P-022), the counter, the dedup table, one
-//! FRAM write, and only then the operation.
+//! Signed requests in P-080's order: the sealed body opened under the
+//! session's key with P-022's window, the dedup table, one FRAM write, and
+//! only then the operation.
 //!
-//! **The order is the types.** `km43` refuses to hand out a counter before
-//! the MAC and the session's `client_id` have both checked out, and the
-//! operation before the counter has; this file continues the chain. A
-//! [`Permit`] is the only thing that carries an operation to a handler, and
-//! the only way to get one is through [`admit`], which returns it after the
-//! part holds the new counter and, for a `Command`, the in-flight dedup
-//! entry, in one record and so in one transaction. A write that does not
-//! land is error 7 and nothing executes (P-079): the RAM copy stays where
-//! the part is, so the next request is judged against what the controller
-//! can prove it accepted.
+//! **The order is the types.** `km43` hands out a [`SignedWrite`] only out of
+//! a body whose tag verified and whose `req_id` its window accepted, and
+//! this file continues the chain. A [`Permit`] is the only thing that
+//! carries an operation to a handler, and the only way to get one is
+//! through [`admit`], which returns it, for a `Command`, only after the part
+//! holds the in-flight dedup entry. A write that does not land is error 7
+//! and nothing executes (P-079): the RAM copy stays where the part is.
 //!
-//! **The row is the session's.** The counter checked and moved is the row
-//! of the client the session was bound to at `Hello`, never one named by
-//! the body (P-084); a body naming another client is refused before any
-//! row is read.
+//! **The client is the session's.** A write carries no client of its own;
+//! the dedup entry is keyed by the slot the session was bound to at
+//! `Hello`, which is the only statement of who sent it.
 //!
 //! **A command is remembered only once it has executed or committed to.**
 //! A match on `(client_id, cmd_id)` is answered without executing: with the
@@ -30,22 +26,20 @@
 //! belong to the behaviour an output is granted to; this file stops at the
 //! permit and takes the outcome back.
 //!
-//! cites: P-022, P-079, P-080, P-084, P-120, P-124
+//! cites: P-079, P-080, P-082, P-120, P-124
 
 use km43::{
-    ClientId, Command, CommandAck, CommandError, CommandOperation, Condition, Counter, ErrorCode,
-    FreshWrite, Header, MessageType, Refusal as Code, SessionKey, SignedClaim, SignedError,
+    ClientId, Command, CommandAck, CommandError, CommandOperation, Condition, ErrorCode, Header,
+    MessageType, Refusal as Code, SignedWrite,
 };
 
 use crate::body::{Kept, Unchanged};
-use crate::clients::{Admitted, CLIENT_TABLE_BYTES, Check, ClientTable};
-use crate::dedup::{Fingerprint, Recorded, Reserved, Settling};
+use crate::dedup::{COMMANDS_BYTES, Commands, Fingerprint, Recorded, Reserved, Settling, Verdict};
 use crate::fram::Fram;
-use crate::req_window::{OutOfWindow, ReqWindow};
 use crate::tick::Tick;
 
-/// The client table as the session layer keeps it.
-pub type Clients = Kept<ClientTable, CLIENT_TABLE_BYTES>;
+/// The dedup table as the session layer keeps it.
+pub type Dedups = Kept<Commands, COMMANDS_BYTES>;
 
 /// What a retry of a command that executed is told.
 pub const DUPLICATE: &str = "already executed under this cmd_id";
@@ -63,16 +57,9 @@ pub const REUSED: &str = "cmd_id reused for a different command";
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a refusal nobody answers is a client waiting on a timeout"]
 pub enum Refusal<E> {
-    /// What `km43` refused: the MAC (error 10), a body naming another
-    /// client than the session's (12, P-084), or a counter not ahead of the
-    /// row (11).
-    Signed(SignedError),
     /// A `Command` whose operation does not read: error 1, before any entry
-    /// is reserved or any counter moves.
+    /// is reserved.
     Operation(CommandError),
-    /// No row at the slot the session is bound to: error 12. A factory reset
-    /// cleared it under a session that is still open.
-    NoSuchClient,
     /// No room in the dedup table, or in this client's half of it: error 7,
     /// rather than evicting (P-122).
     Busy,
@@ -80,7 +67,7 @@ pub enum Refusal<E> {
     /// out: error 7, so the client retries once it has run, and no second
     /// permit is issued beside the first.
     Running,
-    /// The counter did not land: error 7, and the operation does not run
+    /// The dedup entry did not land: error 7, and the command does not run
     /// (P-079).
     NotKept(Unchanged<E>),
 }
@@ -90,70 +77,60 @@ impl<E> Refusal<E> {
     #[must_use]
     pub const fn code(&self) -> Code {
         match self {
-            Self::Signed(why) => why.refusal(),
             Self::Operation(why) => why.refusal(),
-            Self::NoSuchClient => Code::Client(ErrorCode::UnknownClient),
             Self::Busy | Self::Running | Self::NotKept(_) => Code::Client(ErrorCode::BusyRetry),
         }
     }
 
-    /// The class A concern this refusal raises: a counter the part would not
-    /// keep is the controller losing its record of what it accepted, and the
+    /// The class A concern this refusal raises: an entry the part would not
+    /// keep is the controller losing its record of what it ran, and the
     /// error code alone can be dropped by the comms processor (P-079).
     #[must_use]
     pub const fn raises(&self) -> Option<Condition> {
         match self {
-            Self::NotKept(_) => Some(Condition::COUNTER_WRITE_FAILED),
-            Self::Signed(_)
-            | Self::Operation(_)
-            | Self::NoSuchClient
-            | Self::Busy
-            | Self::Running => None,
+            Self::NotKept(_) => Some(Condition::DEDUP_WRITE_FAILED),
+            Self::Operation(_) | Self::Busy | Self::Running => None,
         }
     }
 }
 
 /// What a signed request is to become.
 #[derive(Debug)]
-#[must_use = "an admission nobody acts on is a counter spent on nothing"]
+#[must_use = "an admission nobody acts on is a write nobody answered"]
 pub enum Admission<'a, E> {
-    /// Steps 1 to 4 passed and the part holds their result: execute.
+    /// Execute: for a `Command`, its entry is on the part.
     Execute(Permit<'a>),
-    /// A command the dedup table answered without executing (P-080 step 3).
+    /// A command the dedup table answered without executing (P-080 step 2).
     Answered(CommandAck<'static>),
     /// A command whose entry a reset left in flight: the state store decides.
     InFlight(InFlight<'a>),
     /// Refused before anything executed.
     Refused(Refusal<E>),
-    /// A `req_id` the session accepted already or that is below its window,
-    /// refused after the MAC and before the counter was read. P-022 says it
-    /// is not answered, so it has no wire answer.
-    OutOfWindow(OutOfWindow),
 }
 
-/// An operation the part has already recorded the counter for.
+/// An operation cleared to run.
 #[derive(Debug)]
-#[must_use = "a permit dropped is a counter spent and an operation nobody ran"]
+#[must_use = "a permit dropped is an operation nobody ran"]
 pub enum Permit<'a> {
-    /// `SetConfig`, `Firmware` or `Time`: the counter landed.
+    /// `SetConfig`, `Firmware` or `Time`.
     Write(Write<'a>),
-    /// A `Command`: the counter and the in-flight entry landed together.
+    /// A `Command`: its in-flight entry landed.
     Command(Reservation<'a>),
 }
 
 /// A signed write that is not a command, ready for its handler.
 #[derive(Debug)]
-#[must_use = "a permit dropped is a counter spent and an operation nobody ran"]
-pub struct Write<'a>(FreshWrite<'a>);
+#[must_use = "a permit dropped is an operation nobody ran"]
+pub struct Write<'a>(SignedWrite<'a>);
 
 impl<'a> Write<'a> {
-    /// The three scalars the MAC covered.
+    /// The three scalars the tag covered.
     #[must_use]
     pub const fn header(&self) -> Header {
         self.0.header()
     }
 
-    /// The operation body, exactly as it arrived.
+    /// The operation body, exactly as it opened.
     #[must_use]
     pub const fn operation(&self) -> &'a [u8] {
         self.0.operation()
@@ -162,7 +139,7 @@ impl<'a> Write<'a> {
 
 /// A command whose entry is reserved in flight on the part.
 ///
-/// Consumed by [`finished`](Self::finished), which is P-080 step 6. While it
+/// Consumed by [`finished`](Self::finished), which is P-080 step 5. While it
 /// is held, a retry of the same command is [`Refusal::Running`]: the state
 /// store would see the hardware not moved yet and run it a second time.
 /// Dropped unfinished, its entry stays held until it expires or the next
@@ -177,7 +154,7 @@ pub struct Reservation<'a> {
 }
 
 impl<'a> Reservation<'a> {
-    /// The three scalars the MAC covered.
+    /// The three scalars the tag covered.
     #[must_use]
     pub const fn header(&self) -> Header {
         self.header
@@ -189,7 +166,7 @@ impl<'a> Reservation<'a> {
         self.command
     }
 
-    /// P-080 step 6: record what the command did and build its ack. An
+    /// P-080 step 5: record what the command did and build its ack. An
     /// accepted or shadowed command completes its entry; any other outcome
     /// discards it, because the client is expected to retry past it and a
     /// leftover entry would answer that retry `duplicate` (P-120).
@@ -200,23 +177,25 @@ impl<'a> Reservation<'a> {
     /// on the next retry.
     pub async fn finished<'d, F: Fram>(
         self,
-        clients: &mut Clients,
+        dedups: &mut Dedups,
         fram: &mut F,
         executed: Executed,
         detail: &'d str,
     ) -> Finished<'d, F::Error> {
         let seat = self.seat;
-        let recorded = clients
-            .update(fram, |table| table.finished(seat, executed.recorded()))
+        let recorded = dedups
+            .update(fram, |table| {
+                table.dedup_mut().finished(seat, executed.recorded());
+            })
             .await;
         if recorded.is_err()
-            && let Some(table) = clients.present()
+            && let Some(table) = dedups.present()
         {
             // The part never held that a permit had the entry, so this
             // moves RAM nowhere the part is not.
             let mut released = table.clone();
-            released.released(seat);
-            clients.rebase(released);
+            released.dedup_mut().released(seat);
+            dedups.rebase(released);
         }
         Finished {
             ack: CommandAck {
@@ -228,7 +207,7 @@ impl<'a> Reservation<'a> {
         }
     }
 
-    /// The client whose row holds the entry.
+    /// The client whose entry it is.
     #[must_use]
     pub const fn client(&self) -> ClientId {
         self.client
@@ -307,7 +286,6 @@ pub struct Finished<'d, E> {
 pub struct InFlight<'a> {
     header: Header,
     client: ClientId,
-    counter: Counter,
     command: CommandOperation<'a>,
     fingerprint: Fingerprint,
     seat: Reserved,
@@ -329,12 +307,14 @@ impl<'a> InFlight<'a> {
     /// executing.
     pub async fn already<F: Fram>(
         self,
-        clients: &mut Clients,
+        dedups: &mut Dedups,
         fram: &mut F,
     ) -> Result<Finished<'static, F::Error>, Refusal<F::Error>> {
         let seat = self.seat;
-        let recorded = match clients
-            .update(fram, |table| table.settled(seat, Some(Recorded::Accepted)))
+        let recorded = match dedups
+            .update(fram, |table| {
+                table.dedup_mut().settled(seat, Some(Recorded::Accepted))
+            })
             .await
         {
             Ok(Settling::Held) => return Err(Refusal::Running),
@@ -352,175 +332,93 @@ impl<'a> InFlight<'a> {
     }
 
     /// The hardware is not where the command asked: the entry is discarded
-    /// and the retry runs as a fresh command, its counter and a new entry
-    /// landing in the same one write as the discard. An entry another retry
-    /// settled first is left as that retry left it, and this one is answered
-    /// from it: running, or the outcome it recorded.
+    /// and the retry runs as a fresh command, a new entry landing in the
+    /// same one write as the discard. An entry another retry settled first
+    /// is left as that retry left it, and this one is answered from it:
+    /// running, or the outcome it recorded.
     pub async fn again<F: Fram>(
         self,
-        clients: &mut Clients,
+        dedups: &mut Dedups,
         fram: &mut F,
         now: Tick,
     ) -> Admission<'a, F::Error> {
         let Self {
             header,
             client,
-            counter,
             command,
             fingerprint,
             seat,
         } = self;
-        let Some(last) = clients.present().and_then(|table| table.accepted(client)) else {
-            return Admission::Refused(Refusal::NoSuchClient);
-        };
-        let admitted = clients
-            .update(fram, |table| match table.settled(seat, None) {
-                Settling::Held => Admitted::Running,
+        let verdict = dedups
+            .update(fram, |table| match table.dedup_mut().settled(seat, None) {
+                Settling::Held => Verdict::Running,
                 Settling::Settled | Settling::Gone => {
-                    table.admit(client, counter, command.cmd_id, fingerprint, now)
+                    table
+                        .dedup_mut()
+                        .admit(client, command.cmd_id, fingerprint, now)
                 }
             })
             .await;
-        let asked = Asked {
+        Asked {
             header,
             client,
-            last,
-            counter,
             command,
             fingerprint,
-        };
-        asked.reserved(admitted)
+        }
+        .reserved(verdict)
     }
 }
 
-/// P-080 steps 1 to 4 for one signed request on a session bound to
-/// `bound` under `key`.
-///
-/// The MAC is checked before anything else, the session's `req_id` window
-/// next (P-022), and the counter before any table is consulted; nothing is
-/// written for a request refused at any of them. A request that passes
-/// them lands its counter, and a command its in-flight entry with it, in
-/// one write; the [`Permit`] comes back only once the part has them.
+/// P-080 steps 2 and 3 for a write that opened on a session bound to
+/// `bound`: a `Command`'s dedup lookup and, for a fresh one, its in-flight
+/// entry landed before the [`Permit`] comes back. The other three writes
+/// have nothing to land and are permitted as they are.
 pub async fn admit<'a, F: Fram>(
-    claim: SignedClaim<'a>,
-    key: &SessionKey,
+    write: SignedWrite<'a>,
     bound: ClientId,
-    window: &mut ReqWindow,
-    clients: &mut Clients,
+    dedups: &mut Dedups,
     fram: &mut F,
     now: Tick,
 ) -> Admission<'a, F::Error> {
-    let signed = match claim.verify(key, bound) {
-        Ok(signed) => signed,
-        Err(why) => return Admission::Refused(Refusal::Signed(why)),
-    };
-    if let Err(why) = window.accept(signed.header().req_id) {
-        return Admission::OutOfWindow(why);
+    let header = write.header();
+    if header.kind != MessageType::Command {
+        return Admission::Execute(Permit::Write(Write(write)));
     }
-    let Some(last) = clients.present().and_then(|table| table.accepted(bound)) else {
-        return Admission::Refused(Refusal::NoSuchClient);
+    let command = match CommandOperation::decode(write.operation()) {
+        Ok(command) => command,
+        Err(why) => return Admission::Refused(Refusal::Operation(why)),
     };
-    let fresh = match signed.fresh(last) {
-        Ok(fresh) => fresh,
-        Err(why) => return Admission::Refused(Refusal::Signed(why)),
-    };
-    let header = fresh.header();
-    let counter = fresh.counter();
-    let stale = SignedError::StaleCounter {
-        last,
-        sent: counter,
-    };
-    match header.kind {
-        MessageType::Command => {
-            let command = match CommandOperation::decode(fresh.operation()) {
-                Ok(command) => command,
-                Err(why) => return Admission::Refused(Refusal::Operation(why)),
-            };
-            let fingerprint = Fingerprint::of(fresh.operation());
-            let admitted = clients
-                .update(fram, |table| {
-                    table.admit(bound, counter, command.cmd_id, fingerprint, now)
-                })
-                .await;
-            let asked = Asked {
-                header,
-                client: bound,
-                last,
-                counter,
-                command,
-                fingerprint,
-            };
-            asked.reserved(admitted)
-        }
-        MessageType::SetConfig | MessageType::Firmware | MessageType::Time => {
-            match clients
-                .update(fram, |table| table.accept(bound, counter))
-                .await
-            {
-                Ok(Check::Ahead) => Admission::Execute(Permit::Write(Write(fresh))),
-                Ok(Check::Stale) => Admission::Refused(Refusal::Signed(stale)),
-                Ok(Check::NoSuchClient) => Admission::Refused(Refusal::NoSuchClient),
-                Err(why) => Admission::Refused(Refusal::NotKept(why)),
-            }
-        }
-        // `SignedClaim::decode` refuses every other type before a claim
-        // exists; answered as it would have been, never guessed at.
-        MessageType::Discover
-        | MessageType::DiscoverResponse
-        | MessageType::Hello
-        | MessageType::HelloResponse
-        | MessageType::Inventory
-        | MessageType::InventoryResponse
-        | MessageType::Readings
-        | MessageType::ReadingsResponse
-        | MessageType::Concerns
-        | MessageType::ConcernsResponse
-        | MessageType::History
-        | MessageType::HistoryResponse
-        | MessageType::Subscribe
-        | MessageType::SubscribeResponse
-        | MessageType::EventResponse
-        | MessageType::ReadLog
-        | MessageType::ReadLogResponse
-        | MessageType::WifiScan
-        | MessageType::WifiScanResponse
-        | MessageType::WifiStatus
-        | MessageType::WifiStatusResponse
-        | MessageType::GetConfig
-        | MessageType::GetConfigResponse
-        | MessageType::SetConfigResponse
-        | MessageType::CommandResponse
-        | MessageType::FirmwareResponse
-        | MessageType::TimeResponse
-        | MessageType::Pair
-        | MessageType::PairResponse
-        | MessageType::Goodbye
-        | MessageType::GoodbyeResponse
-        | MessageType::ErrorResponse => {
-            Admission::Refused(Refusal::Signed(SignedError::NotSigned(header.kind)))
-        }
+    let fingerprint = Fingerprint::of(write.operation());
+    let verdict = dedups
+        .update(fram, |table| {
+            table
+                .dedup_mut()
+                .admit(bound, command.cmd_id, fingerprint, now)
+        })
+        .await;
+    Asked {
+        header,
+        client: bound,
+        command,
+        fingerprint,
     }
+    .reserved(verdict)
 }
 
-/// A command that passed steps 1 and 2, with what the table is asked.
+/// A command past the lookup, with what the table said.
 struct Asked<'a> {
     header: Header,
     client: ClientId,
-    /// The row's counter before this request.
-    last: Counter,
-    counter: Counter,
     command: CommandOperation<'a>,
     fingerprint: Fingerprint,
 }
 
 impl<'a> Asked<'a> {
-    /// What the table's answer becomes: steps 3 and 4 read back.
-    fn reserved<E>(self, admitted: Result<Admitted, Unchanged<E>>) -> Admission<'a, E> {
+    /// What the table's answer becomes.
+    fn reserved<E>(self, verdict: Result<Verdict, Unchanged<E>>) -> Admission<'a, E> {
         let Self {
             header,
             client,
-            last,
-            counter,
             command,
             fingerprint,
         } = self;
@@ -531,31 +429,25 @@ impl<'a> Asked<'a> {
                 detail,
             })
         };
-        match admitted {
-            Ok(Admitted::Fresh(seat)) => Admission::Execute(Permit::Command(Reservation {
+        match verdict {
+            Ok(Verdict::Fresh(seat)) => Admission::Execute(Permit::Command(Reservation {
                 header,
                 client,
                 command,
                 seat,
             })),
-            Ok(Admitted::Already(Recorded::Accepted)) => answered(Command::Duplicate, DUPLICATE),
-            Ok(Admitted::Already(Recorded::Shadowed)) => answered(Command::Shadowed, SHADOWED),
-            Ok(Admitted::ReusedId) => answered(Command::Rejected, REUSED),
-            Ok(Admitted::InFlight(seat)) => Admission::InFlight(InFlight {
+            Ok(Verdict::Already(Recorded::Accepted)) => answered(Command::Duplicate, DUPLICATE),
+            Ok(Verdict::Already(Recorded::Shadowed)) => answered(Command::Shadowed, SHADOWED),
+            Ok(Verdict::ReusedId) => answered(Command::Rejected, REUSED),
+            Ok(Verdict::InFlight(seat)) => Admission::InFlight(InFlight {
                 header,
                 client,
-                counter,
                 command,
                 fingerprint,
                 seat,
             }),
-            Ok(Admitted::Busy) => Admission::Refused(Refusal::Busy),
-            Ok(Admitted::Running) => Admission::Refused(Refusal::Running),
-            Ok(Admitted::Stale) => Admission::Refused(Refusal::Signed(SignedError::StaleCounter {
-                last,
-                sent: counter,
-            })),
-            Ok(Admitted::NoSuchClient) => Admission::Refused(Refusal::NoSuchClient),
+            Ok(Verdict::Busy) => Admission::Refused(Refusal::Busy),
+            Ok(Verdict::Running) => Admission::Refused(Refusal::Running),
             Err(why) => Admission::Refused(Refusal::NotKept(why)),
         }
     }
@@ -567,29 +459,46 @@ mod tests {
 
     use embassy_futures::block_on;
     use km43::{
-        CommandKind, DeviceId, DeviceSecret, Envelope, Epoch, Handshake, PrintedSecret, ReqId,
-        SessionId, Signed,
+        ClientChannel, CommandKind, ControllerChannel, DeviceId, Enrolment, Entropy, Envelope,
+        Epoch, Generation, HelloArrival, HelloOffer, HelloPending, HelloReport, MAX_PAYLOAD,
+        Prologue, PrologueFields, ReqId, Sealed, SessionId, Signed, StaticKey, Suite, Version,
     };
 
     use super::*;
     use crate::body::Held;
-    use crate::clients::{Because, Booted, Label, Paired};
     use crate::dedup::PER_CLIENT;
-    use crate::fram::{Address, Refused};
-    use crate::map::CLIENT_TABLE;
-
-    const PART_BYTES: usize = 4096;
-    const _: () = assert!(CLIENT_TABLE.end().0 as usize <= PART_BYTES);
+    use crate::fram::{Address, FRAM_BYTES, Refused};
+    use crate::map::COMMANDS;
 
     /// The bus writes one record takes: the magic cleared, the sequence,
     /// the body, the CRC, the magic.
     const RECORD: usize = 5;
 
-    /// Enough of the part for the client table, and a supply that can fall.
+    const DEVICE_ID: [u8; 16] = *b"ORIGIN89 TEST 01";
+    const HANDLE: u16 = 3;
+
+    /// The whole part, a supply that can fall, and a power cut that lands
+    /// before the n-th write from now.
     struct Part {
-        bytes: [u8; PART_BYTES],
+        bytes: [u8; FRAM_BYTES],
         falling: bool,
         writes: usize,
+        cut_before: Option<usize>,
+    }
+
+    impl Part {
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the whole map, as the boot reads it; a test thread's stack holds it"
+        )]
+        fn fresh() -> Self {
+            Self {
+                bytes: [0xFF; FRAM_BYTES],
+                falling: false,
+                writes: 0,
+                cut_before: None,
+            }
+        }
     }
 
     impl Fram for Part {
@@ -609,6 +518,13 @@ mod tests {
             if self.falling {
                 return core::future::ready(Err(Refused::SupplyFalling));
             }
+            if let Some(left) = self.cut_before {
+                if left == 0 {
+                    // Dead from here: nothing lands until the reboot.
+                    return core::future::ready(Err(Refused::Bus(())));
+                }
+                self.cut_before = left.checked_sub(1);
+            }
             self.writes = self.writes.saturating_add(1);
             let start = usize::from(at.0);
             self.bytes[start..][..bytes.len()].copy_from_slice(bytes);
@@ -620,91 +536,189 @@ mod tests {
         ClientId::new(n).expect("a nonzero client")
     }
 
-    /// The session key a client and this controller both derive.
-    fn key(of: ClientId) -> SessionKey {
-        let secret = DeviceSecret::new(DeviceId::new([7; 16]), PrintedSecret::new([9; 32]));
-        let handshake = Handshake {
-            challenge: [1; 16],
-            client_nonce: [2; 16],
-        };
-        secret
-            .enrolment(Epoch::FIRST, of)
-            .session_key(&handshake, SessionId::from(1))
+    fn controller() -> StaticKey {
+        StaticKey::from_stored([0x40; 32])
     }
 
-    /// A unit with a phone at slot 1 and a laptop at slot 2, both at
-    /// counter zero, and a session bound to the phone.
+    fn enrolment() -> Enrolment {
+        Enrolment::new(
+            DeviceId::new(DEVICE_ID),
+            controller().public(),
+            StaticKey::from_stored([0x60; 32]),
+            Suite::X25519ChachapolySha256,
+            Epoch::FIRST,
+        )
+    }
+
+    /// A real `Hello` between km43's two ends: the channels a session on
+    /// slot 1 seals and opens under, so every write here is one that opened.
+    fn session() -> (ClientChannel, ControllerChannel) {
+        let prologue = Prologue::new(&PrologueFields {
+            suite: Suite::X25519ChachapolySha256,
+            version: Version::V1_0,
+            device_id: DeviceId::new(DEVICE_ID),
+            epoch: Epoch::FIRST,
+            challenge: &[0xC0; 16],
+            handle: SessionId::from(HANDLE),
+        });
+        let header = |kind| km43::Header {
+            kind,
+            session: SessionId::from(HANDLE),
+            req_id: ReqId(1),
+        };
+        let offer = HelloOffer {
+            version: Version::V1_0,
+            client_version: "test",
+        };
+        let mut frame = [0u8; 256];
+        let (pending, len) = HelloPending::start(
+            &prologue,
+            &enrolment(),
+            Entropy::new([2; 32]),
+            &offer,
+            header(MessageType::Hello),
+            &mut frame,
+        )
+        .expect("message 1");
+        let admit = controller()
+            .admit_key(DeviceId::new(DEVICE_ID), &enrolment().static_key().public())
+            .expect("contributory");
+        let mut plain = [0u8; 256];
+        let proved = HelloArrival::decode(Envelope::decode(&frame[..len]).expect("envelope"))
+            .expect("a Hello")
+            .admit(&prologue, [((), &admit)])
+            .expect("admitted")
+            .prove(
+                &prologue,
+                &controller(),
+                (
+                    &enrolment().static_key().public(),
+                    Suite::X25519ChachapolySha256,
+                ),
+                &mut plain,
+            )
+            .expect("proved");
+        let report = HelloReport {
+            version: Version::V1_0,
+            session: SessionId::from(HANDLE),
+            fw_controller: "fw",
+            fw_comms: "comms",
+            capabilities: 0,
+            log_oldest_seq: km43::LogSeq(0),
+            log_newest_seq: km43::LogSeq(0),
+            state_seq: km43::StateSeq(0),
+            time_known: false,
+            caps: km43::Caps::THIS_CONTROLLER,
+            topology: km43::Topology::THIS_CONTROLLER,
+            client_id: client(1),
+            generation: Generation::FIRST,
+        };
+        let mut answer = [0u8; 512];
+        let (controller, len) = proved
+            .reply(Entropy::new([4; 32]), &report, &mut answer)
+            .expect("answered");
+        let mut report_buf = [0u8; 512];
+        let session = pending
+            .finish(
+                &enrolment(),
+                Envelope::decode(&answer[..len]).expect("envelope"),
+                &mut report_buf,
+            )
+            .expect("opens");
+        (session.into_channel(), controller)
+    }
+
+    /// A sealed write, as it arrives.
+    struct Frame {
+        bytes: [u8; MAX_PAYLOAD + 64],
+        len: usize,
+    }
+
+    impl Frame {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes[..self.len]
+        }
+    }
+
+    /// The part, the dedup record on it, and one session's two ends.
     struct Rig {
         part: Part,
-        clients: Clients,
-        key: SessionKey,
+        dedups: Dedups,
+        client: ClientChannel,
+        controller: ControllerChannel,
         bound: ClientId,
     }
 
     impl Rig {
         fn new() -> Self {
-            let mut part = Part {
-                bytes: [0; PART_BYTES],
-                falling: false,
-                writes: 0,
-            };
-            let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut part)).expect("reads");
-            assert_eq!(
-                block_on(clients.booted(&mut part, Epoch::FIRST)),
-                Ok(Booted::Cleared(Because::Absent))
-            );
-            for (text, kind, slot) in [
-                ("phone", km43::ClientKind::App, 1),
-                ("laptop", km43::ClientKind::Cli, 2),
-            ] {
-                let label = Label::new(text).expect("a label under the cap");
-                let paired = block_on(clients.update(&mut part, |table| table.pair(label, kind)));
-                assert_eq!(paired, Ok(Ok(Paired::Enrolled(client(slot)))));
-            }
+            let mut part = Part::fresh();
+            let mut dedups = block_on(Dedups::read(COMMANDS, &mut part)).expect("reads");
+            block_on(dedups.write(&mut part, Commands::cleared(Epoch::FIRST))).expect("written");
             part.writes = 0;
+            let (channel, controller) = session();
             Self {
                 part,
-                clients,
-                key: key(client(1)),
+                dedups,
+                client: channel,
+                controller,
                 bound: client(1),
             }
         }
 
-        fn table(&self) -> &ClientTable {
-            self.clients.present().expect("a table")
+        /// A write of `kind` the client seals under its next `req_id`.
+        fn seal(&mut self, kind: MessageType, operation: &[u8]) -> Frame {
+            let mut frame = Frame {
+                bytes: [0; MAX_PAYLOAD + 64],
+                len: 0,
+            };
+            let (_, len) = Signed::new(kind, operation)
+                .expect("signed")
+                .seal(
+                    &mut self.client.tx,
+                    SessionId::from(HANDLE),
+                    &mut frame.bytes,
+                )
+                .expect("sealed");
+            frame.len = len;
+            frame
         }
 
-        /// The table the part holds, as the next boot would read it.
-        fn on_the_part(&mut self) -> ClientTable {
-            let read = block_on(Clients::read(CLIENT_TABLE, &mut self.part)).expect("reads");
-            match read.held() {
-                Held::Present(table) => table.clone(),
-                other => panic!("the part holds no table: {other:?}"),
-            }
+        fn start(&mut self, cmd_id: u32) -> Frame {
+            let (op, len) = operation(cmd_id, CommandKind::StartGenerator);
+            self.seal(MessageType::Command, &op[..len])
         }
 
-        /// Admitted on a session of its own, whose window has seen
-        /// nothing but its `Hello`: what P-080 decides, whatever the
-        /// `req_id` is.
-        fn admit<'a>(&mut self, frame: &'a [u8], now: u64) -> Admission<'a, ()> {
-            self.admit_in(&mut ReqWindow::opened_by(ReqId(0)), frame, now)
+        fn stop(&mut self, cmd_id: u32) -> Frame {
+            let (op, len) = operation(cmd_id, CommandKind::StopGenerator);
+            self.seal(MessageType::Command, &op[..len])
         }
 
-        /// Admitted on the session whose window is `window`.
-        fn admit_in<'a>(
+        /// Step 1 at the controller, then [`admit`].
+        fn admit<'b>(
             &mut self,
-            window: &mut ReqWindow,
-            frame: &'a [u8],
+            frame: &Frame,
+            plain: &'b mut [u8; MAX_PAYLOAD],
             now: u64,
-        ) -> Admission<'a, ()> {
-            let claim = SignedClaim::decode(Envelope::decode(frame).expect("an envelope"))
-                .expect("a signed body");
+        ) -> Admission<'b, ()> {
+            self.admit_as(self.bound, frame, plain, now)
+        }
+
+        fn admit_as<'b>(
+            &mut self,
+            bound: ClientId,
+            frame: &Frame,
+            plain: &'b mut [u8; MAX_PAYLOAD],
+            now: u64,
+        ) -> Admission<'b, ()> {
+            let opened = Sealed::decode(Envelope::decode(frame.bytes()).expect("envelope"))
+                .expect("sealed")
+                .open(&mut self.controller.rx, plain)
+                .expect("opens");
+            let write = SignedWrite::read(&opened).expect("a write");
             block_on(admit(
-                claim,
-                &self.key,
-                self.bound,
-                window,
-                &mut self.clients,
+                write,
+                bound,
+                &mut self.dedups,
                 &mut self.part,
                 Tick::from_millis(now),
             ))
@@ -715,53 +729,29 @@ mod tests {
             reservation: Reservation<'_>,
             executed: Executed,
         ) -> Finished<'static, ()> {
-            block_on(reservation.finished(&mut self.clients, &mut self.part, executed, "done"))
+            block_on(reservation.finished(&mut self.dedups, &mut self.part, executed, ""))
+        }
+
+        /// What the part holds, as the next boot reads it: rebased (P-121).
+        fn reboot(&mut self) {
+            self.part.cut_before = None;
+            self.part.falling = false;
+            let mut dedups = block_on(Dedups::read(COMMANDS, &mut self.part)).expect("reads");
+            let rebased = dedups.present().expect("a table").clone().rebased();
+            dedups.rebase(rebased);
+            self.dedups = dedups;
+        }
+
+        fn live(&self) -> usize {
+            self.dedups
+                .present()
+                .expect("held")
+                .dedup()
+                .live(Tick::ZERO)
         }
     }
 
-    /// A signed request as the client sends it, signed under `key`.
-    struct Frame {
-        bytes: [u8; 256],
-        len: usize,
-    }
-
-    impl Frame {
-        fn signed(
-            kind: MessageType,
-            from: ClientId,
-            counter: u64,
-            operation: &[u8],
-            key: &SessionKey,
-        ) -> Self {
-            Self::signed_as(ReqId(17), kind, from, counter, operation, key)
-        }
-
-        fn signed_as(
-            req_id: ReqId,
-            kind: MessageType,
-            from: ClientId,
-            counter: u64,
-            operation: &[u8],
-            key: &SessionKey,
-        ) -> Self {
-            let header = Header {
-                kind,
-                session: SessionId::from(1),
-                req_id,
-            };
-            let signed = Signed::over(header, from, Counter(counter), operation, key)
-                .expect("a signed type");
-            let mut bytes = [0; 256];
-            let len = signed.write(&mut bytes).expect("fits");
-            Self { bytes, len }
-        }
-
-        fn bytes(&self) -> &[u8] {
-            &self.bytes[..self.len]
-        }
-    }
-
-    /// A start command's operation body.
+    /// A command's operation body.
     fn operation(cmd_id: u32, kind: CommandKind) -> ([u8; 16], usize) {
         let mut out = [0; 16];
         let len = CommandOperation {
@@ -772,41 +762,6 @@ mod tests {
         .encode(&mut out)
         .expect("fits");
         (out, len)
-    }
-
-    fn command(rig: &Rig, counter: u64, cmd_id: u32, kind: CommandKind) -> Frame {
-        let (op, len) = operation(cmd_id, kind);
-        Frame::signed(
-            MessageType::Command,
-            rig.bound,
-            counter,
-            &op[..len],
-            &rig.key,
-        )
-    }
-
-    fn start(rig: &Rig, counter: u64, cmd_id: u32) -> Frame {
-        command(rig, counter, cmd_id, CommandKind::StartGenerator)
-    }
-
-    /// A start under `req_id`.
-    fn start_as(rig: &Rig, req_id: u32, counter: u64, cmd_id: u32) -> Frame {
-        let (op, len) = operation(cmd_id, CommandKind::StartGenerator);
-        Frame::signed_as(
-            ReqId(req_id),
-            MessageType::Command,
-            rig.bound,
-            counter,
-            &op[..len],
-            &rig.key,
-        )
-    }
-
-    fn out_of_window(admission: Admission<'_, ()>) -> OutOfWindow {
-        match admission {
-            Admission::OutOfWindow(why) => why,
-            other => panic!("refused by the req_id window, not {other:?}"),
-        }
     }
 
     fn permitted(admission: Admission<'_, ()>) -> Reservation<'_> {
@@ -830,228 +785,144 @@ mod tests {
         }
     }
 
+    fn in_flight(admission: Admission<'_, ()>) -> InFlight<'_> {
+        match admission {
+            Admission::InFlight(retry) => retry,
+            other => panic!("an entry in flight, not {other:?}"),
+        }
+    }
+
     #[test]
-    fn p_080_a_fresh_command_is_permitted_only_once_the_part_holds_its_counter_and_entry() {
+    fn p_080_a_fresh_command_is_permitted_only_once_the_part_holds_its_entry() {
         let mut rig = Rig::new();
-        let frame = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(frame.bytes(), 1_000));
+        let frame = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&frame, &mut plain, 1_000));
         assert_eq!(reservation.command().cmd_id, 42);
         assert_eq!(reservation.command().kind, CommandKind::StartGenerator);
         assert_eq!(reservation.client(), client(1));
-        assert_eq!(rig.part.writes, RECORD, "one record for both");
-        // The next boot finds both: the counter, and the entry in flight.
-        let mut found = rig.on_the_part().rebased();
-        assert_eq!(found.accepted(client(1)), Some(Counter(1)));
+        assert_eq!(rig.part.writes, RECORD, "the entry is one record");
+        // The next boot finds the entry, in flight.
+        let mut found = block_on(Dedups::read(COMMANDS, &mut rig.part)).expect("reads");
         let (op, len) = operation(42, CommandKind::StartGenerator);
-        assert!(matches!(
-            found.admit(
-                client(1),
-                Counter(2),
-                42,
-                Fingerprint::of(&op[..len]),
-                Tick::ZERO
-            ),
-            Admitted::InFlight(_)
-        ));
+        let verdict = found
+            .present()
+            .expect("held")
+            .clone()
+            .rebased()
+            .dedup_mut()
+            .admit(client(1), 42, Fingerprint::of(&op[..len]), Tick::ZERO);
+        assert!(matches!(verdict, Verdict::InFlight(_)), "{verdict:?}");
+        let _ = &mut found;
         let finished = rig.finish(reservation, Executed::Accepted);
         assert_eq!(finished.recorded, Ok(()));
         assert_eq!(finished.ack.cmd_id, 42);
         assert_eq!(finished.ack.outcome, Command::Accepted);
-        assert_eq!(rig.part.writes, 2 * RECORD, "step 6 is its own record");
+        assert_eq!(rig.part.writes, 2 * RECORD, "step 5 is its own record");
     }
 
     #[test]
-    fn p_080_a_signed_write_that_is_not_a_command_lands_its_counter_and_reaches_its_handler() {
-        let mut rig = Rig::new();
-        let time = [0xa1, 1, 0x1b, 0, 0, 1, 0x8b, 0xcf, 0xe5, 0x68, 0];
-        for (counter, kind) in [
-            (1, MessageType::Time),
-            (2, MessageType::SetConfig),
-            (3, MessageType::Firmware),
+    fn p_080_a_write_that_is_not_a_command_reaches_its_handler_and_writes_nothing() {
+        for kind in [
+            MessageType::Time,
+            MessageType::SetConfig,
+            MessageType::Firmware,
         ] {
-            let frame = Frame::signed(kind, rig.bound, counter, &time, &rig.key);
-            let Admission::Execute(Permit::Write(write)) = rig.admit(frame.bytes(), 0) else {
-                panic!("a write permit for {kind:?}");
-            };
-            assert_eq!(write.header().kind, kind);
-            assert_eq!(write.operation(), time);
-            assert_eq!(
-                rig.on_the_part().accepted(client(1)),
-                Some(Counter(counter))
-            );
-        }
-        assert_eq!(rig.part.writes, 3 * RECORD);
-        // Nothing reserved an entry: only a command is deduplicated.
-        assert_eq!(rig.table().dedup().live(Tick::ZERO), 0);
-    }
-
-    #[test]
-    fn p_080_a_replayed_request_is_refused_by_the_counter_and_writes_nothing() {
-        let mut rig = Rig::new();
-        let frame = start(&rig, 5, 42);
-        let reservation = permitted(rig.admit(frame.bytes(), 0));
-        let _ = rig.finish(reservation, Executed::Accepted);
-        let writes = rig.part.writes;
-        // The same bytes again: equal is the replay (P-081).
-        let why = refusal(rig.admit(frame.bytes(), 1));
-        assert_eq!(
-            why,
-            Refusal::Signed(SignedError::StaleCounter {
-                last: Counter(5),
-                sent: Counter(5)
-            })
-        );
-        assert_eq!(why.code(), Code::Client(ErrorCode::CounterNotFresh));
-        // An older counter is refused the same way, and a non-command too.
-        let older = start(&rig, 4, 43);
-        assert!(matches!(
-            refusal(rig.admit(older.bytes(), 2)),
-            Refusal::Signed(SignedError::StaleCounter { .. })
-        ));
-        let time = Frame::signed(MessageType::Time, rig.bound, 5, &[0xa1, 1, 0], &rig.key);
-        assert!(matches!(
-            refusal(rig.admit(time.bytes(), 3)),
-            Refusal::Signed(SignedError::StaleCounter { .. })
-        ));
-        assert_eq!(rig.part.writes, writes, "a replay costs the part nothing");
-    }
-
-    /// Conformance 9: a single check of the tag removed, anywhere, and this
-    /// fails. Every bit of the frame flipped in turn: nothing is permitted,
-    /// no answer comes from the table, and the part is never written.
-    #[test]
-    fn p_080_every_single_bit_flip_of_a_signed_command_is_refused_and_writes_nothing() {
-        let mut rig = Rig::new();
-        let frame = start(&rig, 1, 42);
-        let mut refused_by_the_mac = 0;
-        for at in 0..frame.len {
-            for bit in 0..8 {
-                let mut bytes = frame.bytes;
-                bytes[at] ^= 1 << bit;
-                let flipped = &bytes[..frame.len];
-                let Ok(envelope) = Envelope::decode(flipped) else {
-                    continue;
-                };
-                let Ok(claim) = SignedClaim::decode(envelope) else {
-                    continue;
-                };
-                let admission = block_on(admit(
-                    claim,
-                    &rig.key,
-                    rig.bound,
-                    &mut ReqWindow::opened_by(ReqId(0)),
-                    &mut rig.clients,
-                    &mut rig.part,
-                    Tick::ZERO,
-                ));
-                match admission {
-                    Admission::Refused(Refusal::Signed(SignedError::Mac(_))) => {
-                        refused_by_the_mac += 1;
-                    }
-                    Admission::Refused(Refusal::Signed(SignedError::WrongClient { .. })) => {}
-                    other => panic!("byte {at} bit {bit}: {other:?}"),
+            let mut rig = Rig::new();
+            let operation = [0xa1, 1, 0];
+            let frame = rig.seal(kind, &operation);
+            let mut plain = [0; MAX_PAYLOAD];
+            match rig.admit(&frame, &mut plain, 0) {
+                Admission::Execute(Permit::Write(write)) => {
+                    assert_eq!(write.header().kind, kind);
+                    assert_eq!(write.operation(), &operation);
                 }
+                other => panic!("{kind:?} permitted as a write, not {other:?}"),
             }
+            assert_eq!(rig.part.writes, 0, "{kind:?}: nothing to land");
+            // Even with the part refusing every write.
+            rig.part.falling = true;
+            let frame = rig.seal(kind, &operation);
+            let mut plain = [0; MAX_PAYLOAD];
+            assert!(matches!(
+                rig.admit(&frame, &mut plain, 0),
+                Admission::Execute(Permit::Write(_))
+            ));
         }
-        assert!(refused_by_the_mac > 100, "{refused_by_the_mac}");
-        assert_eq!(rig.part.writes, 0);
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(0)));
-        // The unflipped frame is still good: the refusals spent nothing.
-        let _ = permitted(rig.admit(frame.bytes(), 0));
     }
 
     #[test]
-    fn p_080_a_request_under_another_key_is_error_10_and_reads_no_row() {
-        let mut rig = Rig::new();
-        let forged = {
-            let (op, len) = operation(42, CommandKind::StartGenerator);
-            Frame::signed(
-                MessageType::Command,
-                client(1),
-                1,
-                &op[..len],
-                &key(client(2)),
-            )
-        };
-        let why = refusal(rig.admit(forged.bytes(), 0));
-        assert!(
-            matches!(why, Refusal::Signed(SignedError::Mac(_))),
-            "{why:?}"
-        );
-        assert_eq!(why.code(), Code::Client(ErrorCode::BadMAC));
-        assert_eq!(why.raises(), None);
-        assert_eq!(rig.part.writes, 0);
-    }
-
-    #[test]
-    fn p_084_a_body_naming_another_client_is_error_12_and_moves_neither_row() {
-        let mut rig = Rig::new();
-        // The phone's session, signing correctly, claims to be the laptop:
-        // the counter it would move is the laptop's.
-        let (op, len) = operation(42, CommandKind::StopGenerator);
-        let frame = Frame::signed(
-            MessageType::Command,
-            client(2),
-            u64::MAX,
-            &op[..len],
-            &rig.key,
-        );
-        let why = refusal(rig.admit(frame.bytes(), 0));
-        assert_eq!(
-            why,
-            Refusal::Signed(SignedError::WrongClient {
-                bound: client(1),
-                body: client(2)
-            })
-        );
-        assert_eq!(why.code(), Code::Client(ErrorCode::UnknownClient));
-        assert_eq!(rig.part.writes, 0);
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(0)));
-        assert_eq!(rig.table().accepted(client(2)), Some(Counter(0)));
-    }
-
-    #[test]
-    fn p_079_a_counter_the_part_will_not_keep_is_busy_raises_its_concern_and_does_not_execute() {
+    fn p_079_an_entry_the_part_will_not_keep_is_busy_raises_its_concern_and_does_not_execute() {
         let mut rig = Rig::new();
         rig.part.falling = true;
-        let frame = start(&rig, 1, 42);
-        let why = refusal(rig.admit(frame.bytes(), 0));
+        let frame = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let why = refusal(rig.admit(&frame, &mut plain, 0));
         assert_eq!(
             why,
             Refusal::NotKept(Unchanged::Refused(Refused::SupplyFalling))
         );
         assert_eq!(why.code(), Code::Client(ErrorCode::BusyRetry));
-        assert_eq!(why.raises(), Some(Condition::COUNTER_WRITE_FAILED));
-        // RAM is where the part is: the counter was not accepted and no
-        // entry was reserved, so the retry is judged as a first attempt.
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(0)));
-        assert_eq!(rig.table().dedup().live(Tick::ZERO), 0);
-        // The same for a write that is not a command.
-        let time = Frame::signed(MessageType::Time, rig.bound, 1, &[0xa1, 1, 0], &rig.key);
-        assert!(matches!(
-            refusal(rig.admit(time.bytes(), 0)),
-            Refusal::NotKept(_)
-        ));
-        // The supply recovers; the client's retry carries a new counter and
-        // the same cmd_id, and runs.
+        assert_eq!(why.raises(), Some(Condition::DEDUP_WRITE_FAILED));
+        // RAM is where the part is: nothing was reserved, so the retry is
+        // judged as a first attempt.
+        assert_eq!(rig.live(), 0);
+        // The supply recovers; the retry carries a new req_id and the same
+        // cmd_id (P-082), and runs.
         rig.part.falling = false;
-        let retry = start(&rig, 2, 42);
-        let _ = permitted(rig.admit(retry.bytes(), 1));
-        assert_eq!(rig.on_the_part().accepted(client(1)), Some(Counter(2)));
+        let retry = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let _ = permitted(rig.admit(&retry, &mut plain, 1));
+    }
+
+    /// A power cut before every write the reservation makes: a permit comes
+    /// back only when the whole record landed, and a boot after any cut
+    /// finds either no entry, or the entry in flight — never a table it
+    /// cannot read.
+    #[test]
+    fn p_080_a_reservation_cut_at_every_write_is_permitted_only_once_it_landed() {
+        for cut in 0..=RECORD {
+            let mut rig = Rig::new();
+            rig.part.cut_before = Some(cut);
+            let frame = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            let admission = rig.admit(&frame, &mut plain, 0);
+            let landed = cut >= RECORD;
+            match admission {
+                Admission::Execute(Permit::Command(_)) => assert!(landed, "cut {cut}"),
+                Admission::Refused(Refusal::NotKept(_)) => assert!(!landed, "cut {cut}"),
+                other => panic!("cut {cut}: {other:?}"),
+            }
+            rig.reboot();
+            assert!(
+                matches!(rig.dedups.held(), Held::Present(_)),
+                "cut {cut}: the previous record stands"
+            );
+            let retry = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            let admission = rig.admit(&retry, &mut plain, 1);
+            if landed {
+                let _ = in_flight(admission);
+            } else {
+                let _ = permitted(admission);
+            }
+        }
     }
 
     /// Conformance 13, the first direction.
     #[test]
     fn p_120_a_retry_with_identical_operation_bytes_is_answered_duplicate_and_not_executed() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&first, &mut plain, 0));
         let _ = rig.finish(reservation, Executed::Accepted);
         let writes = rig.part.writes;
-        // The ack was lost; the retry carries a new counter and the same
+        // The ack was lost; the retry carries a new req_id and the same
         // operation bytes (P-082).
-        let retry = start(&rig, 2, 42);
-        let ack = answer(rig.admit(retry.bytes(), 5_000));
+        let retry = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let ack = answer(rig.admit(&retry, &mut plain, 5_000));
         assert_eq!(
             ack,
             CommandAck {
@@ -1066,11 +937,13 @@ mod tests {
     #[test]
     fn p_120_a_retry_of_a_command_that_ran_in_shadow_is_answered_shadowed() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&first, &mut plain, 0));
         let _ = rig.finish(reservation, Executed::Shadowed);
-        let retry = start(&rig, 2, 42);
-        let ack = answer(rig.admit(retry.bytes(), 5_000));
+        let retry = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let ack = answer(rig.admit(&retry, &mut plain, 5_000));
         assert_eq!(ack.outcome, Command::Shadowed);
         assert_eq!(ack.detail, SHADOWED);
     }
@@ -1085,17 +958,15 @@ mod tests {
             Executed::WrongTarget,
         ] {
             let mut rig = Rig::new();
-            let first = start(&rig, 1, 42);
-            let reservation = permitted(rig.admit(first.bytes(), 0));
+            let first = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            let reservation = permitted(rig.admit(&first, &mut plain, 0));
             let finished = rig.finish(reservation, executed);
             assert_eq!(finished.recorded, Ok(()));
-            assert_eq!(
-                rig.on_the_part().dedup().live(Tick::ZERO),
-                0,
-                "{executed:?}"
-            );
-            let retry = start(&rig, 2, 42);
-            let _ = permitted(rig.admit(retry.bytes(), 1));
+            assert_eq!(rig.live(), 0, "{executed:?}");
+            let retry = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            let _ = permitted(rig.admit(&retry, &mut plain, 1));
         }
     }
 
@@ -1104,12 +975,14 @@ mod tests {
     #[test]
     fn p_124_the_same_cmd_id_with_different_bytes_is_rejected_and_not_executed() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&first, &mut plain, 0));
         let _ = rig.finish(reservation, Executed::Accepted);
         let writes = rig.part.writes;
-        let other = command(&rig, 2, 42, CommandKind::StopGenerator);
-        let ack = answer(rig.admit(other.bytes(), 1_000));
+        let other = rig.stop(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let ack = answer(rig.admit(&other, &mut plain, 1_000));
         assert_eq!(
             ack,
             CommandAck {
@@ -1119,31 +992,36 @@ mod tests {
             }
         );
         assert_eq!(rig.part.writes, writes, "nothing reserved, nothing moved");
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
     }
 
+    /// Two clients numbering from zero are two commands (P-120's key), and
+    /// one at its half of the table leaves the other's untouched (P-122).
     #[test]
-    fn p_122_a_client_at_its_half_of_the_table_is_busy_and_its_counter_does_not_move() {
+    fn p_122_a_client_at_its_half_of_the_table_is_busy_and_another_is_not() {
         let mut rig = Rig::new();
         let half = u32::try_from(PER_CLIENT).expect("fits");
         for cmd_id in 0..half {
-            let frame = start(&rig, u64::from(cmd_id) + 1, cmd_id);
-            let reservation = permitted(rig.admit(frame.bytes(), 0));
+            let frame = rig.start(cmd_id);
+            let mut plain = [0; MAX_PAYLOAD];
+            let reservation = permitted(rig.admit(&frame, &mut plain, 0));
             let _ = rig.finish(reservation, Executed::Accepted);
         }
         let writes = rig.part.writes;
-        let next = u64::from(half) + 1;
-        let frame = start(&rig, next, half);
-        let why = refusal(rig.admit(frame.bytes(), 1));
+        let frame = rig.start(half);
+        let mut plain = [0; MAX_PAYLOAD];
+        let why = refusal(rig.admit(&frame, &mut plain, 1));
         assert_eq!(why, Refusal::Busy);
         assert_eq!(why.code(), Code::Client(ErrorCode::BusyRetry));
-        assert_eq!(why.raises(), None, "a full table is not a failing part");
+        assert_eq!(why.raises(), None, "a full half is not a failing part");
         assert_eq!(rig.part.writes, writes);
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(next - 1)));
+        // Another client's command 0 is not the first client's.
+        let frame = rig.start(0);
+        let mut plain = [0; MAX_PAYLOAD];
+        let _ = permitted(rig.admit_as(client(2), &frame, &mut plain, 1));
     }
 
     #[test]
-    fn a_command_whose_operation_does_not_read_is_error_1_and_spends_no_counter() {
+    fn p_080_a_command_whose_operation_does_not_read_is_error_1_and_writes_nothing() {
         let mut rig = Rig::new();
         for op in [
             &[0xa0][..],
@@ -1151,64 +1029,47 @@ mod tests {
             &[0xa3, 1, 7, 2, 0x19, 1, 1, 3, 0x80],
             &[0x07],
         ] {
-            let frame = Frame::signed(MessageType::Command, rig.bound, 1, op, &rig.key);
-            let why = refusal(rig.admit(frame.bytes(), 0));
+            let frame = rig.seal(MessageType::Command, op);
+            let mut plain = [0; MAX_PAYLOAD];
+            let why = refusal(rig.admit(&frame, &mut plain, 0));
             assert!(matches!(why, Refusal::Operation(_)), "{op:02x?}: {why:?}");
             assert_eq!(why.code(), Code::Client(ErrorCode::MalformedFrame));
         }
         assert_eq!(rig.part.writes, 0);
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(0)));
+        assert_eq!(rig.live(), 0);
     }
 
-    #[test]
-    fn a_session_bound_to_a_slot_with_no_row_is_error_12_and_writes_nothing() {
-        let mut rig = Rig::new();
-        rig.bound = client(3);
-        rig.key = key(client(3));
-        let frame = start(&rig, 1, 42);
-        let why = refusal(rig.admit(frame.bytes(), 0));
-        assert_eq!(why, Refusal::NoSuchClient);
-        assert_eq!(why.code(), Code::Client(ErrorCode::UnknownClient));
-        assert_eq!(rig.part.writes, 0);
-    }
-
-    /// A reset between steps 4 and 6: the entry says only that the command
+    /// A reset between steps 3 and 5: the entry says only that the command
     /// started. The retry is handed to the state store, never answered
-    /// from the entry, and both of its answers are exercised.
+    /// from the entry, and both of its answers are exercised (P-080, P-121).
     #[test]
-    fn p_080_a_retry_meeting_an_entry_left_in_flight_is_settled_by_the_state_store() {
+    fn p_121_a_retry_meeting_an_entry_left_in_flight_is_settled_by_the_state_store() {
         for hardware_already_there in [true, false] {
             let mut rig = Rig::new();
-            let first = start(&rig, 1, 42);
-            let reservation = permitted(rig.admit(first.bytes(), 0));
-            drop(reservation);
-            // The reset: the boot reads the table back and rebases it.
-            let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
-            assert_eq!(
-                block_on(clients.booted(&mut rig.part, Epoch::FIRST)),
-                Ok(Booted::Rebased)
-            );
-            rig.clients = clients;
-            let retry = start(&rig, 2, 42);
-            let Admission::InFlight(in_flight) = rig.admit(retry.bytes(), 10) else {
-                panic!("an entry in flight");
-            };
-            assert_eq!(in_flight.command().cmd_id, 42);
+            let first = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            drop(permitted(rig.admit(&first, &mut plain, 0)));
+            rig.reboot();
+            let retry = rig.start(42);
+            let mut plain = [0; MAX_PAYLOAD];
+            let admission = rig.admit(&retry, &mut plain, 10);
+            let retry = in_flight(admission);
+            assert_eq!(retry.command().cmd_id, 42);
             if hardware_already_there {
-                let finished = block_on(in_flight.already(&mut rig.clients, &mut rig.part))
+                let finished = block_on(retry.already(&mut rig.dedups, &mut rig.part))
                     .expect("nothing else settled it");
                 assert_eq!(finished.recorded, Ok(()));
                 assert_eq!(finished.ack.outcome, Command::Duplicate);
                 // Completed on the part: a third try is the plain duplicate.
-                let third = start(&rig, 3, 42);
+                let third = rig.start(42);
+                let mut plain = [0; MAX_PAYLOAD];
                 assert_eq!(
-                    answer(rig.admit(third.bytes(), 20)).outcome,
+                    answer(rig.admit(&third, &mut plain, 20)).outcome,
                     Command::Duplicate
                 );
             } else {
-                let again = block_on(in_flight.again(&mut rig.clients, &mut rig.part, Tick::ZERO));
+                let again = block_on(retry.again(&mut rig.dedups, &mut rig.part, Tick::ZERO));
                 let reservation = permitted(again);
-                assert_eq!(rig.on_the_part().accepted(client(1)), Some(Counter(2)));
                 let finished = rig.finish(reservation, Executed::Accepted);
                 assert_eq!(finished.ack.outcome, Command::Accepted);
             }
@@ -1221,21 +1082,23 @@ mod tests {
     #[test]
     fn p_080_a_retry_while_its_command_still_executes_is_busy_and_gets_no_second_permit() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&first, &mut plain, 0));
         let writes = rig.part.writes;
-        let retry = start(&rig, 2, 42);
-        let why = refusal(rig.admit(retry.bytes(), 100));
+        let retry = rig.start(42);
+        let mut retry_plain = [0; MAX_PAYLOAD];
+        let why = refusal(rig.admit(&retry, &mut retry_plain, 100));
         assert_eq!(why, Refusal::Running);
         assert_eq!(why.code(), Code::Client(ErrorCode::BusyRetry));
         assert_eq!(why.raises(), None);
         assert_eq!(rig.part.writes, writes, "the retry moved nothing");
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
         // Once the first has run, the next retry is its duplicate.
         let _ = rig.finish(reservation, Executed::Accepted);
-        let third = start(&rig, 3, 42);
+        let third = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
         assert_eq!(
-            answer(rig.admit(third.bytes(), 200)).outcome,
+            answer(rig.admit(&third, &mut plain, 200)).outcome,
             Command::Duplicate
         );
     }
@@ -1245,48 +1108,40 @@ mod tests {
     /// settled, not the one both were handed, and must not discard it for a
     /// second permit or answer it `duplicate` while its command still runs.
     #[test]
-    fn p_080_two_retries_of_one_entry_left_in_flight_never_get_two_permits() {
+    fn p_121_two_retries_of_one_entry_left_in_flight_never_get_two_permits() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        drop(permitted(rig.admit(first.bytes(), 0)));
-        let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
-        assert_eq!(
-            block_on(clients.booted(&mut rig.part, Epoch::FIRST)),
-            Ok(Booted::Rebased)
-        );
-        rig.clients = clients;
-        let (a, b, c) = (start(&rig, 2, 42), start(&rig, 3, 42), start(&rig, 4, 42));
-        let Admission::InFlight(a) = rig.admit(a.bytes(), 10) else {
-            panic!("the first retry meets the entry in flight");
-        };
-        let Admission::InFlight(b) = rig.admit(b.bytes(), 11) else {
-            panic!("so does the second, before the first is settled");
-        };
-        let Admission::InFlight(c) = rig.admit(c.bytes(), 12) else {
-            panic!("and the third");
-        };
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        drop(permitted(rig.admit(&first, &mut plain, 0)));
+        rig.reboot();
+        let (a, b, c) = (rig.start(42), rig.start(42), rig.start(42));
+        let (mut pa, mut pb, mut pc) = ([0; MAX_PAYLOAD], [0; MAX_PAYLOAD], [0; MAX_PAYLOAD]);
+        let a = in_flight(rig.admit(&a, &mut pa, 10));
+        let b = in_flight(rig.admit(&b, &mut pb, 11));
+        let c = in_flight(rig.admit(&c, &mut pc, 12));
         let running = permitted(block_on(a.again(
-            &mut rig.clients,
+            &mut rig.dedups,
             &mut rig.part,
             Tick::ZERO,
         )));
         let writes = rig.part.writes;
         // Told the hardware has not moved either, the second finds the
         // first one's command running.
-        match block_on(b.again(&mut rig.clients, &mut rig.part, Tick::ZERO)) {
+        match block_on(b.again(&mut rig.dedups, &mut rig.part, Tick::ZERO)) {
             Admission::Refused(why) => assert_eq!(why, Refusal::Running),
             other => panic!("a second permit beside the first: {other:?}"),
         }
         // Told the hardware is there, the third may not complete it.
-        match block_on(c.already(&mut rig.clients, &mut rig.part)) {
+        match block_on(c.already(&mut rig.dedups, &mut rig.part)) {
             Err(why) => assert_eq!(why, Refusal::Running),
             Ok(finished) => panic!("answered while it runs: {finished:?}"),
         }
         assert_eq!(rig.part.writes, writes, "nothing was settled for either");
         let _ = rig.finish(running, Executed::Accepted);
-        let last = start(&rig, 5, 42);
+        let last = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
         assert_eq!(
-            answer(rig.admit(last.bytes(), 13)).outcome,
+            answer(rig.admit(&last, &mut plain, 13)).outcome,
             Command::Duplicate
         );
     }
@@ -1295,34 +1150,30 @@ mod tests {
     /// hardware already there, and the second, handed the same entry, is
     /// answered from what the first recorded.
     #[test]
-    fn p_080_a_retry_settling_an_entry_another_already_completed_is_its_duplicate() {
+    fn p_121_a_retry_settling_an_entry_another_already_completed_is_its_duplicate() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        drop(permitted(rig.admit(first.bytes(), 0)));
-        let mut clients = block_on(Clients::read(CLIENT_TABLE, &mut rig.part)).expect("reads");
-        let _ = block_on(clients.booted(&mut rig.part, Epoch::FIRST));
-        rig.clients = clients;
-        let (a, b) = (start(&rig, 2, 42), start(&rig, 3, 42));
-        let Admission::InFlight(a) = rig.admit(a.bytes(), 10) else {
-            panic!("in flight");
-        };
-        let Admission::InFlight(b) = rig.admit(b.bytes(), 11) else {
-            panic!("in flight");
-        };
-        let settled = block_on(a.already(&mut rig.clients, &mut rig.part)).expect("settled");
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        drop(permitted(rig.admit(&first, &mut plain, 0)));
+        rig.reboot();
+        let (a, b) = (rig.start(42), rig.start(42));
+        let (mut pa, mut pb) = ([0; MAX_PAYLOAD], [0; MAX_PAYLOAD]);
+        let a = in_flight(rig.admit(&a, &mut pa, 10));
+        let b = in_flight(rig.admit(&b, &mut pb, 11));
+        let settled = block_on(a.already(&mut rig.dedups, &mut rig.part)).expect("settled");
         assert_eq!(settled.ack.outcome, Command::Duplicate);
-        let again = block_on(b.again(&mut rig.clients, &mut rig.part, Tick::ZERO));
-        match again {
+        match block_on(b.again(&mut rig.dedups, &mut rig.part, Tick::ZERO)) {
             Admission::Answered(ack) => assert_eq!(ack.outcome, Command::Duplicate),
             other => panic!("the completed command ran again: {other:?}"),
         }
     }
 
     #[test]
-    fn p_080_a_step_6_that_does_not_land_still_answers_and_leaves_the_entry_in_flight() {
+    fn p_080_a_step_5_that_does_not_land_still_answers_and_leaves_the_entry_in_flight() {
         let mut rig = Rig::new();
-        let first = start(&rig, 1, 42);
-        let reservation = permitted(rig.admit(first.bytes(), 0));
+        let first = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let reservation = permitted(rig.admit(&first, &mut plain, 0));
         rig.part.falling = true;
         let finished = rig.finish(reservation, Executed::Accepted);
         assert_eq!(finished.ack.outcome, Command::Accepted, "it ran");
@@ -1331,123 +1182,20 @@ mod tests {
             Err(Unchanged::Refused(Refused::SupplyFalling))
         );
         rig.part.falling = false;
-        let retry = start(&rig, 2, 42);
-        assert!(matches!(
-            rig.admit(retry.bytes(), 1),
-            Admission::InFlight(_)
-        ));
+        let retry = rig.start(42);
+        let mut plain = [0; MAX_PAYLOAD];
+        let _ = in_flight(rig.admit(&retry, &mut plain, 1));
     }
 
     #[test]
-    fn p_022_a_replayed_req_id_is_refused_before_its_counter_is_read_and_writes_nothing() {
-        let mut rig = Rig::new();
-        let mut window = ReqWindow::opened_by(ReqId(19));
-        let first = start_as(&rig, 20, 1, 42);
-        let reservation = permitted(rig.admit_in(&mut window, first.bytes(), 0));
-        let _ = rig.finish(reservation, Executed::Accepted);
-        let writes = rig.part.writes;
-        // The same req_id under a counter that is ahead and a cmd_id the
-        // table has never seen: everything P-080 checks would pass, and
-        // the window refuses it before any of it is consulted.
-        let replay = start_as(&rig, 20, 2, 43);
-        assert_eq!(
-            out_of_window(rig.admit_in(&mut window, replay.bytes(), 1)),
-            OutOfWindow::Replayed
-        );
-        // The frame itself again, whose counter is spent: refused by the
-        // window too, not answered from the table or by error 11.
-        assert_eq!(
-            out_of_window(rig.admit_in(&mut window, first.bytes(), 2)),
-            OutOfWindow::Replayed
-        );
-        assert_eq!(rig.part.writes, writes, "nothing written");
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
-    }
-
-    #[test]
-    fn p_022_a_signed_request_below_the_window_is_refused_with_its_counter_untouched() {
-        let mut rig = Rig::new();
-        let mut window = ReqWindow::opened_by(ReqId(1));
-        let newest = start_as(&rig, 30, 1, 1);
-        let reservation = permitted(rig.admit_in(&mut window, newest.bytes(), 0));
-        let _ = rig.finish(reservation, Executed::Accepted);
-        let writes = rig.part.writes;
-        // Signed at nine and held back: its counter would still be ahead.
-        let withheld = start_as(&rig, 25, 2, 2);
-        assert_eq!(
-            out_of_window(rig.admit_in(&mut window, withheld.bytes(), 1)),
-            OutOfWindow::BelowWindow
-        );
-        assert_eq!(rig.part.writes, writes);
-        assert_eq!(rig.table().accepted(client(1)), Some(Counter(1)));
-        // At the floor, 30 − 4, it is inside and goes on to P-080.
-        let floor = start_as(&rig, 26, 2, 2);
-        let _ = permitted(rig.admit_in(&mut window, floor.bytes(), 2));
-    }
-
-    #[test]
-    fn p_022_signed_requests_reordered_inside_the_window_both_reach_the_counter() {
-        let mut rig = Rig::new();
-        let mut window = ReqWindow::opened_by(ReqId(10));
-        // Sent as 11 then 12, with counters 1 then 2; 12 arrives first.
-        let later = start_as(&rig, 12, 2, 2);
-        let earlier = start_as(&rig, 11, 1, 1);
-        let reservation = permitted(rig.admit_in(&mut window, later.bytes(), 0));
-        let _ = rig.finish(reservation, Executed::Accepted);
-        // Inside the window, so the counter decides, and 1 is behind 2.
-        let why = refusal(rig.admit_in(&mut window, earlier.bytes(), 1));
-        assert_eq!(why.code(), Code::Client(ErrorCode::CounterNotFresh));
-        // Counters in the order the ids arrived: both permitted.
-        let mut rig = Rig::new();
-        let mut window = ReqWindow::opened_by(ReqId(10));
-        let later = start_as(&rig, 12, 1, 1);
-        let earlier = start_as(&rig, 11, 2, 2);
-        let reservation = permitted(rig.admit_in(&mut window, later.bytes(), 0));
-        let _ = rig.finish(reservation, Executed::Accepted);
-        let reservation = permitted(rig.admit_in(&mut window, earlier.bytes(), 1));
-        let _ = rig.finish(reservation, Executed::Accepted);
-    }
-
-    #[test]
-    fn p_022_a_frame_that_fails_its_mac_does_not_spend_its_req_id() {
-        let mut rig = Rig::new();
-        let mut window = ReqWindow::opened_by(ReqId(1));
-        let (op, len) = operation(9, CommandKind::StartGenerator);
-        let forged = Frame::signed_as(
-            ReqId(2),
-            MessageType::Command,
-            rig.bound,
-            1,
-            &op[..len],
-            &key(client(2)),
-        );
-        let why = refusal(rig.admit_in(&mut window, forged.bytes(), 0));
-        assert!(
-            matches!(why, Refusal::Signed(SignedError::Mac(_))),
-            "{why:?}"
-        );
-        // The client's own request under that id is still accepted: the
-        // comms processor cannot burn ids it holds no key for.
-        let genuine = start_as(&rig, 2, 1, 9);
-        let _ = permitted(rig.admit_in(&mut window, genuine.bytes(), 1));
-    }
-
-    #[test]
-    fn every_refusal_names_its_code_and_only_a_counter_not_kept_raises() {
-        let cases: [(Refusal<()>, ErrorCode); 5] = [
-            (
-                Refusal::Signed(SignedError::StaleCounter {
-                    last: Counter(1),
-                    sent: Counter(1),
-                }),
-                ErrorCode::CounterNotFresh,
-            ),
+    fn p_079_every_refusal_names_its_code_and_only_an_entry_not_kept_raises() {
+        let cases: [(Refusal<()>, ErrorCode); 4] = [
             (
                 Refusal::Operation(CommandError::UnknownKind(0)),
                 ErrorCode::MalformedFrame,
             ),
-            (Refusal::NoSuchClient, ErrorCode::UnknownClient),
             (Refusal::Busy, ErrorCode::BusyRetry),
+            (Refusal::Running, ErrorCode::BusyRetry),
             (
                 Refusal::NotKept(Unchanged::NothingHeld),
                 ErrorCode::BusyRetry,
@@ -1456,8 +1204,8 @@ mod tests {
         for (why, code) in cases {
             assert_eq!(why.code(), Code::Client(code), "{why:?}");
             assert_eq!(
-                why.raises().is_some(),
-                matches!(why, Refusal::NotKept(_)),
+                why.raises(),
+                matches!(why, Refusal::NotKept(_)).then_some(Condition::DEDUP_WRITE_FAILED),
                 "{why:?}"
             );
         }

@@ -15,20 +15,23 @@
 //! never refused. The lookup is on `(client_id, cmd_id)` and the hash
 //! decides which answer the match gets (P-120, P-124).
 //!
-//! The table is one field of the client table's record, not a record of
-//! its own, because P-080 lands the in-flight entry and the new counter in
-//! one FRAM transaction, and one record is the only thing that is one
-//! transaction. It survives a reset (P-121), refuses rather than evicts
+//! The table is a record of its own, [`Commands`], stamped with the epoch
+//! it was kept under: an entry names a client by its slot, and a slot
+//! under a new epoch, or re-keyed for a new install, is somebody else. A
+//! factory reset clears it after the epoch lands, and a boot that finds it
+//! under another epoch clears it too, which finishes a reset cut between
+//! the two; a re-key forgets the slot's entries before the new key is
+//! written (P-239). It survives a reset (P-121), refuses rather than evicts
 //! (P-122), and every entry restarts at the new boot's tick zero, because
 //! the tick that measures its ten minutes is zero at exactly the boot it
 //! has to survive.
 //!
-//! cites: P-080, P-120, P-121, P-122, P-124
+//! cites: P-079, P-080, P-085, P-120, P-121, P-122, P-124
 
-use km43::{ClientId, MAX_CLIENTS, MAX_CMD_DEDUP};
+use km43::{ClientId, Epoch, MAX_CLIENTS, MAX_CMD_DEDUP};
 use sha2::{Digest as _, Sha256};
 
-use crate::body::{Malformed, Reader, Writer};
+use crate::body::{Body, Malformed, Reader, Writer};
 use crate::tick::{Millis, Tick};
 
 /// How long a command is remembered.
@@ -363,6 +366,26 @@ impl Dedup {
         }
     }
 
+    /// Forget every entry `client` holds: its slot is being given to
+    /// another install, whose `cmd_id`s start again and must not meet the
+    /// old one's answers.
+    pub(crate) fn forget(&mut self, client: ClientId) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| entry.client == client) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Whether `client` holds any entry.
+    #[must_use]
+    pub fn holds(&self, client: ClientId) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.client == client)
+    }
+
     /// Whether an entry is still inside the window at `now`.
     fn inside(entry: &Entry, now: Tick) -> bool {
         now.since(entry.inserted)
@@ -420,6 +443,78 @@ impl Dedup {
             });
         }
         Ok(Self { entries })
+    }
+}
+
+/// The bytes the dedup record takes: the epoch it was kept under, then the
+/// table.
+pub const COMMANDS_BYTES: usize = 4 + DEDUP_BYTES;
+
+/// The dedup table as the part keeps it: under the epoch its entries were
+/// made in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commands {
+    epoch: Epoch,
+    dedup: Dedup,
+}
+
+impl Commands {
+    /// An empty table under `epoch`.
+    #[must_use]
+    pub const fn cleared(epoch: Epoch) -> Self {
+        Self {
+            epoch,
+            dedup: Dedup::new(),
+        }
+    }
+
+    /// The epoch the entries were made under.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// The table.
+    #[must_use]
+    pub const fn dedup(&self) -> &Dedup {
+        &self.dedup
+    }
+
+    /// The table, to change; the caller lands the record before acting.
+    pub fn dedup_mut(&mut self) -> &mut Dedup {
+        &mut self.dedup
+    }
+
+    /// As a boot keeps it: every entry restarted at tick zero (P-121).
+    #[must_use]
+    pub fn rebased(self) -> Self {
+        Self {
+            epoch: self.epoch,
+            dedup: self.dedup.rebased(),
+        }
+    }
+}
+
+impl Body<COMMANDS_BYTES> for Commands {
+    fn encode(&self) -> [u8; COMMANDS_BYTES] {
+        let mut out = [0u8; COMMANDS_BYTES];
+        let mut dedup = [0u8; DEDUP_BYTES];
+        self.dedup.encode_into(&mut dedup);
+        let mut writer = Writer::over(&mut out);
+        writer.u32(self.epoch.get());
+        writer.put(&dedup);
+        out
+    }
+
+    fn decode(bytes: &[u8; COMMANDS_BYTES]) -> Result<Self, Malformed> {
+        let mut reader = Reader::over(bytes);
+        let epoch = Epoch::new(reader.u32()?).ok_or(reader.malformed(4))?;
+        let base = reader.at();
+        let dedup =
+            Dedup::decode(&reader.take::<DEDUP_BYTES>()?).map_err(|malformed| Malformed {
+                at: base.saturating_add(malformed.at),
+            })?;
+        Ok(Self { epoch, dedup })
     }
 }
 
@@ -678,5 +773,58 @@ mod tests {
         );
         // Every byte zero is the empty table.
         assert_eq!(Dedup::decode(&[0; DEDUP_BYTES]), Ok(Dedup::new()));
+    }
+
+    #[test]
+    fn p_239_forgetting_a_slot_drops_its_entries_and_no_other_clients() {
+        let mut table = Dedup::new();
+        let _ = ran(&mut table, 1, 7, start(), at(0));
+        let _ = ran(&mut table, 1, 8, stop(), at(0));
+        let _ = ran(&mut table, 2, 7, start(), at(0));
+        assert!(table.holds(client(1)));
+        assert!(table.holds(client(2)));
+        assert!(!table.holds(client(3)));
+        table.forget(client(1));
+        assert!(!table.holds(client(1)));
+        assert!(table.holds(client(2)));
+        assert_eq!(table.live(at(0)), 1);
+        // A new install on the slot numbers from zero and meets nothing.
+        assert!(matches!(
+            table.admit(client(1), 7, start(), at(0)),
+            Verdict::Fresh(_)
+        ));
+        // Forgetting a client with no entries changes nothing.
+        let before = table.clone();
+        table.forget(client(5));
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn p_121_the_dedup_record_round_trips_under_its_epoch() {
+        let epoch = Epoch::new(3).expect("nonzero");
+        let empty = Commands::cleared(epoch);
+        assert_eq!(Commands::decode(&empty.encode()), Ok(empty.clone()));
+        assert_eq!(empty.epoch(), epoch);
+        let mut held = Commands::cleared(epoch);
+        let _ = ran(held.dedup_mut(), 4, 9, start(), at(500_000));
+        let found = Commands::decode(&held.encode()).expect("decodes");
+        assert_eq!(found, held);
+        let rebased = found.rebased();
+        assert_eq!(rebased.epoch(), epoch);
+        assert_eq!(rebased.dedup().live(at(599_999)), 1);
+        assert_eq!(rebased.dedup().live(at(600_000)), 0);
+        // Epoch zero is bytes nobody wrote.
+        let mut bytes = held.encode();
+        bytes[..4].fill(0);
+        assert_eq!(Commands::decode(&bytes), Err(Malformed { at: 0 }));
+        // A bad status byte is reported at its offset in the record.
+        let mut bytes = held.encode();
+        bytes[4 + ENTRY_BYTES - 1] = 0x7F;
+        assert_eq!(
+            Commands::decode(&bytes),
+            Err(Malformed {
+                at: 4 + ENTRY_BYTES - 1
+            })
+        );
     }
 }

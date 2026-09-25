@@ -16,8 +16,8 @@
 //! DMA path is a bench question filed on its own, not a rule.
 //!
 //! Past the boot the part is shared: the recorder keeps the ladder's cuts
-//! and serves the bench, the link task keeps the challenge counter and the
-//! client table, and each writes only its own records. They meet at one
+//! and serves the bench, the link task keeps the generator and the client
+//! table, and each writes only its own records. They meet at one
 //! async mutex, a [`Lease`] each, held for one transfer: the transfer
 //! blocks and never awaits, so the lock never waits on anything but the
 //! transfer in front of it, and a NOR erase in the recorder never holds a

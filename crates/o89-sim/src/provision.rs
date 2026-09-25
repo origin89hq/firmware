@@ -1,159 +1,179 @@
-//! Secret replacement and recovery under byte-by-byte power loss.
+//! The manufacturing transaction and a label's replacement, under
+//! byte-by-byte power loss: a unit is born whole or not at all, and nothing
+//! after its birth writes its controller key or its generator again (P-235,
+//! P-237).
 use embassy_futures::block_on;
-use o89_core::{Address, Fram as _, Held, MintFailed, Secret, Store, map, stage_secret};
+use o89_core::{
+    Birth, ControllerKey, DrbgState, Fram as _, Held, Kept, SECRET_CHANGE_BYTES, Secret,
+    SecretChange, SecretRecovery, Store, map, stage_secret,
+};
 
+use crate::link::{controller, manufactured, secret};
 use crate::{SimFram, crash_at_every_step};
 
-fn old() -> Secret {
-    Secret::new([1; 16], [2; 32]).expect("entropy")
+fn replacement() -> Secret {
+    Secret::new(crate::link::DEVICE, [3; 32]).expect("fresh entropy")
 }
-fn new() -> Secret {
-    Secret::new([1; 16], [3; 32]).expect("fresh entropy")
-}
-fn start(corrupt: bool) -> SimFram {
-    let mut part = SimFram::fresh();
-    let (mut store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
-    block_on(store.secret.write(&mut part, old())).expect("legacy secret");
-    for _ in 0..7 {
-        let _ = block_on(store.challenges.mint(&mut part)).expect("mint");
+
+fn birth() -> Birth {
+    Birth {
+        controller: controller(),
+        drbg: DrbgState::new(crate::link::SEED).expect("entropy"),
     }
-    if corrupt {
-        block_on(part.write(Address(32), &[0x55; 40])).expect("damage both slots");
+}
+
+/// The generator's state as the part holds it, compared by encoding.
+fn drbg(store: &Store) -> Option<[u8; 32]> {
+    use o89_core::Body as _;
+    store.drbg.present().map(DrbgState::encode)
+}
+
+/// A manufactured unit whose generator has drawn: its state is not the seed.
+fn drawn() -> SimFram {
+    let mut part = manufactured();
+    let (store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
+    let mut generator = o89_core::Generator::new(store.drbg);
+    for _ in 0..3 {
+        let _ = block_on(generator.challenge(&mut part)).expect("draws");
     }
     part
 }
 
 #[test]
-fn f_041_secret_replacement_cut_at_every_byte_recovers_only_the_old_or_new_pair() {
-    for (corrupt, first, prior_transaction) in [
-        (false, false, false),
-        (true, false, false),
-        (true, true, false),
-        (false, false, true),
-    ] {
-        let mut start = start(corrupt);
-        if first {
-            block_on(start.write(map::WRITE_VOLUME.end(), &[0; 120])).expect("unprovisioned");
-        }
-        if prior_transaction {
-            let earlier = Secret::new([1; 16], [4; 32]).expect("earlier entropy");
-            block_on(stage_secret(&mut start, earlier, true)).expect("previous transaction");
-            let (mut store, _) = block_on(Store::boot(&mut start, None)).expect("previous boot");
-            let mut transaction = block_on(o89_core::Kept::<
-                o89_core::SecretChange,
-                { o89_core::SECRET_CHANGE_BYTES },
-            >::read(map::SECRET_CHANGE, &mut start))
-            .expect("transaction");
-            block_on(transaction.write(&mut start, o89_core::SecretChange::Complete))
-                .expect("label acknowledged");
-            block_on(store.secret.write(&mut start, old())).expect("legacy key fixture");
-            for _ in 0..7 {
-                let _ = block_on(store.challenges.mint(&mut start)).expect("mint");
-            }
-        }
-        let previous = if first { None } else { Some(old()) };
-        let crashes = crash_at_every_step(
-            &start,
-            |part| {
-                block_on(stage_secret(part, new(), !first)).map_err(|_| ())?;
-                // Store::boot is the reboot boundary; preserve the fault injector's
-                // byte count so cuts also cover every byte of boot recovery.
-                let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
-                report.boot_recorded.map_err(|_| ())?;
-                Ok(())
-            },
-            |part, step| {
-                let (mut store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
-                if store.secret.present() == previous.as_ref() {
-                    if corrupt {
-                        assert_eq!(store.challenges.held(), &Held::Corrupt, "cut {step}");
-                        assert_eq!(
-                            block_on(store.challenges.mint(part)),
-                            Err(MintFailed::Unknown)
-                        );
-                    } else {
-                        assert_eq!(
-                            store.challenges.present().expect("old counter").last(),
-                            7,
-                            "cut {step}"
-                        );
-                    }
-                } else {
-                    assert!(store.secret.present() == Some(&new()), "cut {step}");
-                    assert_eq!(
-                        block_on(store.challenges.mint(part))
-                            .expect("fresh counter")
-                            .counter(),
-                        1,
-                        "cut {step}"
-                    );
-                    let (mut again, _) = block_on(Store::boot(part, None)).expect("next boot");
-                    assert_eq!(
-                        block_on(again.challenges.mint(part))
-                            .expect("never reset again")
-                            .counter(),
-                        2,
-                        "cut {step}"
-                    );
-                }
-            },
-        )
-        .expect("uncut transaction");
-        assert!(crashes.steps > 200);
-    }
-}
-
-#[test]
-fn f_041_secret_replacement_recovery_itself_survives_every_byte_cut() {
-    let mut start = start(true);
-    block_on(stage_secret(&mut start, new(), true)).expect("durable intent");
+fn p_235_p_237_manufacture_cut_at_every_byte_is_born_whole_or_not_at_all() {
+    let start = SimFram::fresh();
     let crashes = crash_at_every_step(
         &start,
         |part| {
-            block_on(Store::boot(part, None))
-                .map(|_| ())
-                .map_err(|_| ())
+            block_on(stage_secret(part, secret(), Some(birth()), false)).map_err(|_| ())?;
+            // The boot is the reboot boundary: its applying is cut too.
+            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+            report.boot_recorded.map_err(|_| ())
         },
         |part, step| {
-            let (mut store, _) = block_on(Store::boot(part, None)).expect("recovery retries");
-            assert!(store.secret.present() == Some(&new()), "cut {step}");
-            assert_eq!(
-                block_on(store.challenges.mint(part))
-                    .expect("mintable")
-                    .counter(),
-                1,
+            let (store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
+            let born = (
+                store.secret.present().is_some(),
+                store.controller.present().is_some(),
+                store.drbg.present().is_some(),
+            );
+            match born {
+                (false, false, false) => {
+                    assert!(
+                        matches!(store.controller.held(), Held::Absent),
+                        "cut {step}"
+                    );
+                    assert!(matches!(store.drbg.held(), Held::Absent), "cut {step}");
+                }
+                (true, true, true) => {
+                    assert!(store.secret.present() == Some(&secret()), "cut {step}");
+                    assert!(
+                        store
+                            .controller
+                            .present()
+                            .is_some_and(|key| key.fingerprint() == controller().fingerprint()),
+                        "cut {step}"
+                    );
+                }
+                other => panic!("cut {step}: born in part: {other:?}"),
+            }
+        },
+    )
+    .expect("uncut manufacture");
+    assert!(crashes.steps > 200);
+}
+
+#[test]
+fn p_235_p_237_a_replacement_label_cut_at_every_byte_keeps_the_key_and_the_generator() {
+    let mut start = drawn();
+    let (before, _) = block_on(Store::boot(&mut start, None)).expect("boot");
+    let (fingerprint, state) = (
+        before.controller.present().map(ControllerKey::fingerprint),
+        drbg(&before),
+    );
+    assert!(state.is_some());
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            block_on(stage_secret(part, replacement(), None, true)).map_err(|_| ())?;
+            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+            report.boot_recorded.map_err(|_| ())
+        },
+        |part, step| {
+            let (store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
+            assert!(
+                store.secret.present() == Some(&secret())
+                    || store.secret.present() == Some(&replacement()),
                 "cut {step}"
+            );
+            assert!(
+                store.controller.present().map(ControllerKey::fingerprint) == fingerprint,
+                "cut {step}: the controller key changed"
+            );
+            assert_eq!(
+                drbg(&store),
+                state,
+                "cut {step}: the generator was reseeded"
             );
         },
     )
-    .expect("uncut recovery");
+    .expect("uncut replacement");
     assert!(crashes.steps > 100);
 }
 
 #[test]
-fn f_041_first_secret_over_a_corrupt_counter_is_mintable() {
-    let mut part = SimFram::fresh();
-    block_on(part.write(Address(32), &[0x55; 40])).expect("old layout");
-    block_on(stage_secret(&mut part, new(), false)).expect("first secret");
-    let (mut store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
-    assert!(store.secret.present() == Some(&new()));
-    assert_eq!(
-        block_on(store.challenges.mint(&mut part))
-            .expect("mintable")
-            .counter(),
-        1
-    );
+fn p_235_a_second_birth_is_refused_and_an_unborn_unit_needs_one() {
+    let mut born = manufactured();
     assert!(matches!(
-        block_on(map::SECRET_CHANGE.read(&mut part)),
-        Ok(o89_core::Current::Valid { .. })
+        block_on(stage_secret(&mut born, replacement(), Some(birth()), true)),
+        Err(o89_core::ProvisionFailed::AlreadyBorn)
+    ));
+    let mut unborn = SimFram::fresh();
+    assert!(matches!(
+        block_on(stage_secret(&mut unborn, secret(), None, false)),
+        Err(o89_core::ProvisionFailed::Unborn)
     ));
 }
 
 #[test]
-fn f_041_garbage_intent_discard_cut_at_every_byte_keeps_the_active_pair() {
-    let mut start = start(false);
+fn p_235_an_unappliable_intent_is_discarded_and_every_cut_boot_goes_on() {
+    // An intent carrying no birth onto a unit that holds no controller key:
+    // `stage_secret` refuses to write one, so it is written as bytes.
+    let mut start = SimFram::fresh();
+    let mut intent = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+        map::SECRET_CHANGE,
+        &mut start,
+    ))
+    .expect("reads");
+    block_on(intent.write(&mut start, SecretChange::Pending(secret(), None))).expect("written");
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+            match report.secret_recovery {
+                SecretRecovery::Discarded => Ok(()),
+                SecretRecovery::Unchanged | SecretRecovery::Applied => Err(()),
+            }
+        },
+        |part, step| {
+            let (store, _) = block_on(Store::boot(part, None)).expect("the boot goes on");
+            // All or nothing: not even the secret it carried.
+            assert!(store.secret.present().is_none(), "cut {step}");
+            assert!(store.controller.present().is_none(), "cut {step}");
+        },
+    )
+    .expect("the discard runs uncut");
+    assert!(crashes.steps > 0);
+}
+
+#[test]
+fn p_235_garbage_intent_discard_cut_at_every_byte_keeps_what_the_unit_holds() {
+    let mut start = drawn();
+    let (before, _) = block_on(Store::boot(&mut start, None)).expect("boot");
+    let state = drbg(&before);
     let at = map::LOAD_SHED_CONFIG.end();
-    block_on(start.write(at, &[0x55; 122])).expect("old layout garbage");
+    let len = 2 * o89_core::slot_bytes(SECRET_CHANGE_BYTES);
+    block_on(start.write(at, &vec![0x55; len])).expect("garbage");
     let crashes = crash_at_every_step(
         &start,
         |part| {
@@ -163,12 +183,8 @@ fn f_041_garbage_intent_discard_cut_at_every_byte_keeps_the_active_pair() {
         },
         |part, step| {
             let (store, _) = block_on(Store::boot(part, None)).expect("retry discarded intent");
-            assert!(store.secret.present() == Some(&old()), "cut {step}");
-            assert_eq!(
-                store.challenges.present().expect("old counter").last(),
-                7,
-                "cut {step}"
-            );
+            assert!(store.secret.present() == Some(&secret()), "cut {step}");
+            assert_eq!(drbg(&store), state, "cut {step}");
             let begin = usize::from(at.0);
             let end = usize::from(map::SECRET_CHANGE.end().0);
             assert!(
@@ -178,21 +194,18 @@ fn f_041_garbage_intent_discard_cut_at_every_byte_keeps_the_active_pair() {
         },
     )
     .expect("garbage does not stop boot");
-    assert!(crashes.steps >= 122);
+    assert!(crashes.steps >= len);
 }
 
 #[test]
-fn f_041_label_acknowledgement_cut_never_resets_the_applied_counter() {
-    use o89_core::{Kept, SECRET_CHANGE_BYTES, SecretChange};
-    let mut start = start(false);
-    block_on(stage_secret(&mut start, new(), true)).expect("stage");
-    let (mut store, _) = block_on(Store::boot(&mut start, None)).expect("apply");
-    assert_eq!(
-        block_on(store.challenges.mint(&mut start))
-            .expect("mint")
-            .counter(),
-        1
-    );
+fn p_236_label_acknowledgement_cut_at_every_byte_keeps_the_fingerprint_and_never_reseeds() {
+    let mut start = SimFram::fresh();
+    block_on(stage_secret(&mut start, secret(), Some(birth()), false)).expect("stage");
+    let (store, _) = block_on(Store::boot(&mut start, None)).expect("apply");
+    let mut generator = o89_core::Generator::new(store.drbg);
+    let _ = block_on(generator.challenge(&mut start)).expect("a draw after birth");
+    let (after, _) = block_on(Store::boot(&mut start, None)).expect("boot");
+    let state = drbg(&after);
     let crashes = crash_at_every_step(
         &start,
         |part| {
@@ -203,28 +216,24 @@ fn f_041_label_acknowledgement_cut_never_resets_the_applied_counter() {
             .map_err(|_| ())?;
             block_on(transaction.write(part, SecretChange::Complete)).map_err(|_| ())?;
             let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
-            report.boot_recorded.map_err(|_| ())?;
-            Ok(())
+            report.boot_recorded.map_err(|_| ())
         },
         |part, step| {
-            let (mut store, _) = block_on(Store::boot(part, None)).expect("retry boot");
-            assert!(store.secret.present() == Some(&new()), "cut {step}");
-            assert_eq!(
-                block_on(store.challenges.mint(part))
-                    .expect("not reset")
-                    .counter(),
-                2,
-                "cut {step}"
-            );
+            let (store, _) = block_on(Store::boot(part, None)).expect("retry boot");
+            assert!(store.secret.present() == Some(&secret()), "cut {step}");
+            assert_eq!(drbg(&store), state, "cut {step}: reseeded");
             let transaction = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
                 map::SECRET_CHANGE,
                 part,
             ))
             .expect("transaction");
             match transaction.present().expect("durable state") {
-                SecretChange::Applied(secret) => assert!(*secret == new(), "cut {step}"),
+                SecretChange::Applied(applied, fingerprint) => {
+                    assert!(*applied == secret(), "cut {step}");
+                    assert!(*fingerprint == controller().fingerprint(), "cut {step}");
+                }
                 SecretChange::Complete => {}
-                SecretChange::Pending(_) => panic!("cut {step} reverted application"),
+                SecretChange::Pending(..) => panic!("cut {step} reverted application"),
             }
         },
     )
