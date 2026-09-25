@@ -13,6 +13,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use embassy_futures::block_on;
 use km43::{ClientId, Epoch, Fingerprint};
+use o89_core::Address;
+use o89_core::mailbox::DATA_BYTES;
 use o89_core::{
     BOOT_COUNT_BYTES, Birth, Body, BootCount, COMMS_RELEASE_BYTES, CONTROLLER_KEY_BYTES, Clients,
     CommsRelease, ControllerKey, DEVICE_ID_BYTES, DRBG_BYTES, DrbgState, EPOCH_BYTES, Held, Kept,
@@ -159,6 +161,57 @@ pub fn write_epoch(link: &mut Link, raw: u32) -> Result<()> {
     }
     block_on(kept.write(link, epoch)).map_err(refused)?;
     println!("epoch {raw} written");
+    Ok(())
+}
+
+/// Zero every byte the map names, read each back, and reboot onto a store
+/// that holds nothing. The controller key, the generator, the printed secret
+/// and every enrolment go with it: the unit is a new one, born again by
+/// `write-secret`, and its old label pairs with nothing. It exists because
+/// nothing else may write over a key or a generator that reads as damaged
+/// (P-235, P-237), and a part written under an earlier map reads that way.
+pub fn blank(link: &mut Link, yes: bool) -> Result<()> {
+    run_blank(link, yes, &mut std::io::stdout().lock())
+}
+
+fn run_blank(
+    link: &mut impl SecretLink,
+    yes: bool,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    if !yes {
+        bail!(
+            "blank erases the controller key, the generator, the printed secret and every \
+             enrolment; the unit's label stops working and it needs a new one from \
+             write-secret. Pass --yes."
+        );
+    }
+    let end = usize::from(map::END.0);
+    let zeros = [0u8; DATA_BYTES];
+    let mut back = [0u8; DATA_BYTES];
+    // At most END / DATA_BYTES + 1 transactions, each read back before the next.
+    for start in (0..end).step_by(DATA_BYTES) {
+        let len = DATA_BYTES.min(end.saturating_sub(start));
+        let at = u16::try_from(start).context("the map fits the FRAM's addresses")?;
+        let chunk = zeros.get(..len).context("chunk length")?;
+        block_on(link.write(Address(at), chunk)).map_err(refused)?;
+        let read = back.get_mut(..len).context("chunk length")?;
+        block_on(link.read(Address(at), read))
+            .with_context(|| format!("reading back {len} bytes at {at:#06x}"))?;
+        if read.iter().any(|byte| *byte != 0) {
+            bail!(
+                "{len} bytes at {at:#06x} did not read back blank; the unit is half erased, run blank again"
+            );
+        }
+    }
+    link.reboot()?;
+    if born(link)? {
+        bail!("the rebooted unit still holds a controller key or a generator");
+    }
+    writeln!(
+        output,
+        "blanked {end} bytes of FRAM; the unit is unborn: o89-dev store write-secret gives it a key, a generator and a label"
+    )?;
     Ok(())
 }
 
