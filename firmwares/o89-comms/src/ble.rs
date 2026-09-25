@@ -350,8 +350,17 @@ async fn session(
 ) {
     let mut stamped = [0; MAX_PAYLOAD];
     let mut subscribed = false;
+    let since = Tick::from_millis(Instant::now().as_millis());
     loop {
         pipe.expire(Instant::now().as_millis());
+        // A connection that never subscribes gives its slot back.
+        if o89_comms_core::subscription_overdue(
+            since,
+            Tick::from_millis(Instant::now().as_millis()),
+            subscribed || tx.should_notify(gatt),
+        ) {
+            return;
+        }
         let turn = select3(gatt.next(), clients::receive(index), Timer::after(STATUS)).await;
         if LINK.lock().await.status(conn) != Some(Status::Open) {
             return;

@@ -1,5 +1,5 @@
 //! BLE admission and KM43 codec use, independent of the radio and GATT host.
-use crate::{Link, Peer, Refused, Tick};
+use crate::{Link, Millis, Peer, Refused, Tick};
 use km43::{
     BleError, BleMtu, BleReceiver, BleSender, BleValueLimit, Conn, DisconnectReason, LinkTransport,
 };
@@ -10,6 +10,24 @@ pub const BLE_CONNECTIONS: usize = 2;
 pub const BLE_ATT_MTU: usize = 247;
 /// Maximum characteristic value we offer.
 pub const BLE_VALUE_BYTES: usize = BLE_ATT_MTU - 3;
+
+/// How long a connection may go without subscribing to TX before it is
+/// closed. A phone that connects and never subscribes, a retrying app or a
+/// generic scanner left connecting, otherwise holds one of the
+/// [`BLE_CONNECTIONS`] slots for as long as it stays, and two of them stop
+/// the unit advertising to anybody.
+pub const SUBSCRIBE_WITHIN: Millis = Millis::from_millis(10_000);
+
+/// Whether a connection made at `since` and still not subscribed at `now`
+/// has had its [`SUBSCRIBE_WITHIN`]. A subscribed one is never overdue, and
+/// a `now` before `since` is not yet.
+#[must_use]
+pub fn subscription_overdue(since: Tick, now: Tick, subscribed: bool) -> bool {
+    !subscribed
+        && now
+            .since(since)
+            .is_some_and(|waited| waited.as_millis() >= SUBSCRIBE_WITHIN.as_millis())
+}
 
 /// BLE worker slots only. Every occupied slot also owns a row of the shared table.
 pub struct BleAdmission {
@@ -238,6 +256,48 @@ pub fn ble_uuid(text: &str) -> Option<[u8; 16]> {
         }
     }
     Some(value.to_le_bytes())
+}
+
+#[cfg(test)]
+mod subscribe_tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_that_never_subscribes_is_closed_at_its_deadline() {
+        let since = Tick::from_millis(5_000);
+        assert!(!subscription_overdue(
+            since,
+            Tick::from_millis(14_999),
+            false
+        ));
+        assert!(subscription_overdue(
+            since,
+            Tick::from_millis(15_000),
+            false
+        ));
+        assert!(subscription_overdue(
+            since,
+            Tick::from_millis(u64::MAX),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_subscribed_connection_is_never_overdue() {
+        let since = Tick::from_millis(5_000);
+        for now in [5_000, 15_000, 1_000_000] {
+            assert!(!subscription_overdue(since, Tick::from_millis(now), true));
+        }
+    }
+
+    #[test]
+    fn a_clock_behind_the_connection_is_not_overdue() {
+        assert!(!subscription_overdue(
+            Tick::from_millis(20_000),
+            Tick::from_millis(1_000),
+            false
+        ));
+    }
 }
 
 #[cfg(test)]
