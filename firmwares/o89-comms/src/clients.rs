@@ -29,7 +29,6 @@
 
 use core::cell::{Cell, RefCell};
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_futures::join::join_array;
 use embassy_futures::select::{Either, select};
@@ -54,8 +53,8 @@ use crate::link::LINK;
 const PORT: u16 = km43::WS_PORT;
 /// Workers on the station's network: one per row.
 pub const STATION_WORKERS: usize = o89_comms_core::sockets::STATION_WORKERS;
-/// BLE workers follow the station and access-point workers in the shared mailboxes.
-pub const BLE_FIRST: usize = STATION_WORKERS + crate::access_point::WORKERS;
+/// BLE workers follow the station's workers in the shared mailboxes.
+pub const BLE_FIRST: usize = STATION_WORKERS;
 const WORKERS: usize = BLE_FIRST + o89_comms_core::BLE_CONNECTIONS;
 /// Frames the controller may send a client before it has taken one.
 const MAILBOX: usize = 2;
@@ -76,9 +75,6 @@ const WRITE: Duration = Duration::from_secs(1);
 const IDLE: Duration = Duration::from_secs(60);
 /// A connection is probed after this long quiet.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
-/// The access point's drain (L-196), and how often it looks.
-const DRAIN: Duration = Duration::from_millis(o89_comms_core::DRAIN.as_millis());
-const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 const _: () = assert!(
     REQUEST_BYTES <= MAX_PAYLOAD,
@@ -127,29 +123,6 @@ pub static UPSTREAM: Channel<CriticalSectionRawMutex, Upstream, UPSTREAM_DEPTH> 
 /// The handle each worker holds, if any.
 static OWNERS: Blocking<CriticalSectionRawMutex, RefCell<[Option<Conn>; WORKERS]>> =
     Blocking::new(RefCell::new([None; WORKERS]));
-
-/// The access point is going: its workers take no new client (L-196).
-static DRAINING: AtomicBool = AtomicBool::new(false);
-
-/// The access point is up: its workers take clients.
-pub fn open_access_point() {
-    DRAINING.store(false, Ordering::Relaxed);
-}
-
-/// The pairing window closed: the access point's workers take no new
-/// client, and the ones they have get at most [`DRAIN`] to take the frames
-/// already queued for them before the access point goes (L-196).
-pub async fn drain_access_point() {
-    DRAINING.store(true, Ordering::Relaxed);
-    let drained = MAILBOXES.get(STATION_WORKERS..BLE_FIRST).unwrap_or(&[]);
-    let _drained = with_timeout(DRAIN, async {
-        // Bounded by the deadline.
-        while drained.iter().any(|mailbox| !mailbox.is_empty()) {
-            Timer::after(DRAIN_POLL).await;
-        }
-    })
-    .await;
-}
 
 /// A frame the controller addressed to `conn`, into its worker's mailbox.
 /// A full mailbox closes the client: the frame is neither dropped quietly
@@ -226,11 +199,6 @@ async fn worker(stack: Stack<'_>, index: usize, buffers: &mut Buffers) {
         socket.set_keep_alive(Some(KEEP_ALIVE));
         if socket.accept(PORT).await.is_err() {
             Timer::after(STATUS).await;
-            continue;
-        }
-        if index >= STATION_WORKERS && DRAINING.load(Ordering::Relaxed) {
-            // The access point is going: no new client on it.
-            socket.abort();
             continue;
         }
         let peer = peer(socket.remote_endpoint());

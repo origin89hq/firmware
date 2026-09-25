@@ -17,7 +17,6 @@
 
 #![no_std]
 
-mod access_point;
 mod ble;
 mod connections;
 #[cfg(any(test, feature = "frames"))]
@@ -26,13 +25,13 @@ mod link;
 pub mod mdns;
 mod network;
 mod ntp;
+mod plan;
 mod progress;
 mod relay;
 pub mod sockets;
 mod websocket;
 mod window;
 
-pub use access_point::*;
 pub use ble::*;
 pub use connections::*;
 #[cfg(any(test, feature = "frames"))]
@@ -41,6 +40,7 @@ pub use link::*;
 pub use network::*;
 pub use ntp::*;
 pub use o89_link::{Country, EncodeError, Millis, Tick};
+pub use plan::*;
 pub use progress::*;
 pub use relay::*;
 pub use websocket::*;

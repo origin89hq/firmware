@@ -29,8 +29,8 @@
 //! greatest revision accepted and one local deadline, measured from its
 //! receipt, are all that is kept of it; an older or repeated revision is
 //! acknowledged and changes nothing, link loss ends the lifetime, and a
-//! controller that rebooted clears the history. What the access point
-//! does with the lifetime is #90's.
+//! controller that rebooted clears the history. The BLE advertising rule
+//! reads the lifetime; the radio's plan does not.
 //!
 //! The mechanics are `o89-link`'s, shared with the controller's link: the
 //! requests in flight and their retries, the beats whose answers count, and
@@ -336,7 +336,7 @@ impl Link {
     /// How long the controller's pairing window stays open as this side
     /// measures it: from the receipt of the report that opened it, until a
     /// newer closed report, the link falling, or the controller rebooting.
-    /// `None` is closed or never reported, which grants the access point no
+    /// `None` is closed or never reported, which grants nothing a
     /// pairing-based lifetime (L-193).
     #[must_use]
     pub fn pairing_window(&self, now: Tick) -> Option<Millis> {
@@ -2500,6 +2500,37 @@ mod tests {
                 .get(),
             2
         );
+    }
+
+    #[test]
+    fn l_196_only_the_greatest_revision_and_its_own_deadline_are_kept() {
+        let mut link = linked_at_boot();
+        let mut buf = [0u8; 256];
+        let _ = link.received(report(&mut buf, ReqId(8), 3, 60_000, 0), at(1_000));
+        assert_eq!(
+            link.pairing_window(at(1_000)),
+            Some(Millis::from_millis(60_000))
+        );
+        // An older revision and a repeat are acknowledged and change nothing.
+        for (req, revision, remaining) in [(9, 2, 120_000), (10, 3, 5_000)] {
+            let answer = link.received(
+                report(&mut buf, ReqId(req), revision, remaining, 0),
+                at(2_000),
+            );
+            assert_eq!(answer, Some(ack(req, revision)));
+            assert_eq!(
+                link.pairing_window(at(2_000)),
+                Some(Millis::from_millis(59_000)),
+                "revision {revision}"
+            );
+        }
+        // A newer one replaces the deadline, measured from its own receipt.
+        let _ = link.received(report(&mut buf, ReqId(11), 4, 10_000, 0), at(3_000));
+        assert_eq!(
+            link.pairing_window(at(3_000)),
+            Some(Millis::from_millis(10_000))
+        );
+        assert_eq!(link.pairing_window(at(13_000)), None);
     }
 
     #[test]
