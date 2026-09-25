@@ -177,7 +177,8 @@ fn p_239_an_enrolment_cut_at_any_step_leaves_the_slots_that_were_there_and_never
                 .expect("the phone");
             assert_eq!(phone.label().as_bytes(), b"phone", "cut at {step}");
             assert_eq!(phone.kind(), ClientKind::App, "cut at {step}");
-            // Slot 2 is free, never a key without its label, kind and mask.
+            assert_eq!(phone.role(), km43::Role::Owner, "cut at {step}");
+            // Slot 2 is free, never a key without its label, kind and role.
             assert!(
                 clients.occupant(client(2), Epoch::FIRST).is_none(),
                 "cut at {step}"
