@@ -161,6 +161,10 @@ pub struct Site {
     concerns: ConcernTable,
     announced: [Option<Announced>; SITE_SIGNALS],
     presence: [Option<Seen>; SITE_DEVICES],
+    /// The boot's `0x0901`, until it lands: never merged, because P-213
+    /// makes a boot carry the counts as of that boot.
+    boot_owed: Option<TopologyChanged>,
+    /// Every later move not yet announced, merged into one.
     topology_owed: Option<TopologyChanged>,
     /// Where the next validity sweep starts.
     cursor: usize,
@@ -182,6 +186,7 @@ impl Site {
             concerns: ConcernTable::new(),
             announced: [None; SITE_SIGNALS],
             presence: [None; SITE_DEVICES],
+            boot_owed: None,
             topology_owed: None,
             cursor: 0,
         }
@@ -253,17 +258,37 @@ impl Site {
                 });
             }
         }
-        self.topology_owed = Some(match self.topology_owed {
-            // Two moves before the first was announced are one: the newest
-            // revision and reason, and every row either added.
-            Some(owed) => TopologyChanged {
-                added: owed.added.saturating_add(changed.added),
-                removed: owed.removed.saturating_add(changed.removed),
-                ..changed
-            },
-            None => changed,
-        });
+        self.owe_topology(changed);
         Ok(())
+    }
+
+    /// Owe `changed`: a boot in its own slot, anything else merged with
+    /// the moves not yet announced, which become one with the newest
+    /// revision and reason and every row either added or removed.
+    fn owe_topology(&mut self, changed: TopologyChanged) {
+        match changed.reason {
+            TopologyChangeReason::Boot => self.boot_owed = Some(changed),
+            TopologyChangeReason::ConfigWrite
+            | TopologyChangeReason::SubDeviceAdopted
+            | TopologyChangeReason::SubDeviceRemoved
+            | TopologyChangeReason::DeviceReplaced => {
+                self.topology_owed = Some(match self.topology_owed {
+                    Some(owed) => {
+                        let (older, newer) = if owed.rev <= changed.rev {
+                            (owed, changed)
+                        } else {
+                            (changed, owed)
+                        };
+                        TopologyChanged {
+                            added: older.added.saturating_add(newer.added),
+                            removed: older.removed.saturating_add(newer.removed),
+                            ..newer
+                        }
+                    }
+                    None => changed,
+                });
+            }
+        }
     }
 
     /// What `sig`'s source said at `now`.
@@ -327,7 +352,7 @@ impl Site {
         body: &mut [u8; RECORD_BODY],
     ) -> Result<Option<Owed>, OwedError> {
         if !tally.topology
-            && let Some(changed) = self.topology_owed.take()
+            && let Some(changed) = self.boot_owed.take().or_else(|| self.topology_owed.take())
         {
             tally.topology = true;
             let len = changed.encode(body).map_err(OwedError::Change)?;
@@ -422,11 +447,7 @@ impl Site {
                     }
                 }
             }
-            Token::Topology(changed) => {
-                if self.topology_owed.is_none() {
-                    self.topology_owed = Some(*changed);
-                }
-            }
+            Token::Topology(changed) => self.owe_topology(*changed),
             Token::Concern(record) => self.concerns.unannounced(record),
         }
     }
@@ -1038,5 +1059,72 @@ mod tests {
         assert_eq!(read, 2);
         assert_eq!(values[0], Some((Some(7), Validity::Ok)));
         assert_eq!(values[1], Some((None, Validity::Initialising)));
+    }
+
+    #[test]
+    fn p_213_a_boot_record_is_never_merged_and_a_lost_move_keeps_its_counts() {
+        let mut site = site(1);
+        // Written while the boot record is still owed.
+        site.apply(TopologyChangeReason::ConfigWrite, &[signal(2, 1)])
+            .expect("applies");
+        let mut tally = Tally::new();
+        let mut body = [0u8; RECORD_BODY];
+        let boot = site
+            .next_owed(at(1), 1, &mut tally, &mut body)
+            .expect("writes")
+            .expect("owed");
+        let Token::Topology(boot_record) = boot.token else {
+            panic!("the topology first: {:?}", boot.token);
+        };
+        assert_eq!(
+            (boot_record.reason, boot_record.rev, boot_record.added),
+            (TopologyChangeReason::Boot, 1, 3)
+        );
+        // It does not land, and another move happens meanwhile.
+        site.not_committed(&boot.token, &body[..boot.len]);
+        site.apply(TopologyChangeReason::SubDeviceAdopted, &[signal(3, 1)])
+            .expect("applies");
+        let mut records = [None; 2];
+        for (seq, slot) in (2u64..).zip(records.iter_mut()) {
+            let mut tally = Tally::new();
+            let owed = site
+                .next_owed(at(2), seq, &mut tally, &mut body)
+                .expect("writes")
+                .expect("owed");
+            if let Token::Topology(changed) = owed.token {
+                *slot = Some(changed);
+            }
+            site.committed(&owed.token, seq);
+        }
+        assert_eq!(
+            records[0].map(|c| (c.reason, c.rev, c.added)),
+            Some((TopologyChangeReason::Boot, 1, 3)),
+            "the boot, again and whole"
+        );
+        let later = records[1].expect("the later moves, merged");
+        assert_eq!(
+            (later.reason, later.rev, later.added),
+            (TopologyChangeReason::SubDeviceAdopted, 3, 2)
+        );
+        // A later move that is lost merges with the next.
+        site.apply(TopologyChangeReason::ConfigWrite, &[signal(4, 1)])
+            .expect("applies");
+        let mut tally = Tally::new();
+        let lost = site
+            .next_owed(at(3), 9, &mut tally, &mut body)
+            .expect("writes")
+            .expect("owed");
+        site.not_committed(&lost.token, &body[..lost.len]);
+        site.apply(TopologyChangeReason::ConfigWrite, &[signal(5, 1)])
+            .expect("applies");
+        let mut tally = Tally::new();
+        let merged = site
+            .next_owed(at(4), 10, &mut tally, &mut body)
+            .expect("writes")
+            .expect("owed");
+        let Token::Topology(merged) = merged.token else {
+            panic!("the topology: {:?}", merged.token);
+        };
+        assert_eq!((merged.rev, merged.added), (5, 2), "both moves counted");
     }
 }

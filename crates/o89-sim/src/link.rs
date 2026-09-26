@@ -51,6 +51,10 @@ pub(crate) const LOG_BLOCKS: u32 = 16;
 /// How often the bench's recorder takes a turn of the reading plane.
 pub(crate) const PLANE_PERIOD: Millis = Millis::from_millis(1_000);
 
+/// The link task's longest turn, its read deadline: the most a read of the
+/// log waits to be taken back once the recorder has answered it.
+pub(crate) const LINK_TURN: Millis = Millis::from_millis(100);
+
 /// The site the bench's reading plane reads: one owner, and the tick the
 /// bench stands at.
 pub(crate) struct SimSite {
@@ -73,8 +77,8 @@ impl SimSite {
 }
 
 impl SiteCell for SimSite {
-    fn with<R>(&self, with: impl FnOnce(&mut Site, Tick) -> R) -> R {
-        with(&mut self.site.borrow_mut(), self.now.get())
+    fn with<R>(&self, with: impl FnOnce(&mut Site, Tick) -> R) -> Result<R, o89_core::SiteBusy> {
+        Ok(with(&mut self.site.borrow_mut(), self.now.get()))
     }
 }
 
@@ -90,8 +94,9 @@ fn span_of(log: Option<&Ring<SimNor<LOG_BLOCK>>>) -> LogSpan {
 }
 
 /// What `Hello` reports of the site's topology.
-fn topology_of(site: &SimSite) -> km43::Topology {
+fn topology_of(site: &SimSite) -> Option<km43::Topology> {
     site.with(|site, _| o89_core::reported(site.topology().rev(), site.topology().digest()))
+        .ok()
 }
 
 /// The unit's device id and printed secret.
@@ -291,6 +296,11 @@ pub(crate) struct Bench {
     pub(crate) log: Option<Ring<SimNor<LOG_BLOCK>>>,
     /// When the recorder next takes a turn of the reading plane.
     plane_due: Tick,
+    /// When the link next takes its turn at the log.
+    link_due: Tick,
+    /// The read of the log posted to the recorder, answered by the next
+    /// link turn.
+    posted: Option<o89_core::LogWant>,
 }
 
 impl Bench {
@@ -363,6 +373,8 @@ impl Bench {
             site: SimSite::new(now),
             log: None,
             plane_due: now,
+            link_due: now,
+            posted: None,
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -451,31 +463,42 @@ impl Bench {
         span_of(self.log.as_ref())
     }
 
-    /// The recorder's side of the reading plane, as the controller's
-    /// recorder takes it: once a plane period, what the site owes written
-    /// into the ring; then every read of the log the sessions want.
+    /// The recorder's side of the reading plane and the link's side of
+    /// delivery, paced as the controller paces them: once a plane period
+    /// the site's owed records written into the ring, and once a link turn
+    /// the batch the recorder answered for the read posted the turn before,
+    /// offered to every subscribed session, then the next read posted. The
+    /// recorder answers a read as soon as it is posted, so it is ready by
+    /// the next turn; a turn is the link task's longest, its read deadline.
     fn serve_plane(&mut self) {
         let Some(ring) = self.log.as_mut() else {
             return;
         };
         let mut scratch = [0u8; SCRATCH];
         if self.now.since(self.plane_due).is_some() {
-            let turn = block_on(o89_core::record_owed(&self.site, ring, &mut scratch, None));
+            // The bench reads the span off the ring itself, so there is
+            // nothing to publish as each record lands.
+            let turn = block_on(o89_core::record_owed(
+                &self.site,
+                ring,
+                &mut scratch,
+                None,
+                |_| {},
+            ));
             assert_eq!(turn.unwritten, None, "the site wrote every record it owed");
+            assert!(!turn.busy, "one owner never finds the site held");
             self.plane_due = self.now.after(PLANE_PERIOD).expect("fits");
         }
+        if self.now.since(self.link_due).is_none() {
+            return;
+        }
+        self.link_due = self.now.after(LINK_TURN).expect("fits");
         let mut dst = [0u8; MAX_PAYLOAD];
         let overdue = self.endpoint.sessions.log_overdue(self.now, &mut dst);
         self.answer(overdue, &mut dst);
-        // Bounded: one read per session with something owed.
-        for _ in 0..o89_core::CONNECTIONS {
-            let span = self.log_span();
-            let Some(want) = self.endpoint.sessions.log_want(span, self.now) else {
-                break;
-            };
-            let Some(ring) = self.log.as_mut() else {
-                return;
-            };
+        if let Some(want) = self.posted.take()
+            && let Some(ring) = self.log.as_mut()
+        {
             let mut batch = o89_core::LogBatch::new();
             block_on(o89_core::read_log(
                 ring,
@@ -490,14 +513,23 @@ impl Bench {
                 .sessions
                 .log_answered(want.ticket, &batch, &mut dst);
             self.answer(reply, &mut dst);
-            for index in 0..batch.len() {
-                let reply = self
-                    .endpoint
-                    .sessions
-                    .event(want.ticket, &batch, index, &mut dst);
-                self.answer(reply, &mut dst);
+            for conn in self.endpoint.sessions.subscribers().into_iter().flatten() {
+                for index in 0..batch.len() {
+                    let Some((reply, delivery)) =
+                        self.endpoint
+                            .sessions
+                            .event(conn, want.ticket, &batch, index, &mut dst)
+                    else {
+                        continue;
+                    };
+                    self.answer(reply, &mut dst);
+                    // The bench's transport takes every frame it is given.
+                    self.endpoint.sessions.delivered(delivery);
+                }
             }
         }
+        let span = self.log_span();
+        self.posted = self.endpoint.sessions.log_want(span, self.now);
     }
 
     /// A reply the sessions wrote outside a frame, sent as the adapter

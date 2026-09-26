@@ -35,8 +35,9 @@ pub struct Local<'a> {
     pub time_known: bool,
     /// Whether the pairing window is open, read as this frame is handled.
     pub pairing_open: bool,
-    /// The site's topology as it stands, for `Hello` (P-149).
-    pub topology: km43::Topology,
+    /// The site's topology as it stands, for `Hello` (P-149); `None` when
+    /// the site could not be read, and a `Hello` is then asked to retry.
+    pub topology: Option<km43::Topology>,
 }
 
 /// What one frame asked for: the link's actions, and a client's answer,

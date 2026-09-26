@@ -307,6 +307,10 @@ impl ConcernTable {
                 if let Some(row) = self.row_mut(raised.concern.cid) {
                     row.announced = None;
                 }
+                // A condition that cleared while its raise was out and the
+                // raise did not land was never told to anybody: it leaves
+                // now, as one that clears before its raise is taken does.
+                self.forget_unannounced();
             }
             ConcernRecord::Changed(changed) => {
                 if let Some(row) = self.row_mut(changed.cid) {
@@ -598,6 +602,64 @@ mod tests {
             "the clear and the new raise"
         );
         assert_eq!(table.state(first), None, "released once its clear landed");
+    }
+
+    #[test]
+    fn p_180_p_169_a_condition_that_clears_while_its_raise_is_refused_frees_its_row() {
+        let mut table = ConcernTable::new();
+        let cid = table
+            .observe(report(1, Severity::Fault), at(0))
+            .expect("admitted");
+        let mut taken = None;
+        table
+            .owed(1, at(1), 1, |record| taken = Some(record))
+            .expect("owes");
+        let raised = taken.expect("the raise");
+        // Cleared while the raise is out, and the raise does not land.
+        table
+            .gone(
+                Subject::Part(Part::device(dev(1))),
+                Condition(0x0101),
+                Latch::None,
+            )
+            .expect("open");
+        assert_eq!(
+            table.state(cid),
+            Some(ConcernState::Cleared),
+            "held while its raise is out"
+        );
+        table.unannounced(&raised);
+        assert_eq!(table.state(cid), None, "nobody was told: the row leaves");
+        assert_eq!(commit_all(&mut table, at(2), 1), 0, "and owes nothing");
+        // The row is free again, down to the last one.
+        for n in 1..=u16::try_from(CONCERN_ROWS).expect("fits") {
+            table
+                .observe(report(n, Severity::Fault), at(3))
+                .expect("room for every row");
+        }
+    }
+
+    #[test]
+    fn p_180_a_condition_that_clears_while_its_raise_lands_is_retired_by_its_clear() {
+        let mut table = ConcernTable::new();
+        let cid = table
+            .observe(report(1, Severity::Fault), at(0))
+            .expect("admitted");
+        let mut taken = None;
+        table
+            .owed(1, at(1), 1, |record| taken = Some(record))
+            .expect("owes");
+        table
+            .gone(
+                Subject::Part(Part::device(dev(1))),
+                Condition(0x0101),
+                Latch::None,
+            )
+            .expect("open");
+        table.committed(&taken.expect("the raise"), 7);
+        assert_eq!(table.state(cid), Some(ConcernState::Cleared));
+        assert_eq!(commit_all(&mut table, at(2), 8), 1, "the clear");
+        assert_eq!(table.state(cid), None);
     }
 
     #[test]

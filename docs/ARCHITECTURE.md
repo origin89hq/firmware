@@ -507,9 +507,14 @@ each reading is (buses, devices, components, signals, each table with a
 named capacity that refuses rather than evicts), and the concern table. The
 bus tasks write it, the sessions answer `ReadInventory`, `ReadSignals` and
 `ReadConcerns` out of it, and the recorder asks it for the records its
-changes owe. It sits behind one blocking lock taken for one synchronous
-call, with the tick read inside it, so no reading is asked about at a tick
-older than its last write and no lock is held across an await.
+changes owe. All of them run on the control executor, and the site sits
+behind an async mutex taken with `try_lock` for one synchronous call, the
+tick read while it is held: no reading is asked about at a tick older than
+its last write, no lock is held across an await, and no interrupt is masked
+while a page is encoded or a digest computed. A holder always finishes
+before another task runs, so the lock is free when asked; a caller that
+ever finds it held answers a retry, and a `Hello` is refused with error 7
+rather than told a topology that may not be current.
 
 **The descriptors change as a whole.** A batch is checked against the
 tables as they would stand and taken under a new revision, or refused and
@@ -542,10 +547,19 @@ read out of the ring from there, one sealed copy per session (P-098). Replay
 and live delivery are the same path, so nothing written between the
 subscription and the end of its replay falls between them (P-094). The ring
 is the recorder's, so the link task asks it for a batch, one read out at a
-time and given up after five seconds; a `ReadLog` goes the same way. A
-session owed more live records than a session queue holds is closed as
-`shedding` and catches up from the log when it reconnects; a replay it
-asked for is paced and never counted against it.
+time and given up after five seconds, and the recorder answers as soon as it
+is asked rather than on its ticker; a `ReadLog` goes the same way. A batch is
+offered to every subscribed session whose cursor it covers, so sessions at
+the same place share one read, and a later `Subscribe` that moved a cursor
+is served by that cursor alone. A session owed live records is read for
+before a `ReadLog` or a replay. An event moves its session's cursor only
+once the UART took the frame: one refused or stalled stays owed and is sent
+again, under a new nonce, and a client drops a repeated `seq`. A session
+owed more live records than a session queue holds (sixteen) is closed as
+`shedding` and catches up from the log when it reconnects; a replay it asked
+for is paced and never counted against it. The recorder publishes the log's
+extent as each record lands and before it can yield, so a `Subscribe` is
+answered from the log as it stands (P-104, P-095).
 
 ### Behaviours: parameters, not an engine
 

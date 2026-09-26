@@ -17,6 +17,18 @@ use crate::link::SimSite;
 use crate::{Lent, SimNor};
 use o89_core::SiteCell;
 
+/// The site with its one owner, which never finds it held.
+trait Free {
+    fn free<R>(&self, with: impl FnOnce(&mut o89_core::Site, o89_core::Tick) -> R) -> R;
+}
+
+impl Free for SimSite {
+    fn free<R>(&self, with: impl FnOnce(&mut o89_core::Site, o89_core::Tick) -> R) -> R {
+        self.with(with)
+            .expect("one owner never finds the site held")
+    }
+}
+
 fn id(n: u16) -> Id {
     Id::new(n).expect("non-zero")
 }
@@ -64,7 +76,7 @@ fn site_bench(signals: u16) -> Bench {
     bench.open_log();
     bench
         .site
-        .with(|site, _| site.apply(TopologyChangeReason::Boot, &charger(signals)))
+        .free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(signals)))
         .expect("a valid site");
     bench.run_for(Millis::from_millis(1_100));
     bench
@@ -72,7 +84,7 @@ fn site_bench(signals: u16) -> Bench {
 
 fn write(bench: &SimSite, sig: u16, value: i32) {
     bench
-        .with(|site, now| {
+        .free(|site, now| {
             site.write(
                 id(sig),
                 now,
@@ -114,9 +126,14 @@ fn ask(
 
 /// Every event this client has been sent, opened: its `seq` and kind.
 fn events(client: &mut Client, bench: &Bench) -> Vec<(u64, EventKind)> {
+    events_on(client, bench, 1)
+}
+
+/// The same for the client on `handle`.
+fn events_on(client: &mut Client, bench: &Bench, handle: u16) -> Vec<(u64, EventKind)> {
     bench
         .comms
-        .to_client(1)
+        .to_client(handle)
         .iter()
         .filter(|frame| {
             Envelope::decode(frame)
@@ -221,7 +238,7 @@ fn p_094_p_104_a_live_subscriber_hears_each_change_once_and_nothing_from_before(
     write(&bench.site, 1, 12_000);
     bench
         .site
-        .with(|site, now| {
+        .free(|site, now| {
             site.observe(
                 ConcernReport {
                     subject: Subject::Part(Part::device(id(1))),
@@ -276,7 +293,7 @@ fn p_094_a_replay_runs_into_live_delivery_with_no_gap_and_no_repeat() {
     // A change while the replay is still owed.
     bench
         .site
-        .with(|site, _| site.presence(1, km43::Presence::Online))
+        .free(|site, _| site.presence(1, km43::Presence::Online))
         .expect("a device");
     bench.run_for(Millis::from_millis(3_000));
     let heard = events(&mut client, &bench);
@@ -332,26 +349,183 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
     // Capabilities: none. The NOR loses power before the first append.
     let mut part = SimNor::<{ crate::link::LOG_BLOCK }>::fresh(8);
     let site = SimSite::empty();
-    site.with(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
         .expect("a valid site");
     let mut scratch = [0u8; o89_core::SCRATCH];
     {
         part.cut_after(0);
         let mut ring =
             block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
-        let turn = block_on(o89_core::record_owed(&site, &mut ring, &mut scratch, None));
+        let turn = block_on(o89_core::record_owed(
+            &site,
+            &mut ring,
+            &mut scratch,
+            None,
+            |_| {},
+        ));
         assert_eq!((turn.landed, turn.refused), (0, true));
     }
     part.reboot();
     let mut ring =
         block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
-    let turn = block_on(o89_core::record_owed(&site, &mut ring, &mut scratch, None));
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+    ));
     assert_eq!(
         (turn.landed, turn.refused),
         (1, false),
         "the topology record, once"
     );
-    let again = block_on(o89_core::record_owed(&site, &mut ring, &mut scratch, None));
+    let again = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+    ));
     assert_eq!(again.landed, 0, "and not twice");
     assert_eq!(ring.next_seq(), 2);
+}
+
+#[test]
+fn p_104_p_095_the_log_extent_is_published_as_each_record_lands_not_at_the_end_of_the_turn() {
+    // Capabilities: none.
+    let mut part = SimNor::<{ crate::link::LOG_BLOCK }>::fresh(8);
+    let site = SimSite::empty();
+    site.free(|site, now| {
+        site.apply(TopologyChangeReason::Boot, &charger(1))?;
+        site.write(
+            id(1),
+            now,
+            Observation::value(1, Provenance::Measured).expect("a value"),
+        )
+    })
+    .expect("a valid site");
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring =
+        block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
+    let mut published = Vec::new();
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |ring| published.push(ring.next_seq()),
+    ));
+    assert_eq!(turn.landed, 2, "the topology and the validity sweep");
+    assert_eq!(published, [2, 3], "once per record, each as it landed");
+}
+
+/// Every signal's quality moved once for each tick in `ticks`, and a
+/// plane period run after each when `wait`.
+fn flap(bench: &mut Bench, ticks: std::ops::Range<u16>, wait: bool) {
+    for tick in ticks {
+        for sig in 1..=64u16 {
+            bench
+                .site
+                .free(|site, now| {
+                    let seen = if tick.wrapping_add(sig) % 2 == 0 {
+                        Observation::value(i32::from(sig), Provenance::Measured).expect("a value")
+                    } else {
+                        Observation::missing(km43::Validity::Absent).expect("absent")
+                    };
+                    site.write(id(sig), now, seen)
+                })
+                .expect("registered");
+        }
+        if wait {
+            bench.run_for(Millis::from_millis(1_000));
+        }
+    }
+}
+
+#[test]
+fn p_098_p_182_eight_subscribers_keep_up_with_a_twelve_tick_burst_and_none_is_shed() {
+    // Capabilities: none; the honest relay, delivery paced as the firmware
+    // paces it (one read out, taken back once a 100 ms link turn).
+    let mut bench = site_bench(64);
+    // A log long enough that replaying it competes with the burst.
+    flap(&mut bench, 0..60, true);
+    let mut clients = Vec::new();
+    let mut accepted = Vec::new();
+    for handle in 1..=8u16 {
+        announce(&mut bench, handle);
+        let mut client = Client::on(handle);
+        let _ = client.open(&mut bench);
+        // Three replay the log from three places; the rest are live only.
+        let from: u8 = match handle {
+            1 => 1,
+            2 => 20,
+            3 => 23,
+            _ => 0,
+        };
+        let frame = client.sealed(MessageType::Subscribe, &[0xa1, 1, 0x18, from]);
+        let answers = client.send(&mut bench, &frame);
+        let ack = answers
+            .iter()
+            .rev()
+            .find_map(|frame| {
+                let (header, inner) = client.opened(frame)?;
+                (header.kind == MessageType::SubscribeResponse)
+                    .then(|| km43::SubscribeAck::decode(&inner).expect("an ack"))
+            })
+            .expect("acknowledged");
+        accepted.push(ack.accepted_from_seq().0);
+        clients.push(client);
+    }
+    // Twelve ticks, each moving every signal's quality, a device's
+    // presence, and raising concerns: more than a tick holds.
+    for tick in 0..12u16 {
+        flap(&mut bench, tick..tick.wrapping_add(1), false);
+        let presence = if tick % 2 == 0 {
+            km43::Presence::Online
+        } else {
+            km43::Presence::Offline
+        };
+        bench
+            .site
+            .free(|site, _| site.presence(1, presence))
+            .expect("a device");
+        for n in 0..4u16 {
+            let subject = Subject::Signal(Part::device(id(1)), id(tick * 4 + n + 1));
+            bench
+                .site
+                .free(|site, now| {
+                    site.observe(
+                        ConcernReport {
+                            subject,
+                            cond: Condition(0x0101),
+                            sev: Severity::Fault,
+                            code: None,
+                        },
+                        now,
+                    )
+                })
+                .expect("admitted");
+        }
+        bench.run_for(Millis::from_millis(1_000));
+    }
+    bench.run_for(Millis::from_millis(10_000));
+    let newest = bench.log_span().newest.0;
+    assert!(newest > 12 * 3, "the burst was logged: {newest}");
+    assert!(
+        closes(&bench).is_empty(),
+        "nobody shed: {:?}",
+        closes(&bench)
+    );
+    for ((handle, client), from) in (1u16..).zip(clients.iter_mut()).zip(accepted) {
+        let seqs: Vec<u64> = events_on(client, &bench, handle)
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            (from..=newest).collect::<Vec<_>>(),
+            "handle {handle}: every record from its start, once, in order"
+        );
+    }
 }

@@ -170,7 +170,10 @@ pub struct Facts<'a> {
     pub link: Option<Compat>,
     /// `Hello` keys 18 to 29: the site's topology revision and digest as
     /// they stand, and the caps the controller enforces (P-005, P-149).
-    pub topology: km43::Topology,
+    /// `None` when the site could not be read as the frame was handled: a
+    /// `Hello` is then refused with error 7 before anything is spent,
+    /// rather than answered with a topology that may not be current.
+    pub topology: Option<km43::Topology>,
 }
 
 /// The oldest and newest sequence the log holds.
@@ -309,7 +312,8 @@ pub const LOG_ANSWER_LIMIT: Millis = Millis::from_millis(5_000);
 enum Purpose {
     /// A client's `ReadLog`, answered under its `req_id`.
     ReadLog(ReqId),
-    /// A subscription's next events.
+    /// Subscriptions' next events, for every session whose cursor the
+    /// batch covers.
     Deliver,
 }
 
@@ -320,6 +324,33 @@ pub struct LogTicket {
     conn: Conn,
     serial: u32,
     purpose: Purpose,
+    /// Where the read began.
+    from: u64,
+}
+
+/// An event sealed for a session and not yet known to have left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "an event sent and not marked delivered is sent again"]
+pub struct Delivery {
+    conn: Conn,
+    serial: u32,
+    seq: u64,
+}
+
+/// Which kind of read [`Sessions::log_want`] is looking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Live,
+    ReadLog,
+    Replay,
+}
+
+/// Whether a batch read from `from` up to `next` holds everything a
+/// cursor at `cursor` is owed from it: the cursor is inside what was read,
+/// so nothing between it and the batch's records was skipped.
+const fn covers(from: u64, next: u64, cursor: u64) -> bool {
+    from <= cursor && cursor < next
 }
 
 /// A read of the log for the ring's owner: up to `most` records from
@@ -1372,6 +1403,9 @@ impl Sessions {
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
+        let Some(topology) = facts.topology else {
+            return bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
+        };
         let arrival = match Envelope::decode(frame)
             .map_err(km43::HelloError::from)
             .and_then(HelloArrival::decode)
@@ -1431,7 +1465,7 @@ impl Sessions {
             time_known: facts.time_known,
             client_id: slot,
             generation: occupant.generation(),
-            topology: facts.topology,
+            topology,
         };
         let admit = *occupant.admit_key().to_stored();
         let Some(row) = self.row_mut(to.conn) else {
@@ -1630,52 +1664,61 @@ impl Sessions {
         answered(written)
     }
 
-    /// The next read of the log the sessions want, if none is out: a
-    /// session's `ReadLog`, or the events a subscribed session is owed, in
-    /// turn across the rows. Hand it to the ring's owner and bring the
-    /// batch back to [`Sessions::log_answered`].
+    /// The next read of the log the sessions want, if none is out, in this
+    /// order: a subscribed session owed live records, then a session's
+    /// `ReadLog`, then a subscription's replay; within each, the rows take
+    /// turns. Live delivery comes first because a session owed more live
+    /// records than its queue holds is shed (P-098), and replay is paced
+    /// and never counted. Hand it to the ring's owner and bring the batch
+    /// back to [`Sessions::log_answered`].
     pub fn log_want(&mut self, log: LogSpan, now: Tick) -> Option<LogWant> {
         if self.log_out.is_some() {
             return None;
         }
         let start = self.log_served.saturating_add(1);
-        for step in 0..CONNECTIONS {
-            let index = start.saturating_add(step) % CONNECTIONS;
-            let Some(Some(row)) = self.rows.get(index) else {
-                continue;
-            };
-            let Bound::Session(binding) = &row.bound else {
-                continue;
-            };
-            let want = if let Some((req_id, request)) = binding.reading {
-                LogWant {
-                    ticket: LogTicket {
-                        conn: row.conn,
-                        serial: binding.serial,
-                        purpose: Purpose::ReadLog(req_id),
-                    },
-                    from: request.from_seq.0,
-                    most: request.page_size(),
+        for class in [Want::Live, Want::ReadLog, Want::Replay] {
+            for step in 0..CONNECTIONS {
+                let index = start.saturating_add(step) % CONNECTIONS;
+                let Some(Some(row)) = self.rows.get(index) else {
+                    continue;
+                };
+                let Bound::Session(binding) = &row.bound else {
+                    continue;
+                };
+                let want = match class {
+                    Want::ReadLog => binding.reading.map(|(req_id, request)| LogWant {
+                        ticket: LogTicket {
+                            conn: row.conn,
+                            serial: binding.serial,
+                            purpose: Purpose::ReadLog(req_id),
+                            from: request.from_seq.0,
+                        },
+                        from: request.from_seq.0,
+                        most: request.page_size(),
+                    }),
+                    Want::Live | Want::Replay => binding
+                        .subscription
+                        .filter(|subscription| subscription.next <= log.newest.0)
+                        .filter(|subscription| {
+                            (subscription.next >= subscription.live_from) == (class == Want::Live)
+                        })
+                        .map(|subscription| LogWant {
+                            ticket: LogTicket {
+                                conn: row.conn,
+                                serial: binding.serial,
+                                purpose: Purpose::Deliver,
+                                from: subscription.next,
+                            },
+                            from: subscription.next,
+                            most: EVENTS_PER_READ,
+                        }),
+                };
+                if let Some(want) = want {
+                    self.log_served = index;
+                    self.log_out = Some((want.ticket, now));
+                    return Some(want);
                 }
-            } else if let Some(subscription) = binding
-                .subscription
-                .filter(|subscription| subscription.next <= log.newest.0)
-            {
-                LogWant {
-                    ticket: LogTicket {
-                        conn: row.conn,
-                        serial: binding.serial,
-                        purpose: Purpose::Deliver,
-                    },
-                    from: subscription.next,
-                    most: EVENTS_PER_READ,
-                }
-            } else {
-                continue;
-            };
-            self.log_served = index;
-            self.log_out = Some((want.ticket, now));
-            return Some(want);
+            }
         }
         None
     }
@@ -1693,7 +1736,7 @@ impl Sessions {
             return Reply::NOTHING;
         }
         self.log_out = None;
-        let Some(binding) = self.current(ticket) else {
+        let Some(binding) = self.current(ticket.conn, ticket.serial) else {
             return Reply::NOTHING;
         };
         match ticket.purpose {
@@ -1710,18 +1753,19 @@ impl Sessions {
     }
 
     /// The batch the ring's owner read for `ticket`. A `ReadLog` is
-    /// answered with its page; a delivery is sent entry by entry through
-    /// [`Sessions::event`]. Nothing goes to a session that has ended or
-    /// been bound again since.
+    /// answered with its page, once, while it is the request still waiting.
+    /// A delivery batch is offered to every subscribed session through
+    /// [`Sessions::event`]; one that took nothing walked only holes
+    /// (P-096), and every session whose cursor it covers moves past them.
     pub fn log_answered(&mut self, ticket: LogTicket, batch: &LogBatch, dst: &mut [u8]) -> Reply {
         if self.log_out.is_some_and(|(out, _)| out == ticket) {
             self.log_out = None;
         }
-        let Some(binding) = self.current(ticket) else {
-            return Reply::NOTHING;
-        };
         match ticket.purpose {
             Purpose::ReadLog(req_id) => {
+                let Some(binding) = self.current(ticket.conn, ticket.serial) else {
+                    return Reply::NOTHING;
+                };
                 // Only the request still waiting is answered: a batch that
                 // comes back after the read was given up, or twice, is not.
                 if binding.reading.is_none_or(|(waiting, _)| waiting != req_id) {
@@ -1753,55 +1797,99 @@ impl Sessions {
                 log_page(to, binding, &page, dst)
             }
             Purpose::Deliver => {
-                // A batch that took nothing walked only holes (P-096): the
-                // cursor moves past them rather than asking for them again.
-                if batch.is_empty()
-                    && let Some(subscription) = binding.subscription.as_mut()
-                {
-                    subscription.next = subscription.next.max(batch.next());
+                if batch.is_empty() {
+                    for row in self.rows.iter_mut().flatten() {
+                        if let Bound::Session(Binding {
+                            subscription: Some(subscription),
+                            ..
+                        }) = &mut row.bound
+                            && covers(ticket.from, batch.next(), subscription.next)
+                        {
+                            subscription.next = batch.next();
+                        }
+                    }
                 }
                 Reply::NOTHING
             }
         }
     }
 
-    /// Entry `index` of a delivery batch, sealed as an `Event 0x04` for the
-    /// session `ticket` names, if it is the one the cursor is owed; the
-    /// cursor then moves past it. One sealed copy per session (P-098).
+    /// Every connection with a subscription, for offering it a batch.
+    #[must_use]
+    pub fn subscribers(&self) -> [Option<Conn>; CONNECTIONS] {
+        let mut out = [None; CONNECTIONS];
+        let subscribed = self.rows.iter().flatten().filter(|row| {
+            matches!(
+                row.bound,
+                Bound::Session(Binding {
+                    subscription: Some(_),
+                    ..
+                })
+            )
+        });
+        for (slot, row) in out.iter_mut().zip(subscribed) {
+            *slot = Some(row.conn);
+        }
+        out
+    }
+
+    /// Entry `index` of a delivery batch read from `ticket`'s position,
+    /// sealed as an `Event 0x04` for the session on `conn`, when it is the
+    /// next record that session is owed: its cursor falls inside what the
+    /// batch read, and the entry is at or past it. One sealed copy per
+    /// session (P-098). The cursor does not move here: it moves by
+    /// [`Sessions::delivered`] once the frame is sent, so a send that fails
+    /// or stalls leaves the event owed and it is sent again.
     pub fn event(
         &mut self,
+        conn: Conn,
         ticket: LogTicket,
         batch: &LogBatch,
         index: usize,
         dst: &mut [u8],
-    ) -> Reply {
+    ) -> Option<(Reply, Delivery)> {
         if ticket.purpose != Purpose::Deliver {
-            return Reply::NOTHING;
+            return None;
         }
-        let Some((seq, bytes)) = batch.get(index) else {
-            return Reply::NOTHING;
+        let (seq, bytes) = batch.get(index)?;
+        let row = self.row_mut(conn)?;
+        let Bound::Session(binding) = &mut row.bound else {
+            return None;
         };
-        let Some(binding) = self.current(ticket) else {
-            return Reply::NOTHING;
-        };
-        let Some(subscription) = binding.subscription.as_mut() else {
-            return Reply::NOTHING;
-        };
-        if seq < subscription.next {
-            return Reply::NOTHING;
+        let subscription = binding.subscription?;
+        if !covers(ticket.from, batch.next(), subscription.next) || seq < subscription.next {
+            return None;
         }
-        subscription.next = seq.saturating_add(1);
         let to = Addressed {
-            conn: ticket.conn,
+            conn,
             req_id: ReqId(0),
         };
-        answered(
-            binding
-                .channel
-                .tx
-                .seal(to.header(MessageType::EventResponse), bytes, dst)
-                .ok(),
-        )
+        let sealed = binding
+            .channel
+            .tx
+            .seal(to.header(MessageType::EventResponse), bytes, dst)
+            .ok()?;
+        Some((
+            answered(Some(sealed)),
+            Delivery {
+                conn,
+                serial: binding.serial,
+                seq,
+            },
+        ))
+    }
+
+    /// The event [`Sessions::event`] sealed has left: the session's cursor
+    /// moves past it, if the session is still the one it was sealed for.
+    pub fn delivered(&mut self, delivery: Delivery) {
+        if let Some(Binding {
+            subscription: Some(subscription),
+            ..
+        }) = self.current(delivery.conn, delivery.serial)
+            && subscription.next <= delivery.seq
+        {
+            subscription.next = delivery.seq.saturating_add(1);
+        }
     }
 
     /// Sessions owed more live events than a session's queue holds, which
@@ -1828,10 +1916,10 @@ impl Sessions {
         Shed(shed)
     }
 
-    /// The binding a ticket was issued for, if it is still the one bound.
-    fn current(&mut self, ticket: LogTicket) -> Option<&mut Binding> {
-        match self.row_mut(ticket.conn).map(|row| &mut row.bound) {
-            Some(Bound::Session(binding)) if binding.serial == ticket.serial => Some(binding),
+    /// The binding on `conn`, if it is still the one of `serial`.
+    fn current(&mut self, conn: Conn, serial: u32) -> Option<&mut Binding> {
+        match self.row_mut(conn).map(|row| &mut row.bound) {
+            Some(Bound::Session(binding)) if binding.serial == serial => Some(binding),
             Some(Bound::Session(_) | Bound::Never | Bound::Ended) | None => None,
         }
     }
@@ -2342,28 +2430,29 @@ fn read_answer<S: SiteCell>(
         MessageType::Inventory => match km43::ReadInventory::decode(payload) {
             Ok(request) => (
                 MessageType::InventoryResponse,
-                site.with(|site, _| site.inventory(&request, &mut body))
-                    .ok(),
+                site.with(|site, _| site.inventory(&request, &mut body).ok()),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         MessageType::Readings => match km43::ReadSignals::decode(payload) {
             Ok(request) => (
                 MessageType::ReadingsResponse,
-                site.with(|site, now| site.readings(&request, log.newest.0, now, &mut body))
-                    .ok(),
+                site.with(|site, now| site.readings(&request, log.newest.0, now, &mut body).ok()),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         MessageType::Concerns => match km43::ReadConcerns::decode(payload) {
             Ok(request) => (
                 MessageType::ConcernsResponse,
-                site.with(|site, now| site.concerns_page(&request, now, &mut body))
-                    .ok(),
+                site.with(|site, now| site.concerns_page(&request, now, &mut body).ok()),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         _ => return sealed_error(to, binding, ErrorCode::MalformedFrame, dst),
+    };
+    let Ok(written) = written else {
+        // Held by another task, which one executor never shows: retry.
+        return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
     };
     let Some(len) = written else {
         // The site could not write a page it should always be able to: a
@@ -2418,6 +2507,8 @@ fn subscribed(
     }) else {
         return Reply::noted(SessionNote::TooLarge);
     };
+    // A batch read for the subscription this replaces is offered to it by
+    // the new cursor alone, so none of it is skipped (P-094).
     binding.subscription = Some(Subscription {
         next: ack.accepted_from_seq().0,
         live_from: ack.current_seq().0.saturating_add(1),
@@ -2589,9 +2680,12 @@ mod tests {
     struct NoSite;
 
     impl SiteCell for NoSite {
-        fn with<R>(&self, with: impl FnOnce(&mut crate::Site, Tick) -> R) -> R {
+        fn with<R>(
+            &self,
+            with: impl FnOnce(&mut crate::Site, Tick) -> R,
+        ) -> Result<R, crate::SiteBusy> {
             let mut site = crate::Site::new();
-            with(&mut site, Tick::ZERO)
+            Ok(with(&mut site, Tick::ZERO))
         }
     }
     use crate::body::Kept;
@@ -2711,6 +2805,8 @@ mod tests {
         pairing_open: bool,
         /// The log's span the sessions are told.
         log: LogSpan,
+        /// The topology `Hello` reports, `None` when the site is held.
+        topology: Option<km43::Topology>,
     }
 
     impl Rig {
@@ -2772,6 +2868,7 @@ mod tests {
                     oldest: LogSeq(0),
                     newest: LogSeq(0),
                 },
+                topology: Some(crate::reported(0, [0; 8])),
             }
         }
 
@@ -2784,7 +2881,7 @@ mod tests {
                 time_known: false,
                 pairing_open: self.pairing_open,
                 link: Some(Compat::Agreed(Version::V1_0)),
-                topology: crate::reported(0, [0; 8]),
+                topology: self.topology,
             }
         }
 
@@ -3825,12 +3922,188 @@ mod tests {
         (rig, phone)
     }
 
-    fn subscribe(rig: &mut Rig, phone: &mut Phone, from_seq: u8) -> km43::SubscribeAck {
-        let frame = phone.sealed(MessageType::Subscribe, &[0xa1, 1, from_seq]);
+    fn subscribe(rig: &mut Rig, phone: &mut Phone, from_seq: u64) -> km43::SubscribeAck {
+        let replay = match from_seq {
+            0 => km43::Replay::LiveOnly,
+            at => km43::Replay::From(LogSeq(at)),
+        };
+        let mut body = [0u8; 16];
+        let len = km43::Subscribe { replay }.encode(&mut body).expect("fits");
+        let frame = phone.sealed(MessageType::Subscribe, &body[..len]);
         let (_, answer) = rig.send(&frame);
         let (kind, body) = phone.open(&answer);
         assert_eq!(kind, MessageType::SubscribeResponse);
         km43::SubscribeAck::decode(&body).expect("an ack")
+    }
+
+    /// An encoded boot record at `seq`, as the ring would hand it back.
+    fn record(seq: u64) -> ([u8; 32], usize) {
+        let mut out = [0u8; 32];
+        let len = km43::Event::new(LogSeq(seq), None, km43::EventKind::BOOT, &[0xa0])
+            .expect("an event")
+            .encode(&mut out)
+            .expect("fits");
+        (out, len)
+    }
+
+    #[test]
+    fn p_094_a_batch_read_for_a_replaced_subscription_moves_nothing_of_the_new_one() {
+        let (mut rig, mut phone) = subscribed_rig(1, 103);
+        let _ = subscribe(&mut rig, &mut phone, 100);
+        let old = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        assert_eq!(old.from, 100);
+        // Replaced before the old read comes back, replaying from the start.
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        let (a, a_len) = record(100);
+        let (b, b_len) = record(101);
+        let stale = LogBatch::of(&[(100, &a[..a_len]), (101, &b[..b_len])], 1, 103);
+        let mut dst = [0u8; MAX_FRAME];
+        assert_eq!(
+            rig.sessions
+                .log_answered(old.ticket, &stale, &mut dst)
+                .answer,
+            None
+        );
+        for index in 0..stale.len() {
+            let sent = rig
+                .sessions
+                .event(conn(1), old.ticket, &stale, index, &mut dst);
+            assert!(sent.is_none(), "not the replacement's to send");
+        }
+        // An empty stale batch past the records moves nothing either.
+        let empty = LogBatch::of(&[], 1, 103);
+        let _ = rig.sessions.log_answered(old.ticket, &empty, &mut dst);
+        let new = rig
+            .sessions
+            .log_want(rig.log, rig.now)
+            .expect("the replay is owed");
+        assert_eq!(new.from, 1, "the replacement replays from its own start");
+        // Its own batch is delivered.
+        let (c, c_len) = record(1);
+        let own = LogBatch::of(&[(1, &c[..c_len])], 1, 103);
+        let _ = rig.sessions.log_answered(new.ticket, &own, &mut dst);
+        let (sent, delivery) = rig
+            .sessions
+            .event(conn(1), new.ticket, &own, 0, &mut dst)
+            .expect("its own");
+        let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
+        assert_eq!(kind, MessageType::EventResponse);
+        rig.sessions.delivered(delivery);
+    }
+
+    #[test]
+    fn p_098_an_event_whose_send_failed_is_sent_again_and_one_that_left_is_not() {
+        let (mut rig, mut phone) = subscribed_rig(1, 5);
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let (a, a_len) = record(1);
+        let batch = LogBatch::of(&[(1, &a[..a_len])], 1, 5);
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+        // Sealed, and the UART refused it: nothing marks it delivered.
+        let _ = rig
+            .sessions
+            .event(conn(1), want.ticket, &batch, 0, &mut dst)
+            .expect("sealed");
+        let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
+        assert_eq!(again.from, 1, "the same event, read again");
+        let _ = rig.sessions.log_answered(again.ticket, &batch, &mut dst);
+        let (sent, delivery) = rig
+            .sessions
+            .event(conn(1), again.ticket, &batch, 0, &mut dst)
+            .expect("sealed again");
+        let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
+        assert_eq!(kind, MessageType::EventResponse, "under a fresh nonce");
+        rig.sessions.delivered(delivery);
+        let next = rig.sessions.log_want(rig.log, rig.now).expect("the rest");
+        assert_eq!(next.from, 2);
+        // A delivery for a session bound again since moves nothing.
+        rig.sessions.delivered(delivery);
+        assert_eq!(
+            rig.sessions.log_want(rig.log, rig.now),
+            None,
+            "one read out"
+        );
+    }
+
+    #[test]
+    fn p_094_a_batch_that_comes_back_after_its_read_was_given_up_is_still_its_own() {
+        let (mut rig, mut phone) = subscribed_rig(1, 5);
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_overdue(Tick::from_millis(5_000), &mut dst);
+        // Late, and for the subscription still running: delivered in order,
+        // and the read asked again later starts after it.
+        let (a, a_len) = record(1);
+        let late = LogBatch::of(&[(1, &a[..a_len])], 1, 5);
+        let _ = rig.sessions.log_answered(want.ticket, &late, &mut dst);
+        let (_, delivery) = rig
+            .sessions
+            .event(conn(1), want.ticket, &late, 0, &mut dst)
+            .expect("its own");
+        rig.sessions.delivered(delivery);
+        let again = rig
+            .sessions
+            .log_want(rig.log, Tick::from_millis(5_000))
+            .expect("the rest");
+        assert_eq!(again.from, 2);
+    }
+
+    /// Two phones with sessions on handles 1 and 2.
+    fn two_phones(oldest: u64, newest: u64) -> (Rig, Phone, Phone) {
+        let mut rig = Rig::new();
+        rig.log = span(oldest, newest);
+        let mut one = enrolled_phone(&mut rig, 1, "one", 1);
+        one.hello(&mut rig).expect("a session");
+        let mut two = enrolled_phone(&mut rig, 2, "two", 2);
+        two.hello(&mut rig).expect("a session");
+        (rig, one, two)
+    }
+
+    #[test]
+    fn p_098_one_read_serves_every_session_at_its_cursor_each_under_its_own_keys() {
+        let (mut rig, mut one, mut two) = two_phones(1, 3);
+        let _ = subscribe(&mut rig, &mut one, 3);
+        let _ = subscribe(&mut rig, &mut two, 3);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let (a, a_len) = record(3);
+        let batch = LogBatch::of(&[(3, &a[..a_len])], 1, 3);
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+        let subscribers = rig.sessions.subscribers();
+        assert_eq!(subscribers.iter().flatten().count(), 2);
+        for (handle, phone) in [(1, &mut one), (2, &mut two)] {
+            let (sent, delivery) = rig
+                .sessions
+                .event(conn(handle), want.ticket, &batch, 0, &mut dst)
+                .expect("owed to each");
+            let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
+            assert_eq!(kind, MessageType::EventResponse);
+            rig.sessions.delivered(delivery);
+        }
+        assert_eq!(
+            rig.sessions.log_want(rig.log, rig.now),
+            None,
+            "both caught up"
+        );
+    }
+
+    #[test]
+    fn p_098_a_session_owed_live_records_is_read_for_before_another_replays() {
+        let (mut rig, mut one, mut two) = two_phones(1, 50);
+        // One replays from the start; the other is live and one behind.
+        let _ = subscribe(&mut rig, &mut one, 1);
+        let _ = subscribe(&mut rig, &mut two, 0);
+        rig.log = span(1, 51);
+        for _ in 0..3 {
+            let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+            assert_eq!(want.from, 51, "live first, however the turns fall");
+            let mut dst = [0u8; MAX_FRAME];
+            let _ = rig
+                .sessions
+                .log_overdue(Tick::from_millis(60_000), &mut dst);
+        }
     }
 
     #[test]
@@ -3993,6 +4266,27 @@ mod tests {
             (header.outcome, header.total),
             (km43::ConcernsOutcome::Ok, 0)
         );
+    }
+
+    #[test]
+    fn p_149_a_hello_while_the_site_is_held_is_asked_to_retry_and_spends_nothing() {
+        let mut rig = Rig::new();
+        let mut phone = enrolled_phone(&mut rig, 1, "phone", 1);
+        rig.topology = None;
+        let _ = phone.discover(&mut rig);
+        let (_, frame) = phone.hello_frame();
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(bare_code(&answer), ErrorCode::BusyRetry as u16);
+        assert_eq!(
+            reply.note,
+            Some(SessionNote::Refused(ErrorCode::BusyRetry as u16))
+        );
+        assert!(rig.sessions.next_job().is_none(), "no key agreement queued");
+        // The challenge was not spent: the same frame binds once the site
+        // answers.
+        rig.topology = Some(crate::reported(1, [1; 8]));
+        let (reply, _) = rig.send(&frame);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(1))));
     }
 
     #[test]

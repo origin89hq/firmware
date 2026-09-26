@@ -600,8 +600,11 @@ fn local(site: Shared) -> Local<'static> {
         // No clock before its slice.
         time_known: false,
         pairing_open: selector::pairing_open(),
+        // None when the site is held: a `Hello` is then asked to retry
+        // rather than told a topology that may not be current.
         topology: site
-            .with(|site, _| o89_core::reported(site.topology().rev(), site.topology().digest())),
+            .with(|site, _| o89_core::reported(site.topology().rev(), site.topology().digest()))
+            .ok(),
     }
 }
 
@@ -694,28 +697,52 @@ async fn reply(
     answer: &[u8],
     reply: Option<Reply>,
 ) -> Option<Ended> {
-    let reply = reply?;
+    match send_reply(tx, writer, answer, reply?).await {
+        Sent::Yes | Sent::No => None,
+        Sent::Stalled => Some(Ended::Stalled),
+    }
+}
+
+/// What became of a client frame put on the wire.
+enum Sent {
+    /// The UART took all of it.
+    Yes,
+    /// Nothing to send, or the UART refused it or it did not frame.
+    No,
+    /// CTS held the transmitter past its deadline.
+    Stalled,
+}
+
+/// A client's answer onto the wire, and what became of it.
+async fn send_reply(
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &[u8],
+    reply: Reply,
+) -> Sent {
     if let Some(note) = reply.note {
         session_note(note);
     }
-    let envelope = answer.get(..reply.answer?)?;
+    let Some(envelope) = reply.answer.and_then(|len| answer.get(..len)) else {
+        return Sent::No;
+    };
     let mut frame = [0u8; MAX_FRAME];
     let Ok(len) = writer.write(envelope, &mut frame) else {
         defmt::error!(
             "link: a client answer of {} bytes did not frame",
             envelope.len()
         );
-        return None;
+        return Sent::No;
     };
     match with_timeout(WRITE_DEADLINE, send(tx, frame.get(..len).unwrap_or(&[]))).await {
-        Ok(Ok(())) => None,
+        Ok(Ok(())) => Sent::Yes,
         Ok(Err(error)) => {
             defmt::warn!("link: a client answer not sent: {}", error);
-            None
+            Sent::No
         }
         Err(_) => {
             defmt::warn!("link: a client answer stalled; the module holds CTS");
-            Some(Ended::Stalled)
+            Sent::Stalled
         }
     }
 }
@@ -1498,10 +1525,22 @@ async fn serve_log(
         if let Some(ended) = reply(tx, writer, answer, Some(answered)).await {
             return Some(ended);
         }
-        for index in 0..batch.len() {
-            let event = endpoint.sessions.event(ticket, &batch, index, answer);
-            if let Some(ended) = reply(tx, writer, answer, Some(event)).await {
-                return Some(ended);
+        // Every subscribed session the batch covers, each its own sealed
+        // copy (P-098). An event is marked delivered only once the UART
+        // took it: one it refused stays owed and is read again, and a
+        // session that stays behind is shed by its queue's bound.
+        for conn in endpoint.sessions.subscribers().into_iter().flatten() {
+            for index in 0..batch.len() {
+                let Some((event, delivery)) =
+                    endpoint.sessions.event(conn, ticket, &batch, index, answer)
+                else {
+                    continue;
+                };
+                match send_reply(tx, writer, answer, event).await {
+                    Sent::Yes => endpoint.sessions.delivered(delivery),
+                    Sent::No => break,
+                    Sent::Stalled => return Some(Ended::Stalled),
+                }
             }
         }
     }

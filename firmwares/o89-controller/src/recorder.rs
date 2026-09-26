@@ -17,7 +17,7 @@
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU32;
 
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
@@ -257,7 +257,9 @@ pub fn log_span() -> LogSpan {
     SPAN.lock(Cell::get)
 }
 
-fn publish(ring: &Ring<Nor>) {
+/// The span of the log as the ring stands now, for the link task's
+/// `Hello` and `Subscribe`.
+pub fn publish(ring: &Ring<Nor>) {
     let head = ring.head();
     let span = LogSpan {
         oldest: LogSeq(head.oldest.unwrap_or(0)),
@@ -319,8 +321,8 @@ pub async fn run(
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
-        match select(ticker.next(), CUTS.wait()).await {
-            Either::First(()) => {
+        match select3(ticker.next(), CUTS.wait(), crate::site::WANTS.receive()).await {
+            Either3::First(()) => {
                 serve_time(
                     ring.as_mut(),
                     &mut scratch,
@@ -372,7 +374,6 @@ pub async fn run(
                         plane(site, ring, &mut scratch, calendar.now()).await;
                     }
                 }
-                serve_log(ring.as_mut(), &mut scratch, &mut batch).await;
                 mailbox::serve(mailbox::Parts {
                     fram: &mut fram,
                     ring: ring.as_mut(),
@@ -385,9 +386,12 @@ pub async fn run(
                     publish(ring);
                 }
             }
-            Either::Second((request, recent)) => {
+            Either3::Second((request, recent)) => {
                 keep_cuts(&mut cuts, &mut fram, request, recent).await;
             }
+            // Answered as soon as it is asked, not on the ticker, so a
+            // subscriber's events leave at the link's pace (P-098).
+            Either3::Third(want) => serve_log(ring.as_mut(), &mut scratch, &mut batch, want).await,
         }
         check_in(Task::Recorder);
     }
@@ -400,7 +404,8 @@ async fn plane(
     scratch: &mut [u8],
     at: Option<UnixMillis>,
 ) {
-    let turn = o89_core::record_owed(&site, ring, scratch, at.map(UnixMillis::as_millis)).await;
+    let turn =
+        o89_core::record_owed(&site, ring, scratch, at.map(UnixMillis::as_millis), publish).await;
     if turn.refused {
         defmt::error!("plane: a record did not land; the next tick owes it again");
     }
@@ -415,10 +420,8 @@ async fn serve_log(
     ring: Option<&mut Ring<Nor>>,
     scratch: &mut [u8],
     batch: &mut o89_core::LogBatch,
+    want: o89_core::LogWant,
 ) {
-    let Ok(want) = crate::site::WANTS.try_receive() else {
-        return;
-    };
     let Some(ring) = ring else {
         return;
     };
@@ -532,6 +535,9 @@ async fn append_body(
     {
         Ok(seq) => {
             defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq);
+            // Published before anything else can yield, so a `Subscribe`
+            // is never answered from a log older than the one it reads.
+            publish(ring);
             Ok(())
         }
         Err(error) => {
