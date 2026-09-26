@@ -13,8 +13,10 @@
 //! KM43 allocates no dialect for these meters (origin89hq/km43#154), so
 //! their cells form the checked blocks [`PZEM_014`] and [`PZEM_016`] and
 //! not a [`RegisterMap`], and they are not in [`REGISTER_MAPS`]: the build
-//! reads them, and does not yet say it supports them. Power factor has no KM43 kind and the alarm no alarm kind;
-//! both come back as [`Words`] from the same reply and are never stored.
+//! reads them, and does not yet say it supports them.
+//!
+//! Power factor has no KM43 kind and the alarm no alarm kind; both come
+//! back as [`Words`] from the same reply and are never stored.
 //! The meter is powered from the voltage it measures, so with no AC it does
 //! not answer at all, and the manual defines no *not available* word: a
 //! stopped generator leaves the signals without a value and ages them out.

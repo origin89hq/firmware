@@ -41,7 +41,7 @@ use o89_core::{Signals, Tick};
 use crate::dialect::{Block, Cell, Kind, RegisterMap, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Read, Registers, Timing};
 use crate::port::Rs485;
-use crate::vendor::{self, ConditionError, Report, VendorError};
+use crate::vendor::{self, ConditionError, DeclaredError, Report, VendorError};
 use crate::{PollError, Polled};
 
 /// A cell in hundredths, which is how V2.5 scales every voltage, current
@@ -328,10 +328,12 @@ impl Charger {
     /// of charge and the battery current, then the charging status.
     ///
     /// Five exchanges, each bounded by `timing`, in this order: PV, load,
-    /// state of charge, battery, status. A failed read of one of the first
-    /// four is [`PollError::Modbus`] with its position in that order. The
-    /// poll stops at the first failure, and what it wrote before stands; a
-    /// failed status read leaves every signal written and the words unknown.
+    /// state of charge, battery, status. A failure in [`MAP`]'s blocks or
+    /// cells is [`VendorError::Poll`] with their positions in the map; one
+    /// in the state of charge or the battery current is
+    /// [`VendorError::Declared`] with its register. The poll stops at the
+    /// first failure, and what it wrote before stands; a failed status read
+    /// leaves every signal written and the words unknown.
     pub async fn poll<P: Rs485, const N: usize>(
         &self,
         port: &mut P,
@@ -342,10 +344,8 @@ impl Charger {
         let signal = |cell| self.signal(cell);
         let mut buf = [0u8; RECEIVE_BYTES];
         let [pv, load, battery] = &BLOCKS;
-        // The map's cells written so far, which is where its next cell
-        // falls, and the declared readings written after all of them.
+        // The map's cells written so far, which is where its next cell falls.
         let mut cells = 0usize;
-        let mut declared = 0usize;
 
         for (at, block) in [pv, load].into_iter().enumerate() {
             let registers = modbus::read(port, block.read(self.address), timing, &mut buf)
@@ -359,21 +359,26 @@ impl Charger {
 
         let registers = modbus::read(port, SOC_WHOLE_BLOCK.read(self.address), timing, &mut buf)
             .await
-            .map_err(|error| VendorError::Poll(PollError::Modbus { block: 2, error }))?;
+            .map_err(|error| VendorError::Declared {
+                register: SOC_REGISTER,
+                error: DeclaredError::Read(error),
+            })?;
         let state_of_charge_raw =
             vendor::word(&registers, SOC_REGISTER).map_err(VendorError::Condition)?;
         let soc = self
             .signal(SOC_AT)
             .ok_or(VendorError::Poll(PollError::Signals))?;
         let soc_block = self.state_of_charge.block();
-        declared = declared.saturating_add(
-            vendor::publish_declared(soc_block, &registers, SOC_AT, soc, now, store)
-                .map_err(VendorError::Poll)?,
-        );
+        vendor::publish_declared(soc_block, &registers, soc, now, store).map_err(|error| {
+            VendorError::Declared {
+                register: SOC_REGISTER,
+                error,
+            }
+        })?;
 
         let registers = modbus::read(port, battery.read(self.address), timing, &mut buf)
             .await
-            .map_err(|error| VendorError::Poll(PollError::Modbus { block: 3, error }))?;
+            .map_err(|error| VendorError::Poll(PollError::Modbus { block: 2, error }))?;
         let battery_current_raw =
             vendor::low_first(&registers, BATTERY_CURRENT).map_err(VendorError::Condition)?;
         cells = cells.saturating_add(
@@ -384,11 +389,14 @@ impl Charger {
             .signal(CURRENT_AT)
             .ok_or(VendorError::Poll(PollError::Signals))?;
         let current_block = self.battery_current.block();
-        declared = declared.saturating_add(
-            vendor::publish_declared(current_block, &registers, CURRENT_AT, current, now, store)
-                .map_err(VendorError::Poll)?,
-        );
-        let written = cells.saturating_add(declared);
+        vendor::publish_declared(current_block, &registers, current, now, store).map_err(
+            |error| VendorError::Declared {
+                register: BATTERY_CURRENT,
+                error,
+            },
+        )?;
+        // The map's cells, then the two declared readings.
+        let written = cells.saturating_add(2);
 
         let registers = modbus::read(port, Status::read(self.address), timing, &mut buf)
             .await
@@ -708,10 +716,10 @@ mod tests {
         bursts[5] = &wrong[..wrong_len];
         assert_eq!(
             poll_prefix(DECLARED, &bursts[..6], &mut store),
-            Err(VendorError::Poll(PollError::Modbus {
-                block: 2,
-                error: ModbusError::Reply(ReplyError::ByteCount(4))
-            }))
+            Err(VendorError::Declared {
+                register: SOC_REGISTER,
+                error: DeclaredError::Read(ModbusError::Reply(ReplyError::ByteCount(4)))
+            })
         );
         let seen = published(&store);
         assert_eq!(seen[5].0, Some(192));
@@ -732,7 +740,7 @@ mod tests {
         assert_eq!(
             poll_prefix(DECLARED, &bursts[..8], &mut store),
             Err(VendorError::Poll(PollError::Modbus {
-                block: 3,
+                block: 2,
                 error: ModbusError::Reply(ReplyError::Exception(Exception::IllegalDataAddress))
             }))
         );
