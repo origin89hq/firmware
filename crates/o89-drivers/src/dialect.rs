@@ -716,8 +716,8 @@ impl RegisterMap {
 
 /// Every register map this build decodes; the table #6's `xtask` reads.
 ///
-/// The PZEM-014/016 is read as [`crate::pzem::ac::BLOCK`] and is not here:
-/// KM43 has no dialect for it yet (origin89hq/km43#154).
+/// The PZEM-014/016 is read through [`crate::pzem::ac::Model::block`] and
+/// is not here: KM43 has no dialect for it yet (origin89hq/km43#154).
 pub const REGISTER_MAPS: &[RegisterMap] = &[crate::epever::MAP, crate::pzem::dc::MAP];
 
 #[cfg(test)]

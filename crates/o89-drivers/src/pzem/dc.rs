@@ -27,7 +27,7 @@ use crate::dialect::{Block, Cell, Kind, Plausible, RegisterMap, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Registers, Timing};
 use crate::port::Rs485;
 use crate::vendor::{self, Alarm, ConditionError, Report, VendorError};
-use crate::{ModbusDevice, PollError, Polled};
+use crate::{PollError, Polled};
 
 /// The measurement registers, §2.3.
 const CELLS: [Cell; 1] = [
@@ -96,21 +96,32 @@ impl Words {
 /// A PZEM-003 or PZEM-017 on an RS-485 port at 9600 8N2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Meter(ModbusDevice);
+pub struct Meter {
+    address: Address,
+    voltage: Id,
+}
 
 impl Meter {
-    /// The meter at `address`, whose voltage publishes as `signal`.
-    ///
-    /// `None` only where [`ModbusDevice::new`] refuses.
+    /// How many signals a meter publishes: the voltage.
+    pub const SIGNALS: usize = CELLS.len();
+
+    /// The meter at `address`, whose voltage publishes as `voltage`.
     #[must_use]
-    pub fn new(address: Address, signal: Id) -> Option<Self> {
-        ModbusDevice::new(address, &MAP, signal).map(Self)
+    pub const fn new(address: Address, voltage: Id) -> Self {
+        Self { address, voltage }
     }
 
-    /// The device and its signals.
+    /// The meter's address.
     #[must_use]
-    pub const fn device(&self) -> &ModbusDevice {
-        &self.0
+    pub const fn address(&self) -> Address {
+        self.address
+    }
+
+    /// The signal the `index`th reading publishes as, of
+    /// [`Meter::SIGNALS`]; `None` past the last.
+    #[must_use]
+    pub fn signal(&self, index: usize) -> Option<Id> {
+        vendor::signal(self.voltage, Self::SIGNALS, index)
     }
 
     /// Read the meter once and write its voltage into `store` at `now`.
@@ -126,11 +137,11 @@ impl Meter {
     ) -> Result<Report<Words>, VendorError<P::Error>> {
         let [block] = &BLOCKS;
         let mut buf = [0u8; RECEIVE_BYTES];
-        let registers = modbus::read(port, block.read(self.0.address()), timing, &mut buf)
+        let registers = modbus::read(port, block.read(self.address), timing, &mut buf)
             .await
             .map_err(|error| VendorError::Poll(PollError::Modbus { block: 0, error }))?;
         let conditions = Words::from_registers(&registers).map_err(VendorError::Condition)?;
-        let written = vendor::publish(block, &registers, 0, |cell| self.0.signal(cell), now, store)
+        let written = vendor::publish(block, &registers, 0, |cell| self.signal(cell), now, store)
             .map_err(VendorError::Poll)?;
         Ok(Report {
             polled: Polled { written },
@@ -153,7 +164,7 @@ mod tests {
     }
 
     fn meter() -> Meter {
-        Meter::new(Address::new(1).unwrap(), id()).unwrap()
+        Meter::new(Address::new(1).unwrap(), id())
     }
 
     fn store() -> Signals<1> {

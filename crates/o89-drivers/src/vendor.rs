@@ -9,10 +9,10 @@
 //!
 //! cites: F-052
 
-use km43::Id;
-use o89_core::{Signals, Tick};
+use km43::{Id, Validity};
+use o89_core::{Observation, Signals, Tick};
 
-use crate::dialect::Block;
+use crate::dialect::{Block, DecodeError};
 use crate::modbus::{ModbusError, Registers};
 use crate::{PollError, Polled};
 
@@ -129,6 +129,45 @@ pub(crate) fn publish<E, const N: usize>(
     Ok(written)
 }
 
+/// The signal a device's `index`th reading publishes as, when its `count`
+/// readings publish as consecutive signals from `first`; `None` past the
+/// last or past `0xFFFF`.
+pub(crate) fn signal(first: Id, count: usize, index: usize) -> Option<Id> {
+    if index >= count {
+        return None;
+    }
+    let offset = u16::try_from(index).ok()?;
+    Id::new(first.get().checked_add(offset)?).ok()
+}
+
+/// Whether a device's `count` readings, from `first`, all have a signal.
+pub(crate) fn fits(first: Id, count: usize) -> bool {
+    signal(first, count, count.saturating_sub(1)).is_some()
+}
+
+/// Write the one reading whose representation the caller declared: the one
+/// cell of `declared` decoded from `registers`, or `unsupported` and no
+/// value when nothing was declared. It is the device's `cell`th reading and
+/// publishes as `signal`.
+pub(crate) fn publish_declared<E, const N: usize>(
+    declared: Option<&Block>,
+    registers: &Registers<'_>,
+    cell: usize,
+    signal: Id,
+    now: Tick,
+    store: &mut Signals<N>,
+) -> Result<usize, PollError<E>> {
+    if let Some(block) = declared {
+        return publish(block, registers, cell, |_| Some(signal), now, store);
+    }
+    let seen = Observation::missing(Validity::Unsupported).map_err(|error| PollError::Decode {
+        cell,
+        error: DecodeError::Quality(error),
+    })?;
+    store.write(signal, now, seen).map_err(PollError::Store)?;
+    Ok(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +194,17 @@ mod tests {
             })
         );
         assert_eq!(Alarm::at(&words, 3), Err(ConditionError::Missing(3)));
+    }
+
+    #[test]
+    fn a_device_s_signals_are_consecutive_and_refused_past_its_last_or_the_top() {
+        let first = Id::new(0xFFFD).unwrap();
+        assert_eq!(signal(first, 3, 0), Some(first));
+        assert_eq!(signal(first, 3, 2), Id::new(0xFFFF).ok());
+        assert_eq!(signal(first, 3, 3), None);
+        assert!(fits(first, 3));
+        assert!(!fits(first, 4));
+        assert!(!fits(first, 0));
     }
 
     #[test]
