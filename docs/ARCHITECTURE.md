@@ -137,8 +137,9 @@ crates/
                            requests and beats in flight, the rules every
                            link-local frame meets. Host-tested.
   o89-drivers/             no_std device dialects: Modbus RTU, EPEver, PZEM DC,
-                           PZEM-016, VE.Direct text, Pylontech CAN, DS18B20.
-                           Tested against committed captures.
+                           PZEM-016, VE.Direct text, Pylontech CAN, DS18B20
+                           over 1-Wire, the onboard ADC inputs. Tested
+                           against committed captures.
   o89-sim/                 The simulated site: seasons, faults, the hostile
                            comms processor on o89-comms-core's own link,
                            crash-at-every-step.
