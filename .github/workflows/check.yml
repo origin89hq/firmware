@@ -38,7 +38,7 @@ jobs:
             .
             firmwares
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: true
       # `espflash save-image` is how the comms image is measured: the bytes
       # the bootloader loads, not the ELF. Its release asset, pinned by version
       # and digest; the static musl build needs no library on the runner.
@@ -56,3 +56,4 @@ jobs:
           just-version: '1.58.0'
       - run: just check
       - run: git diff --exit-code
+      - run: sha256sum firmwares/target/*/release/*.bin
