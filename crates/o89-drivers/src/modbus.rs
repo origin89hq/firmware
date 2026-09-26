@@ -303,7 +303,7 @@ impl Registers<'_> {
     /// Whether there are none. A parsed reply always has at least one.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len() == 0
     }
 
     /// The register at `address`, or `None` outside the reply.
