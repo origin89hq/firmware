@@ -18,8 +18,11 @@
 //!
 //! Nothing here writes to a directory another build could be using: the
 //! stage, the cargo home and the container's output are one fresh temporary
-//! directory, removed afterwards, and the output directory must not exist.
-//! Two builds can run at once, each at [`STAGE`] in its own container.
+//! directory, removed when the build ends, and the output directory must not
+//! exist. Two builds can run at once, each at [`STAGE`] in its own
+//! container. An interrupted build stops its container and leaves that
+//! directory, `o89-reproducible-<pid>-<time>` in the system's temporary
+//! directory, for its owner to delete.
 //!
 //! A consumer of a release takes the recorded files after `verify`, never a
 //! rebuild: a rebuild at another path is another set of bytes. `compare`
@@ -28,7 +31,8 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -337,7 +341,6 @@ pub struct Environment {
     /// The container's platform, `os/architecture`.
     pub platform: String,
     /// The container's own report.
-    #[serde(flatten)]
     pub inside: Inside,
 }
 
@@ -429,33 +432,46 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// A `git` run on `dir` with nothing from the user's or the system's
-/// configuration: `core.autocrlf` or a filter there would change the bytes a
-/// checkout writes, and a variable inherited from a hook would point it at
-/// another repository.
+/// The `GIT_*` variables in `environment`, every one of which a `git` run
+/// here drops: command-scope configuration (`GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_PARAMETERS`) outranks every configuration file and can turn
+/// on `core.autocrlf` or a filter, replacement refs can make `rev-parse`
+/// answer for another object, and the repository selectors a hook sets
+/// would point it at another repository.
+fn inherited_git<I, K, V>(environment: I) -> Vec<K>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+{
+    environment
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.as_ref().as_encoded_bytes().starts_with(b"GIT_"))
+        .collect()
+}
+
+/// A `git` run on `dir` with nothing of the caller's configuration: no
+/// inherited `GIT_*` variable, no global or system file, no replacement
+/// refs, and no discovery of a repository above `dir`.
 fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-    ] {
+    for variable in inherited_git(std::env::vars_os()) {
         command.env_remove(variable);
     }
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    if let Some(parent) = dir.parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
     command
 }
 
-/// Run `command` and return its trimmed standard output, or fail naming
-/// `what` and what it wrote to standard error.
-fn capture(command: &mut Command, what: &str) -> Result<String> {
+/// Run `command` and return its standard output as it wrote it, or fail
+/// naming `what` and what it wrote to standard error.
+fn capture_bytes(command: &mut Command, what: &str) -> Result<Vec<u8>> {
     let out = command
         .output()
         .with_context(|| format!("starting {what}"))?;
@@ -466,16 +482,20 @@ fn capture(command: &mut Command, what: &str) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8(out.stdout)
+    Ok(out.stdout)
+}
+
+/// Run `command` and return its trimmed standard output, or fail naming
+/// `what` and what it wrote to standard error.
+fn capture(command: &mut Command, what: &str) -> Result<String> {
+    Ok(String::from_utf8(capture_bytes(command, what)?)
         .with_context(|| format!("{what} wrote something that is not UTF-8"))?
         .trim()
         .to_owned())
 }
 
-/// The commit at `HEAD` of the checkout at `root`, refused when anything in
-/// the checkout differs from it: a build of a commit is not a build of the
-/// edits beside it, and an artifact must not be mistaken for one.
-pub fn identify(root: &Path) -> Result<Source> {
+/// The commit at `HEAD` of the checkout at `root`.
+pub fn head(root: &Path) -> Result<ObjectId> {
     let commit = git(root)
         .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
         .output()
@@ -486,12 +506,19 @@ pub fn identify(root: &Path) -> Result<Source> {
             root.display()
         );
     }
-    let commit = ObjectId::try_from(
+    ObjectId::try_from(
         String::from_utf8(commit.stdout)
             .context("git rev-parse wrote something that is not UTF-8")?
             .trim()
             .to_owned(),
-    )?;
+    )
+}
+
+/// The commit at `HEAD` of the checkout at `root`, refused when anything in
+/// the checkout differs from it: a build of a commit is not a build of the
+/// edits beside it, and an artifact must not be mistaken for one.
+pub fn identify(root: &Path) -> Result<Source> {
+    let commit = head(root)?;
     let status = capture(
         git(root).args([
             "status",
@@ -504,7 +531,7 @@ pub fn identify(root: &Path) -> Result<Source> {
     if !status.is_empty() {
         let shown: Vec<&str> = status.lines().take(10).collect();
         bail!(
-            "{} differs from {commit}; commit, stash or remove these first:\n{}",
+            "{} differs from {commit}; commit, stash or remove these first (only the repository's own ignore rules apply, not a global excludes file):\n{}",
             root.display(),
             shown.join("\n")
         );
@@ -515,6 +542,7 @@ pub fn identify(root: &Path) -> Result<Source> {
             .arg(format!("{commit}^{{tree}}")),
         "git rev-parse of the tree",
     )?)?;
+    check_tree(root, &tree, Leftovers::Ignored)?;
     Ok(Source { commit, tree })
 }
 
@@ -548,65 +576,159 @@ pub fn stage(root: &Path, source: &Source, dir: &Path) -> Result<()> {
     check_stage(dir, source, Leftovers::None)
 }
 
-/// What a stage may hold beyond the tree.
+/// What a working tree may hold beyond the tree it is checked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leftovers {
-    /// Nothing: before a build.
+    /// Nothing: a stage before its build.
     None,
-    /// What `.gitignore` names: after a build, its `target` directories.
+    /// What the repository's `.gitignore` files name: its `target`
+    /// directories, in a checkout or in a stage after its build.
     Ignored,
 }
 
 /// Refuse a stage whose `HEAD`, tree or files are not `source`'s.
-///
-/// Every tracked file is hashed again rather than trusted to its timestamp,
-/// and every untracked file counts, so the tree a manifest names is the tree
-/// that was built.
 pub fn check_stage(dir: &Path, source: &Source, leftovers: Leftovers) -> Result<()> {
-    let head = capture(
-        git(dir).args(["rev-parse", "--verify", "HEAD^{commit}"]),
-        "git rev-parse in the stage",
-    )?;
+    let head = head(dir)?;
     ensure!(
-        head == source.commit.to_string(),
+        head == source.commit,
         "the stage is at {head}, not {}",
         source.commit
     );
-    let tree = capture(
-        git(dir).args(["rev-parse", "--verify", "HEAD^{tree}"]),
-        "git rev-parse of the stage's tree",
+    check_tree(dir, &source.tree, leftovers)
+}
+
+/// One entry of `git ls-tree -r -z`.
+struct Entry<'a> {
+    mode: &'a [u8],
+    id: &'a [u8],
+    path: &'a [u8],
+}
+
+/// Parse `git ls-tree -r -z` output: `<mode> <type> <id>\t<path>\0` each.
+fn entries(listing: &[u8]) -> Result<Vec<Entry<'_>>> {
+    listing
+        .split(|&b| b == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let tab = record
+                .iter()
+                .position(|&b| b == b'\t')
+                .context("a git ls-tree record with no tab")?;
+            let (meta, path) = record.split_at(tab);
+            let path = path.get(1..).context("a git ls-tree record with no tab")?;
+            let mut fields = meta.split(|&b| b == b' ');
+            let (Some(mode), Some(_kind), Some(id), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                bail!(
+                    "a git ls-tree record that is not `mode type id`: {}",
+                    String::from_utf8_lossy(meta)
+                );
+            };
+            Ok(Entry { mode, id, path })
+        })
+        .collect()
+}
+
+/// Git's id for a blob holding `content`, in the repository's hash.
+fn blob_id(sha256: bool, content: &[u8]) -> String {
+    let header = format!("blob {}\0", content.len());
+    if sha256 {
+        let mut hash = Sha256::new();
+        hash.update(header.as_bytes());
+        hash.update(content);
+        hex::encode(hash.finalize())
+    } else {
+        let mut hash = sha1::Sha1::new();
+        hash.update(header.as_bytes());
+        hash.update(content);
+        hex::encode(hash.finalize())
+    }
+}
+
+/// Why a tracked file does not match its entry, if it does not.
+fn mismatch(dir: &Path, entry: &Entry<'_>, sha256: bool) -> Result<Option<&'static str>> {
+    let path = dir.join(OsStr::from_bytes(entry.path));
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ok(Some("missing"));
+    };
+    let content = match entry.mode {
+        b"120000" => {
+            if !metadata.file_type().is_symlink() {
+                return Ok(Some("not a symbolic link"));
+            }
+            fs::read_link(&path)
+                .with_context(|| format!("reading the link {}", path.display()))?
+                .into_os_string()
+                .into_encoded_bytes()
+        }
+        b"100644" | b"100755" => {
+            if !metadata.file_type().is_file() {
+                return Ok(Some("not a file"));
+            }
+            let executable = metadata.permissions().mode() & 0o100 != 0;
+            if executable != (entry.mode == b"100755") {
+                return Ok(Some("mode"));
+            }
+            fs::read(&path).with_context(|| format!("reading {}", path.display()))?
+        }
+        other => bail!(
+            "{} has mode {}, which a release cannot be built from (a submodule?)",
+            path.display(),
+            String::from_utf8_lossy(other)
+        ),
+    };
+    Ok((blob_id(sha256, &content).as_bytes() != entry.id).then_some("content"))
+}
+
+/// Refuse a working tree at `dir` whose files are not `tree`'s: every
+/// tracked file is read and hashed as git hashes a blob, with its mode, so
+/// no timestamp, index or checkout conversion can vouch for a changed byte,
+/// and every file git does not track counts unless `leftovers` allows it.
+pub fn check_tree(dir: &Path, tree: &ObjectId, leftovers: Leftovers) -> Result<()> {
+    let format = capture(
+        git(dir).args(["rev-parse", "--show-object-format"]),
+        "git rev-parse --show-object-format",
     )?;
-    ensure!(
-        tree == source.tree.to_string(),
-        "the stage's tree is {tree}, not {}",
-        source.tree
-    );
-    // `--really-refresh` rehashes every file whatever its timestamp says.
-    // It exits non-zero when a file needs updating, which `diff-index` then
-    // names; its output is not the verdict.
-    git(dir)
-        .args(["update-index", "-q", "--really-refresh"])
-        .output()
-        .context("starting git update-index in the stage")?;
-    let changed = capture(
-        git(dir).args(["diff-index", "--name-only", "HEAD", "--"]),
-        "git diff-index in the stage",
+    let sha256 = match format.as_str() {
+        "sha1" => false,
+        "sha256" => true,
+        other => bail!("{} hashes objects with {other}", dir.display()),
+    };
+    let listing = capture_bytes(
+        git(dir)
+            .args(["ls-tree", "-r", "-z", "--full-tree"])
+            .arg(tree.to_string()),
+        "git ls-tree",
     )?;
+    let mut differing = Vec::new();
+    for entry in entries(&listing)? {
+        if let Some(why) = mismatch(dir, &entry, sha256)? {
+            differing.push(format!("{}: {why}", String::from_utf8_lossy(entry.path)));
+        }
+    }
     ensure!(
-        changed.is_empty(),
-        "the stage's tracked files differ from {}:\n{changed}",
-        source.commit
+        differing.is_empty(),
+        "{} differs from tree {tree} in {} files:\n{}",
+        dir.display(),
+        differing.len(),
+        differing
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     let mut others = git(dir);
     others.args(["ls-files", "--others", "--directory"]);
     if leftovers == Leftovers::Ignored {
         others.arg("--exclude-standard");
     }
-    let untracked = capture(&mut others, "git ls-files in the stage")?;
+    let untracked = capture(&mut others, "git ls-files --others")?;
     ensure!(
         untracked.is_empty(),
-        "the stage holds files {} does not:\n{untracked}",
-        source.commit
+        "{} holds files tree {tree} does not:\n{untracked}",
+        dir.display()
     );
     Ok(())
 }
@@ -625,11 +747,13 @@ impl Scratch {
         // `create_dir`, not `create_dir_all`: a directory already there is
         // someone else's.
         fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Owned from here, so a failure below still removes it.
+        let scratch = Self(dir);
         for sub in ["src", "cargo", "out", "context"] {
-            fs::create_dir(dir.join(sub))
-                .with_context(|| format!("creating {}", dir.join(sub).display()))?;
+            let path = scratch.path(sub);
+            fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
         }
-        Ok(Self(dir))
+        Ok(scratch)
     }
 
     fn path(&self, sub: &str) -> PathBuf {
@@ -674,7 +798,7 @@ fn bind(source: &Path, target: &str) -> Result<String> {
 }
 
 /// Paths of this machine found in `bytes`: the checkout that asked, and the
-/// scratch directory the stage lives in. Either in an image makes its bytes
+/// scratch directory the stage lives in, except [`STAGE`] itself. Either in an image makes its bytes
 /// depend on where the command ran, which is what the fixed path exists to
 /// prevent; a panic site that names one would name the caller's machine.
 fn leaks<'a>(bytes: &[u8], paths: &[&'a Path]) -> Vec<&'a Path> {
@@ -682,6 +806,10 @@ fn leaks<'a>(bytes: &[u8], paths: &[&'a Path]) -> Vec<&'a Path> {
         .iter()
         .copied()
         .filter(|path| {
+            // A checkout at the stage's own path is what every image names.
+            if *path == Path::new(STAGE) {
+                return false;
+            }
             let needle = path.as_os_str().as_encoded_bytes();
             !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
         })
@@ -727,12 +855,15 @@ fn build(repo: &Repo, out: &Path, fresh_image: bool) -> Result<()> {
     )?;
     check_stage(&src, &source, Leftovers::Ignored)
         .context("the build changed the tree it was building")?;
+    check_tree(repo.root(), &source.tree, Leftovers::Ignored)
+        .context("the checkout changed during the build")?;
 
     let built = scratch.path("out");
     let inside: Inside = toml::from_str(
         &fs::read_to_string(built.join(INSIDE)).context("reading the container's report")?,
     )
     .context("parsing the container's report")?;
+    expect_packages("the container built", &inside.packages)?;
     fs::create_dir(out).with_context(|| format!("creating {}", out.display()))?;
     let mut output = Output {
         dir: out.to_path_buf(),
@@ -801,7 +932,9 @@ fn container(scratch: &Scratch, image: &str, epoch: Epoch) -> Result<Command> {
     let owner = fs::metadata(&src).context("reading the stage's owner")?;
     let mut command = Command::new("docker");
     command
-        .args(["run", "--rm", "--user"])
+        // `--init` puts a process in front of cargo that passes on the
+        // interrupt `docker run` forwards, so Ctrl-C stops the build.
+        .args(["run", "--rm", "--init", "--user"])
         .arg(format!("{}:{}", owner.uid(), owner.gid()))
         .arg("--mount")
         .arg(bind(&src, STAGE)?)
@@ -871,11 +1004,7 @@ fn print_manifest(dir: &Path, manifest: &Manifest) {
 /// three images, measured against their slots, copied to `out` with a report
 /// of the toolchain that made them.
 fn inside(repo: &Repo, out: &Path) -> Result<()> {
-    ensure!(
-        repo.root() == Path::new(STAGE),
-        "`reproducible inside` runs in the container `reproducible build` starts, at {STAGE}, not at {}",
-        repo.root().display()
-    );
+    staged_here(repo.root())?;
     Epoch::from_env()?;
     let measured = images::build_and_measure(repo)?;
     images::report(&measured);
@@ -911,6 +1040,64 @@ fn inside(repo: &Repo, out: &Path) -> Result<()> {
     .context("writing the report")
 }
 
+/// Refuse to build the container's half anywhere but [`STAGE`].
+fn staged_here(root: &Path) -> Result<()> {
+    ensure!(
+        root == Path::new(STAGE),
+        "`reproducible inside` runs in the container `reproducible build` starts, at {STAGE}, not at {}",
+        root.display()
+    );
+    Ok(())
+}
+
+/// Refuse a list of packages that is not the three images in their order.
+fn expect_packages<'a>(what: &str, packages: impl IntoIterator<Item = &'a String>) -> Result<()> {
+    let expected: Vec<&str> = images::packages().collect();
+    let found: Vec<&str> = packages.into_iter().map(String::as_str).collect();
+    ensure!(
+        found == expected,
+        "{what} {found:?}; a release is exactly {expected:?}"
+    );
+    Ok(())
+}
+
+/// Refuse a manifest that does not record exactly the three images, each
+/// under its own file names, and the container's report agreeing.
+fn check_shape(manifest: &Manifest) -> Result<()> {
+    expect_packages(
+        "the manifest lists",
+        manifest.images.iter().map(|i| &i.package),
+    )?;
+    expect_packages(
+        "the environment built",
+        &manifest.environment.inside.packages,
+    )?;
+    for image in &manifest.images {
+        for (record, extension) in [(&image.bin, "bin"), (&image.elf, "elf")] {
+            let canonical = format!("{}.{extension}", image.package);
+            ensure!(
+                record.file == canonical,
+                "the manifest records {}'s {extension} as {:?}, not {canonical:?}",
+                image.package,
+                record.file
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to log sizes under a commit other than the checkout's own: the
+/// budgets `sizes` holds an image to are this checkout's, and a row pairs
+/// the two.
+pub fn recordable(manifest: &Manifest, head: &ObjectId) -> Result<()> {
+    ensure!(
+        manifest.source.commit == *head,
+        "the artifacts are of {}, and this checkout is at {head}: record them from a checkout of their own commit",
+        manifest.source.commit
+    );
+    Ok(())
+}
+
 /// Read the manifest in `dir` and check every file it lists.
 pub fn verify(dir: &Path) -> Result<Manifest> {
     let path = dir.join(MANIFEST);
@@ -924,11 +1111,7 @@ pub fn verify(dir: &Path) -> Result<Manifest> {
         path.display(),
         manifest.format
     );
-    ensure!(
-        !manifest.images.is_empty(),
-        "{} lists no image",
-        path.display()
-    );
+    check_shape(&manifest).with_context(|| format!("checking {}", path.display()))?;
     for image in &manifest.images {
         image.bin.read_checked(dir)?;
         image.elf.read_checked(dir)?;
@@ -1013,8 +1196,9 @@ pub fn compare(first: &Path, second: &Path) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStrExt as _;
+    use std::ffi::OsString;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     use super::*;
 
@@ -1103,6 +1287,34 @@ mod tests {
         assert!(ObjectId::try_from(String::new()).is_err());
     }
 
+    /// Every `GIT_*` variable goes, whatever it configures, and nothing else.
+    #[test]
+    fn every_inherited_git_variable_is_dropped_and_no_other() {
+        let environment = [
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.autocrlf"),
+            ("GIT_CONFIG_VALUE_0", "true"),
+            ("GIT_CONFIG_PARAMETERS", "'core.autocrlf'='true'"),
+            ("GIT_DIR", "/elsewhere/.git"),
+            ("PATH", "/usr/bin"),
+            ("MY_GIT_DIR", "/x"),
+            ("git_dir", "/x"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        assert_eq!(
+            inherited_git(environment),
+            [
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_DIR"
+            ]
+            .map(OsString::from)
+        );
+        assert!(inherited_git(Vec::<(OsString, OsString)>::new()).is_empty());
+    }
+
     /// A directory of the test's own under the system's temporary directory,
     /// removed when dropped.
     struct TempDir(PathBuf);
@@ -1122,7 +1334,11 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).expect("cleaned up");
+            // Not `expect`: a failing test unwinds through here, and a second
+            // panic would hide its assertion.
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!("could not remove {}: {error}", self.0.display());
+            }
         }
     }
 
@@ -1136,16 +1352,47 @@ mod tests {
         assert!(status.status.success(), "git {args:?}: {status:?}");
     }
 
-    /// A repository with one commit: a tracked file and a `.gitignore` that
-    /// names `target/`.
+    /// Long enough ago that no index written now counts it as racy.
+    fn old() -> SystemTime {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_000_000_000))
+            .expect("in range")
+    }
+
+    fn set_mtime(path: &Path, at: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(at))
+            .expect("mtime set");
+    }
+
+    /// A repository with one commit: a file, an executable, a symbolic link
+    /// and a `.gitignore` that names `target/`, all dated long ago.
     fn repository(name: &str) -> TempDir {
         let dir = TempDir::new(name);
         git_ok(&dir.0, &["init", "-q"]);
         fs::write(dir.0.join("a.txt"), "one\n").expect("written");
+        fs::write(dir.0.join("run.sh"), "#!/bin/sh\n").expect("written");
+        fs::set_permissions(dir.0.join("run.sh"), fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        std::os::unix::fs::symlink("a.txt", dir.0.join("link")).expect("linked");
         fs::write(dir.0.join(".gitignore"), "target/\n").expect("written");
+        for file in ["a.txt", "run.sh", ".gitignore"] {
+            set_mtime(&dir.0.join(file), old());
+        }
         git_ok(&dir.0, &["add", "."]);
         git_ok(&dir.0, &["commit", "-q", "-m", "one"]);
         dir
+    }
+
+    /// `repository`'s commit staged, with the scratch directory holding it.
+    fn staged(name: &str) -> (TempDir, TempDir, Source) {
+        let repo = repository(name);
+        let source = identify(&repo.0).expect("clean");
+        let into = TempDir::new(&format!("{name}-stage"));
+        stage(&repo.0, &source, &into.0.join("src")).expect("staged");
+        (repo, into, source)
     }
 
     #[test]
@@ -1173,6 +1420,22 @@ mod tests {
         assert!(identify(&repo.0).is_err());
     }
 
+    /// The change `git status` cannot see: the same length, the same inode,
+    /// the old timestamp put back, and a checkout told to ignore ctime. The
+    /// file's bytes are what refuse it.
+    #[test]
+    fn a_checkout_whose_change_git_status_misses_is_still_refused() {
+        let repo = repository("stat-hidden");
+        git_ok(&repo.0, &["config", "core.trustctime", "false"]);
+        let file = repo.0.join("a.txt");
+        fs::write(&file, "two\n").expect("written");
+        set_mtime(&file, old());
+        let status = capture(git(&repo.0).args(["status", "--porcelain"]), "status").expect("runs");
+        assert_eq!(status, "", "the fixture must fool the index");
+        let error = format!("{:#}", identify(&repo.0).expect_err("changed"));
+        assert!(error.contains("a.txt: content"), "{error}");
+    }
+
     #[test]
     fn a_checkout_with_an_untracked_file_is_refused() {
         let repo = repository("untracked");
@@ -1188,6 +1451,7 @@ mod tests {
         git_ok(&empty.0, &["init", "-q"]);
         let error = format!("{:#}", identify(&empty.0).expect_err("no commit"));
         assert!(error.contains("no commit at HEAD"), "{error}");
+        // Not a repository, and never the one around it.
         let bare = TempDir::new("not-a-repo");
         assert!(identify(&bare.0).is_err());
     }
@@ -1202,9 +1466,10 @@ mod tests {
         let into = TempDir::new("stage-into");
         let dir = into.0.join("src");
         stage(&repo.0, &source, &dir).expect("staged");
+        assert_eq!(fs::read(dir.join("a.txt")).expect("staged"), b"one\n");
         assert_eq!(
-            fs::read_to_string(dir.join("a.txt")).expect("staged"),
-            "one\n"
+            fs::read_link(dir.join("link")).expect("a link"),
+            Path::new("a.txt")
         );
         assert!(!dir.join("target").exists());
         check_stage(&dir, &source, Leftovers::None).expect("matches");
@@ -1212,36 +1477,69 @@ mod tests {
 
     #[test]
     fn a_stage_whose_file_changed_is_refused_even_with_its_timestamp_kept() {
-        let repo = repository("tamper");
-        let source = identify(&repo.0).expect("clean");
-        let into = TempDir::new("tamper-into");
+        let (_repo, into, source) = staged("tamper");
         let dir = into.0.join("src");
-        stage(&repo.0, &source, &dir).expect("staged");
+        git_ok(&dir, &["config", "core.trustctime", "false"]);
         let file = dir.join("a.txt");
         let modified = fs::metadata(&file)
             .and_then(|m| m.modified())
             .expect("mtime");
-        // Same length, same timestamp: only a rehash sees it.
         fs::write(&file, "two\n").expect("written");
-        fs::File::options()
-            .write(true)
-            .open(&file)
-            .and_then(|f| f.set_modified(modified))
-            .expect("mtime kept");
+        set_mtime(&file, modified);
         let error = format!(
             "{:#}",
             check_stage(&dir, &source, Leftovers::Ignored).expect_err("tampered")
         );
-        assert!(error.contains("a.txt"), "{error}");
+        assert!(error.contains("a.txt: content"), "{error}");
+    }
+
+    /// What a checkout conversion would write: the same text, other bytes.
+    #[test]
+    fn a_stage_with_converted_line_endings_is_refused() {
+        let (_repo, into, source) = staged("crlf");
+        let dir = into.0.join("src");
+        fs::write(dir.join("a.txt"), "one\r\n").expect("written");
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::None).expect_err("converted")
+        );
+        assert!(error.contains("a.txt: content"), "{error}");
+    }
+
+    #[test]
+    fn a_stage_whose_modes_or_kinds_changed_is_refused() {
+        let (_repo, into, source) = staged("modes");
+        let dir = into.0.join("src");
+        fs::set_permissions(dir.join("a.txt"), fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o644)).expect("chmod");
+        fs::remove_file(dir.join("link")).expect("removed");
+        fs::write(dir.join("link"), "a.txt").expect("a file where the link was");
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::None).expect_err("changed")
+        );
+        assert!(error.contains("a.txt: mode"), "{error}");
+        assert!(error.contains("run.sh: mode"), "{error}");
+        assert!(error.contains("link: not a symbolic link"), "{error}");
+        assert!(error.contains("in 3 files"), "{error}");
+    }
+
+    #[test]
+    fn a_stage_missing_a_file_is_refused() {
+        let (_repo, into, source) = staged("missing");
+        let dir = into.0.join("src");
+        fs::remove_file(dir.join("run.sh")).expect("removed");
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::None).expect_err("missing")
+        );
+        assert!(error.contains("run.sh: missing"), "{error}");
     }
 
     #[test]
     fn a_stage_gains_only_ignored_files_and_only_after_the_build() {
-        let repo = repository("leftovers");
-        let source = identify(&repo.0).expect("clean");
-        let into = TempDir::new("leftovers-into");
+        let (_repo, into, source) = staged("leftovers");
         let dir = into.0.join("src");
-        stage(&repo.0, &source, &dir).expect("staged");
         fs::create_dir(dir.join("target")).expect("created");
         fs::write(dir.join("target/x"), "built").expect("written");
         check_stage(&dir, &source, Leftovers::Ignored).expect("ignored output is allowed");
@@ -1256,23 +1554,51 @@ mod tests {
 
     #[test]
     fn a_stage_at_another_commit_is_refused() {
-        let repo = repository("moved");
-        let source = identify(&repo.0).expect("clean");
-        let into = TempDir::new("moved-into");
-        let dir = into.0.join("src");
-        stage(&repo.0, &source, &dir).expect("staged");
+        let (_repo, into, source) = staged("moved");
         let other = Source {
             commit: ObjectId::try_from("1".repeat(40)).expect("an id"),
             tree: source.tree.clone(),
         };
         let error = format!(
             "{:#}",
-            check_stage(&dir, &other, Leftovers::None).expect_err("elsewhere")
+            check_stage(&into.0.join("src"), &other, Leftovers::None).expect_err("elsewhere")
         );
         assert!(error.contains("not 1111"), "{error}");
     }
 
+    #[test]
+    fn a_git_ls_tree_listing_is_read_and_a_malformed_one_refused() {
+        let listing = b"100644 blob abc\ta b.txt\x00120000 blob def\tlink\x00";
+        let parsed = entries(listing).expect("parses");
+        let paths: Vec<&[u8]> = parsed.iter().map(|e| e.path).collect();
+        assert_eq!(paths, [b"a b.txt".as_slice(), b"link"]);
+        assert_eq!(parsed.first().map(|e| e.mode), Some(b"100644".as_slice()));
+        assert!(entries(b"").expect("empty").is_empty());
+        assert!(entries(b"100644 blob abc a.txt\0").is_err(), "no tab");
+        assert!(entries(b"100644 abc\ta.txt\0").is_err(), "no type");
+    }
+
+    #[test]
+    fn a_blob_is_hashed_as_git_hashes_it() {
+        // `printf 'one\n' | git hash-object --stdin`, and the empty blob.
+        assert_eq!(
+            blob_id(false, b"one\n"),
+            "5626abf0f72e58d7a153368ba57db4c673c0e171"
+        );
+        assert_eq!(
+            blob_id(false, b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            blob_id(true, b""),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+        );
+    }
+
+    /// The three images' files as a build leaves them, `bin` for the boot
+    /// image's bytes.
     fn manifest_for(dir: &Path, epoch: u64) -> Manifest {
+        let packages: Vec<String> = images::packages().map(str::to_owned).collect();
         Manifest {
             format: FORMAT,
             source: SourceRecord {
@@ -1290,29 +1616,50 @@ mod tests {
                     cargo: "cargo 1.98.1".to_owned(),
                     espflash: "espflash 4.5.0".to_owned(),
                     rustflags: vec!["--remap-path-prefix=/o89=/o89".to_owned()],
-                    packages: vec!["o89-boot".to_owned()],
+                    packages: packages.clone(),
                 },
             },
-            images: vec![ImageRecord {
-                package: "o89-boot".to_owned(),
-                bin: FileRecord::of(dir, "o89-boot.bin").expect("hashed"),
-                elf: FileRecord::of(dir, "o89-boot.elf").expect("hashed"),
-            }],
+            images: packages
+                .iter()
+                .map(|package| ImageRecord {
+                    package: package.clone(),
+                    bin: FileRecord::of(dir, &format!("{package}.bin")).expect("hashed"),
+                    elf: FileRecord::of(dir, &format!("{package}.elf")).expect("hashed"),
+                })
+                .collect(),
         }
+    }
+
+    fn write_manifest(dir: &Path, manifest: &Manifest) {
+        fs::write(
+            dir.join(MANIFEST),
+            toml::to_string(manifest).expect("serialises"),
+        )
+        .expect("written");
     }
 
     /// A build directory as `build` leaves one.
     fn built(name: &str, bin: &[u8], epoch: u64) -> TempDir {
         let dir = TempDir::new(name);
-        fs::write(dir.0.join("o89-boot.bin"), bin).expect("written");
-        fs::write(dir.0.join("o89-boot.elf"), b"\x7fELF").expect("written");
-        let manifest = manifest_for(&dir.0, epoch);
-        fs::write(
-            dir.0.join(MANIFEST),
-            toml::to_string(&manifest).expect("serialises"),
-        )
-        .expect("written");
+        for package in images::packages() {
+            let bytes: &[u8] = if package == "o89-boot" {
+                bin
+            } else {
+                package.as_bytes()
+            };
+            fs::write(dir.0.join(format!("{package}.bin")), bytes).expect("written");
+            fs::write(dir.0.join(format!("{package}.elf")), b"\x7fELF").expect("written");
+        }
+        write_manifest(&dir.0, &manifest_for(&dir.0, epoch));
         dir
+    }
+
+    /// Rewrite a built directory's manifest.
+    fn rewrite(dir: &Path, change: impl FnOnce(&mut Manifest)) {
+        let text = fs::read_to_string(dir.join(MANIFEST)).expect("read");
+        let mut manifest: Manifest = toml::from_str(&text).expect("parses");
+        change(&mut manifest);
+        write_manifest(dir, &manifest);
     }
 
     #[test]
@@ -1320,10 +1667,11 @@ mod tests {
         let dir = built("verify", b"\x00\x01\x02", 1_758_900_000);
         let read = verify(&dir.0).expect("verifies");
         assert_eq!(read, manifest_for(&dir.0, 1_758_900_000));
-        assert_eq!(read.images.first().map(|i| i.bin.bytes), Some(3));
+        let boot = read.images.first().expect("the boot image");
+        assert_eq!(boot.bin.bytes, 3);
         assert_eq!(
-            read.images.first().map(|i| i.bin.sha256.as_str()),
-            Some("ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc")
+            boot.bin.sha256,
+            "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc"
         );
     }
 
@@ -1336,37 +1684,90 @@ mod tests {
         fs::write(dir.0.join("o89-boot.bin"), b"\x00\x01").expect("written");
         let error = format!("{:#}", verify(&dir.0).expect_err("shorter"));
         assert!(error.contains("is 2 bytes"), "{error}");
-        fs::remove_file(dir.0.join("o89-boot.elf")).expect("removed");
         fs::write(dir.0.join("o89-boot.bin"), b"\x00\x01\x02").expect("restored");
-        assert!(verify(&dir.0).is_err());
+        fs::remove_file(dir.0.join("o89-comms.elf")).expect("removed");
+        let error = format!("{:#}", verify(&dir.0).expect_err("missing"));
+        assert!(error.contains("o89-comms.elf"), "{error}");
     }
 
     #[test]
     fn a_manifest_that_escapes_its_directory_or_is_malformed_is_refused() {
         let dir = built("escape", b"\x00", 1_758_900_000);
         let text = fs::read_to_string(dir.0.join(MANIFEST)).expect("read");
-        fs::write(
-            dir.0.join(MANIFEST),
-            text.replace("file = \"o89-boot.bin\"", "file = \"../o89-boot.bin\""),
-        )
-        .expect("written");
-        let error = format!("{:#}", verify(&dir.0).expect_err("escapes"));
-        assert!(error.contains("not a file name"), "{error}");
-        fs::write(dir.0.join(MANIFEST), format!("{text}extra = 1\n")).expect("written");
-        assert!(verify(&dir.0).is_err(), "an unknown field");
-        fs::write(
-            dir.0.join(MANIFEST),
-            text.replace("epoch = 1758900000", "epoch = 0"),
-        )
-        .expect("written");
-        assert!(verify(&dir.0).is_err(), "a zero epoch");
-        fs::write(
-            dir.0.join(MANIFEST),
-            text.replace("format = 1", "format = 2"),
-        )
-        .expect("written");
-        let error = format!("{:#}", verify(&dir.0).expect_err("format"));
+        let refused = |text: String| {
+            fs::write(dir.0.join(MANIFEST), text).expect("written");
+            format!("{:#}", verify(&dir.0).expect_err("refused"))
+        };
+        let error = refused(text.replace("file = \"o89-boot.bin\"", "file = \"../o89-boot.bin\""));
+        assert!(error.contains("not \"o89-boot.bin\""), "{error}");
+        let error = refused(text.replace("[environment]\n", "[environment]\nextra = 1\n"));
+        assert!(error.contains("extra"), "{error}");
+        let error = refused(format!("{text}extra = 1\n"));
+        assert!(error.contains("extra"), "{error}");
+        let error = refused(text.replace("epoch = 1758900000", "epoch = 0"));
+        assert!(error.contains("zero"), "{error}");
+        let error = refused(text.replace("format = 1", "format = 2"));
         assert!(error.contains("format 2"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_missing_an_image_is_refused_though_its_files_verify() {
+        let dir = built("subset", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| {
+            m.images.retain(|image| image.package == "o89-boot");
+            m.environment.inside.packages.retain(|p| p == "o89-boot");
+        });
+        let error = format!("{:#}", verify(&dir.0).expect_err("a subset"));
+        assert!(error.contains("a release is exactly"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_repeating_or_inventing_an_image_is_refused() {
+        let dir = built("duplicate", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| {
+            if let Some(image) = m.images.get_mut(2) {
+                image.package = "o89-boot".to_owned();
+            }
+        });
+        assert!(verify(&dir.0).is_err(), "a duplicate");
+        let dir = built("unknown", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| {
+            if let Some(image) = m.images.get_mut(2) {
+                image.package = "o89-dev".to_owned();
+            }
+        });
+        assert!(verify(&dir.0).is_err(), "an unknown package");
+        let dir = built("reordered", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| m.images.reverse());
+        assert!(verify(&dir.0).is_err(), "out of order");
+    }
+
+    /// Two images pointing at one set of files would verify one file twice
+    /// and the other never.
+    #[test]
+    fn a_manifest_recording_one_images_files_under_another_is_refused() {
+        let dir = built("aliased", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| {
+            let boot = FileRecord::of(&dir.0, "o89-boot.bin").expect("hashed");
+            if let Some(image) = m.images.get_mut(1) {
+                image.bin = boot;
+            }
+        });
+        let error = format!("{:#}", verify(&dir.0).expect_err("aliased"));
+        assert!(
+            error.contains("records o89-controller's bin as \"o89-boot.bin\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_environment_built_other_packages_is_refused() {
+        let dir = built("inside", b"\x00", 1_758_900_000);
+        rewrite(&dir.0, |m| {
+            m.environment.inside.packages.truncate(2);
+        });
+        let error = format!("{:#}", verify(&dir.0).expect_err("disagrees"));
+        assert!(error.contains("the environment built"), "{error}");
     }
 
     #[test]
@@ -1424,6 +1825,20 @@ mod tests {
     }
 
     #[test]
+    fn sizes_are_recorded_only_from_a_checkout_of_the_artifacts_commit() {
+        let dir = built("record", b"\x00", 1_758_900_000);
+        let manifest = verify(&dir.0).expect("verifies");
+        let same = ObjectId::try_from("a".repeat(40)).expect("an id");
+        recordable(&manifest, &same).expect("the artifacts' own commit");
+        let other = ObjectId::try_from("c".repeat(40)).expect("an id");
+        let error = format!("{:#}", recordable(&manifest, &other).expect_err("another"));
+        assert!(
+            error.contains("record them from a checkout of their own commit"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_machine_path_in_an_image_is_found() {
         let root = Path::new("/Users/a/firmware");
         let scratch = Path::new("/tmp/o89-reproducible-1-2");
@@ -1432,6 +1847,66 @@ mod tests {
         assert!(leaks(b"panicked at /o89/crates/x.rs", &[root, scratch]).is_empty());
         assert!(leaks(b"", &[root]).is_empty());
         assert!(leaks(b"anything", &[Path::new("")]).is_empty());
+        // A checkout that is itself at the stage's path names nothing new.
+        assert!(leaks(b"/o89/crates/x.rs", &[Path::new(STAGE)]).is_empty());
+    }
+
+    #[test]
+    fn an_image_naming_the_machine_is_refused_when_collected() {
+        let built_dir = TempDir::new("collect-from");
+        let out = TempDir::new("collect-to");
+        let root = Path::new("/Users/a/firmware");
+        fs::write(built_dir.0.join("o89-boot.bin"), b"\x00\x01").expect("written");
+        fs::write(
+            built_dir.0.join("o89-boot.elf"),
+            b"at /Users/a/firmware/x.rs",
+        )
+        .expect("written");
+        let error = format!(
+            "{:#}",
+            collect("o89-boot", &built_dir.0, &out.0, &[root]).expect_err("names the machine")
+        );
+        assert!(error.contains("o89-boot.elf names"), "{error}");
+        fs::write(built_dir.0.join("o89-boot.elf"), b"at /o89/x.rs").expect("written");
+        let record = collect("o89-boot", &built_dir.0, &out.0, &[root]).expect("clean");
+        assert_eq!(record.bin.sha256, sha256(b"\x00\x01"));
+        assert_eq!(
+            fs::read(out.0.join("o89-boot.bin")).expect("copied"),
+            b"\x00\x01"
+        );
+        assert!(collect("../x", &built_dir.0, &out.0, &[root]).is_err());
+    }
+
+    #[test]
+    fn an_unfinished_output_is_removed_and_a_finished_one_kept() {
+        let parent = TempDir::new("output");
+        let dir = parent.0.join("out");
+        fs::create_dir(&dir).expect("created");
+        fs::write(dir.join("partial"), "x").expect("written");
+        drop(Output {
+            dir: dir.clone(),
+            done: false,
+        });
+        assert!(!dir.exists());
+        fs::create_dir(&dir).expect("created");
+        drop(Output {
+            dir: dir.clone(),
+            done: true,
+        });
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_scratch_directory_is_its_own_and_removed_when_dropped() {
+        let one = Scratch::create().expect("created");
+        let two = Scratch::create().expect("created");
+        assert_ne!(one.0, two.0);
+        for sub in ["src", "cargo", "out", "context"] {
+            assert!(one.path(sub).is_dir(), "{sub}");
+        }
+        let path = one.0.clone();
+        drop(one);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1454,12 +1929,14 @@ mod tests {
     }
 
     #[test]
-    fn the_container_is_refused_everywhere_but_the_fixed_path() {
-        let repo = Repo::locate().expect("the checkout");
+    fn the_containers_half_runs_only_at_the_fixed_path() {
+        staged_here(Path::new(STAGE)).expect("the stage");
         let error = format!(
             "{:#}",
-            inside(&repo, Path::new("/nowhere")).expect_err("not the stage")
+            staged_here(Path::new("/nowhere")).expect_err("not the stage")
         );
         assert!(error.contains("runs in the container"), "{error}");
+        assert!(staged_here(Path::new("/o89/")).is_ok(), "the same path");
+        assert!(staged_here(Path::new("/o890")).is_err());
     }
 }

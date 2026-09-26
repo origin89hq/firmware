@@ -15,6 +15,8 @@ clap.workspace = true
 # The bootloader's hash, held to the one recorded beside it.
 hex.workspace = true
 sha2.workspace = true
+# Git's blob ids, which a staged tree's files are hashed against (#74).
+sha1.workspace = true
 km43.workspace = true
 serde.workspace = true
 syn.workspace = true

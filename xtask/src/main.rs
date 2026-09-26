@@ -108,6 +108,7 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             images::report(&measured);
             if record {
+                reproducible::recordable(&manifest, &reproducible::head(repo.root())?)?;
                 images::record(&repo, &manifest.source.commit.to_string(), &measured)?;
             }
         }

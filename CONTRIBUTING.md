@@ -27,6 +27,17 @@ dependency boundaries and the three images measured against their slots.
 `just test-fast` is the inner loop. A change that moves an image's size says
 so in its message; `just sizes --record` appends the row to `docs/sizes.tsv`.
 
+A new check in the gate is watched go red before it is trusted: break what it
+guards on purpose, see it fail, and put the file back from a copy you made
+first — `git checkout -- <file>` and `git restore` discard every uncommitted
+change in the file, and a hook refuses them on a dirty path.
+
+A change that can affect physical equipment needs the evidence the
+[embedded standard](https://github.com/origin89hq/engineering/blob/main/docs/embedded.md)
+asks for: the board revision, the firmware hash, what was measured and with
+what. A build is not bench evidence. Flashing and actuation are never part of
+an ordinary check.
+
 ## Release artifacts
 
 `just reproducible <out>` builds the three images as release artifacts: the
@@ -38,7 +49,9 @@ path it cannot, because Cargo hashes the absolute path of every crate under
 `crates/` into the symbols. `<out>` holds the `.bin` and ELF of each image
 and `manifest.toml`: the commit and tree, the epoch, the environment and
 each file's SHA-256. It needs Docker and refuses a dirty checkout, a missing,
-zero, malformed or future epoch, and an `<out>` that exists.
+zero, malformed or future epoch, and an `<out>` that exists. Ctrl-C stops the
+container but leaves the build's scratch directory,
+`o89-reproducible-<pid>-<time>` under `$TMPDIR`, to delete by hand.
 
 ```sh
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) just reproducible ../o89-release
@@ -48,20 +61,12 @@ cargo xtask sizes --from ../o89-release --record   # on main, after the merge
 ```
 
 A release is flashed or published from the recorded files after
-`reproducible-verify`, never rebuilt at another path. Ordinary builds keep
-their actual build time. The identity is qualified for one platform at a
-time; the manifest names the one that built it.
-
-A new check in the gate is watched go red before it is trusted: break what it
-guards on purpose, see it fail, and put the file back from a copy you made
-first — `git checkout -- <file>` and `git restore` discard every uncommitted
-change in the file, and a hook refuses them on a dirty path.
-
-A change that can affect physical equipment needs the evidence the
-[embedded standard](https://github.com/origin89hq/engineering/blob/main/docs/embedded.md)
-asks for: the board revision, the firmware hash, what was measured and with
-what. A build is not bench evidence. Flashing and actuation are never part of
-an ordinary check.
+`reproducible-verify`, which refuses a directory without exactly the three
+images, never rebuilt at another path. `sizes --from --record` takes its row
+from such a directory, and only in a checkout of the commit it was built
+from. Ordinary builds keep their actual build time. The identity is
+qualified for one platform at a time; the manifest names the one that built
+it.
 
 ## Protocol
 

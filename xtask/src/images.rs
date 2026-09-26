@@ -82,6 +82,11 @@ const IMAGES: &[Image] = &[
     },
 ];
 
+/// The packages of the three images, in the order they are built.
+pub fn packages() -> impl Iterator<Item = &'static str> {
+    IMAGES.iter().map(|image| image.package)
+}
+
 /// A measured image.
 pub struct Measured {
     package: &'static str,
