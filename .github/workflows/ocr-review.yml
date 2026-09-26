@@ -1,8 +1,10 @@
 # Open Code Review pilot; see origin89hq/engineering docs/code-review.md.
 name: Open Code Review
 
+# pull_request_target keeps this secret-bearing file on the base branch;
+# a PR cannot edit the workflow that receives the key.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -12,6 +14,6 @@ permissions:
 jobs:
   review:
     # Pinned engineering commit; this job passes the secret to that code.
-    uses: origin89hq/engineering/.github/workflows/ocr-review.yml@d919dceb997db469d62f2a896ae6be55ece543ca
+    uses: origin89hq/engineering/.github/workflows/ocr-review.yml@176197a52a30f18a2113dd77d601c0c7b1d41e48
     secrets:
       OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
