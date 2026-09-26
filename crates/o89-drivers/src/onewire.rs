@@ -310,7 +310,9 @@ pub async fn read_byte<W: OneWire>(line: &mut W) -> Result<u8, W::Error> {
 /// Every device on the line, by Maxim's binary search (application note
 /// 187), at most [`MAX_DEVICES`] of them.
 ///
-/// Nothing answering the reset is an empty line, not an error. Each pass
+/// Nothing answering the first reset is an empty line, not an error;
+/// nothing answering a later one is a line that changed under the search,
+/// [`SearchError::Lost`]. Each pass
 /// finds one device, so the search makes at most `MAX_DEVICES + 1` passes of
 /// 64 bits each.
 pub async fn search<W: OneWire>(line: &mut W) -> Result<Roms, SearchError<W::Error>> {
@@ -320,7 +322,8 @@ pub async fn search<W: OneWire>(line: &mut W) -> Result<Roms, SearchError<W::Err
     for _ in 0..=MAX_DEVICES {
         match line.reset().await.map_err(SearchError::Line)? {
             Presence::Present => {}
-            Presence::Absent => return Ok(roms),
+            Presence::Absent if roms.is_empty() => return Ok(roms),
+            Presence::Absent => return Err(SearchError::Lost),
         }
         write_byte(line, SEARCH_ROM)
             .await
@@ -899,6 +902,27 @@ pub(crate) mod tests {
             block_on(search(&mut Line::new(&both))).map(|roms| roms.len()),
             Ok(2)
         );
+    }
+
+    #[test]
+    fn a_line_emptied_between_passes_is_lost_not_the_devices_found_so_far() {
+        // Both unplugged after the first pass found `kept`, with `leaving`'s
+        // branch still to search: the next reset hears nobody.
+        let kept = rom(0x28, [0x10, 0, 0, 0, 0, 0]);
+        let leaving = rom(0x28, [0x11, 0, 0, 0, 0, 0]);
+        let devices = [
+            Device {
+                leaves_after: Some(1),
+                ..device(kept)
+            },
+            Device {
+                leaves_after: Some(1),
+                ..device(leaving)
+            },
+        ];
+        let mut line = Line::new(&devices);
+        assert_eq!(block_on(search(&mut line)), Err(SearchError::Lost));
+        assert_eq!(line.resets, 2);
     }
 
     #[test]
