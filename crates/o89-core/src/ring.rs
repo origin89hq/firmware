@@ -126,6 +126,10 @@ pub enum RingError<E> {
     /// A block of the ring's own, which only
     /// [`Ring::drop_oldest`] erases (#78).
     InsideTheRing(u32),
+    /// The erase would take the block holding the position [`Ring::keep`]
+    /// holds, a record whose outcome is not yet known. Refused before
+    /// anything is written or erased; it goes once the outcome is.
+    Kept(u64),
     /// The part refused.
     Flash(E),
 }
@@ -199,6 +203,22 @@ struct Scanned {
     failed_crc: u32,
 }
 
+/// Whether the part holds a record, as [`Ring::holds`] found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Holding {
+    /// The record at that position, byte for byte.
+    Present,
+    /// Nothing at that position: the log ends before it.
+    Absent,
+    /// Something else at that position. Positions are unique, so the
+    /// record asked about is not in the log.
+    Other,
+    /// The position is older than the oldest the ring still holds: whatever
+    /// was there, retention has erased it, and the part can no longer say.
+    Gone,
+}
+
 /// The ring on a part.
 pub struct Ring<N> {
     flash: N,
@@ -207,6 +227,14 @@ pub struct Ring<N> {
     head: Head,
     damage: Damage,
     floor: Floor,
+    /// Whether the head describes the part. An operation that failed after
+    /// touching it may have erased or half-written what the head names;
+    /// until the head is found again from the bytes, nothing appends,
+    /// reads or drops on it.
+    proven: bool,
+    /// A position whose record may or may not be on the part, which no
+    /// erase may take until its owner has asked the part (P-180).
+    kept: Option<u64>,
 }
 
 impl<N: MultiwriteNorFlash> Ring<N> {
@@ -242,8 +270,11 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             },
             damage: Damage::default(),
             floor: Floor::Unknown,
+            proven: false,
+            kept: None,
         };
         ring.find_the_head(scratch).await?;
+        ring.proven = true;
         Ok(ring)
     }
 
@@ -335,10 +366,23 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if scratch.len() < SCRATCH {
             return Err(RingError::ScratchTooSmall(scratch.len()));
         }
+        self.prove(scratch).await?;
+        let dropped = self.drop_proven(scratch).await;
+        // A drop refused for the kept position erased nothing.
+        self.proven = matches!(dropped, Ok(_) | Err(RingError::Kept(_)));
+        dropped
+    }
+
+    async fn drop_proven(&mut self, scratch: &mut [u8]) -> Result<Dropped, RingError<N::Error>> {
         if self.head.oldest.is_none() {
             return Ok(Dropped::Nothing);
         }
         let (block, _) = self.run(scratch).await?;
+        if let Some(kept) = self.kept
+            && self.holds_kept(block, scratch).await?
+        {
+            return Err(RingError::Kept(kept));
+        }
         self.erase(block).await?;
         self.damage = Damage::default();
         self.floor = Floor::Unknown;
@@ -349,6 +393,87 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         })
     }
 
+    /// Find the head again from the bytes on the part, as a boot does.
+    ///
+    /// An append or a drop that failed may have erased the oldest block, or
+    /// part of it, and left the head held in memory describing records that
+    /// are no longer there; nothing but the bytes proves the extent again.
+    /// Until this succeeds the ring is not proven, and every append, read
+    /// and drop runs it first.
+    pub async fn reconcile(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
+        }
+        self.proven = false;
+        self.damage = Damage::default();
+        self.floor = Floor::Unknown;
+        self.find_the_head(scratch).await?;
+        self.proven = true;
+        Ok(())
+    }
+
+    /// Keep `seq` from every erase until it is given back with `None`: an
+    /// append at it failed after touching the part, and only its bytes can
+    /// say whether it landed. A page turn and a drop that would erase its
+    /// block are refused with [`RingError::Kept`], so the answer is never
+    /// erased before it is read. A full ring whose oldest block holds it
+    /// refuses appends until then, which asks for a part that can be read.
+    pub const fn keep(&mut self, seq: Option<u64>) {
+        self.kept = seq;
+    }
+
+    /// The position [`keep`](Self::keep) holds.
+    #[must_use]
+    pub const fn kept(&self) -> Option<u64> {
+        self.kept
+    }
+
+    /// Whether the head describes the part: true from a successful open or
+    /// [`reconcile`](Self::reconcile) until an operation fails after
+    /// touching the part.
+    #[must_use]
+    pub const fn is_proven(&self) -> bool {
+        self.proven
+    }
+
+    /// The head found again first, if it is not proven: what a caller does
+    /// before it takes [`next_seq`](Self::next_seq) to frame a record, so a
+    /// stale head never numbers one.
+    pub async fn prove(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
+        if self.proven {
+            return Ok(());
+        }
+        self.reconcile(scratch).await
+    }
+
+    /// Whether the part holds `payload` as the record at `seq`: what an
+    /// append that returned an error did, which only the bytes can say. The
+    /// head is proven first.
+    pub async fn holds(
+        &mut self,
+        seq: u64,
+        payload: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<Holding, RingError<N::Error>> {
+        self.prove(scratch).await?;
+        if seq >= self.head.next_seq {
+            return Ok(Holding::Absent);
+        }
+        if self.head.oldest.is_none_or(|oldest| seq < oldest) {
+            return Ok(Holding::Gone);
+        }
+        let mut holding = Holding::Other;
+        let _ = self
+            .read_from(seq, scratch, |found| {
+                if found.seq == seq && found.payload == payload {
+                    holding = Holding::Present;
+                }
+                Wants::Enough
+            })
+            .await?;
+        Ok(holding)
+    }
+
     /// Append one event and answer the sequence it got.
     ///
     /// `payload` is an encoded `Event` naming [`next_seq`](Self::next_seq),
@@ -357,7 +482,28 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// record. The body lands first, then the magic in a program of its
     /// own; a cut between the two leaves a record the scan reads as the
     /// tail.
+    ///
+    /// An unproven ring is found again first. An error after the part was
+    /// touched leaves it unproven: the record may or may not be there, and
+    /// [`holds`](Self::holds) is how to know.
     pub async fn append(
+        &mut self,
+        class: Class,
+        payload: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<u64, RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
+        }
+        self.prove(scratch).await?;
+        let appended = self.append_proven(class, payload, scratch).await;
+        if let Err(RingError::Flash(_) | RingError::OutOfRange) = appended {
+            self.proven = false;
+        }
+        appended
+    }
+
+    async fn append_proven(
         &mut self,
         class: Class,
         payload: &[u8],
@@ -415,6 +561,8 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if scratch.len() < SCRATCH {
             return Err(RingError::ScratchTooSmall(scratch.len()));
         }
+        // A head that may name erased records is not one to read from.
+        self.prove(scratch).await?;
         let Some(oldest) = self.head.oldest else {
             return Ok(from.max(1));
         };
@@ -494,8 +642,9 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     async fn run(&mut self, scratch: &mut [u8]) -> Result<(u32, u32), RingError<N::Error>> {
         // Post-wrap the run starts two past the head, after the erased
         // block; pre-wrap it starts at zero. Either way the first block of
-        // the run is the first holding records from two past the head.
-        let mut block = self.next_block(self.next_block(self.head.block));
+        // the run is the first holding records from past the head: one past
+        // while the erase ahead waits on a kept position, two otherwise.
+        let mut block = self.next_block(self.head.block);
         for _ in 0..self.blocks {
             yield_now().await;
             match self.probe(block, scratch).await? {
@@ -612,6 +761,7 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             // read whole before the head goes into it: a probe reaches one
             // record's length and cannot promise the rest.
             at = 0;
+            let closed = head;
             for _ in 0..self.blocks {
                 yield_now().await;
                 head = self.next_block(head);
@@ -625,7 +775,16 @@ impl<N: MultiwriteNorFlash> Ring<N> {
                     }
                 }
             }
-            self.ensure_erased(head, scratch).await?;
+            if self.holds_kept(head, scratch).await? {
+                // Unless it holds the kept position. The head stays at the
+                // end of the closed block, so the next append turns the
+                // page, and the turn refuses until the position is given
+                // back.
+                head = closed;
+                at = Self::block_len();
+            } else {
+                self.ensure_erased(head, scratch).await?;
+            }
         }
         if next_seq == 1 {
             next_seq = first.saturating_add(1);
@@ -636,7 +795,15 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             next_seq,
             oldest: None,
         };
-        self.erase_ahead(scratch).await?;
+        // Finding the head again must not erase the kept position either,
+        // or the question its owner asks next is answered by the erase. A
+        // page turn refuses to erase it, but a torn write that closes the
+        // head's block leaves the block ahead to this search. The erase
+        // ahead waits instead: an append into a block not erased ahead is
+        // one the page turn erases first, under the same check.
+        if !self.holds_kept(self.next_block(head), scratch).await? {
+            self.erase_ahead(scratch).await?;
+        }
         self.head.oldest = self.find_the_oldest(first, scratch).await?;
         Ok(())
     }
@@ -646,8 +813,8 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// Before the ring has wrapped, the records sit in one run in block
     /// order and the oldest is the anchor's, the first block of the part
     /// that holds any. Once it has wrapped, the oldest are the first found
-    /// walking forward from two past the head, over erased and closed
-    /// blocks alike: a dropped oldest block (#78) leaves two or more erased
+    /// walking forward from past the head, over erased and closed blocks
+    /// alike: a dropped oldest block (#78) leaves two or more erased
     /// blocks ahead of the head with older records after them, and stopping
     /// at the first would answer with a newer block's sequence and hide
     /// every record behind it.
@@ -666,7 +833,9 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if self.head.block != last && self.probe(last, scratch).await? == Probe::Erased {
             return Ok(Some(anchor));
         }
-        let mut block = self.next_block(self.next_block(self.head.block));
+        // From one past the head: that block is erased, unless its erase
+        // waits on a kept position, and then it holds the oldest.
+        let mut block = self.next_block(self.head.block);
         for _ in 0..self.blocks {
             yield_now().await;
             match self.probe(block, scratch).await? {
@@ -698,6 +867,14 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// Move the head into the next block and erase the one after it.
     async fn turn_the_page(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
         let next = self.next_block(self.head.block);
+        // Both erases this turn may make, checked before either and before
+        // the head moves, so a refusal leaves the ring as it was.
+        if let Some(kept) = self.kept
+            && (self.holds_kept(next, scratch).await?
+                || self.holds_kept(self.next_block(next), scratch).await?)
+        {
+            return Err(RingError::Kept(kept));
+        }
         // The erase ahead may not have landed before a reset, or the block
         // may have closed: it goes now, and an append waits once.
         self.ensure_erased(next, scratch).await?;
@@ -709,6 +886,35 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         let anchor = self.head.oldest.unwrap_or(self.head.next_seq);
         self.head.oldest = self.find_the_oldest(anchor, scratch).await?;
         Ok(())
+    }
+
+    /// Whether `block` holds the kept position: its first record is at or
+    /// before it, and the next block in ring order that holds records
+    /// starts after it, or starts older, which is the wrap and makes
+    /// `block` the newest. Nothing is read while nothing is kept.
+    async fn holds_kept(
+        &mut self,
+        block: u32,
+        scratch: &mut [u8],
+    ) -> Result<bool, RingError<N::Error>> {
+        let Some(kept) = self.kept else {
+            return Ok(false);
+        };
+        let Probe::Records { first } = self.probe(block, scratch).await? else {
+            return Ok(false);
+        };
+        if first > kept {
+            return Ok(false);
+        }
+        let mut after = self.next_block(block);
+        for _ in 1..self.blocks {
+            yield_now().await;
+            match self.probe(after, scratch).await? {
+                Probe::Records { first: next } => return Ok(next <= first || next > kept),
+                Probe::Erased | Probe::Closed => after = self.next_block(after),
+            }
+        }
+        Ok(true)
     }
 
     /// Erase the block after the head unless it already is.
@@ -1103,6 +1309,119 @@ mod tests {
         }))
         .expect("reads");
         (seqs, count, next)
+    }
+
+    /// Append one class A event, answering what the ring said.
+    fn try_append<const E: usize>(ring: &mut Ring<Part<E>>) -> Result<u64, RingError<Refused>> {
+        let mut payload = [0u8; 64];
+        let len = event(ring.next_seq(), None, &mut payload);
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.append(Class::A, &payload[..len], &mut scratch))
+    }
+
+    /// Append until the ring refuses, answering the refusal.
+    fn append_until_refused<const E: usize>(ring: &mut Ring<Part<E>>) -> RingError<Refused> {
+        for _ in 0..1_000 {
+            if let Err(error) = try_append(ring) {
+                return error;
+            }
+        }
+        panic!("never refused");
+    }
+
+    #[test]
+    fn p_180_a_drop_refuses_the_block_holding_the_kept_position_until_it_is_given_back() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        for _ in 0..30 {
+            let _ = append(&mut ring, None);
+        }
+        assert_eq!(ring.head().block, 1, "block 0 full, the head past it");
+        let head = ring.head();
+        let mut scratch = [0u8; SCRATCH];
+        ring.keep(Some(5));
+        assert_eq!(
+            block_on(ring.drop_oldest(&mut scratch)),
+            Err(RingError::Kept(5))
+        );
+        assert!(ring.is_proven(), "nothing was erased");
+        assert_eq!(ring.head(), head);
+        assert_eq!(read(&mut ring, 5).0[0], 5, "still there to be asked");
+        ring.keep(None);
+        assert!(block_on(ring.drop_oldest(&mut scratch)).is_ok());
+        assert!(ring.head().oldest.is_some_and(|oldest| oldest > 5));
+    }
+
+    #[test]
+    fn p_180_a_kept_position_in_a_newer_block_leaves_the_oldest_to_drop() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        let mut last = 0;
+        for _ in 0..30 {
+            last = append(&mut ring, None);
+        }
+        ring.keep(Some(last));
+        let mut scratch = [0u8; SCRATCH];
+        assert!(
+            block_on(ring.drop_oldest(&mut scratch)).is_ok(),
+            "the oldest block does not hold it"
+        );
+        assert_eq!(ring.kept(), Some(last));
+        assert_eq!(read(&mut ring, last).0[0], last);
+    }
+
+    #[test]
+    fn p_180_a_page_turn_that_would_erase_the_kept_position_is_refused_and_turns_once_given_back() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        let first = append(&mut ring, None);
+        ring.keep(Some(first));
+        assert_eq!(append_until_refused(&mut ring), RingError::Kept(first));
+        let head = ring.head();
+        assert!(ring.is_proven(), "refused before anything was erased");
+        assert_eq!(head.oldest, Some(first), "nothing erased");
+        assert_eq!(try_append(&mut ring), Err(RingError::Kept(first)), "still");
+        assert_eq!(ring.head(), head);
+        ring.keep(None);
+        assert_eq!(try_append(&mut ring), Ok(head.next_seq), "turned");
+        assert!(ring.head().oldest.is_some_and(|oldest| oldest > first));
+    }
+
+    #[test]
+    fn p_180_finding_the_head_again_after_a_torn_write_leaves_the_kept_block_unerased() {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        let first = append(&mut ring, None);
+        ring.keep(Some(first));
+        assert_eq!(append_until_refused(&mut ring), RingError::Kept(first));
+        // A torn record at the head closes its block: the search moves the
+        // head on, and the block ahead of it is the kept one.
+        let head = ring.head();
+        let at = head.block as usize * ERASE + head.at as usize;
+        ring.flash.bytes[at..at + 4].copy_from_slice(&[0x00, 0x12, 0x34, 0x56]);
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.reconcile(&mut scratch)).expect("found again");
+        assert_ne!(ring.head().block, head.block, "moved past the closed block");
+        assert_eq!(ring.head().oldest, Some(first), "the erase ahead waited");
+        assert_eq!(read(&mut ring, first).0[0], first);
+        ring.keep(None);
+        assert_eq!(append_until_refused_or(&mut ring, first), None);
+    }
+
+    /// Append until the oldest has moved past `seq`, or the ring refuses.
+    fn append_until_refused_or<const E: usize>(
+        ring: &mut Ring<Part<E>>,
+        seq: u64,
+    ) -> Option<RingError<Refused>> {
+        for _ in 0..1_000 {
+            if let Err(error) = try_append(ring) {
+                return Some(error);
+            }
+            if ring.head().oldest.is_some_and(|oldest| oldest > seq) {
+                return None;
+            }
+        }
+        panic!("the oldest never moved");
     }
 
     #[test]

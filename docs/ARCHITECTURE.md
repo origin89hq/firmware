@@ -513,6 +513,116 @@ and never blocks function: autostart still works on voltage-plus-duration,
 labelled crude, and a shunt makes it good. The moment an accessory becomes a
 paywall the product has become the thing it is positioned against.
 
+### The reading plane: what a client reads of the site
+
+The controller holds one `Site`: the store, the descriptors that say what
+each reading is (buses, devices, components, signals, each table with a
+named capacity that refuses rather than evicts), and the concern table. The
+bus tasks write it, the sessions answer `ReadInventory`, `ReadSignals` and
+`ReadConcerns` out of it, and the recorder asks it for the records its
+changes owe. All of them run on the control executor, and the site sits
+behind an async mutex taken with `try_lock` for one synchronous call, the
+tick read while it is held: no reading is asked about at a tick older than
+its last write, no lock is held across an await, and no interrupt is masked
+while a page is encoded or a digest computed. A holder always finishes
+before another task runs, so the lock is free when asked; a caller that
+ever finds it held answers a retry, and a `Hello` is refused with error 7
+rather than told a topology that may not be current.
+
+**The descriptors change as a whole.** A batch is checked against the
+tables as they would stand and taken under a new revision, or refused and
+nothing moves: not the rows, not the revision, not the digest, and no
+signal is registered in the store without its row. The digest is computed
+again on every applied batch, so `Hello` never reports a revision beside a
+digest of other rows (P-149). Pages are rebuilt from scratch on every
+request in id order (P-146, P-198).
+
+**A concern ends only when its condition does** (P-168). Acknowledging moves
+`active` to `active_acked` and nothing else. A row leaves the table only once
+the record announcing its clear has landed in the log, so its `cid` is never
+handed to another condition a client could confuse it with (P-180). A
+source that reports the same condition under another severity or code is
+refused until it ends the old one, so a fault cannot downgrade into the
+band P-169 caps.
+
+**What a change owes is derived, never queued** (P-182). Each signal, device
+and concern keeps the last value a record announced for it, and once a
+second the recorder compares that with what it is now: at most one
+`0x0102`, one `0x0902`, one `0x0901` and four concern records a tick, seven
+against a session queue of sixteen. What does not fit is still different
+next tick, so nothing is dropped, and a record the ring refuses is handed
+back and owed again. An outcome the site was held for when it was known is
+kept by the recorder and told first next turn, before anything new is
+taken. A record is as wide as one ring record, so a sweep
+carries at most nineteen signals.
+
+**A subscription is a cursor into the log.** There is no outbox: a
+subscribed session holds the next position it is owed, and its events are
+read out of the ring from there, one sealed copy per session (P-098). Replay
+and live delivery are the same path, so nothing written between the
+subscription and the end of its replay falls between them (P-094). The ring
+is the recorder's, so the link task asks it for a batch, one read out at a
+time and given up after five seconds, and the recorder answers as soon as it
+is asked rather than on its ticker; a `ReadLog` goes the same way. A batch is
+offered to every subscribed session whose cursor it covers, so sessions at
+the same place share one read, and a later `Subscribe` that moved a cursor
+is served by that cursor alone. A session owed live records is read for
+first; below it a `ReadLog` and a replay take turns, so neither holds the
+other off for more than one read. A read takes up to sixteen records, as
+many as fit the 896 bytes of a `LogPage`'s entries while one more at its
+largest still does. One fan-out has the transport take at most sixteen
+frames, starting with the session the read was for so the sessions take
+turns, and offers at most one more per session that refuses one: at the
+transport's 200 ms write deadline that is at most 4.8 s, at most half the
+link task's 10 s check-in window, and a compile-time assertion holds it
+there. The rest of a turn, its fixed replies and the actions a tick asks
+for, is bounded frame by frame by the same deadline and not by that
+assertion. What is left stays owed. An event moves its session's cursor only
+once the UART took the frame: one refused or stalled stays owed and is sent
+again, under a new nonce, and a client drops a repeated `seq`. A session
+owed more live records than a session queue holds (sixteen) is closed as
+`shedding` and catches up from the log when it reconnects; a replay it asked
+for is paced, but the live records that arrive while it runs are counted, so
+a replay of thousands of records during steady production can be shed and
+resumes from the client's last `seq`. The ring owns whether its head is proven: an
+append, a page turn or a drop that fails after touching the part leaves it
+unproven, and every later append, read and drop finds the head again from the
+bytes first. A record is numbered only from a proven head. An append that
+failed after touching the part is not taken for an absent record: the
+reading plane keeps it, with its record, until the part says whether that
+exact record is at its position, commits it if it is, and owes it again if
+the log ends before it or holds something else there, since positions are
+unique. The plane appends nothing while it waits; the recorder's other
+writers may, and one of theirs at that position is such proof. **No erase
+takes a position the plane is still asking about.** The ring keeps it
+(`Ring::keep`): a page turn or a bench drop that would erase its block is
+refused before anything is written or erased (`RingError::Kept`; the
+mailbox answers `Unresolved`), and finding the head again after a torn
+write leaves that block for the next page turn rather than erasing it
+ahead. On a ring of many blocks this never touches an ordinary page turn,
+since the position is at the head when it is kept; a ring that fills all
+the way round to it refuses appends until the part can be read and the
+outcome is known. A diagnostic refused this way is reported and not
+retried. So a record that may have been read and whose state has since
+moved back is found on the part, committed, and followed by its
+correction, instead of being rolled back to a state that looks unchanged.
+A position retention has nonetheless erased before the part could answer
+is neither: the record may have landed and been read, so it is not
+treated as one that never reached anybody, and the plane is not held for
+good either. A concern raise is taken as told: its row opens at that
+position, an active concern is not raised again, and a cleared one keeps its
+`cid` until its clear commits (P-180). Every other record states the site as
+it is now and is owed again; if it had landed, a client hears the same state
+twice.
+The recorder publishes the log's extent from the ring's head only while it
+is proven, marks it moving before every append and drop, and has nothing to
+publish before the ring opens. While it moves a `Subscribe`, whose answer
+promises history from the oldest record, is asked to retry (P-104, P-095); a
+`Hello` is asked to retry only before the ring has opened (P-075). A unit
+whose ring never opened answers a `ReadLog` with an empty page and refuses a
+`Subscribe`, since no event could reach it. A `Hello` otherwise reports
+the last extent published, which it promises nothing from.
+
 ### Behaviours: parameters, not an engine
 
 A general rule engine on the MCU means an AST, an encoder, a validator,

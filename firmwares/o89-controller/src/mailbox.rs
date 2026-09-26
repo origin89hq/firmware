@@ -365,33 +365,35 @@ async fn write_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
 /// next never passes a record the page left out.
 async fn read_ring(ring: &mut NorRing<Nor>, lo: u32, hi: u32, scratch: &mut [u8]) -> (Status, u32) {
     let from = RingPage::from_args(lo, hi);
-    let oldest = ring.head().oldest;
     let mut at = RingPage::HEADER;
-    let walked = ring
-        .read_from(from, scratch, |found| {
-            // The ring holds nothing longer than a record carries, so the
-            // head always builds; a page cut here says so by its length.
-            let Some(head) = RingPage::entry_head(found.seq, found.class, found.payload.len())
-            else {
-                return Wants::Enough;
-            };
-            put_at(at, &head);
-            put_at(at.saturating_add(RingPage::ENTRY_HEAD), found.payload);
-            at = at
-                .saturating_add(RingPage::ENTRY_HEAD)
-                .saturating_add(found.payload.len());
-            if RingPage::room_after(at) {
-                Wants::More
-            } else {
-                Wants::Enough
-            }
-        })
-        .await;
+    // One visitor type for every reader of the ring, so its walk is built
+    // once rather than once per caller.
+    let mut take = |found: &o89_core::Found<'_>| -> Wants {
+        // The ring holds nothing longer than a record carries, so the
+        // head always builds; a page cut here says so by its length.
+        let Some(head) = RingPage::entry_head(found.seq, found.class, found.payload.len()) else {
+            return Wants::Enough;
+        };
+        put_at(at, &head);
+        put_at(at.saturating_add(RingPage::ENTRY_HEAD), found.payload);
+        at = at
+            .saturating_add(RingPage::ENTRY_HEAD)
+            .saturating_add(found.payload.len());
+        if RingPage::room_after(at) {
+            Wants::More
+        } else {
+            Wants::Enough
+        }
+    };
+    let visit: &mut dyn FnMut(&o89_core::Found<'_>) -> Wants = &mut take;
+    let walked = ring.read_from(from, scratch, visit).await;
     match walked {
         Ok(next) => {
+            // Read after the walk, which finds an unproven head again first:
+            // the page never names an oldest the part no longer holds.
             let page = RingPage {
                 ring_next: ring.next_seq(),
-                oldest,
+                oldest: ring.head().oldest,
                 next,
             };
             put_at(0, &page.header());
@@ -440,12 +442,16 @@ async fn erase_nor(ring: &mut NorRing<Nor>, block: u32) -> (Status, u32) {
 
 /// The ring's oldest block, erased, and what it left.
 async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u32) {
+    // The oldest moves under the erase and the search after it: nothing
+    // answers from the span until the head is known again (P-095).
+    crate::recorder::unsettle();
     match ring.drop_oldest(scratch).await {
         Ok(dropped) => {
             defmt::warn!(
                 "mailbox: the host dropped the ring's oldest block: {}",
                 dropped
             );
+            crate::recorder::publish(ring);
             match DropAnswer::encode(dropped) {
                 Some(bytes) => {
                     put(&bytes);
@@ -454,8 +460,18 @@ async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u3
                 None => (Status::Ok, 0),
             }
         }
+        Err(RingError::Kept(seq)) => {
+            // Refused before the erase: the ring is as it was.
+            defmt::warn!(
+                "mailbox: the drop would erase seq {}, whose outcome is not yet read",
+                seq
+            );
+            crate::recorder::publish(ring);
+            (Status::Unresolved, 0)
+        }
         Err(error) => {
             defmt::error!("mailbox: the drop failed: {}", error);
+            crate::recorder::reconcile(ring, scratch).await;
             (Status::Bus, 0)
         }
     }

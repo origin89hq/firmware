@@ -67,28 +67,32 @@
 # - reboot: sessions::l_041_a_comms_reboot_takes_every_row_and_session_with_it
 # - signed replay: sessions::p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once
 # - network: link::l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions
-# Slow drain/CTS, P-098 event queues and selective event suppression remain open:
-# Subscribe currently returns error 2; the event plane belongs to M5 (#12).
+# Slow drain/CTS and selective event suppression remain open (#91). Subscribe
+# is answered (#195): sessions::reading::p_077_subscription_is_active_before_testing_outbound_only_expiry
+# is #91's prerequisite, and core session::p_098_* sheds a session owed more
+# live events than MAX_EVENT_QUEUE; no CTS-held relay has been simulated yet.
 # These tests do not establish the week-alone site exit or hardware CTS behavior.
 
 # KM43 0.5.1 PROTOCOL.md conformance 6-10 and 12-14 against this controller.
 # Partial evidence is not a conformance claim; M4/#11 exits remain open.
 # 6: new sessions::conformance::p_019_unknown_get_config_key_is_accepted_but_duplicate_key_is_malformed
 #    and p_019_unknown_command_discriminant_is_refused_without_spending_a_counter.
-#    Mixed known/vendor Readings requires the M5 reading plane (#12).
+#    Readings are answered (#195); mixed known/vendor Readings waits on a
+#    vendor-range metric kind, which the descriptor table refuses today.
 # 7: existing sessions::l_061_a_ninth_transport_is_refused_over_the_wire_and_no_row_is_evicted
 #    and p_051_eight_bad_macs_inside_a_minute_close_the_connection_over_the_wire;
 #    core session::p_051_eight_failures_inside_a_minute_shed_the_connection_and_a_hello_resets_nothing,
 #    clients::p_067_a_full_table_refuses_rather_than_evicts,
 #    dedup::p_122_the_table_refuses_at_thirty_two_rather_than_evicting, and
 #    o89-link requests::l_014_a_full_table_refuses_the_next_request_and_keeps_the_ones_in_flight.
-#    This is partial table coverage; MAX_EVENT_QUEUE/class A/B awaits #12.
+#    This is partial table coverage; MAX_EVENT_QUEUE shedding is core
+#    session::p_098_*, and class B has no members to drop.
 # 8: existing sessions::p_022_a_verified_command_the_comms_processor_replays_acts_once_and_is_answered_once;
 #    new conformance::p_080_fresh_request_id_does_not_make_an_old_signed_counter_fresh,
 #    adversarial::p_022_p_077_withheld_request_below_the_window_and_replays_cannot_extend_a_session,
 #    and p_047_response_moved_to_another_request_fails_its_mac.
 #    Event seq and backwards LogPage receiver cases are client-side checks;
-#    this controller still needs the M5 event/ReadLog producer (#12).
+#    the producer is sessions::reading::p_094_* and p_099_* (#195).
 # 9: new adversarial::p_051_hello_proof_for_another_challenge_binds_nothing,
 #    p_064_pair_proof_under_a_foreign_printed_secret_enrols_nothing,
 #    p_072_stamping_another_live_handle_does_not_transfer_authority, and
@@ -112,8 +116,9 @@
 #     Controller dispatch rejects commands without recording a dedup entry;
 #     end-to-end duplicate behavior waits on executing commands (M8, #15).
 # 14: existing sessions::p_077_a_quiet_session_is_closed_at_fifteen_minutes_and_its_row_freed_by_the_answer
-#     proves only quiet expiry. Subscribe returns error 2 today; an active
-#     outbound-only subscription and slow-drain/P-098 require M5 (#12).
+#     proves only quiet expiry. An active subscription is now possible
+#     (sessions::reading::p_077_*, #195); the outbound-only expiry and
+#     slow-drain tests that build on it are #91's.
 # F-032 tests cover comms progress expiry and independent Wi-Fi/BLE ownership;
 # watchdog arming, reset and recovery-window timing still need board evidence.
 # No failing test is ignored or counted as coverage, and no bench exit is closed.

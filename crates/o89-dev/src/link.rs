@@ -106,6 +106,9 @@ impl Answer {
             Status::ImageRegion => bail!(
                 "{what}: the block is in an image region, which only the updater and the bootloader erase (#185)"
             ),
+            Status::Unresolved => bail!(
+                "{what}: the oldest block holds a record the controller has not yet read back; retry once it has"
+            ),
         }
     }
 }
@@ -336,7 +339,8 @@ impl Link {
             | Status::BridgeRefused
             | Status::ModuleRefused
             | Status::InsideTheRing
-            | Status::ImageRegion => Err(Refused::Bus(anyhow!(
+            | Status::ImageRegion
+            | Status::Unresolved => Err(Refused::Bus(anyhow!(
                 "writing the FRAM: {:?}",
                 answer.status
             ))),

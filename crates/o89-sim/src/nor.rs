@@ -66,6 +66,12 @@ impl<const ERASE: usize> SimNor<ERASE> {
         self.steps = 0;
     }
 
+    /// Power lost now: nothing answers, reads included, until a reboot.
+    #[cfg(test)]
+    pub(crate) fn kill(&mut self) {
+        self.dead = true;
+    }
+
     /// Power back on: the bytes stay, the part answers again.
     pub fn reboot(&mut self) {
         self.dead = false;
@@ -151,7 +157,7 @@ impl<const ERASE: usize> NorFlash for SimNor<ERASE> {
 }
 
 impl<const ERASE: usize> SimNor<ERASE> {
-    fn read_now(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), NorError> {
+    pub(crate) fn read_now(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), NorError> {
         if self.dead {
             return Err(NorError::PowerLost);
         }
@@ -161,7 +167,7 @@ impl<const ERASE: usize> SimNor<ERASE> {
     }
 
     /// Erase a byte at a time, so a cut leaves a block half erased.
-    fn erase_now(&mut self, from: u32, to: u32) -> Result<(), NorError> {
+    pub(crate) fn erase_now(&mut self, from: u32, to: u32) -> Result<(), NorError> {
         if self.dead {
             return Err(NorError::PowerLost);
         }
@@ -177,7 +183,7 @@ impl<const ERASE: usize> SimNor<ERASE> {
     }
 
     /// Program a byte at a time, clearing bits only.
-    fn write_now(&mut self, offset: u32, bytes: &[u8]) -> Result<(), NorError> {
+    pub(crate) fn write_now(&mut self, offset: u32, bytes: &[u8]) -> Result<(), NorError> {
         if self.dead {
             return Err(NorError::PowerLost);
         }

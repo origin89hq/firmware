@@ -17,7 +17,7 @@
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU32;
 
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
@@ -28,8 +28,9 @@ use km43::{
 };
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
-    LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
-    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map, time_expired,
+    LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing,
+    RecentCuts, Ring, RingError, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock,
+    nor_map, time_expired,
 };
 
 use crate::fram::Lease;
@@ -140,6 +141,11 @@ const _: () = {
 /// the roll is thirty seconds.
 const PERIOD: Duration = Duration::from_millis(100);
 
+/// Turns between two ticks of the reading plane: one a second, so a burst
+/// of changes drains at P-182's few records a second rather than at the
+/// mailbox's pace.
+const PLANE_TURNS: u32 = 10;
+
 /// Events waiting for the ring, from the tasks that raise them. As deep
 /// as the protocol's event queue; a task whose event does not fit is told
 /// so and says so, and nothing is evicted.
@@ -240,25 +246,70 @@ impl CutsKeeper {
     }
 }
 
-/// The span of the log, as the ring last stood: zero for none (P-104's
-/// reading of an empty log), until the ring opens.
-static SPAN: Mutex<CriticalSectionRawMutex, Cell<LogSpan>> = Mutex::new(Cell::new(LogSpan {
-    oldest: LogSeq(0),
-    newest: LogSeq(0),
-}));
+/// The span of the log as last published, and what is known of it:
+/// nothing until the ring opens, held while the ring's head is proven,
+/// moving while an append or a drop may move the oldest record or one
+/// failed and the head is not yet found again, and no log at all when the
+/// part never opened.
+static SPAN: Mutex<CriticalSectionRawMutex, Cell<(LogSpan, LogKnown)>> = Mutex::new(Cell::new((
+    LogSpan {
+        oldest: LogSeq(0),
+        newest: LogSeq(0),
+    },
+    LogKnown::Opening,
+)));
 
 /// The log's span, for a `Hello` (keys 7 and 8).
 pub fn log_span() -> LogSpan {
-    SPAN.lock(Cell::get)
+    SPAN.lock(|cell| cell.get().0)
 }
 
-fn publish(ring: &Ring<Nor>) {
+/// What is known of [`log_span`].
+pub fn log_known() -> LogKnown {
+    SPAN.lock(|cell| cell.get().1)
+}
+
+/// Before anything that may move the oldest record: the span published is
+/// no longer known to hold until [`publish`] finds the ring proven.
+pub fn unsettle() {
+    SPAN.lock(|cell| {
+        let (span, known) = cell.get();
+        let known = match known {
+            LogKnown::Held | LogKnown::Moving => LogKnown::Moving,
+            LogKnown::Opening | LogKnown::NoLog => known,
+        };
+        cell.set((span, known));
+    });
+}
+
+/// The span of the log as the ring's head stands, held, when the ring is
+/// proven; otherwise the last span stays published as moving.
+pub fn publish(ring: &Ring<Nor>) {
+    if !ring.is_proven() {
+        unsettle();
+        return;
+    }
     let head = ring.head();
     let span = LogSpan {
         oldest: LogSeq(head.oldest.unwrap_or(0)),
         newest: LogSeq(head.next_seq.saturating_sub(1)),
     };
-    SPAN.lock(|cell| cell.set(span));
+    SPAN.lock(|cell| cell.set((span, LogKnown::Held)));
+}
+
+/// The part never opened: a log holding nothing, said deliberately.
+fn no_log() {
+    SPAN.lock(|cell| cell.set((cell.get().0, LogKnown::NoLog)));
+}
+
+/// After an operation on the ring failed: the head found again from the
+/// bytes, and the span published only if that succeeds. Otherwise it stays
+/// moving, and every later operation on the ring tries again first.
+pub async fn reconcile(ring: &mut Ring<Nor>, scratch: &mut [u8]) {
+    if let Err(error) = ring.reconcile(scratch).await {
+        defmt::error!("recorder: the log's head was not found again: {}", error);
+    }
+    publish(ring);
 }
 
 /// The ladder's cuts as the boot read them, and the boot count they are
@@ -289,6 +340,7 @@ pub async fn run(
     nor: Nor,
     boot: Boot,
     mut calendar: CalendarClock,
+    site: crate::site::Shared,
 ) {
     if let Some(change) = calendar.pending() {
         let _ = CLOCK.lock(|clock| clock.borrow_mut().recover_audit(change));
@@ -296,23 +348,29 @@ pub async fn run(
     let mut scratch = [0u8; SCRATCH];
     let ring = open_ring(nor, &mut scratch).await;
     let mut ring = ring;
-    if let Some(ring) = ring.as_mut() {
-        defmt::info!("recorder: writing the boot record");
-        boot_records(ring, &mut scratch, boot, calendar.now()).await;
-    }
-    if let Some(ring) = ring.as_ref() {
-        publish(ring);
+    // The head the open found, before the boot's records can move it; each
+    // of those publishes its own outcome.
+    match ring.as_mut() {
+        Some(ring) => {
+            publish(ring);
+            defmt::info!("recorder: writing the boot record");
+            boot_records(ring, &mut scratch, boot, calendar.now()).await;
+        }
+        None => no_log(),
     }
     let boot = cuts.boot.map_or(0, BootCount::get);
     // The client whose set is applied and owed to the log, and the clock it
     // set, answered once the record lands.
     let mut client_waiting: Option<(u32, u64)> = None;
     mailbox::init();
+    let mut plane_turn = 0u32;
+    let mut unsettled = None;
+    let mut batch = o89_core::LogBatch::new();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
-        match select(ticker.next(), CUTS.wait()).await {
-            Either::First(()) => {
+        match select3(ticker.next(), CUTS.wait(), crate::site::WANTS.receive()).await {
+            Either3::First(()) => {
                 serve_time(
                     ring.as_mut(),
                     &mut scratch,
@@ -357,6 +415,13 @@ pub async fn run(
                         defmt::error!("recorder: no ring; diagnostic not recorded");
                     }
                 }
+                plane_turn = plane_turn.saturating_add(1);
+                if plane_turn >= PLANE_TURNS {
+                    plane_turn = 0;
+                    if let Some(ring) = ring.as_mut() {
+                        plane(site, ring, &mut scratch, calendar.now(), &mut unsettled).await;
+                    }
+                }
                 mailbox::serve(mailbox::Parts {
                     fram: &mut fram,
                     ring: ring.as_mut(),
@@ -364,16 +429,83 @@ pub async fn run(
                     boot,
                 })
                 .await;
-                // Records appended this turn, and a block the bench dropped.
-                if let Some(ring) = ring.as_ref() {
-                    publish(ring);
+                // Every append and drop published its own outcome; a head
+                // left unproven by a failure is looked for again.
+                if let Some(ring) = ring.as_mut()
+                    && log_known() == LogKnown::Moving
+                {
+                    reconcile(ring, &mut scratch).await;
                 }
             }
-            Either::Second((request, recent)) => {
+            Either3::Second((request, recent)) => {
                 keep_cuts(&mut cuts, &mut fram, request, recent).await;
             }
+            // Answered as soon as it is asked, not on the ticker, so a
+            // subscriber's events leave at the link's pace (P-098).
+            Either3::Third(want) => serve_log(ring.as_mut(), &mut scratch, &mut batch, want).await,
         }
         check_in(Task::Recorder);
+    }
+}
+
+/// One tick of the reading plane: what the site's changes owe, appended.
+async fn plane(
+    site: crate::site::Shared,
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    at: Option<UnixMillis>,
+    unsettled: &mut Option<o89_core::Unsettled>,
+) {
+    let turn = o89_core::record_owed(
+        &site,
+        ring,
+        scratch,
+        at.map(UnixMillis::as_millis),
+        |extent| match extent {
+            o89_core::Extent::Moving => unsettle(),
+            o89_core::Extent::Settled(ring) => publish(ring),
+        },
+        unsettled,
+    )
+    .await;
+    if turn.adrift {
+        defmt::error!("plane: an append failed and the log's head is unproven");
+    }
+    if turn.busy {
+        defmt::error!("plane: the site was held; its records wait a turn");
+    }
+    if turn.refused {
+        defmt::error!("plane: a record did not land; the next tick owes it again");
+    }
+    if turn.gone > 0 {
+        defmt::warn!("plane: retention erased a record's position before it could be proven");
+    }
+    if let Some(error) = turn.unwritten {
+        defmt::error!("plane: a record the site owes did not write: {}", error);
+    }
+}
+
+/// A session's read of the log, answered from the ring. Without a ring the
+/// read is left to the session's own deadline, which answers it busy.
+async fn serve_log(
+    ring: Option<&mut Ring<Nor>>,
+    scratch: &mut [u8],
+    batch: &mut o89_core::LogBatch,
+    want: o89_core::LogWant,
+) {
+    let Some(ring) = ring else {
+        return;
+    };
+    match o89_core::read_log(ring, want.from, want.most, scratch, batch).await {
+        Ok(()) => {
+            if crate::site::BATCHES
+                .try_send((want.ticket, batch.clone()))
+                .is_err()
+            {
+                defmt::error!("plane: a log batch found its answer slot full");
+            }
+        }
+        Err(error) => defmt::error!("plane: the log could not be read: {}", error),
     }
 }
 
@@ -422,7 +554,7 @@ async fn append_record(
     scratch: &mut [u8],
     record: ControllerRecord,
     at: Option<UnixMillis>,
-) -> Result<(), ()> {
+) -> Result<(), NotAppended> {
     let mut body = [0; CONTROLLER_RECORD_MAX_BYTES];
     match record.encode(&mut body) {
         Ok(len) => {
@@ -441,7 +573,7 @@ async fn append_record(
                 record.kind().0,
                 error
             );
-            Err(())
+            Err(NotAppended::Unbuilt)
         }
     }
 }
@@ -453,7 +585,19 @@ async fn append_body(
     kind: EventKind,
     body: &[u8],
     at: Option<UnixMillis>,
-) -> Result<(), ()> {
+) -> Result<(), NotAppended> {
+    // The head proven before it numbers the record: a stale one would frame
+    // it at a position the part has already used, and the record would be
+    // refused and lost.
+    if let Err(error) = ring.prove(scratch).await {
+        defmt::error!(
+            "record {=u16:#06x}: the log's head is unproven: {}",
+            kind.0,
+            error
+        );
+        publish(ring);
+        return Err(NotAppended::Unproven);
+    }
     let mut payload = [0u8; MAX_PAYLOAD];
     let Ok(event) = Event::new(
         LogSeq(ring.next_seq()),
@@ -462,25 +606,58 @@ async fn append_body(
         body,
     ) else {
         defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
-        return Err(());
+        return Err(NotAppended::Unbuilt);
     };
     let Ok(len) = event.encode(&mut payload) else {
         defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
-        return Err(());
+        return Err(NotAppended::Unbuilt);
     };
+    // An append may turn the page and erase the oldest records: nothing
+    // answers from the span until it is known again (P-104, P-095).
+    unsettle();
     match ring
         .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
         .await
     {
         Ok(seq) => {
             defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq);
+            publish(ring);
             Ok(())
         }
+        Err(RingError::Kept(seq)) => {
+            // Refused before anything was erased or written: the page turn
+            // would erase the plane's record whose outcome it has not yet
+            // read. Not retried; the ring appends again once it has.
+            defmt::warn!(
+                "record {=u16:#06x}: not appended: the page turn would erase seq {}, not yet resolved",
+                kind.0,
+                seq
+            );
+            publish(ring);
+            Err(NotAppended::Kept(seq))
+        }
         Err(error) => {
+            // The ring stays unproven, and the next operation finds its head
+            // first; the span stays moving until one does.
             defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error);
-            Err(())
+            publish(ring);
+            Err(NotAppended::Refused)
         }
     }
+}
+
+/// Why a record the recorder wrote is not in the log. Each is logged where
+/// it happens; none is retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotAppended {
+    /// The head could not be proven, so nothing could number it.
+    Unproven,
+    /// The event did not build or encode.
+    Unbuilt,
+    /// The page turn would erase the position the plane keeps.
+    Kept(u64),
+    /// The ring refused it, or the part failed under it.
+    Refused,
 }
 
 /// A failed floor scan or calendar write produces no successful acknowledgement.
