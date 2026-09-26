@@ -262,6 +262,7 @@ fn p_237_boots_between_draws_never_repeat_a_challenge() {
         fw_controller: "0.0.0-sim",
         fw_comms: "",
         log: LOG,
+        topology: o89_core::reported(0, [0; 8]),
         time_known: false,
         pairing_open: false,
         link: Some(Compat::Agreed(Version::V1_0)),
@@ -278,8 +279,13 @@ fn p_237_boots_between_draws_never_repeat_a_challenge() {
             let mut client = Client::on(handle);
             let frame = client.empty(MessageType::Discover);
             let mut dst = [0u8; 256];
-            let reply =
-                block_on(sessions.frame(&frame, now, (&facts, &mut wifi), &mut part, &mut dst));
+            let reply = block_on(sessions.frame(
+                &frame,
+                now,
+                (&facts, &mut wifi, &crate::link::SimSite::empty()),
+                &mut part,
+                &mut dst,
+            ));
             let len = reply.answer.expect("answered");
             let discovery =
                 Discovery::decode(Envelope::decode(&dst[..len]).unwrap()).expect("a challenge");
@@ -305,6 +311,7 @@ fn pair_directly(
         fw_controller: "0.0.0-sim",
         fw_comms: "",
         log: LOG,
+        topology: o89_core::reported(0, [0; 8]),
         time_known: false,
         pairing_open: true,
         link: Some(Compat::Agreed(Version::V1_0)),
@@ -317,7 +324,13 @@ fn pair_directly(
     let mut client = Client::install(1, install);
     let mut dst = [0u8; MAX_FRAME];
     let discover = client.empty(MessageType::Discover);
-    let reply = block_on(sessions.frame(&discover, now, (&facts, &mut wifi), part, &mut dst));
+    let reply = block_on(sessions.frame(
+        &discover,
+        now,
+        (&facts, &mut wifi, &crate::link::SimSite::empty()),
+        part,
+        &mut dst,
+    ));
     let discovery =
         Discovery::decode(Envelope::decode(&dst[..reply.answer.ok_or(())?]).map_err(|_| ())?)
             .map_err(|_| ())?;
@@ -328,7 +341,13 @@ fn pair_directly(
                         frame: &[u8],
                         dst: &mut [u8]|
      -> Result<usize, ()> {
-        let _ = block_on(sessions.frame(frame, now, (&facts, &mut wifi), part, dst));
+        let _ = block_on(sessions.frame(
+            frame,
+            now,
+            (&facts, &mut wifi, &crate::link::SimSite::empty()),
+            part,
+            dst,
+        ));
         let job = sessions.next_job().ok_or(())?;
         let done = worker.run(job);
         block_on(sessions.completed(done, now, &facts, part, dst))

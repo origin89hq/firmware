@@ -19,6 +19,7 @@ use km43::LinkEnvelope;
 use crate::agreement::{Done, Job};
 use crate::fram::Fram;
 use crate::link::{Actions, Link};
+use crate::log_read::SiteCell;
 use crate::session::{Facts, LogSpan, Reply, Sessions};
 use crate::tick::Tick;
 use o89_link::is_peer_refusal;
@@ -34,6 +35,8 @@ pub struct Local<'a> {
     pub time_known: bool,
     /// Whether the pairing window is open, read as this frame is handled.
     pub pairing_open: bool,
+    /// The site's topology as it stands, for `Hello` (P-149).
+    pub topology: km43::Topology,
 }
 
 /// What one frame asked for: the link's actions, and a client's answer,
@@ -58,11 +61,12 @@ pub struct Endpoint {
 impl Endpoint {
     /// A frame from the comms processor, whole and CRC-checked. A client's
     /// answer is written into `dst`.
-    pub async fn frame<F: Fram>(
+    pub async fn frame<F: Fram, S: SiteCell>(
         &mut self,
         frame: &[u8],
         now: Tick,
         local: &Local<'_>,
+        site: &S,
         fram: &mut F,
         dst: &mut [u8],
     ) -> Step {
@@ -91,7 +95,7 @@ impl Endpoint {
         let facts = facts(&self.link, local, controller_fw.as_str(), peer.as_ref());
         let reply = self
             .sessions
-            .frame(frame, now, (&facts, &mut self.link.wifi), fram, dst)
+            .frame(frame, now, (&facts, &mut self.link.wifi, site), fram, dst)
             .await;
         self.answered(reply, now)
     }
@@ -137,10 +141,18 @@ impl Endpoint {
     }
 
     /// Time passed: the link's own tick, then every session that has gone
-    /// quiet for fifteen minutes closed (P-077). `install_in_flight` is
-    /// L-113's; `pairing` is the panel's window deadline while it is open,
-    /// read now, which the link reports when it changed (L-195).
-    pub fn tick(&mut self, now: Tick, install_in_flight: bool, pairing: Option<Tick>) -> Actions {
+    /// quiet for fifteen minutes closed (P-077), and every subscribed one
+    /// that can no longer take its events closed as shedding (P-098).
+    /// `install_in_flight` is L-113's; `pairing` is the panel's window
+    /// deadline while it is open, read now, which the link reports when it
+    /// changed (L-195); `log` is the log's span as last published.
+    pub fn tick(
+        &mut self,
+        now: Tick,
+        install_in_flight: bool,
+        pairing: Option<Tick>,
+        log: LogSpan,
+    ) -> Actions {
         self.link
             .set_network(match self.sessions.keys().network.held() {
                 crate::Held::Present(network) => (network.version() != 0).then_some(*network),
@@ -150,6 +162,10 @@ impl Endpoint {
         self.link.pairing_window(pairing, now);
         let mut actions = self.link.tick(now, install_in_flight, &mut self.sessions);
         for close in self.sessions.tick(now).iter() {
+            self.link
+                .close_into(close.conn, close.reason, now, &mut actions);
+        }
+        for close in self.sessions.shed(log).iter() {
             self.link
                 .close_into(close.conn, close.reason, now, &mut actions);
         }
@@ -172,6 +188,7 @@ fn facts<'a>(
         time_known: local.time_known,
         pairing_open: local.pairing_open,
         link: link.compat(),
+        topology: local.topology,
     }
 }
 
