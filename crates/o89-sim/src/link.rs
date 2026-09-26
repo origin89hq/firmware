@@ -305,6 +305,15 @@ pub(crate) struct Bench {
     posted: Option<o89_core::LogWant>,
     /// A record's outcome the site has not been told, kept between turns.
     unsettled: Option<o89_core::Unsettled>,
+    /// Whether the log's span is known to hold, as the plane's turn left it.
+    extent: Extent,
+}
+
+/// Whether the log's span the bench tells the sessions is known to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extent {
+    Held,
+    Moving,
 }
 
 impl Bench {
@@ -380,6 +389,7 @@ impl Bench {
             link_due: now,
             posted: None,
             unsettled: None,
+            extent: Extent::Held,
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -450,6 +460,7 @@ impl Bench {
         Local {
             model: MODEL,
             log: span_of(self.log.as_ref()),
+            log_settled: self.extent == Extent::Held,
             time_known: self.calendar.is_some(),
             pairing_open: self.window.is_open(self.now),
             topology: topology_of(&self.site),
@@ -483,14 +494,21 @@ impl Bench {
         if self.now.since(self.plane_due).is_some() {
             // The bench reads the span off the ring itself, so there is
             // nothing to publish as each record lands.
+            let mut held = self.extent;
             let turn = block_on(o89_core::record_owed(
                 &self.site,
                 ring,
                 &mut scratch,
                 None,
-                |_| {},
+                |extent| {
+                    held = match extent {
+                        o89_core::Extent::Moving => Extent::Moving,
+                        o89_core::Extent::Settled(_) => Extent::Held,
+                    };
+                },
                 &mut self.unsettled,
             ));
+            self.extent = held;
             assert_eq!(turn.unwritten, None, "the site wrote every record it owed");
             assert!(!turn.busy, "one owner never finds the site held");
             self.plane_due = self.now.after(PLANE_PERIOD).expect("fits");
@@ -521,7 +539,7 @@ impl Bench {
             self.answer(reply, &mut dst);
             for conn in self.endpoint.sessions.subscribers().into_iter().flatten() {
                 for index in 0..batch.len() {
-                    let Some((reply, delivery)) =
+                    let Ok(Some((reply, delivery))) =
                         self.endpoint
                             .sessions
                             .event(conn, want.ticket, &batch, index, &mut dst)
@@ -769,6 +787,7 @@ impl Bench {
                     let local = Local {
                         model: MODEL,
                         log: span_of(self.log.as_ref()),
+                        log_settled: self.extent == Extent::Held,
                         time_known: self.calendar.is_some(),
                         pairing_open: self.window.is_open(self.now),
                         topology: topology_of(&self.site),

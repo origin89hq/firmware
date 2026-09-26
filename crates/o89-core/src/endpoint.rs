@@ -31,6 +31,8 @@ pub struct Local<'a> {
     pub model: &'a str,
     /// The log's span, as the recorder last published it.
     pub log: LogSpan,
+    /// Whether that span is known to hold (see [`Facts::log_settled`]).
+    pub log_settled: bool,
     /// Whether the controller holds a time.
     pub time_known: bool,
     /// Whether the pairing window is open, read as this frame is handled.
@@ -186,6 +188,7 @@ fn facts<'a>(
         fw_controller,
         fw_comms: peer.map_or("", |peer| peer.fw.as_str()),
         log: local.log,
+        log_settled: local.log_settled,
         time_known: local.time_known,
         pairing_open: local.pairing_open,
         link: link.compat(),

@@ -417,11 +417,20 @@ fn p_104_p_095_the_log_extent_is_published_as_each_record_lands_not_at_the_end_o
         &mut ring,
         &mut scratch,
         None,
-        |ring| published.push(ring.next_seq()),
+        |extent| {
+            published.push(match extent {
+                o89_core::Extent::Moving => None,
+                o89_core::Extent::Settled(ring) => Some(ring.next_seq()),
+            });
+        },
         &mut None,
     ));
     assert_eq!(turn.landed, 2, "the topology and the validity sweep");
-    assert_eq!(published, [2, 3], "once per record, each as it landed");
+    assert_eq!(
+        published,
+        [None, Some(2), None, Some(3)],
+        "moving before each append, settled as each landed"
+    );
 }
 
 /// Every signal's quality moved once for each tick in `ticks`, and a
@@ -699,4 +708,255 @@ fn p_182_a_raise_the_ring_refused_while_the_site_was_held_is_owed_again_once() {
         &mut unsettled,
     ));
     assert_eq!(turn.landed, 0);
+}
+
+/// A NOR part shared with the test, which can hold the first program
+/// after an erase pending once: the moment an append has turned the page
+/// and erased the oldest block, and has not yet written its record.
+#[derive(Clone)]
+struct Pausing {
+    nor: std::rc::Rc<RefCell<SimNor<{ crate::link::LOG_BLOCK }>>>,
+    /// Armed: the next erase arms `hold`.
+    armed: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The next write is held once.
+    hold: std::rc::Rc<std::cell::Cell<bool>>,
+    /// A write is being held now.
+    held: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl embedded_storage_async::nor_flash::ErrorType for Pausing {
+    type Error = crate::NorError;
+}
+
+impl embedded_storage_async::nor_flash::ReadNorFlash for Pausing {
+    const READ_SIZE: usize = 1;
+
+    fn read(
+        &mut self,
+        offset: u32,
+        bytes: &mut [u8],
+    ) -> impl core::future::Future<Output = Result<(), crate::NorError>> {
+        core::future::ready(self.nor.borrow_mut().read_now(offset, bytes))
+    }
+
+    fn capacity(&self) -> usize {
+        self.nor.borrow().bytes().len()
+    }
+}
+
+impl embedded_storage_async::nor_flash::NorFlash for Pausing {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = crate::link::LOG_BLOCK;
+
+    fn erase(
+        &mut self,
+        from: u32,
+        to: u32,
+    ) -> impl core::future::Future<Output = Result<(), crate::NorError>> {
+        if self.armed.replace(false) {
+            self.hold.set(true);
+        }
+        core::future::ready(self.nor.borrow_mut().erase_now(from, to))
+    }
+
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), crate::NorError> {
+        if self.hold.replace(false) {
+            self.held.set(true);
+            let mut yielded = false;
+            core::future::poll_fn(|cx| {
+                if yielded {
+                    core::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
+                }
+            })
+            .await;
+            self.held.set(false);
+        }
+        self.nor.borrow_mut().write_now(offset, bytes)
+    }
+}
+
+impl embedded_storage_async::nor_flash::MultiwriteNorFlash for Pausing {}
+
+/// The extent as a publisher would hold it: oldest, newest, and whether it
+/// is known to hold.
+type Published = std::rc::Rc<std::cell::Cell<(u64, u64, bool)>>;
+
+/// A three-block ring on `nor`, filled until its head is near the end of
+/// its second block, so the next append turns the page into the third and
+/// erases the first, where the oldest records are.
+fn ring_before_rollover(nor: &Pausing, scratch: &mut [u8]) -> o89_core::Ring<Pausing> {
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, scratch)).expect("opens");
+    let block = u32::try_from(crate::link::LOG_BLOCK).expect("fits");
+    for _ in 0..10_000 {
+        let head = ring.head();
+        if head.block == 1 && block.saturating_sub(head.at) < 40 {
+            break;
+        }
+        let mut payload = [0u8; 32];
+        let len = km43::Event::new(
+            km43::LogSeq(ring.next_seq()),
+            None,
+            EventKind::BOOT,
+            &[0xa0],
+        )
+        .expect("an event")
+        .encode(&mut payload)
+        .expect("fits");
+        block_on(ring.append(o89_core::Class::A, &payload[..len], scratch)).expect("appends");
+    }
+    assert_eq!(ring.head().oldest, Some(1), "nothing dropped yet");
+    ring
+}
+
+/// Poll `turn` until it is held inside its append, then call `during`,
+/// then run it to the end.
+fn held_turn<F: core::future::Future>(nor: &Pausing, turn: F, during: impl FnOnce()) -> F::Output {
+    let mut turn = core::pin::pin!(turn);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    for _ in 0..100_000 {
+        match turn.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(_) => panic!("the turn finished without being held"),
+            core::task::Poll::Pending if nor.held.get() => break,
+            core::task::Poll::Pending => {}
+        }
+    }
+    during();
+    loop {
+        if let core::task::Poll::Ready(out) = turn.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
+
+fn pausing() -> Pausing {
+    Pausing {
+        nor: std::rc::Rc::new(RefCell::new(SimNor::fresh(3))),
+        armed: std::rc::Rc::default(),
+        hold: std::rc::Rc::default(),
+        held: std::rc::Rc::default(),
+    }
+}
+
+fn publisher(published: &Published) -> impl FnMut(o89_core::Extent<'_, Pausing>) + '_ {
+    move |extent| match extent {
+        o89_core::Extent::Moving => {
+            let (oldest, newest, _) = published.get();
+            published.set((oldest, newest, false));
+        }
+        o89_core::Extent::Settled(ring) => {
+            let head = ring.head();
+            published.set((
+                head.oldest.unwrap_or(0),
+                head.next_seq.saturating_sub(1),
+                true,
+            ));
+        }
+    }
+}
+
+#[test]
+fn p_095_p_104_while_an_append_has_erased_the_oldest_block_the_extent_is_not_published_as_held() {
+    // Capabilities: none. The part holds the append after its page turn.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = ring_before_rollover(&nor, &mut scratch);
+    let site = SimSite::empty();
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+        .expect("a valid site");
+    let before = ring.head();
+    let published: Published = std::rc::Rc::new(std::cell::Cell::new((
+        1,
+        before.next_seq.saturating_sub(1),
+        true,
+    )));
+    nor.armed.set(true);
+    let turn = held_turn(
+        &nor,
+        o89_core::record_owed(
+            &site,
+            &mut ring,
+            &mut scratch,
+            None,
+            publisher(&published),
+            &mut None,
+        ),
+        || {
+            // The oldest block is gone from the part, and what a
+            // `Subscribe` would answer from says it is not known to hold.
+            let nor = nor.nor.borrow();
+            assert!(
+                nor.bytes()[..crate::link::LOG_BLOCK]
+                    .iter()
+                    .all(|byte| *byte == 0xFF)
+            );
+            let (oldest, _, settled) = published.get();
+            assert_eq!((oldest, settled), (1, false));
+        },
+    );
+    assert_eq!(turn.landed, 1);
+    let (oldest, newest, settled) = published.get();
+    assert!(settled, "published once the append landed");
+    assert!(oldest > 1, "with the oldest the erase left: {oldest}");
+    assert_eq!(newest, before.next_seq);
+}
+
+#[test]
+fn p_095_an_append_that_fails_after_erasing_the_oldest_block_leaves_the_extent_unknown_until_found_again()
+ {
+    // Capabilities: none. The part loses power while the append is held
+    // after its page turn.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = ring_before_rollover(&nor, &mut scratch);
+    let site = SimSite::empty();
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+        .expect("a valid site");
+    let before = ring.head();
+    let published: Published = std::rc::Rc::new(std::cell::Cell::new((
+        1,
+        before.next_seq.saturating_sub(1),
+        true,
+    )));
+    nor.armed.set(true);
+    let turn = held_turn(
+        &nor,
+        o89_core::record_owed(
+            &site,
+            &mut ring,
+            &mut scratch,
+            None,
+            publisher(&published),
+            &mut None,
+        ),
+        || nor.nor.borrow_mut().cut_after(0),
+    );
+    assert_eq!((turn.landed, turn.refused, turn.adrift), (0, true, true));
+    let (oldest, _, settled) = published.get();
+    assert_eq!(
+        (oldest, settled),
+        (1, false),
+        "the stale oldest is never published as held"
+    );
+    // Power back: the head found again from the bytes, and only then
+    // published, with the oldest the erase left.
+    nor.nor.borrow_mut().reboot();
+    block_on(ring.reconcile(&mut scratch)).expect("found again");
+    let head = ring.head();
+    assert!(head.oldest.is_some_and(|oldest| oldest > 1));
+    // The record that failed is owed again and lands.
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        publisher(&published),
+        &mut None,
+    ));
+    assert_eq!(turn.landed, 1);
+    let (oldest, _, settled) = published.get();
+    assert!(settled && oldest == head.oldest.unwrap_or(0));
 }

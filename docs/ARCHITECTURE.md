@@ -567,14 +567,23 @@ is asked rather than on its ticker; a `ReadLog` goes the same way. A batch is
 offered to every subscribed session whose cursor it covers, so sessions at
 the same place share one read, and a later `Subscribe` that moved a cursor
 is served by that cursor alone. A session owed live records is read for
-before a `ReadLog` or a replay. An event moves its session's cursor only
+first; below it a `ReadLog` and a replay take turns, so neither holds the
+other off for more than one read. A read takes up to sixteen records, as
+many as fit the 896 bytes of a `LogPage`'s entries while one more at its
+largest still does. An event moves its session's cursor only
 once the UART took the frame: one refused or stalled stays owed and is sent
 again, under a new nonce, and a client drops a repeated `seq`. A session
 owed more live records than a session queue holds (sixteen) is closed as
 `shedding` and catches up from the log when it reconnects; a replay it asked
-for is paced and never counted against it. The recorder publishes the log's
-extent as each record lands and before it can yield, so a `Subscribe` is
-answered from the log as it stands (P-104, P-095).
+for is paced, but the live records that arrive while it runs are counted, so
+a replay of thousands of records during steady production can be shed and
+resumes from the client's last `seq`. The recorder marks the log's extent
+unsettled before every append and every drop, since either may erase the
+oldest block, and publishes it again only when the ring's head describes the
+part: after the operation landed, or after a failure once the head has been
+found again from the bytes. While it is unsettled a `Subscribe` and a
+`Hello`, whose answers promise history from the oldest record, are asked to
+retry (P-104, P-095).
 
 ### Behaviours: parameters, not an engine
 

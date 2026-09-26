@@ -349,6 +349,21 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         })
     }
 
+    /// Find the head again from the bytes on the part, as a boot does.
+    ///
+    /// An append or a drop that failed may have erased the oldest block, or
+    /// part of it, and left the head held in memory describing records that
+    /// are no longer there; nothing but the bytes proves the extent again.
+    /// Until this succeeds the extent is not to be reported as known.
+    pub async fn reconcile(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
+        }
+        self.damage = Damage::default();
+        self.floor = Floor::Unknown;
+        self.find_the_head(scratch).await
+    }
+
     /// Append one event and answer the sequence it got.
     ///
     /// `payload` is an encoded `Event` naming [`next_seq`](Self::next_seq),

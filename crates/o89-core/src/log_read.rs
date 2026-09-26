@@ -44,6 +44,17 @@ pub trait SiteCell {
 #[must_use = "a site that could not be read is a question left unanswered"]
 pub struct SiteBusy;
 
+/// What the log's extent is, as [`record_owed`] tells whoever publishes it.
+pub enum Extent<'a, N> {
+    /// An append is about to begin: it may turn the page and erase the
+    /// oldest records, so the extent published before it is no longer
+    /// known to hold until one of these follows.
+    Moving,
+    /// The ring's head describes the part again: the append landed, or it
+    /// failed and the head was found again from the bytes.
+    Settled(&'a Ring<N>),
+}
+
 /// What one turn of [`record_owed`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -60,6 +71,9 @@ pub struct PlaneTurn {
     /// after that; an outcome not yet told to the site waits in the
     /// [`Unsettled`] the caller keeps, and is told first next turn.
     pub busy: bool,
+    /// An append failed and the head could not be found again from the
+    /// bytes: the extent stays unknown until [`Ring::reconcile`] succeeds.
+    pub adrift: bool,
 }
 
 /// What became of a record handed to the ring.
@@ -98,10 +112,14 @@ impl Unsettled {
 /// One tick of the reading plane: every record the site owes, at most
 /// [`TICK_RECORDS`], appended in order under the wall-clock `at` when the
 /// controller holds one. The site is held only between appends, never
-/// across one. `landed` runs after each record lands and before the next
-/// append can yield, so whatever publishes the log's extent to the
-/// sessions does so before any of them can answer from an older one
-/// (P-104, P-095).
+/// across one.
+///
+/// `extent` hears [`Extent::Moving`] before each append and
+/// [`Extent::Settled`] once the head is known again, before anything else
+/// can yield, so whatever answers from the log's extent never answers from
+/// one an append is changing (P-104, P-095). After a failed append the head
+/// is found again from the bytes first; if that fails too, nothing settles
+/// it and the turn reports `adrift`.
 ///
 /// `unsettled` is the caller's across turns: an outcome the site was too
 /// held to hear is kept there and told first, and until it is, nothing new
@@ -111,7 +129,7 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
     ring: &mut Ring<N>,
     scratch: &mut [u8],
     at: Option<u64>,
-    mut landed: impl FnMut(&Ring<N>),
+    mut extent: impl FnMut(Extent<'_, N>),
     unsettled: &mut Option<Unsettled>,
 ) -> PlaneTurn {
     let mut done = PlaneTurn::default();
@@ -145,10 +163,19 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
             .ok()
             .and_then(|event| event.encode(&mut payload).ok());
         let appended = match framed {
-            Some(len) => ring
-                .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
-                .await
-                .ok(),
+            Some(len) => {
+                extent(Extent::Moving);
+                let appended = ring
+                    .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
+                    .await
+                    .ok();
+                if appended.is_some() || ring.reconcile(scratch).await.is_ok() {
+                    extent(Extent::Settled(ring));
+                } else {
+                    done.adrift = true;
+                }
+                appended
+            }
             None => None,
         };
         let pending = Unsettled {
@@ -158,7 +185,6 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
             len: owed.len,
         };
         if appended.is_some() {
-            landed(ring);
             done.landed = done.landed.saturating_add(1);
         } else {
             done.refused = true;
@@ -276,6 +302,17 @@ impl LogBatch {
             let _ = batch.take(*seq, payload, MAX_LOG_PAGE_ENTRIES);
             batch.next = seq.saturating_add(1);
         }
+        batch
+    }
+
+    /// A batch that read nothing, from `from` through the holes up to
+    /// `next`, in a log holding `oldest..=newest`.
+    #[cfg(test)]
+    pub(crate) fn nothing_until(next: u64, oldest: u64, newest: u64) -> Self {
+        let mut batch = Self::new();
+        batch.oldest = oldest;
+        batch.newest = newest;
+        batch.next = next;
         batch
     }
 

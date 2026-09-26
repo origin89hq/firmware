@@ -246,26 +246,57 @@ impl CutsKeeper {
 }
 
 /// The span of the log, as the ring last stood: zero for none (P-104's
-/// reading of an empty log), until the ring opens.
-static SPAN: Mutex<CriticalSectionRawMutex, Cell<LogSpan>> = Mutex::new(Cell::new(LogSpan {
-    oldest: LogSeq(0),
-    newest: LogSeq(0),
-}));
+/// reading of an empty log), until the ring opens; and whether it is known
+/// to hold, which it is not while an append or a drop may be moving the
+/// oldest record, nor after one failed until the head is found again.
+static SPAN: Mutex<CriticalSectionRawMutex, Cell<(LogSpan, bool)>> = Mutex::new(Cell::new((
+    LogSpan {
+        oldest: LogSeq(0),
+        newest: LogSeq(0),
+    },
+    true,
+)));
 
 /// The log's span, for a `Hello` (keys 7 and 8).
 pub fn log_span() -> LogSpan {
-    SPAN.lock(Cell::get)
+    SPAN.lock(|cell| cell.get().0)
 }
 
-/// The span of the log as the ring stands now, for the link task's
-/// `Hello` and `Subscribe`.
+/// Whether [`log_span`] is known to hold: a `Subscribe` or a `Hello`
+/// answered while it is not would promise history the ring may be erasing.
+pub fn log_settled() -> bool {
+    SPAN.lock(|cell| cell.get().1)
+}
+
+/// Before anything that may move the oldest record: the span published is
+/// no longer known to hold until [`publish`] follows.
+pub fn unsettle() {
+    SPAN.lock(|cell| {
+        let (span, _) = cell.get();
+        cell.set((span, false));
+    });
+}
+
+/// The span of the log as the ring's head stands, known to hold: called
+/// only when the head describes the part, after an operation that landed or
+/// a [`reconcile`] that found it again.
 pub fn publish(ring: &Ring<Nor>) {
     let head = ring.head();
     let span = LogSpan {
         oldest: LogSeq(head.oldest.unwrap_or(0)),
         newest: LogSeq(head.next_seq.saturating_sub(1)),
     };
-    SPAN.lock(|cell| cell.set(span));
+    SPAN.lock(|cell| cell.set((span, true)));
+}
+
+/// After an operation on the ring failed: the head found again from the
+/// bytes, and the span published only if that succeeds. Otherwise it stays
+/// unsettled, and the next turn tries again.
+pub async fn reconcile(ring: &mut Ring<Nor>, scratch: &mut [u8]) {
+    match ring.reconcile(scratch).await {
+        Ok(()) => publish(ring),
+        Err(error) => defmt::error!("recorder: the log's head was not found again: {}", error),
+    }
 }
 
 /// The ladder's cuts as the boot read them, and the boot count they are
@@ -382,9 +413,12 @@ pub async fn run(
                     boot,
                 })
                 .await;
-                // Records appended this turn, and a block the bench dropped.
-                if let Some(ring) = ring.as_ref() {
-                    publish(ring);
+                // Every append and drop published its own outcome; a head
+                // left unproven by a failure is looked for again.
+                if let Some(ring) = ring.as_mut()
+                    && !log_settled()
+                {
+                    reconcile(ring, &mut scratch).await;
                 }
             }
             Either3::Second((request, recent)) => {
@@ -411,10 +445,16 @@ async fn plane(
         ring,
         scratch,
         at.map(UnixMillis::as_millis),
-        publish,
+        |extent| match extent {
+            o89_core::Extent::Moving => unsettle(),
+            o89_core::Extent::Settled(ring) => publish(ring),
+        },
         unsettled,
     )
     .await;
+    if turn.adrift {
+        defmt::error!("plane: an append failed and the log's head is unproven");
+    }
     if turn.busy {
         defmt::error!("plane: the site was held; its records wait a turn");
     }
@@ -541,19 +581,21 @@ async fn append_body(
         defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
         return Err(());
     };
+    // An append may turn the page and erase the oldest records: nothing
+    // answers from the span until it is known again (P-104, P-095).
+    unsettle();
     match ring
         .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
         .await
     {
         Ok(seq) => {
             defmt::info!("record {=u16:#06x}: seq {}", kind.0, seq);
-            // Published before anything else can yield, so a `Subscribe`
-            // is never answered from a log older than the one it reads.
             publish(ring);
             Ok(())
         }
         Err(error) => {
             defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error);
+            reconcile(ring, scratch).await;
             Err(())
         }
     }

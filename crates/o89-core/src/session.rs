@@ -164,6 +164,11 @@ pub struct Facts<'a> {
     pub fw_comms: &'a str,
     /// `Hello` keys 7 and 8.
     pub log: LogSpan,
+    /// Whether `log` is known to hold: false while an append or a drop that
+    /// may move the oldest record is under way, or after one failed and the
+    /// head has not been found again. A `Subscribe` or a `Hello`, whose
+    /// answers promise history from `oldest`, is then asked to retry.
+    pub log_settled: bool,
     /// `Hello` key 10.
     pub time_known: bool,
     /// `Discover` key 6, and whether a pairing may enrol: the pairing window,
@@ -321,9 +326,10 @@ impl Expired {
     }
 }
 
-/// Events one delivery read takes, so one session's replay cannot hold the
-/// ring's owner for long and the others take their turns.
-pub const EVENTS_PER_READ: usize = 4;
+/// Events one delivery read takes at most: a session queue's worth. The
+/// batch's byte budget binds first for wide records, so a read holds as
+/// many as fit its 896 bytes while one more at its largest still does.
+pub const EVENTS_PER_READ: usize = MAX_EVENT_QUEUE;
 
 /// How long a read of the log may be out before it is given up.
 pub const LOG_ANSWER_LIMIT: Millis = Millis::from_millis(5_000);
@@ -359,6 +365,12 @@ pub struct Delivery {
     serial: u32,
     seq: u64,
 }
+
+/// An event a session is owed could not be sealed for it: its channel is
+/// exhausted or the frame did not fit. It stays owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Unsealed;
 
 /// Which kind of read [`Sessions::log_want`] is looking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,6 +733,9 @@ pub struct Sessions {
     log_out: Option<(LogTicket, Tick)>,
     /// The row the last read of the log was for.
     log_served: usize,
+    /// Which of a `ReadLog` and a replay was read for last, so the other
+    /// goes first next time both wait.
+    served_below_live: Want,
 }
 
 impl Sessions {
@@ -737,6 +752,7 @@ impl Sessions {
             served: 0,
             log_out: None,
             log_served: 0,
+            served_below_live: Want::Replay,
         }
     }
 
@@ -1042,7 +1058,7 @@ impl Sessions {
                     envelope,
                     now,
                     (wifi, agreed),
-                    (site, facts.log),
+                    (site, facts.log, facts.log_settled),
                     fram,
                     dst,
                 )
@@ -1504,7 +1520,9 @@ impl Sessions {
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
-        let Some(topology) = facts.topology else {
+        // Keys 7 and 8 and 18 to 29 must describe the controller as it
+        // stands: while either cannot be read, retry, with nothing spent.
+        let (Some(topology), true) = (facts.topology, facts.log_settled) else {
             return bare(to, Incoming::Client(ErrorCode::BusyRetry), dst);
         };
         let arrival = match Envelope::decode(frame)
@@ -1618,7 +1636,7 @@ impl Sessions {
         envelope: Envelope<'_>,
         now: Tick,
         link: (&mut crate::Wifi, bool),
-        plane: (&S, LogSpan),
+        plane: (&S, LogSpan, bool),
         fram: &mut F,
         dst: &mut [u8],
     ) -> Reply {
@@ -1649,6 +1667,8 @@ impl Sessions {
         binding.heard = now;
         let payload = opened.inner();
         let mask = keys.mask(binding);
+        // The log's span, when it is known to hold.
+        let settled = plane.2.then_some(plane.1);
         let reply = match Request::of(kind) {
             Request::Goodbye => goodbye(to, binding, payload, dst),
             Request::Wifi => {
@@ -1668,9 +1688,11 @@ impl Sessions {
                 Err(refused) => refused,
             },
             Request::Vouch => row.vouch(to, keys.epoch, payload, dst),
-            Request::Read => read_answer(to, binding, mask, (kind, payload), plane, dst),
-            Request::Subscribe => subscribed(to, binding, mask, payload, plane.1, dst),
-            Request::ReadLog => read_log(to, binding, mask, payload, plane.1, dst),
+            Request::Read => {
+                read_answer(to, binding, mask, (kind, payload), (plane.0, plane.1), dst)
+            }
+            Request::Subscribe => subscribed(to, binding, mask, payload, settled, dst),
+            Request::ReadLog => read_log(to, binding, mask, payload, settled, dst),
             Request::Clients => clients_answer(to, binding, (keys, mask), payload, now, dst),
             Request::Invite => match signed(to, binding, &opened, dst) {
                 Ok(write) => invite(to, binding, keys, &write, now, fram, dst).await,
@@ -1743,19 +1765,23 @@ impl Sessions {
         answered(written)
     }
 
-    /// The next read of the log the sessions want, if none is out, in this
-    /// order: a subscribed session owed live records, then a session's
-    /// `ReadLog`, then a subscription's replay; within each, the rows take
-    /// turns. Live delivery comes first because a session owed more live
-    /// records than its queue holds is shed (P-098), and replay is paced
-    /// and never counted. Hand it to the ring's owner and bring the batch
-    /// back to [`Sessions::log_answered`].
+    /// The next read of the log the sessions want, if none is out: a
+    /// subscribed session owed live records first, because one owed more
+    /// than its queue holds is shed (P-098); then a session's `ReadLog` and
+    /// a subscription's replay in alternation, so neither can hold the other
+    /// off for longer than one read; within each, the rows take turns. Hand
+    /// it to the ring's owner and bring the batch back to
+    /// [`Sessions::log_answered`].
     pub fn log_want(&mut self, log: LogSpan, now: Tick) -> Option<LogWant> {
         if self.log_out.is_some() {
             return None;
         }
         let start = self.log_served.saturating_add(1);
-        for class in [Want::Live, Want::ReadLog, Want::Replay] {
+        let below = match self.served_below_live {
+            Want::ReadLog => [Want::Replay, Want::ReadLog],
+            Want::Live | Want::Replay => [Want::ReadLog, Want::Replay],
+        };
+        for class in [Want::Live, below[0], below[1]] {
             for step in 0..CONNECTIONS {
                 let index = start.saturating_add(step) % CONNECTIONS;
                 let Some(Some(row)) = self.rows.get(index) else {
@@ -1794,6 +1820,9 @@ impl Sessions {
                 };
                 if let Some(want) = want {
                     self.log_served = index;
+                    if class != Want::Live {
+                        self.served_below_live = class;
+                    }
                     self.log_out = Some((want.ticket, now));
                     return Some(want);
                 }
@@ -1919,6 +1948,10 @@ impl Sessions {
     /// session (P-098). The cursor does not move here: it moves by
     /// [`Sessions::delivered`] once the frame is sent, so a send that fails
     /// or stalls leaves the event owed and it is sent again.
+    ///
+    /// `Ok(None)` is an entry this session is not owed; `Err` is one it is
+    /// owed and that could not be sealed, after which the link sends it
+    /// nothing more from this batch, so no later record overtakes it.
     pub fn event(
         &mut self,
         conn: Conn,
@@ -1926,18 +1959,21 @@ impl Sessions {
         batch: &LogBatch,
         index: usize,
         dst: &mut [u8],
-    ) -> Option<(Reply, Delivery)> {
+    ) -> Result<Option<(Reply, Delivery)>, Unsealed> {
         if ticket.purpose != Purpose::Deliver {
-            return None;
+            return Ok(None);
         }
-        let (seq, bytes) = batch.get(index)?;
-        let row = self.row_mut(conn)?;
-        let Bound::Session(binding) = &mut row.bound else {
-            return None;
+        let Some((seq, bytes)) = batch.get(index) else {
+            return Ok(None);
         };
-        let subscription = binding.subscription?;
+        let Some(Bound::Session(binding)) = self.row_mut(conn).map(|row| &mut row.bound) else {
+            return Ok(None);
+        };
+        let Some(subscription) = binding.subscription else {
+            return Ok(None);
+        };
         if !covers(ticket.from, batch.next(), subscription.next) || seq < subscription.next {
-            return None;
+            return Ok(None);
         }
         let to = Addressed {
             conn,
@@ -1947,15 +1983,15 @@ impl Sessions {
             .channel
             .tx
             .seal(to.header(MessageType::EventResponse), bytes, dst)
-            .ok()?;
-        Some((
+            .map_err(|_| Unsealed)?;
+        Ok(Some((
             answered(Some(sealed)),
             Delivery {
                 conn,
                 serial: binding.serial,
                 seq,
             },
-        ))
+        )))
     }
 
     /// The event [`Sessions::event`] sealed has left: the session's cursor
@@ -2897,7 +2933,7 @@ fn subscribed(
     binding: &mut Binding,
     mask: Option<km43::ClientCapability>,
     payload: &[u8],
-    log: LogSpan,
+    log: Option<LogSpan>,
     dst: &mut [u8],
 ) -> Reply {
     if mask.is_none() {
@@ -2907,7 +2943,11 @@ fn subscribed(
         Ok(request) => request,
         Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
-    let Some(ack) = extent(log).and_then(|log| km43::SubscribeAck::answer(request, log).ok())
+    // An extent an append or a drop is moving is not one to promise
+    // history from: retry once it settles (P-104, P-095).
+    let Some(ack) = log
+        .and_then(extent)
+        .and_then(|log| km43::SubscribeAck::answer(request, log).ok())
     else {
         return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
     };
@@ -2939,7 +2979,7 @@ fn read_log(
     binding: &mut Binding,
     mask: Option<km43::ClientCapability>,
     payload: &[u8],
-    log: LogSpan,
+    log: Option<LogSpan>,
     dst: &mut [u8],
 ) -> Reply {
     if mask.is_none() {
@@ -2949,7 +2989,7 @@ fn read_log(
         Ok(request) => request,
         Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
-    if log.newest.0 == 0 {
+    if log.is_some_and(|log| log.newest.0 == 0) {
         let resume = LogSeq(request.from_seq.0.max(1));
         let page = km43::LogPage::new(resume, LogSeq(0), true);
         return log_page(to, binding, &page, dst);
@@ -3236,6 +3276,8 @@ mod tests {
         log: LogSpan,
         /// The topology `Hello` reports, `None` when the site is held.
         topology: Option<km43::Topology>,
+        /// Whether the log's span is known to hold.
+        log_settled: bool,
     }
 
     impl Rig {
@@ -3300,6 +3342,7 @@ mod tests {
                     newest: LogSeq(0),
                 },
                 topology: Some(crate::reported(0, [0; 8])),
+                log_settled: true,
             }
         }
 
@@ -3309,6 +3352,7 @@ mod tests {
                 fw_controller: "0.1.0",
                 fw_comms: "0.1.0",
                 log: self.log,
+                log_settled: self.log_settled,
                 time_known: false,
                 pairing_open: self.pairing_open,
                 link: Some(Compat::Agreed(Version::V1_0)),
@@ -4337,6 +4381,20 @@ mod tests {
         assert!(!rig.sessions.is_computing(), "the worker is free again");
     }
 
+    /// What `event` seals for `conn`, where sealing cannot fail.
+    fn owed(
+        rig: &mut Rig,
+        conn: Conn,
+        ticket: LogTicket,
+        batch: &LogBatch,
+        index: usize,
+        dst: &mut [u8],
+    ) -> Option<(Reply, Delivery)> {
+        rig.sessions
+            .event(conn, ticket, batch, index, dst)
+            .expect("sealable")
+    }
+
     fn span(oldest: u64, newest: u64) -> LogSpan {
         LogSpan {
             oldest: LogSeq(oldest),
@@ -4396,9 +4454,7 @@ mod tests {
             None
         );
         for index in 0..stale.len() {
-            let sent = rig
-                .sessions
-                .event(conn(1), old.ticket, &stale, index, &mut dst);
+            let sent = owed(&mut rig, conn(1), old.ticket, &stale, index, &mut dst);
             assert!(sent.is_none(), "not the replacement's to send");
         }
         // An empty stale batch past the records moves nothing either.
@@ -4413,10 +4469,8 @@ mod tests {
         let (c, c_len) = record(1);
         let own = LogBatch::of(&[(1, &c[..c_len])], 1, 103);
         let _ = rig.sessions.log_answered(new.ticket, &own, &mut dst);
-        let (sent, delivery) = rig
-            .sessions
-            .event(conn(1), new.ticket, &own, 0, &mut dst)
-            .expect("its own");
+        let (sent, delivery) =
+            owed(&mut rig, conn(1), new.ticket, &own, 0, &mut dst).expect("its own");
         let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
         assert_eq!(kind, MessageType::EventResponse);
         rig.sessions.delivered(delivery);
@@ -4432,17 +4486,12 @@ mod tests {
         let mut dst = [0u8; MAX_FRAME];
         let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
         // Sealed, and the UART refused it: nothing marks it delivered.
-        let _ = rig
-            .sessions
-            .event(conn(1), want.ticket, &batch, 0, &mut dst)
-            .expect("sealed");
+        let _ = owed(&mut rig, conn(1), want.ticket, &batch, 0, &mut dst).expect("sealed");
         let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
         assert_eq!(again.from, 1, "the same event, read again");
         let _ = rig.sessions.log_answered(again.ticket, &batch, &mut dst);
-        let (sent, delivery) = rig
-            .sessions
-            .event(conn(1), again.ticket, &batch, 0, &mut dst)
-            .expect("sealed again");
+        let (sent, delivery) =
+            owed(&mut rig, conn(1), again.ticket, &batch, 0, &mut dst).expect("sealed again");
         let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
         assert_eq!(kind, MessageType::EventResponse, "under a fresh nonce");
         rig.sessions.delivered(delivery);
@@ -4469,10 +4518,8 @@ mod tests {
         let (a, a_len) = record(1);
         let late = LogBatch::of(&[(1, &a[..a_len])], 1, 5);
         let _ = rig.sessions.log_answered(want.ticket, &late, &mut dst);
-        let (_, delivery) = rig
-            .sessions
-            .event(conn(1), want.ticket, &late, 0, &mut dst)
-            .expect("its own");
+        let (_, delivery) =
+            owed(&mut rig, conn(1), want.ticket, &late, 0, &mut dst).expect("its own");
         rig.sessions.delivered(delivery);
         let again = rig
             .sessions
@@ -4505,9 +4552,7 @@ mod tests {
         let subscribers = rig.sessions.subscribers();
         assert_eq!(subscribers.iter().flatten().count(), 2);
         for (handle, phone) in [(1, &mut one), (2, &mut two)] {
-            let (sent, delivery) = rig
-                .sessions
-                .event(conn(handle), want.ticket, &batch, 0, &mut dst)
+            let (sent, delivery) = owed(&mut rig, conn(handle), want.ticket, &batch, 0, &mut dst)
                 .expect("owed to each");
             let (kind, _) = phone.open(&dst[..sent.answer.expect("sealed")]);
             assert_eq!(kind, MessageType::EventResponse);
@@ -4533,15 +4578,10 @@ mod tests {
         let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
         // The first session's first frame is refused by the UART: the link
         // stops that session there and goes on to the next.
-        let _ = rig
-            .sessions
-            .event(conn(1), want.ticket, &batch, 0, &mut dst)
-            .expect("sealed");
+        let _ = owed(&mut rig, conn(1), want.ticket, &batch, 0, &mut dst).expect("sealed");
         for index in 0..batch.len() {
-            let (sent, delivery) = rig
-                .sessions
-                .event(conn(2), want.ticket, &batch, index, &mut dst)
-                .expect("owed");
+            let (sent, delivery) =
+                owed(&mut rig, conn(2), want.ticket, &batch, index, &mut dst).expect("owed");
             let (kind, _) = two.open(&dst[..sent.answer.expect("sealed")]);
             assert_eq!(kind, MessageType::EventResponse, "under its own keys");
             rig.sessions.delivered(delivery);
@@ -4550,14 +4590,8 @@ mod tests {
         let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
         assert_eq!(again.from, 3);
         let _ = rig.sessions.log_answered(again.ticket, &batch, &mut dst);
-        assert!(
-            rig.sessions
-                .event(conn(2), again.ticket, &batch, 0, &mut dst)
-                .is_none()
-        );
-        let (sent, _) = rig
-            .sessions
-            .event(conn(1), again.ticket, &batch, 0, &mut dst)
+        assert!(owed(&mut rig, conn(2), again.ticket, &batch, 0, &mut dst).is_none());
+        let (sent, _) = owed(&mut rig, conn(1), again.ticket, &batch, 0, &mut dst)
             .expect("the same event, sent again");
         let (kind, _) = one.open(&dst[..sent.answer.expect("sealed")]);
         assert_eq!(
@@ -4582,6 +4616,174 @@ mod tests {
                 .sessions
                 .log_overdue(Tick::from_millis(60_000), &mut dst);
         }
+    }
+
+    #[test]
+    fn p_104_p_095_while_the_log_is_moving_a_subscribe_and_a_hello_are_asked_to_retry() {
+        let (mut rig, mut phone) = subscribed_rig(5, 20);
+        rig.log_settled = false;
+        let frame = phone.sealed(MessageType::Subscribe, &[0xa1, 1, 1]);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(sealed_code(&mut phone, &answer), ErrorCode::BusyRetry as u8);
+        assert_eq!(
+            rig.sessions.log_want(rig.log, rig.now),
+            None,
+            "no cursor was set"
+        );
+        // A second phone's Hello spends nothing while the extent moves.
+        let mut other = enrolled_phone(&mut rig, 2, "other", 2);
+        let _ = other.discover(&mut rig);
+        let (_, hello) = other.hello_frame();
+        let (_, answer) = rig.send(&hello);
+        assert_eq!(bare_code(&answer), ErrorCode::BusyRetry as u16);
+        // Settled: both are answered, the Hello with the same frame.
+        rig.log_settled = true;
+        let ack = subscribe(&mut rig, &mut phone, 1);
+        assert_eq!((ack.accepted_from_seq(), ack.gap()), (LogSeq(5), true));
+        let (reply, _) = rig.send(&hello);
+        assert_eq!(reply.note, Some(SessionNote::Queued(conn(2))));
+    }
+
+    #[test]
+    fn p_094_a_replay_is_read_for_at_least_every_other_read_while_others_keep_asking_for_pages() {
+        let mut rig = Rig::new();
+        rig.log = span(1, 40);
+        let mut phones = [1u8, 2, 3].map(|n| {
+            let mut phone = enrolled_phone(&mut rig, u16::from(n), "phone", n);
+            phone.hello(&mut rig).expect("a session");
+            phone
+        });
+        // The third replays from the start; the first two keep a ReadLog
+        // waiting, each asking again as soon as its page comes back.
+        let _ = subscribe(&mut rig, &mut phones[2], 1);
+        let read_log = [0xa2, 1, 1, 2, 4];
+        for phone in phones.iter_mut().take(2) {
+            let frame = phone.sealed(MessageType::ReadLog, &read_log);
+            let _ = rig.send(&frame);
+        }
+        let records: [([u8; 32], usize); 44] = core::array::from_fn(|n| {
+            record(
+                u64::try_from(n)
+                    .expect("fits")
+                    .checked_add(1)
+                    .expect("fits"),
+            )
+        });
+        let mut dst = [0u8; MAX_FRAME];
+        let mut replay_reads = 0usize;
+        let mut caught_up_at = None;
+        for turn in 0..60usize {
+            if turn == 10 {
+                // New records arrive during the contention.
+                rig.log = span(1, 44);
+            }
+            let want = rig
+                .sessions
+                .log_want(rig.log, rig.now)
+                .expect("someone waits");
+            if want.ticket.purpose == Purpose::Deliver {
+                replay_reads += 1;
+                let from = usize::try_from(want.from).expect("fits");
+                let upto = from.checked_add(4).expect("fits").min(45);
+                let taken: [(u64, &[u8]); 4] = core::array::from_fn(|k| {
+                    let at = from.checked_add(k).expect("fits").min(44);
+                    let (bytes, len) = &records[at - 1];
+                    (u64::try_from(at).expect("fits"), &bytes[..*len])
+                });
+                let batch = LogBatch::of(&taken[..upto - from], 1, rig.log.newest.0);
+                let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+                for index in 0..batch.len() {
+                    if let Some((_, delivery)) =
+                        owed(&mut rig, conn(3), want.ticket, &batch, index, &mut dst)
+                    {
+                        rig.sessions.delivered(delivery);
+                    }
+                }
+            } else {
+                let empty = LogBatch::nothing_until(1, 1, rig.log.newest.0);
+                let _ = rig.sessions.log_answered(want.ticket, &empty, &mut dst);
+                let phone = &mut phones[usize::from(want.ticket.conn.get()) - 1];
+                let frame = phone.sealed(MessageType::ReadLog, &read_log);
+                let _ = rig.send(&frame);
+            }
+            if caught_up_at.is_none() && replay_reads == 11 {
+                caught_up_at = Some(turn);
+            }
+        }
+        // Forty-four records, four a read: eleven reads, one every other
+        // turn at worst, however hard the pages are asked for.
+        assert_eq!(replay_reads, 11, "and none after it caught up");
+        assert!(
+            caught_up_at.is_some_and(|turn| turn <= 22),
+            "caught up at {caught_up_at:?}"
+        );
+    }
+
+    #[test]
+    fn p_098_an_event_that_cannot_be_sealed_stays_owed_and_nothing_overtakes_it() {
+        let (mut rig, mut phone) = subscribed_rig(1, 5);
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let (a, a_len) = record(1);
+        let batch = LogBatch::of(&[(1, &a[..a_len])], 1, 5);
+        let mut small = [0u8; 8];
+        assert_eq!(
+            rig.sessions
+                .event(conn(1), want.ticket, &batch, 0, &mut small)
+                .map(|sent| sent.is_some()),
+            Err(Unsealed)
+        );
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+        let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
+        assert_eq!(again.from, 1);
+    }
+
+    #[test]
+    fn p_096_an_empty_batch_moves_only_the_cursors_it_read_past() {
+        let (mut rig, mut one, mut two) = two_phones(1, 110);
+        let _ = subscribe(&mut rig, &mut one, 100);
+        let _ = subscribe(&mut rig, &mut two, 100);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        assert_eq!(want.from, 100);
+        // The first is replaced to replay from the start; then the read
+        // comes back having found only holes up to 104.
+        let _ = subscribe(&mut rig, &mut one, 1);
+        let holes = LogBatch::nothing_until(104, 1, 110);
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &holes, &mut dst);
+        // The second moved past the holes; the first was not read for.
+        let mut froms = [0u64; 2];
+        for from in &mut froms {
+            let next = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+            *from = next.from;
+            let _ = rig
+                .sessions
+                .log_overdue(Tick::from_millis(60_000), &mut dst);
+        }
+        froms.sort_unstable();
+        assert_eq!(froms, [1, 104]);
+    }
+
+    #[test]
+    fn p_098_a_delivery_for_a_session_bound_again_since_moves_nothing() {
+        let (mut rig, mut phone) = subscribed_rig(1, 5);
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let (a, a_len) = record(1);
+        let batch = LogBatch::of(&[(1, &a[..a_len])], 1, 5);
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+        let (_, stale) = owed(&mut rig, conn(1), want.ticket, &batch, 0, &mut dst).expect("owed");
+        // Goodbye, a new Hello, a new subscription from the start.
+        let bye = phone.sealed(MessageType::Goodbye, &[0xa0]);
+        let _ = rig.send(&bye);
+        let _ = phone.discover(&mut rig);
+        phone.hello(&mut rig).expect("a session again");
+        let _ = subscribe(&mut rig, &mut phone, 1);
+        rig.sessions.delivered(stale);
+        let next = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        assert_eq!(next.from, 1, "the old binding's delivery moved nothing");
     }
 
     #[test]

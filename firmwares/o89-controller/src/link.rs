@@ -597,6 +597,7 @@ fn local(site: Shared) -> Local<'static> {
     Local {
         model: MODEL,
         log: recorder::log_span(),
+        log_settled: recorder::log_settled(),
         // No clock before its slice.
         time_known: false,
         pairing_open: selector::pairing_open(),
@@ -1553,11 +1554,16 @@ async fn serve_log(
         // session that stays behind is shed by its queue's bound.
         for conn in endpoint.sessions.subscribers().into_iter().flatten() {
             for index in 0..batch.len() {
-                let Some((event, delivery)) =
-                    endpoint.sessions.event(conn, ticket, &batch, index, answer)
-                else {
-                    continue;
-                };
+                let (event, delivery) =
+                    match endpoint.sessions.event(conn, ticket, &batch, index, answer) {
+                        Ok(Some(owed)) => owed,
+                        Ok(None) => continue,
+                        // Owed and not sealable: nothing later overtakes it.
+                        Err(unsealed) => {
+                            defmt::error!("link: an event did not seal: {}", unsealed);
+                            break;
+                        }
+                    };
                 match send_reply(tx, writer, answer, event).await {
                     Sent::Yes => endpoint.sessions.delivered(delivery),
                     Sent::No => break,

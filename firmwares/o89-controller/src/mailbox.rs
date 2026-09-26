@@ -441,14 +441,15 @@ async fn erase_nor(ring: &mut NorRing<Nor>, block: u32) -> (Status, u32) {
 
 /// The ring's oldest block, erased, and what it left.
 async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u32) {
+    // The oldest moves under the erase and the search after it: nothing
+    // answers from the span until the head is known again (P-095).
+    crate::recorder::unsettle();
     match ring.drop_oldest(scratch).await {
         Ok(dropped) => {
             defmt::warn!(
                 "mailbox: the host dropped the ring's oldest block: {}",
                 dropped
             );
-            // The oldest moved: a `Subscribe` answered after this must see
-            // it, or its gap goes unreported (P-095).
             crate::recorder::publish(ring);
             match DropAnswer::encode(dropped) {
                 Some(bytes) => {
@@ -460,6 +461,7 @@ async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u3
         }
         Err(error) => {
             defmt::error!("mailbox: the drop failed: {}", error);
+            crate::recorder::reconcile(ring, scratch).await;
             (Status::Bus, 0)
         }
     }
