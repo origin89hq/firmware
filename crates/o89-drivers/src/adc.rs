@@ -107,6 +107,10 @@ pub struct Vdda {
 pub enum ReferenceError {
     /// The reference converted to zero.
     Zero,
+    /// A conversion of the reference reached the top of the range, which the
+    /// mean of the others can hide: the supply it would give is not one to
+    /// scale against.
+    Clipped,
     /// The supply it implies is outside [`Vdda::LOWEST_MV`] to
     /// [`Vdda::HIGHEST_MV`].
     OutOfRange,
@@ -372,6 +376,9 @@ pub async fn read<S: Sampler, const N: usize>(
     store: &mut Signals<N>,
 ) -> Result<Sampled, AdcError<S::Error>> {
     let reference = average(sampler, AdcInput::Reference).await?;
+    if reference.clipped {
+        return Err(AdcError::Reference(ReferenceError::Clipped));
+    }
     let vdda = Vdda::from_reference(cal, Counts(reference.counts)).map_err(AdcError::Reference)?;
     let mut written = 0usize;
     for input in inputs {
@@ -853,22 +860,51 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_at_the_top_of_the_range_is_a_supply_too_low_and_writes_nothing() {
-        // 1650 × 3000 / 4095 is 1.21 V, and a mean just under the top is no
-        // higher: every clipped reference is refused by the supply's range.
-        let mut sampler = Mixed {
-            reference: FULL_SCALE,
-            low: 1489,
-            high: 1489,
-            lows: SAMPLES,
+    fn a_reference_with_any_conversion_at_the_top_writes_nothing() {
+        /// The reference reads `clean` fifteen times and `last` once; every
+        /// channel reads 1489.
+        struct Reference {
+            clean: u16,
+            last: u16,
+            taken: u16,
+        }
+        impl Sampler for Reference {
+            type Error = Overrun;
+            fn sample(&mut self, input: AdcInput) -> impl Future<Output = Result<Counts, Overrun>> {
+                ready(Ok(Counts(match input {
+                    AdcInput::Reference => {
+                        self.taken = self.taken.checked_add(1).unwrap();
+                        if self.taken == SAMPLES {
+                            self.last
+                        } else {
+                            self.clean
+                        }
+                    }
+                    AdcInput::Channel(_) => 1489,
+                })))
+            }
+        }
+        // Fifteen of 1500 and one of 4095: the mean, 1662, is a plausible
+        // 2.978 V, and scaling against it would be wrong.
+        let mut sampler = Reference {
+            clean: 1500,
+            last: FULL_SCALE,
             taken: 0,
         };
         let mut store = store();
         assert_eq!(
             block_on(read(&mut sampler, cal(), &inputs(), Tick::ZERO, &mut store)),
-            Err(AdcError::Reference(ReferenceError::OutOfRange))
+            Err(AdcError::Reference(ReferenceError::Clipped))
         );
         assert_eq!(sample(&store, 50).q.validity_of(), Validity::Initialising);
+        // The same pass with its last conversion one under the top scales.
+        let mut sampler = Reference {
+            clean: 1500,
+            last: FULL_SCALE - 1,
+            taken: 0,
+        };
+        let pass = block_on(read(&mut sampler, cal(), &inputs(), Tick::ZERO, &mut store)).unwrap();
+        assert_eq!((pass.vdda.millivolts(), pass.written), (2978, 3));
     }
 
     #[test]
