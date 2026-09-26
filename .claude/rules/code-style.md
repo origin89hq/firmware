@@ -33,19 +33,21 @@ turn the first five into build failures outside `#[cfg(test)]`.
    application, the controller's hard-fault handler, the polls of the
    supervisor's and the control executor from their interrupts, and the
    `link_section` attributes that keep the last words and the host mailbox
-   in memory the runtime never zeroes. The download window's register write
-   is a field the register crate makes safe. The comms processor has one:
-   `radio::country_code` calls the blob's `esp_wifi_set_country_code`,
-   because the pinned `esp-radio` sets a country only through `CountryInfo`,
-   which fixes channels 1 to 13 with the manual policy and would enable 12
-   and 13 for CA and US.
-   The call is sound while its caller holds the sole initialized
-   `WifiController` by `&mut`, the NUL-terminated code it builds stays
-   alive through the synchronous call, and it runs before the session sets
-   its configuration, scans or connects; `station_session` and
-   `scan_session` call it first and end the session if it fails. Moving
-   the `esp-radio` pin is when to look for a safe setter, and any other
-   blob call is a new exception argued on its own. Never `#[allow]`.
+   in memory the runtime never zeroes. An `unsafe(...)` attribute carries
+   its justification in the `expect` reason, which names the section and
+   why it is right, instead of a `// SAFETY:` line. The download window's
+   register write is a field the register crate makes safe. The comms
+   processor has one: `radio::country_code` calls the blob's
+   `esp_wifi_set_country_code`, because the pinned `esp-radio` sets a
+   country only through `CountryInfo`, which fixes channels 1 to 13 with
+   the manual policy and would enable 12 and 13 for CA and US. The call is
+   sound while its caller holds the sole initialized `WifiController` by
+   `&mut`, the NUL-terminated code it builds stays alive through the
+   synchronous call, and it runs before the session sets its
+   configuration, scans or connects; `station_session` and `scan_session`
+   call it first and end the session if it fails. Moving the `esp-radio`
+   pin is when to look for a safe setter, and any other blob call is a new
+   exception argued on its own. Never `#[allow]`.
 10. **Type-state where a rule must hold in an order**: a sealed body that
     cannot give up its plaintext before its tag verifies, a draw that cannot
     be used before its successor is on the part. A rule in a type is one the
