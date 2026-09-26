@@ -16,10 +16,14 @@ pub mod adc;
 mod device;
 pub mod dialect;
 pub mod ds18b20;
+pub mod epever;
 pub mod modbus;
 pub mod onewire;
 pub mod port;
 pub mod pylontech;
+pub mod pzem;
 pub mod vedirect;
+mod vendor;
 
 pub use device::*;
+pub use vendor::{Alarm, ConditionError, DeclaredError, Report, VendorError};
