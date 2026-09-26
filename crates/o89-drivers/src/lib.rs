@@ -14,7 +14,11 @@
 
 mod device;
 pub mod dialect;
+pub mod epever;
 pub mod modbus;
 pub mod port;
+pub mod pzem;
+mod vendor;
 
 pub use device::*;
+pub use vendor::{Alarm, ConditionError, Report, VendorError};
