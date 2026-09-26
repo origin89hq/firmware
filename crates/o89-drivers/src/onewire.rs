@@ -401,6 +401,9 @@ pub(crate) mod tests {
         pub converts: usize,
         /// Makes the line report its fault on the next slot.
         pub fault: bool,
+        /// When set, every slot moves this clock on by a millisecond, so a
+        /// test sees time pass while the master talks.
+        pub clock: Option<&'a core::cell::Cell<u64>>,
     }
 
     /// One simulated device.
@@ -449,6 +452,7 @@ pub(crate) mod tests {
                 resets: 0,
                 converts: 0,
                 fault: false,
+                clock: None,
             }
         }
 
@@ -509,7 +513,14 @@ pub(crate) mod tests {
     }
 
     impl Line<'_> {
+        fn slot(&self) {
+            if let Some(clock) = self.clock {
+                clock.set(clock.get().checked_add(1).unwrap());
+            }
+        }
+
         fn reset_now(&mut self) -> Result<Presence, HeldLow> {
+            self.slot();
             if self.fault {
                 return Err(HeldLow);
             }
@@ -532,6 +543,7 @@ pub(crate) mod tests {
         }
 
         fn write_now(&mut self, bit: bool) -> Result<(), HeldLow> {
+            self.slot();
             if self.fault {
                 return Err(HeldLow);
             }
@@ -584,6 +596,7 @@ pub(crate) mod tests {
         }
 
         fn read_now(&mut self) -> Result<bool, HeldLow> {
+            self.slot();
             if self.fault {
                 return Err(HeldLow);
             }

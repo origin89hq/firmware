@@ -46,7 +46,7 @@
 //! cites: F-053
 
 use km43::{Id, Provenance, QualityError, SignalDomain, Validity};
-use o89_core::{Millis, Observation, SignalError, Signals, Tick};
+use o89_core::{Clock, Millis, Observation, SignalError, Signals, Tick};
 
 use crate::dialect::{Kind, Plausible};
 use crate::onewire::{self, Rom};
@@ -60,12 +60,17 @@ use crate::port::{OneWire, Presence};
 /// with a conversion that may no longer describe the probe.
 pub const READ_WINDOW: Millis = Millis::from_millis(1_000);
 
+/// The tick's resolution. A tick read just after the conversion started can
+/// be up to one tick short of the moment it names, so the wait adds one.
+const TICK_RESOLUTION: Millis = Millis::from_millis(1);
+
 /// The DS18B20's family code, the first byte of its ROM.
 pub const FAMILY: u8 = 0x28;
 
-/// The longest a 12-bit conversion takes, from the datasheet's `tCONV`. The
-/// caller waits at least this long between [`convert_all`] and the reads;
-/// nothing here waits, and no host test establishes the wait on the board.
+/// The longest a 12-bit conversion takes, from the datasheet's `tCONV`. A
+/// [`Conversion`] refuses reads until this long, and one tick, after the
+/// line showed it under way; nothing here waits, and no host test
+/// establishes the timing on the board.
 pub const CONVERSION: Millis = Millis::from_millis(750);
 
 /// CRC failures in a row before a read returns [`ProbeRead::Failing`].
@@ -154,21 +159,23 @@ pub enum ConvertError<E> {
     /// say so either, and is refused the same way; board A's probes are
     /// powered from `OW_VCC`.
     NotConverting,
-    /// The tick is too close to its end to bound the reads.
+    /// The tick is too close to its end to bound the reads. The command was
+    /// sent; no read of it is accepted.
     Tick,
 }
 
-/// Start a conversion on every probe on the line at once, at `now`.
+/// Start a conversion on every probe on the line at once.
 ///
 /// After the command, one read slot: a probe powered from `OW_VCC` holds it
 /// low while it converts, so a slot read high is refused as
-/// [`ConvertError::NotConverting`].
-pub async fn convert_all<W: OneWire>(
+/// [`ConvertError::NotConverting`]. The clock is read only once that slot has
+/// shown the conversion under way, which is after it started, so the reads
+/// it allows can only open late, never early, however long the reset, the
+/// commands and the executor took.
+pub async fn convert_all<W: OneWire, C: Clock>(
     line: &mut W,
-    now: Tick,
+    clock: &C,
 ) -> Result<Conversion, ConvertError<W::Error>> {
-    let ready = now.after(CONVERSION).ok_or(ConvertError::Tick)?;
-    let until = ready.after(READ_WINDOW).ok_or(ConvertError::Tick)?;
     match line.reset().await.map_err(ConvertError::Line)? {
         Presence::Absent => return Err(ConvertError::Absent),
         Presence::Present => {}
@@ -182,6 +189,12 @@ pub async fn convert_all<W: OneWire>(
     if line.read_bit().await.map_err(ConvertError::Line)? {
         return Err(ConvertError::NotConverting);
     }
+    let ready = clock
+        .now()
+        .after(CONVERSION)
+        .and_then(|done| done.after(TICK_RESOLUTION))
+        .ok_or(ConvertError::Tick)?;
+    let until = ready.after(READ_WINDOW).ok_or(ConvertError::Tick)?;
     Ok(Conversion { ready, until })
 }
 
@@ -453,8 +466,18 @@ mod tests {
         Tick::from_millis(millis)
     }
 
-    /// When a conversion started at zero is ready.
-    const READY: u64 = 750;
+    /// When a conversion started at zero is ready: the datasheet's wait and
+    /// one tick for the clock's resolution.
+    const READY: u64 = 751;
+
+    /// A clock that reads one tick.
+    struct At(Tick);
+
+    impl Clock for At {
+        fn now(&self) -> Tick {
+            self.0
+        }
+    }
 
     fn store() -> Signals<2> {
         let mut store = Signals::new();
@@ -482,7 +505,7 @@ mod tests {
     /// A conversion started at `start` on a line whose probe converts.
     fn converted(start: u64) -> Conversion {
         let devices = on_line(pad(0));
-        block_on(convert_all(&mut Line::new(&devices), at(start))).unwrap()
+        block_on(convert_all(&mut Line::new(&devices), &At(at(start)))).unwrap()
     }
 
     /// One read of `pad` through a conversion started at `start`, at its
@@ -551,15 +574,15 @@ mod tests {
             Ok(ProbeRead::Crc { consecutive: 1 })
         );
         // The slot still holds the good reading, from its own write.
-        let seen = sample(&store, 10_750);
+        let seen = sample(&store, 10_751);
         assert_eq!(
             (seen.value(), seen.q.validity_of(), seen.q.provenance_of()),
             (Some(251), Validity::Ok, Provenance::Measured)
         );
         // The failed read refreshed nothing: the reading ages out a minute
-        // after its own write at 750 ms, not after the failure.
-        assert_eq!(sample(&store, 60_750).q.validity_of(), Validity::Ok);
-        let seen = sample(&store, 60_751);
+        // after its own write at 751 ms, not after the failure.
+        assert_eq!(sample(&store, 60_751).q.validity_of(), Validity::Ok);
+        let seen = sample(&store, 60_752);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (Some(251), Validity::Stale)
@@ -636,7 +659,7 @@ mod tests {
         let mut store = store();
         let mut probe = probe();
         assert_eq!(
-            block_on(convert_all(&mut Line::new(&[]), at(0))),
+            block_on(convert_all(&mut Line::new(&[]), &At(at(0)))),
             Err(ConvertError::Absent)
         );
         let seen = probe.absent(at(0), &mut store).unwrap();
@@ -653,9 +676,9 @@ mod tests {
             ..device(rom(FAMILY, [9, 9, 9, 9, 9, 9]))
         }];
         let mut line = Line::new(&other);
-        let conversion = block_on(convert_all(&mut line, at(10_000))).unwrap();
-        let _ = block_on(probe.read(&mut line, &conversion, at(10_750), &mut store)).unwrap();
-        let seen = sample(&store, 10_750);
+        let conversion = block_on(convert_all(&mut line, &At(at(10_000)))).unwrap();
+        let _ = block_on(probe.read(&mut line, &conversion, at(10_751), &mut store)).unwrap();
+        let seen = sample(&store, 10_751);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (None, Validity::Absent)
@@ -667,9 +690,9 @@ mod tests {
             ..on_line(pad(0x0191))[0]
         }];
         let mut line = Line::new(&gone);
-        let conversion = block_on(convert_all(&mut line, at(20_000))).unwrap();
-        let _ = block_on(probe.read(&mut line, &conversion, at(20_750), &mut store)).unwrap();
-        assert_eq!(sample(&store, 20_750).q.validity_of(), Validity::Absent);
+        let conversion = block_on(convert_all(&mut line, &At(at(20_000)))).unwrap();
+        let _ = block_on(probe.read(&mut line, &conversion, at(20_751), &mut store)).unwrap();
+        assert_eq!(sample(&store, 20_751).q.validity_of(), Validity::Absent);
     }
 
     #[test]
@@ -681,7 +704,7 @@ mod tests {
         }];
         let mut line = Line::new(&deaf);
         assert_eq!(
-            block_on(convert_all(&mut line, at(0))),
+            block_on(convert_all(&mut line, &At(at(0)))),
             Err(ConvertError::NotConverting)
         );
         assert_eq!(line.converts, 1);
@@ -690,23 +713,62 @@ mod tests {
         let mut line = Line::new(&devices);
         line.fault = true;
         assert_eq!(
-            block_on(convert_all(&mut line, at(0))),
+            block_on(convert_all(&mut line, &At(at(0)))),
             Err(ConvertError::Line(HeldLow))
         );
         // A tick too close to its end cannot bound the reads.
         let mut line = Line::new(&devices);
         assert_eq!(
-            block_on(convert_all(&mut line, Tick::from_millis(u64::MAX - 1_000))),
+            block_on(convert_all(
+                &mut line,
+                &At(Tick::from_millis(u64::MAX - 1_000))
+            )),
             Err(ConvertError::Tick)
         );
-        assert_eq!(line.resets, 0);
+        assert_eq!(line.resets, 1);
         // A probe converting: ready after the datasheet's wait, open for
         // the read window.
         let conversion = converted(5_000);
         assert_eq!(
             (conversion.ready(), conversion.until()),
-            (at(5_750), at(6_750))
+            (at(5_751), at(6_751))
         );
+    }
+
+    /// A clock the simulated line moves on as it runs.
+    struct Stepping<'a>(&'a core::cell::Cell<u64>);
+
+    impl Clock for Stepping<'_> {
+        fn now(&self) -> Tick {
+            Tick::from_millis(self.0.get())
+        }
+    }
+
+    #[test]
+    fn the_wait_runs_from_when_the_line_showed_the_conversion_not_from_before_it() {
+        // Every slot takes a millisecond: the reset, sixteen command bits and
+        // the busy slot put the conversion under way at 18 ms, not at zero.
+        let clock = core::cell::Cell::new(0);
+        let devices = on_line(pad(0x0191));
+        let mut line = Line::new(&devices);
+        line.clock = Some(&clock);
+        let conversion = block_on(convert_all(&mut line, &Stepping(&clock))).unwrap();
+        assert_eq!(clock.get(), 18);
+        assert_eq!(conversion.ready(), at(18 + 751));
+        assert_eq!(conversion.until(), at(18 + 1_751));
+
+        let mut store = store();
+        let mut probe = probe();
+        // The datasheet's wait counted from before the command is too soon.
+        let mut read = |when: u64, store: &mut Signals<2>| {
+            block_on(probe.read(&mut Line::new(&devices), &conversion, at(when), store))
+        };
+        assert_eq!(read(751, &mut store), Err(ProbeError::Early));
+        assert_eq!(read(768, &mut store), Err(ProbeError::Early));
+        assert!(matches!(read(769, &mut store), Ok(ProbeRead::Wrote(_))));
+        // Written at the tick the conversion finished.
+        assert_eq!(sample(&store, 60_769).q.validity_of(), Validity::Ok);
+        assert_eq!(sample(&store, 60_770).q.validity_of(), Validity::Stale);
     }
 
     #[test]
@@ -718,12 +780,12 @@ mod tests {
         let mut read = |when: u64, store: &mut Signals<2>| {
             block_on(probe.read(&mut Line::new(&devices), &conversion, at(when), store))
         };
-        assert_eq!(read(749, &mut store), Err(ProbeError::Early));
-        assert_eq!(read(1_751, &mut store), Err(ProbeError::Expired));
-        assert_eq!(sample(&store, 749).q.validity_of(), Validity::Initialising);
+        assert_eq!(read(750, &mut store), Err(ProbeError::Early));
+        assert_eq!(read(1_752, &mut store), Err(ProbeError::Expired));
+        assert_eq!(sample(&store, 750).q.validity_of(), Validity::Initialising);
         // Both ends of the window are inside.
-        assert!(matches!(read(750, &mut store), Ok(ProbeRead::Wrote(_))));
-        assert!(matches!(read(1_750, &mut store), Ok(ProbeRead::Wrote(_))));
+        assert!(matches!(read(751, &mut store), Ok(ProbeRead::Wrote(_))));
+        assert!(matches!(read(1_751, &mut store), Ok(ProbeRead::Wrote(_))));
     }
 
     #[test]
@@ -748,15 +810,15 @@ mod tests {
         let conversion = converted(0);
         let mut store = store();
         let mut probe = probe();
-        for when in [750, 1_200, 1_750] {
+        for when in [751, 1_200, 1_751] {
             let read =
                 block_on(probe.read(&mut Line::new(&devices), &conversion, at(when), &mut store));
             assert!(matches!(read, Ok(ProbeRead::Wrote(_))), "{when}");
         }
-        // Every write was at 750 ms: stale a minute after that, not after
+        // Every write was at 751 ms: stale a minute after that, not after
         // the last read.
-        assert_eq!(sample(&store, 60_750).q.validity_of(), Validity::Ok);
-        assert_eq!(sample(&store, 60_751).q.validity_of(), Validity::Stale);
+        assert_eq!(sample(&store, 60_751).q.validity_of(), Validity::Ok);
+        assert_eq!(sample(&store, 60_752).q.validity_of(), Validity::Stale);
     }
 
     #[test]
