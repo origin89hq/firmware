@@ -19,6 +19,7 @@ pub mod ds18b20;
 pub mod modbus;
 pub mod onewire;
 pub mod port;
+pub mod pylontech;
 pub mod vedirect;
 
 pub use device::*;
