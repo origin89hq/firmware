@@ -10,7 +10,7 @@
 //! cites: F-052
 
 use km43::{Id, Validity};
-use o89_core::{Observation, Signals, Tick};
+use o89_core::{Observation, SignalError, Signals, Tick};
 
 use crate::dialect::{Block, DecodeError};
 use crate::modbus::{ModbusError, Registers};
@@ -57,11 +57,32 @@ pub enum VendorError<E> {
     /// The cells were written; the separate read of the vendor's condition
     /// words failed, so the conditions are unknown.
     Conditions(ModbusError<E>),
+    /// A reading outside the register map, published as its caller
+    /// declared, was not written.
+    Declared {
+        /// Its first register.
+        register: u16,
+        /// Why.
+        error: DeclaredError<E>,
+    },
     /// A reply held a vendor word its vendor does not define. Nothing from
     /// that reply was written: its CRC held, so the word is what the device
     /// sent, and a device sending words its manual does not define is not
     /// one whose other registers can be trusted as that manual's.
     Condition(ConditionError),
+}
+
+/// Why a declared reading was not written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a failed reading is a signal that was not refreshed"]
+pub enum DeclaredError<E> {
+    /// Its read failed.
+    Read(ModbusError<E>),
+    /// It could not be decoded.
+    Decode(DecodeError),
+    /// The store refused the write.
+    Store(SignalError),
 }
 
 /// A two-state vendor flag whose words are `0x0000` for clear and `0xFFFF`
@@ -147,25 +168,20 @@ pub(crate) fn fits(first: Id, count: usize) -> bool {
 
 /// Write the one reading whose representation the caller declared: the one
 /// cell of `declared` decoded from `registers`, or `unsupported` and no
-/// value when nothing was declared. It is the device's `cell`th reading and
-/// publishes as `signal`.
+/// value when nothing was declared. It publishes as `signal`.
 pub(crate) fn publish_declared<E, const N: usize>(
     declared: Option<&Block>,
     registers: &Registers<'_>,
-    cell: usize,
     signal: Id,
     now: Tick,
     store: &mut Signals<N>,
-) -> Result<usize, PollError<E>> {
-    if let Some(block) = declared {
-        return publish(block, registers, cell, |_| Some(signal), now, store);
-    }
-    let seen = Observation::missing(Validity::Unsupported).map_err(|error| PollError::Decode {
-        cell,
-        error: DecodeError::Quality(error),
-    })?;
-    store.write(signal, now, seen).map_err(PollError::Store)?;
-    Ok(1)
+) -> Result<(), DeclaredError<E>> {
+    let seen = match declared.and_then(|block| block.decode(registers).next()) {
+        Some(seen) => seen.map_err(DeclaredError::Decode)?,
+        None => Observation::missing(Validity::Unsupported)
+            .map_err(|error| DeclaredError::Decode(DecodeError::Quality(error)))?,
+    };
+    store.write(signal, now, seen).map_err(DeclaredError::Store)
 }
 
 #[cfg(test)]

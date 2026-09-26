@@ -21,4 +21,4 @@ pub mod pzem;
 mod vendor;
 
 pub use device::*;
-pub use vendor::{Alarm, ConditionError, Report, VendorError};
+pub use vendor::{Alarm, ConditionError, DeclaredError, Report, VendorError};
