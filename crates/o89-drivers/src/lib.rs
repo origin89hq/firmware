@@ -12,9 +12,12 @@
 
 #![no_std]
 
+pub mod adc;
 mod device;
 pub mod dialect;
+pub mod ds18b20;
 pub mod modbus;
+pub mod onewire;
 pub mod port;
 
 pub use device::*;
