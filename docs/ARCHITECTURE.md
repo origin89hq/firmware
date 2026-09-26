@@ -500,6 +500,53 @@ and never blocks function: autostart still works on voltage-plus-duration,
 labelled crude, and a shunt makes it good. The moment an accessory becomes a
 paywall the product has become the thing it is positioned against.
 
+### The reading plane: what a client reads of the site
+
+The controller holds one `Site`: the store, the descriptors that say what
+each reading is (buses, devices, components, signals, each table with a
+named capacity that refuses rather than evicts), and the concern table. The
+bus tasks write it, the sessions answer `ReadInventory`, `ReadSignals` and
+`ReadConcerns` out of it, and the recorder asks it for the records its
+changes owe. It sits behind one blocking lock taken for one synchronous
+call, with the tick read inside it, so no reading is asked about at a tick
+older than its last write and no lock is held across an await.
+
+**The descriptors change as a whole.** A batch is checked against the
+tables as they would stand and taken under a new revision, or refused and
+nothing moves: not the rows, not the revision, not the digest, and no
+signal is registered in the store without its row. The digest is computed
+again on every applied batch, so `Hello` never reports a revision beside a
+digest of other rows (P-149). Pages are rebuilt from scratch on every
+request in id order (P-146, P-198).
+
+**A concern ends only when its condition does** (P-168). Acknowledging moves
+`active` to `active_acked` and nothing else. A row leaves the table only once
+the record announcing its clear has landed in the log, so its `cid` is never
+handed to another condition a client could confuse it with (P-180). A
+source that reports the same condition under another severity or code is
+refused until it ends the old one, so a fault cannot downgrade into the
+band P-169 caps.
+
+**What a change owes is derived, never queued** (P-182). Each signal, device
+and concern keeps the last value a record announced for it, and once a
+second the recorder compares that with what it is now: at most one
+`0x0102`, one `0x0902`, one `0x0901` and four concern records a tick, seven
+against a session queue of sixteen. What does not fit is still different
+next tick, so nothing is dropped, and a record the ring refuses is handed
+back and owed again. A record is as wide as one ring record, so a sweep
+carries at most nineteen signals.
+
+**A subscription is a cursor into the log.** There is no outbox: a
+subscribed session holds the next position it is owed, and its events are
+read out of the ring from there, one sealed copy per session (P-098). Replay
+and live delivery are the same path, so nothing written between the
+subscription and the end of its replay falls between them (P-094). The ring
+is the recorder's, so the link task asks it for a batch, one read out at a
+time and given up after five seconds; a `ReadLog` goes the same way. A
+session owed more live records than a session queue holds is closed as
+`shedding` and catches up from the log when it reconnects; a replay it
+asked for is paced and never counted against it.
+
 ### Behaviours: parameters, not an engine
 
 A general rule engine on the MCU means an AST, an encoder, a validator,

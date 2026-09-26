@@ -11,7 +11,7 @@ use embassy_futures::block_on;
 use km43::{
     ClientChannel, ClientId, ClientKind, CloseReason, CommandKind, CommandOperation, Conn,
     DeviceId, Discovery, EmptyBody, EnrolAnswer, Envelope, Epoch, ErrorBody, Fingerprint, Header,
-    HelloOffer, HelloPending, Incoming, LinkTransport, MAX_FRAME, MAX_PAYLOAD, MessageType,
+    HelloOffer, HelloPending, Incoming, LinkTransport, LogSeq, MAX_FRAME, MAX_PAYLOAD, MessageType,
     PairOffer, PairPending, PairRefusal, PairReply, Prologue, PrologueFields, ReqId, Sealed,
     SessionId, Signed, Suite, Version,
 };
@@ -46,6 +46,8 @@ pub(crate) struct Client {
     epoch: Epoch,
     enrolment: Option<km43::Enrolment>,
     channel: Option<ClientChannel>,
+    /// What the last `Hello 0x81` reported of the log and the topology.
+    pub(crate) reported: Option<(LogSeq, km43::Topology)>,
 }
 
 impl Client {
@@ -67,6 +69,7 @@ impl Client {
             epoch: Epoch::FIRST,
             enrolment: None,
             channel: None,
+            reported: None,
         }
     }
 
@@ -272,7 +275,7 @@ impl Client {
                 &mut plain,
             )
             .expect("message 2 opens under the pinned key");
-        assert_eq!(session.report().log_newest_seq, LOG.newest);
+        self.reported = Some((session.report().log_newest_seq, session.report().topology));
         let named = (session.report().client_id, session.report().generation);
         self.channel = Some(session.into_channel());
         Some(named)
@@ -289,6 +292,13 @@ impl Client {
             self.finish(pending, answer).is_some(),
             "Hello refused: {:?}",
             code(answer)
+        );
+        // The report describes the log as it stood when the `Hello` was
+        // queued; the recorder may have written since.
+        assert!(
+            self.reported
+                .is_some_and(|(newest, _)| newest <= bench.log_span().newest),
+            "Hello reports the log as the recorder published it"
         );
         frame
     }
@@ -793,6 +803,7 @@ fn p_237_a_challenge_never_leaves_before_its_successor_is_on_the_part_and_none_r
         fw_controller: "0.0.0-sim",
         fw_comms: "",
         log: LOG,
+        topology: o89_core::reported(0, [0; 8]),
         time_known: false,
         pairing_open: false,
         link: Some(Compat::Agreed(Version::V1_0)),
@@ -816,8 +827,13 @@ fn p_237_a_challenge_never_leaves_before_its_successor_is_on_the_part_and_none_r
             .write(0, &mut frame)
             .map_err(|_| ())?;
             let len = cbor.finish().map_err(|_| ())?;
-            let reply =
-                block_on(sessions.frame(&frame[..len], now, (&facts, &mut wifi), part, &mut dst));
+            let reply = block_on(sessions.frame(
+                &frame[..len],
+                now,
+                (&facts, &mut wifi, &crate::link::SimSite::empty()),
+                part,
+                &mut dst,
+            ));
             let len = reply.answer.ok_or(())?;
             let envelope = Envelope::decode(&dst[..len]).map_err(|_| ())?;
             let discovery = Discovery::decode(envelope).map_err(|_| ())?;
@@ -926,6 +942,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_the_old_section_or_the_new_on
         fw_controller: "sim",
         fw_comms: "sim",
         log: LOG,
+        topology: o89_core::reported(0, [0; 8]),
         time_known: false,
         pairing_open: false,
         link: Some(Compat::Agreed(Version::V1_0)),
@@ -953,7 +970,7 @@ fn p_102_signed_set_config_cut_at_every_step_keeps_the_old_section_or_the_new_on
         let _ = block_on(bench.endpoint.sessions.frame(
             &frame,
             bench.now,
-            (&facts, &mut bench.endpoint.link.wifi),
+            (&facts, &mut bench.endpoint.link.wifi, &bench.site),
             &mut bench.fram,
             &mut dst,
         ));
@@ -993,6 +1010,7 @@ fn p_080_p_079_a_sealed_command_cut_at_every_step_leaves_its_entry_in_flight_or_
         fw_controller: "sim",
         fw_comms: "sim",
         log: LOG,
+        topology: o89_core::reported(0, [0; 8]),
         time_known: false,
         pairing_open: false,
         link: Some(Compat::Agreed(Version::V1_0)),
@@ -1031,7 +1049,7 @@ fn p_080_p_079_a_sealed_command_cut_at_every_step_leaves_its_entry_in_flight_or_
         let _ = block_on(bench.endpoint.sessions.frame(
             &frame,
             bench.now,
-            (&facts, &mut bench.endpoint.link.wifi),
+            (&facts, &mut bench.endpoint.link.wifi, &bench.site),
             &mut bench.fram,
             &mut dst,
         ));
@@ -1177,3 +1195,4 @@ mod adversarial;
 mod agreement;
 mod configuration;
 mod conformance;
+mod reading;

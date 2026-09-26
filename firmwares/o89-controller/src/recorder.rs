@@ -140,6 +140,11 @@ const _: () = {
 /// the roll is thirty seconds.
 const PERIOD: Duration = Duration::from_millis(100);
 
+/// Turns between two ticks of the reading plane: one a second, so a burst
+/// of changes drains at P-182's few records a second rather than at the
+/// mailbox's pace.
+const PLANE_TURNS: u32 = 10;
+
 /// Events waiting for the ring, from the tasks that raise them. As deep
 /// as the protocol's event queue; a task whose event does not fit is told
 /// so and says so, and nothing is evicted.
@@ -289,6 +294,7 @@ pub async fn run(
     nor: Nor,
     boot: Boot,
     mut calendar: CalendarClock,
+    site: crate::site::Shared,
 ) {
     if let Some(change) = calendar.pending() {
         let _ = CLOCK.lock(|clock| clock.borrow_mut().recover_audit(change));
@@ -308,6 +314,8 @@ pub async fn run(
     // set, answered once the record lands.
     let mut client_waiting: Option<(u32, u64)> = None;
     mailbox::init();
+    let mut plane_turn = 0u32;
+    let mut batch = o89_core::LogBatch::new();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
     loop {
@@ -357,6 +365,14 @@ pub async fn run(
                         defmt::error!("recorder: no ring; diagnostic not recorded");
                     }
                 }
+                plane_turn = plane_turn.saturating_add(1);
+                if plane_turn >= PLANE_TURNS {
+                    plane_turn = 0;
+                    if let Some(ring) = ring.as_mut() {
+                        plane(site, ring, &mut scratch, calendar.now()).await;
+                    }
+                }
+                serve_log(ring.as_mut(), &mut scratch, &mut batch).await;
                 mailbox::serve(mailbox::Parts {
                     fram: &mut fram,
                     ring: ring.as_mut(),
@@ -374,6 +390,48 @@ pub async fn run(
             }
         }
         check_in(Task::Recorder);
+    }
+}
+
+/// One tick of the reading plane: what the site's changes owe, appended.
+async fn plane(
+    site: crate::site::Shared,
+    ring: &mut Ring<Nor>,
+    scratch: &mut [u8],
+    at: Option<UnixMillis>,
+) {
+    let turn = o89_core::record_owed(&site, ring, scratch, at.map(UnixMillis::as_millis)).await;
+    if turn.refused {
+        defmt::error!("plane: a record did not land; the next tick owes it again");
+    }
+    if let Some(error) = turn.unwritten {
+        defmt::error!("plane: a record the site owes did not write: {}", error);
+    }
+}
+
+/// A session's read of the log, answered from the ring. Without a ring the
+/// read is left to the session's own deadline, which answers it busy.
+async fn serve_log(
+    ring: Option<&mut Ring<Nor>>,
+    scratch: &mut [u8],
+    batch: &mut o89_core::LogBatch,
+) {
+    let Ok(want) = crate::site::WANTS.try_receive() else {
+        return;
+    };
+    let Some(ring) = ring else {
+        return;
+    };
+    match o89_core::read_log(ring, want.from, want.most, scratch, batch).await {
+        Ok(()) => {
+            if crate::site::BATCHES
+                .try_send((want.ticket, batch.clone()))
+                .is_err()
+            {
+                defmt::error!("plane: a log batch found its answer slot full");
+            }
+        }
+        Err(error) => defmt::error!("plane: the log could not be read: {}", error),
     }
 }
 

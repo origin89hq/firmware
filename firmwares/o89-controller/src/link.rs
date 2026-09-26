@@ -40,7 +40,7 @@ use km43::{
 use o89_core::mailbox::DownloadEntry;
 use o89_core::{
     Action, Actions, Clock, Endpoint, Identity, Keys, KnockAnswer, Link, Local, ModuleBoot,
-    ModuleReset, Note, Recovery, Reply, SessionNote, Sessions, Task, knock_answer,
+    ModuleReset, Note, Recovery, Reply, SessionNote, Sessions, SiteCell, Task, knock_answer,
 };
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
@@ -51,6 +51,7 @@ use crate::mailbox;
 use crate::rail::{self, RailWord};
 use crate::recorder;
 use crate::selector;
+use crate::site::{self, Shared};
 use crate::supervisor::{Uptime, check_in};
 
 /// What the bench asks of the link, through the mailbox (F-038).
@@ -219,7 +220,7 @@ const MODEL: &str = "origin89 controller";
 /// part and nothing more. With one come the records the sessions keep, and
 /// a lease on the part to keep them through.
 #[embassy_executor::task]
-pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) {
+pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease, site: Shared) {
     let Some((identity, keys)) = linked else {
         // The bench's requests are answered, not served: a unit without
         // its store has no link, and the FRAM is what is serviced first.
@@ -249,6 +250,7 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) 
             sessions: Sessions::new(keys),
         },
         fram,
+        site,
     };
     let mut reader = FrameReader::new();
     let mut writer = FrameWriter::new();
@@ -283,7 +285,7 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease) 
         // The module is off, or being cut: nothing to say, the words to hear.
         // After a stall the module is still powered and the UART comes
         // straight back with nothing new to say.
-        drain_agreement(&mut machine.endpoint, &mut machine.fram).await;
+        drain_agreement(&mut machine.endpoint, &mut machine.fram, machine.site).await;
         let first = if core::mem::take(&mut resume) {
             Some(Actions::NONE)
         } else {
@@ -359,6 +361,7 @@ async fn unpowered(endpoint: &mut Endpoint) -> Option<Actions> {
                 Uptime.now(),
                 install_in_flight(),
                 selector::pairing_deadline(),
+                recorder::log_span(),
             );
             perform_quiet(&mut endpoint.link, &actions);
             None
@@ -382,11 +385,12 @@ fn park(pins: &mut Pins) {
     Flex::new(pins.rts.reborrow()).set_as_input(Pull::None);
 }
 
-/// The state machine, and the lease on the part its records are kept
-/// through.
+/// The state machine, the lease on the part its records are kept
+/// through, and the site its sessions read.
 struct Machine {
     endpoint: Endpoint,
     fram: Lease,
+    site: Shared,
 }
 
 /// The driver's rings, owned for the life of the part and lent to each
@@ -423,7 +427,7 @@ async fn episode(
     first: &Actions,
     #[cfg(feature = "frames")] counts: &mut frames::Counts,
 ) -> Ended {
-    let Machine { endpoint, fram } = machine;
+    let (endpoint, fram, site) = (&mut machine.endpoint, &mut machine.fram, machine.site);
     // A new UART starts a new run: the tail of a frame cut off by the last
     // episode's end, by a cut or by a stall, would merge into this one's
     // first frame and count its noise against the wrong boot (F-031).
@@ -461,8 +465,15 @@ async fn episode(
                             #[cfg(feature = "frames")]
                             counts.frame(frame);
                             let was_up = endpoint.link.is_up();
-                            let ended =
-                                on_frame(endpoint, fram, &mut tx, writer, &mut answer, frame).await;
+                            let ended = on_frame(
+                                endpoint,
+                                (fram, site),
+                                &mut tx,
+                                writer,
+                                &mut answer,
+                                frame,
+                            )
+                            .await;
                             // The peer's own statement records it without
                             // linking (L-033): only the transition is news.
                             if !was_up
@@ -520,7 +531,9 @@ async fn episode(
             break 'episode ended;
         }
         serve_reset(&mut endpoint.sessions, fram).await;
-        if let Some(ended) = serve_agreement(endpoint, fram, &mut tx, writer, &mut answer).await {
+        if let Some(ended) =
+            serve_agreement(endpoint, (fram, site), &mut tx, writer, &mut answer).await
+        {
             break 'episode ended;
         }
         if let Some(ended) = service_tick(endpoint, &mut tx, writer, &mut answer).await {
@@ -566,26 +579,29 @@ async fn serve_rail(
 /// so a close its frame asked for comes after it.
 async fn on_frame(
     endpoint: &mut Endpoint,
-    fram: &mut Lease,
+    parts: (&mut Lease, Shared),
     tx: &mut BufferedUartTx<'_>,
     writer: &mut FrameWriter,
     answer: &mut [u8],
     frame: &[u8],
 ) -> Option<Ended> {
+    let (fram, site) = parts;
     let step = endpoint
-        .frame(frame, Uptime.now(), &local(), fram, answer)
+        .frame(frame, Uptime.now(), &local(site), &site, fram, answer)
         .await;
     answer_step(endpoint, tx, writer, answer, &step).await
 }
 
 /// What the link task tells the sessions besides the frame.
-fn local() -> Local<'static> {
+fn local(site: Shared) -> Local<'static> {
     Local {
         model: MODEL,
         log: recorder::log_span(),
         // No clock before its slice.
         time_known: false,
         pairing_open: selector::pairing_open(),
+        topology: site
+            .with(|site, _| o89_core::reported(site.topology().rev(), site.topology().digest())),
     }
 }
 
@@ -624,14 +640,15 @@ async fn answer_step(
 /// result never waits on the worker's side for longer than one.
 async fn serve_agreement(
     endpoint: &mut Endpoint,
-    fram: &mut Lease,
+    parts: (&mut Lease, Shared),
     tx: &mut BufferedUartTx<'_>,
     writer: &mut FrameWriter,
     answer: &mut [u8],
 ) -> Option<Ended> {
+    let (fram, site) = parts;
     if let Ok(done) = crate::agreement::DONE.try_receive() {
         let step = endpoint
-            .completed(done, Uptime.now(), &local(), fram, answer)
+            .completed(done, Uptime.now(), &local(site), fram, answer)
             .await;
         if let Some(ended) = answer_step(endpoint, tx, writer, answer, &step).await {
             return Some(ended);
@@ -654,11 +671,11 @@ fn hand_out(endpoint: &mut Endpoint) {
 
 /// A result that came back while the module is off: nobody to answer, but
 /// the sessions have to hear it, or the worker is never free again.
-async fn drain_agreement(endpoint: &mut Endpoint, fram: &mut Lease) {
+async fn drain_agreement(endpoint: &mut Endpoint, fram: &mut Lease, site: Shared) {
     if let Ok(done) = crate::agreement::DONE.try_receive() {
         let mut answer = [0u8; MAX_PAYLOAD];
         let step = endpoint
-            .completed(done, Uptime.now(), &local(), fram, &mut answer)
+            .completed(done, Uptime.now(), &local(site), fram, &mut answer)
             .await;
         if let Some(reply) = step.reply
             && let Some(note) = reply.note
@@ -736,6 +753,7 @@ fn session_note(note: SessionNote) {
         | SessionNote::Queued(_)
         | SessionNote::Dropped
         | SessionNote::Stale
+        | SessionNote::LogAsked(_)
         | SessionNote::ClientError => defmt::debug!("session: {}", note),
     }
 }
@@ -1449,12 +1467,54 @@ async fn service_tick(
     // The panel's window as it stands now, after any `Pair` this turn
     // answered: that answer is already on the wire, so the closed report
     // this tick owes goes out behind it (L-195).
+    if let Some(ended) = serve_log(endpoint, tx, writer, answer).await {
+        return Some(ended);
+    }
     let actions = endpoint.tick(
         Uptime.now(),
         install_in_flight(),
         selector::pairing_deadline(),
+        recorder::log_span(),
     );
     perform(&mut endpoint.link, tx, writer, &actions).await
+}
+
+/// The sessions' reads of the log: one given up past its deadline, the
+/// recorder's batch answered, a `ReadLog`'s page or a subscription's
+/// events one sealed copy each, and the next read asked for once the last
+/// is answered.
+async fn serve_log(
+    endpoint: &mut Endpoint,
+    tx: &mut BufferedUartTx<'_>,
+    writer: &mut FrameWriter,
+    answer: &mut [u8],
+) -> Option<Ended> {
+    let overdue = endpoint.sessions.log_overdue(Uptime.now(), answer);
+    if let Some(ended) = reply(tx, writer, answer, Some(overdue)).await {
+        return Some(ended);
+    }
+    if let Ok((ticket, batch)) = site::BATCHES.try_receive() {
+        let answered = endpoint.sessions.log_answered(ticket, &batch, answer);
+        if let Some(ended) = reply(tx, writer, answer, Some(answered)).await {
+            return Some(ended);
+        }
+        for index in 0..batch.len() {
+            let event = endpoint.sessions.event(ticket, &batch, index, answer);
+            if let Some(ended) = reply(tx, writer, answer, Some(event)).await {
+                return Some(ended);
+            }
+        }
+    }
+    if site::WANTS.is_empty()
+        && let Some(want) = endpoint
+            .sessions
+            .log_want(recorder::log_span(), Uptime.now())
+        && site::WANTS.try_send(want).is_err()
+    {
+        // One producer, and the channel was empty: the deadline recovers it.
+        defmt::error!("link: a read of the log found its slot taken");
+    }
+    None
 }
 
 /// Encode and send one answer. True means CTS held the transmitter past its deadline.

@@ -50,6 +50,7 @@ mod recorder;
 mod reset;
 mod rtc;
 mod selector;
+mod site;
 #[expect(
     unsafe_code,
     reason = "the supervisor's executor is polled from the interrupt started for it; the one call is under a SAFETY line"
@@ -429,6 +430,10 @@ async fn main(spawner: Spawner) {
     };
     let fram = fram::share(fram);
 
+    // 9. The one site the reading plane reads, at its boot revision, before
+    // the link can answer a client out of it or the recorder announce it.
+    let site = site::boot();
+
     // 9a. The link, which builds its UART only once the rail task says the
     // rail has settled (F-006), and drops it before every cut (F-003).
     supervisor::check_in(Task::Link);
@@ -439,7 +444,7 @@ async fn main(spawner: Spawner) {
         rts: b.module.rts,
         cts: b.module.cts,
     };
-    if let Ok(token) = link::run(link_pins, identity.zip(keys), fram) {
+    if let Ok(token) = link::run(link_pins, identity.zip(keys), fram, site) {
         tasks.spawn(token);
     } else {
         defmt::error!("the link task did not spawn; the watchdog will reset the part");
@@ -452,7 +457,7 @@ async fn main(spawner: Spawner) {
     let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
     let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
     supervisor::check_in(Task::Recorder);
-    if let Ok(token) = recorder::run(cuts, fram, nor, record.body(), calendar) {
+    if let Ok(token) = recorder::run(cuts, fram, nor, record.body(), calendar, site) {
         tasks.spawn(token);
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");

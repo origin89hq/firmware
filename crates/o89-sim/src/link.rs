@@ -9,6 +9,7 @@
 //! the pump drains, and what the peer answers goes back through the same
 //! reader the controller will use.
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroU16;
 
@@ -22,12 +23,12 @@ use o89_core::{
     ControllerKey, DEAD_AFTER, DrbgState, DropReason, Endpoint, Enrolment, Generator, Gesture,
     Identity, Job, Keep, Keys, Link, LinkEvent, LinkText, Local, LogSpan, Millis, NotKept, Note,
     Outgoing, PairingWindow, Rail, RailEvent, RailLine, RailRequest, RailSequencer,
-    RailThroughReset, Recovery, Revision, Secret, SessionNote, Sessions, Step, Store, Tick,
-    stage_secret,
+    RailThroughReset, Recovery, Revision, Ring, SCRATCH, Secret, SessionNote, Sessions, Site,
+    SiteCell, Step, Store, Tick, stage_secret,
 };
 
 use crate::{
-    Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, SimFram, Statement,
+    Answers, Beats, Capabilities, Claims, Frames, Heard, HostileComms, SimFram, SimNor, Statement,
 };
 
 pub(crate) const STEP: Millis = Millis::from_millis(10);
@@ -40,6 +41,58 @@ pub(crate) const LOG: LogSpan = LogSpan {
     oldest: LogSeq(1),
     newest: LogSeq(9),
 };
+
+/// An erase block of the bench's log.
+pub(crate) const LOG_BLOCK: usize = 4096;
+
+/// Erase blocks of the bench's log.
+pub(crate) const LOG_BLOCKS: u32 = 16;
+
+/// How often the bench's recorder takes a turn of the reading plane.
+pub(crate) const PLANE_PERIOD: Millis = Millis::from_millis(1_000);
+
+/// The site the bench's reading plane reads: one owner, and the tick the
+/// bench stands at.
+pub(crate) struct SimSite {
+    site: RefCell<Site>,
+    now: Cell<Tick>,
+}
+
+impl SimSite {
+    /// A site with nothing registered, for a test that reads none.
+    pub(crate) fn empty() -> Self {
+        Self::new(Tick::ZERO)
+    }
+
+    fn new(now: Tick) -> Self {
+        Self {
+            site: RefCell::new(Site::new()),
+            now: Cell::new(now),
+        }
+    }
+}
+
+impl SiteCell for SimSite {
+    fn with<R>(&self, with: impl FnOnce(&mut Site, Tick) -> R) -> R {
+        with(&mut self.site.borrow_mut(), self.now.get())
+    }
+}
+
+/// The log's span as the recorder publishes it, or [`LOG`] with no ring.
+fn span_of(log: Option<&Ring<SimNor<LOG_BLOCK>>>) -> LogSpan {
+    log.map_or(LOG, |ring| {
+        let head = ring.head();
+        LogSpan {
+            oldest: LogSeq(head.oldest.unwrap_or(0)),
+            newest: LogSeq(head.next_seq.saturating_sub(1)),
+        }
+    })
+}
+
+/// What `Hello` reports of the site's topology.
+fn topology_of(site: &SimSite) -> km43::Topology {
+    site.with(|site, _| o89_core::reported(site.topology().rev(), site.topology().digest()))
+}
 
 /// The unit's device id and printed secret.
 pub(crate) const DEVICE: [u8; 16] = [7; 16];
@@ -231,6 +284,13 @@ pub(crate) struct Bench {
     /// a `Pair` as its frame is handled, closed by the enrolment it
     /// answers, and its deadline handed to the link every tick.
     pub(crate) window: PairingWindow,
+    /// The one site, written by the tests as the bus tasks would.
+    pub(crate) site: SimSite,
+    /// The event log, once a test opens one; until then the sessions are
+    /// told [`LOG`] and nothing reads a ring.
+    pub(crate) log: Option<Ring<SimNor<LOG_BLOCK>>>,
+    /// When the recorder next takes a turn of the reading plane.
+    plane_due: Tick,
 }
 
 impl Bench {
@@ -300,6 +360,9 @@ impl Bench {
             compute: COMPUTE,
             keeps_land: true,
             window: PairingWindow::new(),
+            site: SimSite::new(now),
+            log: None,
+            plane_due: now,
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -369,10 +432,88 @@ impl Bench {
     fn local(&self) -> Local<'static> {
         Local {
             model: MODEL,
-            log: LOG,
+            log: span_of(self.log.as_ref()),
             time_known: self.calendar.is_some(),
             pairing_open: self.window.is_open(self.now),
+            topology: topology_of(&self.site),
         }
+    }
+
+    /// Open an empty event log, as the recorder does at boot.
+    pub(crate) fn open_log(&mut self) {
+        let mut scratch = [0u8; SCRATCH];
+        let part = SimNor::<LOG_BLOCK>::fresh(LOG_BLOCKS as usize);
+        self.log = Some(block_on(Ring::open(part, 0, LOG_BLOCKS, &mut scratch)).expect("opens"));
+    }
+
+    /// The log's span as the recorder would publish it.
+    pub(crate) fn log_span(&self) -> LogSpan {
+        span_of(self.log.as_ref())
+    }
+
+    /// The recorder's side of the reading plane, as the controller's
+    /// recorder takes it: once a plane period, what the site owes written
+    /// into the ring; then every read of the log the sessions want.
+    fn serve_plane(&mut self) {
+        let Some(ring) = self.log.as_mut() else {
+            return;
+        };
+        let mut scratch = [0u8; SCRATCH];
+        if self.now.since(self.plane_due).is_some() {
+            let turn = block_on(o89_core::record_owed(&self.site, ring, &mut scratch, None));
+            assert_eq!(turn.unwritten, None, "the site wrote every record it owed");
+            self.plane_due = self.now.after(PLANE_PERIOD).expect("fits");
+        }
+        let mut dst = [0u8; MAX_PAYLOAD];
+        let overdue = self.endpoint.sessions.log_overdue(self.now, &mut dst);
+        self.answer(overdue, &mut dst);
+        // Bounded: one read per session with something owed.
+        for _ in 0..o89_core::CONNECTIONS {
+            let span = self.log_span();
+            let Some(want) = self.endpoint.sessions.log_want(span, self.now) else {
+                break;
+            };
+            let Some(ring) = self.log.as_mut() else {
+                return;
+            };
+            let mut batch = o89_core::LogBatch::new();
+            block_on(o89_core::read_log(
+                ring,
+                want.from,
+                want.most,
+                &mut scratch,
+                &mut batch,
+            ))
+            .expect("the ring reads");
+            let reply = self
+                .endpoint
+                .sessions
+                .log_answered(want.ticket, &batch, &mut dst);
+            self.answer(reply, &mut dst);
+            for index in 0..batch.len() {
+                let reply = self
+                    .endpoint
+                    .sessions
+                    .event(want.ticket, &batch, index, &mut dst);
+                self.answer(reply, &mut dst);
+            }
+        }
+    }
+
+    /// A reply the sessions wrote outside a frame, sent as the adapter
+    /// sends it.
+    fn answer(&mut self, reply: o89_core::Reply, dst: &mut [u8]) {
+        if reply.answer.is_none() {
+            return;
+        }
+        let actions = self.stepped(
+            Step {
+                reply: Some(reply),
+                actions: Actions::NONE,
+            },
+            dst,
+        );
+        self.perform(&actions);
     }
 
     /// What one step of the sessions asked of the adapter: a `Time` to the
@@ -448,6 +589,7 @@ impl Bench {
     fn step(&mut self) {
         self.now = self.now.after(STEP).expect("fits");
         let now = self.now;
+        self.site.now.set(now);
         let turn = self.rail.turn(now, None, None);
         if let Some(event) = turn.event {
             match event {
@@ -463,14 +605,16 @@ impl Bench {
         }
         let late = self.comms.drain(now);
         self.feed(&late);
-        let actions = self
-            .endpoint
-            .tick(now, self.install_in_flight, self.window.deadline(now));
+        let span = self.log_span();
+        let actions =
+            self.endpoint
+                .tick(now, self.install_in_flight, self.window.deadline(now), span);
         if actions.iter().next().is_some() {
             self.ticked.push((now, actions));
         }
         self.perform(&actions);
         self.serve_agreement();
+        self.serve_plane();
     }
 
     /// Perform actions, pumping what the peer answers back through the
@@ -586,14 +730,16 @@ impl Bench {
                     let mut dst = [0u8; MAX_PAYLOAD];
                     let local = Local {
                         model: MODEL,
-                        log: LOG,
+                        log: span_of(self.log.as_ref()),
                         time_known: self.calendar.is_some(),
                         pairing_open: self.window.is_open(self.now),
+                        topology: topology_of(&self.site),
                     };
                     let step = block_on(self.endpoint.frame(
                         frame,
                         self.now,
                         &local,
+                        &self.site,
                         &mut self.fram,
                         &mut dst,
                     ));
@@ -905,7 +1051,7 @@ fn l_113_a_module_taken_for_a_flash_suspends_the_ladder_and_records_no_loss() {
     let mut now = bench.now;
     for _ in 0..9_000 {
         now = now.after(STEP).expect("fits");
-        let ticked = bench.endpoint.tick(now, false, None);
+        let ticked = bench.endpoint.tick(now, false, None, LOG);
         assert_eq!((&ticked).into_iter().count(), 0, "silent at {now:?}");
     }
     // Given back, the module is stated to as after any power-up.
@@ -2521,7 +2667,7 @@ fn wifi_started(bench: &mut Bench, at: Tick, outcome: km43::WifiScan) -> u32 {
     bench.now = at;
     assert_eq!(bench.endpoint.link.wifi.refresh(true, true, true, at), None);
     let order = bench.endpoint.link.wifi.order().expect("scan");
-    let actions = bench.endpoint.tick(at, false, None);
+    let actions = bench.endpoint.tick(at, false, None, LOG);
     let req_id = actions
         .iter()
         .find_map(|action| match action {

@@ -112,6 +112,8 @@ pub(crate) struct Report {
     pub(crate) time_known: bool,
     pub(crate) client_id: ClientId,
     pub(crate) generation: Generation,
+    /// Keys 18 to 29: the topology as it stood and the caps enforced.
+    pub(crate) topology: km43::Topology,
 }
 
 /// A handshake step too slow for the control loop's executor.
@@ -365,7 +367,7 @@ impl Agreement {
             state_seq: km43::StateSeq(0),
             time_known: report.time_known,
             caps: km43::Caps::THIS_CONTROLLER,
-            topology: km43::Topology::THIS_CONTROLLER,
+            topology: report.topology,
             client_id: report.client_id,
             generation: report.generation,
         };
