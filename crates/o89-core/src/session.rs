@@ -1546,7 +1546,7 @@ impl Sessions {
                     to,
                     binding,
                     keys,
-                    (&mut row.work, &mut row.approving, row.attempt),
+                    (&row.pairing, &mut row.work, &mut row.approving, row.attempt),
                     &write,
                     now,
                     dst,
@@ -2305,13 +2305,14 @@ async fn invite<F: Fram>(
 }
 
 /// `Approve 0x16` that opened: P-255's steps 1 to 4, then its proof queued
-/// for the worker on the session's row (P-243). A row already waiting on
-/// the worker is error 7.
+/// for the worker on the session's row (P-243). A row whose one job is
+/// taken, by a pairing it holds or by the worker, is error 7: a pairing's
+/// next message would replace the job, and its expiry abandon it (P-229).
 fn approve(
     to: Addressed,
     binding: &mut Binding,
     keys: &mut Keys,
-    row: (&mut Work, &mut Option<Approving>, u32),
+    row: (&Pairing, &mut Work, &mut Option<Approving>, u32),
     write: &SignedWrite<'_>,
     now: Tick,
     dst: &mut [u8],
@@ -2320,8 +2321,8 @@ fn approve(
         Ok(operation) => operation,
         Err(why) => return refused_under(to, binding, why.refusal(), dst),
     };
-    let (work, approving, attempt) = row;
-    if !matches!(work, Work::Idle) {
+    let (pairing, work, approving, attempt) = row;
+    if !matches!(pairing, Pairing::None) || !matches!(work, Work::Idle) {
         return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
     }
     let from = sender(binding);
@@ -4566,6 +4567,23 @@ mod tests {
             ack.map(km43::InviteAck::outcome),
             Ok(km43::Invite::TableFull)
         );
+    }
+
+    #[test]
+    fn p_229_p_255_an_approval_on_a_row_mid_pairing_is_error_7_and_the_pairing_goes_on() {
+        let mut rig = Rig::new();
+        let (mut owner, _admin) = owner_and_admin(&mut rig);
+        let nonce = proposed(&mut rig, &mut owner, Role::Admin, 9);
+        let (decision, _) = approval(&rig, 9, nonce);
+        // The owner's connection starts a pairing and waits for message 3.
+        owner.challenged(&mut rig);
+        let (_, frame) = owner.pair_frame(&label(), "second", ClientKind::App);
+        let (reply, _) = rig.exchange(&frame);
+        assert!(reply.answer.is_some(), "message 2 went out");
+        let (_, ack) = decide(&mut rig, &mut owner, nonce, decision);
+        assert_eq!(ack, Err(Incoming::Client(ErrorCode::BusyRetry)));
+        assert!(rig.sessions.next_job().is_none(), "nothing was queued");
+        assert_eq!(pending(&rig), 1, "the invite is still pending");
     }
 
     #[test]
