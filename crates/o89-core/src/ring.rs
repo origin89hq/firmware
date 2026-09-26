@@ -199,6 +199,18 @@ struct Scanned {
     failed_crc: u32,
 }
 
+/// Whether the part holds a record, as [`Ring::holds`] found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Holding {
+    /// The record at that position, byte for byte.
+    Present,
+    /// Nothing at that position: the log ends before it.
+    Absent,
+    /// Something else at that position, which no append of ours made.
+    Other,
+}
+
 /// The ring on a part.
 pub struct Ring<N> {
     flash: N,
@@ -207,6 +219,11 @@ pub struct Ring<N> {
     head: Head,
     damage: Damage,
     floor: Floor,
+    /// Whether the head describes the part. An operation that failed after
+    /// touching it may have erased or half-written what the head names;
+    /// until the head is found again from the bytes, nothing appends,
+    /// reads or drops on it.
+    proven: bool,
 }
 
 impl<N: MultiwriteNorFlash> Ring<N> {
@@ -242,8 +259,10 @@ impl<N: MultiwriteNorFlash> Ring<N> {
             },
             damage: Damage::default(),
             floor: Floor::Unknown,
+            proven: false,
         };
         ring.find_the_head(scratch).await?;
+        ring.proven = true;
         Ok(ring)
     }
 
@@ -335,6 +354,13 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if scratch.len() < SCRATCH {
             return Err(RingError::ScratchTooSmall(scratch.len()));
         }
+        self.prove(scratch).await?;
+        let dropped = self.drop_proven(scratch).await;
+        self.proven = dropped.is_ok();
+        dropped
+    }
+
+    async fn drop_proven(&mut self, scratch: &mut [u8]) -> Result<Dropped, RingError<N::Error>> {
         if self.head.oldest.is_none() {
             return Ok(Dropped::Nothing);
         }
@@ -354,14 +380,59 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// An append or a drop that failed may have erased the oldest block, or
     /// part of it, and left the head held in memory describing records that
     /// are no longer there; nothing but the bytes proves the extent again.
-    /// Until this succeeds the extent is not to be reported as known.
+    /// Until this succeeds the ring is not proven, and every append, read
+    /// and drop runs it first.
     pub async fn reconcile(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
         if scratch.len() < SCRATCH {
             return Err(RingError::ScratchTooSmall(scratch.len()));
         }
+        self.proven = false;
         self.damage = Damage::default();
         self.floor = Floor::Unknown;
-        self.find_the_head(scratch).await
+        self.find_the_head(scratch).await?;
+        self.proven = true;
+        Ok(())
+    }
+
+    /// Whether the head describes the part: true from a successful open or
+    /// [`reconcile`](Self::reconcile) until an operation fails after
+    /// touching the part.
+    #[must_use]
+    pub const fn is_proven(&self) -> bool {
+        self.proven
+    }
+
+    /// The head found again first, if it is not proven.
+    async fn prove(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
+        if self.proven {
+            return Ok(());
+        }
+        self.reconcile(scratch).await
+    }
+
+    /// Whether the part holds `payload` as the record at `seq`: what an
+    /// append that returned an error did, which only the bytes can say. The
+    /// head is proven first.
+    pub async fn holds(
+        &mut self,
+        seq: u64,
+        payload: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<Holding, RingError<N::Error>> {
+        self.prove(scratch).await?;
+        if seq >= self.head.next_seq {
+            return Ok(Holding::Absent);
+        }
+        let mut holding = Holding::Other;
+        let _ = self
+            .read_from(seq, scratch, |found| {
+                if found.seq == seq && found.payload == payload {
+                    holding = Holding::Present;
+                }
+                Wants::Enough
+            })
+            .await?;
+        Ok(holding)
     }
 
     /// Append one event and answer the sequence it got.
@@ -372,7 +443,28 @@ impl<N: MultiwriteNorFlash> Ring<N> {
     /// record. The body lands first, then the magic in a program of its
     /// own; a cut between the two leaves a record the scan reads as the
     /// tail.
+    ///
+    /// An unproven ring is found again first. An error after the part was
+    /// touched leaves it unproven: the record may or may not be there, and
+    /// [`holds`](Self::holds) is how to know.
     pub async fn append(
+        &mut self,
+        class: Class,
+        payload: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<u64, RingError<N::Error>> {
+        if scratch.len() < SCRATCH {
+            return Err(RingError::ScratchTooSmall(scratch.len()));
+        }
+        self.prove(scratch).await?;
+        let appended = self.append_proven(class, payload, scratch).await;
+        if let Err(RingError::Flash(_) | RingError::OutOfRange) = appended {
+            self.proven = false;
+        }
+        appended
+    }
+
+    async fn append_proven(
         &mut self,
         class: Class,
         payload: &[u8],
@@ -430,6 +522,8 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         if scratch.len() < SCRATCH {
             return Err(RingError::ScratchTooSmall(scratch.len()));
         }
+        // A head that may name erased records is not one to read from.
+        self.prove(scratch).await?;
         let Some(oldest) = self.head.oldest else {
             return Ok(from.max(1));
         };

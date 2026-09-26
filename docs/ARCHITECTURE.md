@@ -570,20 +570,30 @@ is served by that cursor alone. A session owed live records is read for
 first; below it a `ReadLog` and a replay take turns, so neither holds the
 other off for more than one read. A read takes up to sixteen records, as
 many as fit the 896 bytes of a `LogPage`'s entries while one more at its
-largest still does. An event moves its session's cursor only
+largest still does. One fan-out sends at most sixteen frames, starting with
+the session the read was for so the sessions take turns; at the transport's
+200 ms write deadline that is 3.2 s, half the link task's check-in window,
+and a compile-time assertion holds it there. What is left stays owed. An event moves its session's cursor only
 once the UART took the frame: one refused or stalled stays owed and is sent
 again, under a new nonce, and a client drops a repeated `seq`. A session
 owed more live records than a session queue holds (sixteen) is closed as
 `shedding` and catches up from the log when it reconnects; a replay it asked
 for is paced, but the live records that arrive while it runs are counted, so
 a replay of thousands of records during steady production can be shed and
-resumes from the client's last `seq`. The recorder marks the log's extent
-unsettled before every append and every drop, since either may erase the
-oldest block, and publishes it again only when the ring's head describes the
-part: after the operation landed, or after a failure once the head has been
-found again from the bytes. While it is unsettled a `Subscribe` and a
-`Hello`, whose answers promise history from the oldest record, are asked to
-retry (P-104, P-095).
+resumes from the client's last `seq`. The ring owns whether its head is proven: an
+append, a page turn or a drop that fails after touching the part leaves it
+unproven, and every later append, read and drop finds the head again from the
+bytes first. An append that returned an error is not taken for an absent
+record: the reading plane keeps it, with its record, until the part says
+whether that exact record is at its position, commits it if it is and owes it
+again only if the log ends before it, and appends nothing over it meanwhile.
+The recorder publishes the log's extent from the ring's head only while it
+is proven, marks it moving before every append and drop, and has nothing to
+publish before the ring opens. While it moves a `Subscribe`, whose answer
+promises history from the oldest record, is asked to retry (P-104, P-095); a
+`Hello` is asked to retry only before the ring has opened (P-075), and
+otherwise reports the last extent published, which it promises nothing
+from.
 
 ### Behaviours: parameters, not an engine
 

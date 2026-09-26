@@ -66,6 +66,12 @@ impl<const ERASE: usize> SimNor<ERASE> {
         self.steps = 0;
     }
 
+    /// Power lost now: nothing answers, reads included, until a reboot.
+    #[cfg(test)]
+    pub(crate) fn kill(&mut self) {
+        self.dead = true;
+    }
+
     /// Power back on: the bytes stay, the part answers again.
     pub fn reboot(&mut self) {
         self.dead = false;

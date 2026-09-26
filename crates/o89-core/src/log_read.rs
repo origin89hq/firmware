@@ -22,7 +22,7 @@ use embedded_storage_async::nor_flash::MultiwriteNorFlash;
 use km43::{Event, LogSeq, MAX_LOG_PAGE_BYTES, MAX_LOG_PAGE_ENTRIES};
 
 use crate::record::{self, Class};
-use crate::ring::{Ring, RingError, Wants};
+use crate::ring::{Holding, Ring, RingError, Wants};
 use crate::site::{OwedError, RECORD_BODY, Site, TICK_RECORDS, Tally, Token};
 use crate::tick::Tick;
 
@@ -71,8 +71,9 @@ pub struct PlaneTurn {
     /// after that; an outcome not yet told to the site waits in the
     /// [`Unsettled`] the caller keeps, and is told first next turn.
     pub busy: bool,
-    /// An append failed and the head could not be found again from the
-    /// bytes: the extent stays unknown until [`Ring::reconcile`] succeeds.
+    /// An append returned an error and the part has not yet said whether
+    /// its record landed: the outcome is kept, the extent stays unsettled,
+    /// and the next turn asks again before anything else.
     pub adrift: bool,
 }
 
@@ -81,29 +82,56 @@ pub struct PlaneTurn {
 enum Outcome {
     /// It landed at this position.
     Landed(u64),
-    /// The ring refused it.
+    /// It is not in the log.
     Refused,
+    /// The append at this position returned an error, which does not say
+    /// whether the record reached the part: only the bytes can.
+    Uncertain(u64),
 }
 
-/// A record's outcome the site has not been told yet, because it was held
-/// when the outcome was known. Kept by the caller between turns: the
-/// record's announcement stays marked until the site hears which way it
-/// went, so nothing is owed twice and nothing is lost.
+/// A record's outcome the site has not been told yet: one the site was
+/// held for when it was known, or one the part has not yet said. Kept by
+/// the caller between turns; the record's announcement stays marked until
+/// the site hears which way it went, so nothing is owed twice, nothing is
+/// lost, and nothing is appended over an outcome still unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsettled {
     token: Token,
     outcome: Outcome,
     body: [u8; RECORD_BODY],
     len: usize,
+    payload: [u8; record::MAX_PAYLOAD],
+    payload_len: usize,
 }
 
 impl Unsettled {
-    /// Tell the site; whether it could be told.
+    /// Ask the part what an uncertain append did: landed if the exact
+    /// record is at its position, refused if the log ends before it. An
+    /// answer the part cannot give leaves it uncertain. Whether it is now
+    /// known.
+    async fn resolve<N: MultiwriteNorFlash>(
+        &mut self,
+        ring: &mut Ring<N>,
+        scratch: &mut [u8],
+    ) -> bool {
+        let Outcome::Uncertain(seq) = self.outcome else {
+            return true;
+        };
+        let payload = self.payload.get(..self.payload_len).unwrap_or(&[]);
+        match ring.holds(seq, payload, scratch).await {
+            Ok(Holding::Present) => self.outcome = Outcome::Landed(seq),
+            Ok(Holding::Absent) => self.outcome = Outcome::Refused,
+            Ok(Holding::Other) | Err(_) => return false,
+        }
+        true
+    }
+
+    /// Tell the site a known outcome; whether it could be told.
     fn settle(&self, site: &impl SiteCell) -> bool {
         let body = self.body.get(..self.len).unwrap_or(&[]);
         site.with(|site, _| match self.outcome {
             Outcome::Landed(seq) => site.committed(&self.token, seq),
-            Outcome::Refused => site.not_committed(&self.token, body),
+            Outcome::Refused | Outcome::Uncertain(_) => site.not_committed(&self.token, body),
         })
         .is_ok()
     }
@@ -115,15 +143,16 @@ impl Unsettled {
 /// across one.
 ///
 /// `extent` hears [`Extent::Moving`] before each append and
-/// [`Extent::Settled`] once the head is known again, before anything else
-/// can yield, so whatever answers from the log's extent never answers from
-/// one an append is changing (P-104, P-095). After a failed append the head
-/// is found again from the bytes first; if that fails too, nothing settles
-/// it and the turn reports `adrift`.
+/// [`Extent::Settled`] only while the ring is proven, after the append
+/// landed or after a failure once the part answered, before anything else
+/// can yield: whatever answers from the log's extent never answers from one
+/// an append is changing or has left unproven (P-104, P-095).
 ///
-/// `unsettled` is the caller's across turns: an outcome the site was too
-/// held to hear is kept there and told first, and until it is, nothing new
-/// is taken.
+/// `unsettled` is the caller's across turns. An append that returned an
+/// error is kept there, with its record, until the part says whether it
+/// landed; a known outcome the site was too held to hear is kept until it
+/// hears it. Either is dealt with first, and until it is, nothing new is
+/// taken or appended.
 pub async fn record_owed<N: MultiwriteNorFlash>(
     site: &impl SiteCell,
     ring: &mut Ring<N>,
@@ -133,7 +162,14 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
     unsettled: &mut Option<Unsettled>,
 ) -> PlaneTurn {
     let mut done = PlaneTurn::default();
-    if let Some(pending) = unsettled.as_ref() {
+    if let Some(pending) = unsettled.as_mut() {
+        if !pending.resolve(ring, scratch).await {
+            done.adrift = true;
+            return done;
+        }
+        if ring.is_proven() {
+            extent(Extent::Settled(ring));
+        }
         if !pending.settle(site) {
             done.busy = true;
             return done;
@@ -162,29 +198,35 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
         let framed = Event::new(LogSeq(seq), at, owed.kind, written)
             .ok()
             .and_then(|event| event.encode(&mut payload).ok());
-        let appended = match framed {
-            Some(len) => {
-                extent(Extent::Moving);
-                let appended = ring
-                    .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
-                    .await
-                    .ok();
-                if appended.is_some() || ring.reconcile(scratch).await.is_ok() {
-                    extent(Extent::Settled(ring));
-                } else {
-                    done.adrift = true;
-                }
-                appended
-            }
-            None => None,
-        };
-        let pending = Unsettled {
+        let mut pending = Unsettled {
             token: owed.token,
-            outcome: appended.map_or(Outcome::Refused, Outcome::Landed),
+            outcome: Outcome::Refused,
             body,
             len: owed.len,
+            payload,
+            payload_len: framed.unwrap_or(0),
         };
-        if appended.is_some() {
+        if let Some(len) = framed {
+            extent(Extent::Moving);
+            pending.outcome = match ring
+                .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
+                .await
+            {
+                Ok(landed) => Outcome::Landed(landed),
+                Err(_) => Outcome::Uncertain(seq),
+            };
+            if !pending.resolve(ring, scratch).await {
+                done.adrift = true;
+                done.refused = true;
+                *unsettled = Some(pending);
+                break;
+            }
+            if ring.is_proven() {
+                extent(Extent::Settled(ring));
+            }
+        }
+        let landed = matches!(pending.outcome, Outcome::Landed(_));
+        if landed {
             done.landed = done.landed.saturating_add(1);
         } else {
             done.refused = true;
@@ -194,7 +236,7 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
             *unsettled = Some(pending);
             break;
         }
-        if appended.is_none() {
+        if !landed {
             break;
         }
     }
@@ -353,16 +395,23 @@ pub async fn read_log<N: MultiwriteNorFlash>(
     batch: &mut LogBatch,
 ) -> Result<(), RingError<N::Error>> {
     *batch = LogBatch::new();
+    // The walk proves the head first when it is not; the extent the batch
+    // reports is read after it, so it is never one a failure left stale.
+    let mut take = |found: &record::Found<'_>| {
+        if most == 0 {
+            return Wants::Enough;
+        }
+        batch.take(found.seq, found.payload, most)
+    };
+    let visit: &mut dyn FnMut(&record::Found<'_>) -> Wants = &mut take;
+    let next = ring.read_from(from, scratch, visit).await?;
     let head = ring.head();
     batch.oldest = head.oldest.unwrap_or(0);
     batch.newest = head.next_seq.saturating_sub(1);
-    if most == 0 {
-        batch.next = from.max(batch.oldest).max(1);
-        return Ok(());
-    }
-    let mut take = |found: &record::Found<'_>| batch.take(found.seq, found.payload, most);
-    let visit: &mut dyn FnMut(&record::Found<'_>) -> Wants = &mut take;
-    let next = ring.read_from(from, scratch, visit).await?;
-    batch.next = next;
+    batch.next = if most == 0 {
+        from.max(batch.oldest).max(1)
+    } else {
+        next
+    };
     Ok(())
 }

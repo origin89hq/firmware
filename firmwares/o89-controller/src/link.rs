@@ -39,8 +39,9 @@ use km43::{
 };
 use o89_core::mailbox::DownloadEntry;
 use o89_core::{
-    Action, Actions, Clock, Endpoint, Identity, Keys, KnockAnswer, Link, Local, ModuleBoot,
-    ModuleReset, Note, Recovery, Reply, SessionNote, Sessions, SiteCell, Task, knock_answer,
+    Action, Actions, Clock, Endpoint, EventSink, Identity, Keys, KnockAnswer, Link, Local,
+    ModuleBoot, ModuleReset, Note, Recovery, Reply, SENDS_PER_FAN_OUT, Sent, SessionNote, Sessions,
+    SiteCell, Task, knock_answer,
 };
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
@@ -597,7 +598,7 @@ fn local(site: Shared) -> Local<'static> {
     Local {
         model: MODEL,
         log: recorder::log_span(),
-        log_settled: recorder::log_settled(),
+        log_known: recorder::log_known(),
         // No clock before its slice.
         time_known: false,
         pairing_open: selector::pairing_open(),
@@ -704,15 +705,24 @@ async fn reply(
     }
 }
 
-/// What became of a client frame put on the wire.
-enum Sent {
-    /// The UART took all of it.
-    Yes,
-    /// Nothing to send, or the UART refused it or it did not frame.
-    No,
-    /// CTS held the transmitter past its deadline.
-    Stalled,
+/// The link as where the sessions' events go.
+struct Uplink<'a, 'b> {
+    tx: &'a mut BufferedUartTx<'b>,
+    writer: &'a mut FrameWriter,
 }
+
+impl EventSink for Uplink<'_, '_> {
+    async fn send(&mut self, reply: Reply, frame: &[u8]) -> Sent {
+        send_reply(self.tx, self.writer, frame, reply).await
+    }
+}
+
+// A fan-out's sends, each at most a write deadline, stay inside half the
+// link task's check-in window, with the rest of its turn in the other half.
+const _: () = assert!(
+    SENDS_PER_FAN_OUT as u64 * WRITE_DEADLINE.as_millis() * 2 <= Task::Link.window().as_millis(),
+    "a fan-out at its budget of stalled-just-short sends must not starve the link's check-in"
+);
 
 /// A client's answer onto the wire, and what became of it.
 async fn send_reply(
@@ -1549,27 +1559,14 @@ async fn serve_log(
             return Some(ended);
         }
         // Every subscribed session the batch covers, each its own sealed
-        // copy (P-098). An event is marked delivered only once the UART
-        // took it: one it refused stays owed and is read again, and a
-        // session that stays behind is shed by its queue's bound.
-        for conn in endpoint.sessions.subscribers().into_iter().flatten() {
-            for index in 0..batch.len() {
-                let (event, delivery) =
-                    match endpoint.sessions.event(conn, ticket, &batch, index, answer) {
-                        Ok(Some(owed)) => owed,
-                        Ok(None) => continue,
-                        // Owed and not sealable: nothing later overtakes it.
-                        Err(unsealed) => {
-                            defmt::error!("link: an event did not seal: {}", unsealed);
-                            break;
-                        }
-                    };
-                match send_reply(tx, writer, answer, event).await {
-                    Sent::Yes => endpoint.sessions.delivered(delivery),
-                    Sent::No => break,
-                    Sent::Stalled => return Some(Ended::Stalled),
-                }
-            }
+        // copy, within the fan-out's send budget (P-098); what is left stays
+        // owed and is read for again.
+        let fanned = endpoint
+            .sessions
+            .fan_out(ticket, &batch, answer, &mut Uplink { tx, writer })
+            .await;
+        if fanned.stalled {
+            return Some(Ended::Stalled);
         }
     }
     if site::WANTS.is_empty()

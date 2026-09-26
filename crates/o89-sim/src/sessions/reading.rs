@@ -352,6 +352,7 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
     site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
         .expect("a valid site");
     let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut unsettled = None;
     {
         part.cut_after(0);
         let mut ring =
@@ -362,9 +363,11 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
             &mut scratch,
             None,
             |_| {},
-            &mut None,
+            &mut unsettled,
         ));
-        assert_eq!((turn.landed, turn.refused), (0, true));
+        // An error is not an absence: kept until the part can say.
+        assert_eq!((turn.landed, turn.refused, turn.adrift), (0, true, true));
+        assert!(unsettled.is_some());
     }
     part.reboot();
     let mut ring =
@@ -375,12 +378,12 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
         &mut scratch,
         None,
         |_| {},
-        &mut None,
+        &mut unsettled,
     ));
     assert_eq!(
         (turn.landed, turn.refused),
         (1, false),
-        "the topology record, once"
+        "found absent, owed again, logged once"
     );
     let again = block_on(o89_core::record_owed(
         &site,
@@ -388,7 +391,7 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
         &mut scratch,
         None,
         |_| {},
-        &mut None,
+        &mut unsettled,
     ));
     assert_eq!(again.landed, 0, "and not twice");
     assert_eq!(ring.next_seq(), 2);
@@ -657,8 +660,8 @@ fn p_180_a_raise_that_landed_while_the_site_was_held_is_told_to_it_next_turn_onc
 
 #[test]
 fn p_182_a_raise_the_ring_refused_while_the_site_was_held_is_owed_again_once() {
-    // Capabilities: none. The NOR loses power under the append, and the
-    // site is held when the refusal is known.
+    // Capabilities: none. The NOR loses power under the append; once it is
+    // back and the part says the raise is absent, the site is held.
     let mut part = SimNor::<{ crate::link::LOG_BLOCK }>::fresh(8);
     let mut scratch = [0u8; o89_core::SCRATCH];
     let site = HeldOnce {
@@ -679,12 +682,25 @@ fn p_182_a_raise_the_ring_refused_while_the_site_was_held_is_owed_again_once() {
             |_| {},
             &mut unsettled,
         ));
-        assert_eq!((turn.landed, turn.refused, turn.busy), (0, true, true));
+        assert_eq!((turn.landed, turn.adrift, turn.busy), (0, true, false));
     }
-    assert!(unsettled.is_some(), "the refusal is kept, not lost");
+    assert!(unsettled.is_some(), "the uncertain raise is kept, not lost");
     part.reboot();
     let mut ring =
         block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.adrift, turn.busy),
+        (0, false, true),
+        "absent, and the site held"
+    );
     let turn = block_on(o89_core::record_owed(
         &site,
         &mut ring,
@@ -712,7 +728,9 @@ fn p_182_a_raise_the_ring_refused_while_the_site_was_held_is_owed_again_once() {
 
 /// A NOR part shared with the test, which can hold the first program
 /// after an erase pending once: the moment an append has turned the page
-/// and erased the oldest block, and has not yet written its record.
+/// and erased the oldest block, and has not yet written its record. It can
+/// also fail the program it holds after performing it, as a part whose
+/// completion poll errs after the bytes landed does.
 #[derive(Clone)]
 struct Pausing {
     nor: std::rc::Rc<RefCell<SimNor<{ crate::link::LOG_BLOCK }>>>,
@@ -722,6 +740,11 @@ struct Pausing {
     hold: std::rc::Rc<std::cell::Cell<bool>>,
     /// A write is being held now.
     held: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Writes to let through before one that lands and then reports an
+    /// error; `None` for none.
+    err_after: std::rc::Rc<std::cell::Cell<Option<u8>>>,
+    /// The part loses power right after that error, reads included.
+    die_after_err: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl embedded_storage_async::nor_flash::ErrorType for Pausing {
@@ -775,7 +798,21 @@ impl embedded_storage_async::nor_flash::NorFlash for Pausing {
             .await;
             self.held.set(false);
         }
-        self.nor.borrow_mut().write_now(offset, bytes)
+        let written = self.nor.borrow_mut().write_now(offset, bytes);
+        match self.err_after.get() {
+            Some(0) => {
+                self.err_after.set(None);
+                if self.die_after_err.get() {
+                    self.nor.borrow_mut().kill();
+                }
+                written.and(Err(crate::NorError::PowerLost))
+            }
+            Some(n) => {
+                self.err_after.set(Some(n.saturating_sub(1)));
+                written
+            }
+            None => written,
+        }
     }
 }
 
@@ -838,6 +875,8 @@ fn pausing() -> Pausing {
         armed: std::rc::Rc::default(),
         hold: std::rc::Rc::default(),
         held: std::rc::Rc::default(),
+        err_after: std::rc::Rc::default(),
+        die_after_err: std::rc::Rc::default(),
     }
 }
 
@@ -908,7 +947,8 @@ fn p_095_p_104_while_an_append_has_erased_the_oldest_block_the_extent_is_not_pub
 fn p_095_an_append_that_fails_after_erasing_the_oldest_block_leaves_the_extent_unknown_until_found_again()
  {
     // Capabilities: none. The part loses power while the append is held
-    // after its page turn.
+    // after its page turn; the next turn runs as it would, with no manual
+    // recovery.
     let nor = pausing();
     let mut scratch = [0u8; o89_core::SCRATCH];
     let mut ring = ring_before_rollover(&nor, &mut scratch);
@@ -921,6 +961,7 @@ fn p_095_an_append_that_fails_after_erasing_the_oldest_block_leaves_the_extent_u
         before.next_seq.saturating_sub(1),
         true,
     )));
+    let mut unsettled = None;
     nor.armed.set(true);
     let turn = held_turn(
         &nor,
@@ -930,33 +971,301 @@ fn p_095_an_append_that_fails_after_erasing_the_oldest_block_leaves_the_extent_u
             &mut scratch,
             None,
             publisher(&published),
-            &mut None,
+            &mut unsettled,
         ),
         || nor.nor.borrow_mut().cut_after(0),
     );
     assert_eq!((turn.landed, turn.refused, turn.adrift), (0, true, true));
+    assert!(!ring.is_proven());
     let (oldest, _, settled) = published.get();
     assert_eq!(
         (oldest, settled),
         (1, false),
         "the stale oldest is never published as held"
     );
-    // Power back: the head found again from the bytes, and only then
-    // published, with the oldest the erase left.
-    nor.nor.borrow_mut().reboot();
-    block_on(ring.reconcile(&mut scratch)).expect("found again");
-    let head = ring.head();
-    assert!(head.oldest.is_some_and(|oldest| oldest > 1));
-    // The record that failed is owed again and lands.
+    // Still dead: the next turn cannot say, publishes nothing, appends
+    // nothing over the unknown outcome.
     let turn = block_on(o89_core::record_owed(
         &site,
         &mut ring,
         &mut scratch,
         None,
         publisher(&published),
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (0, true));
+    assert!(!published.get().2);
+    // Power back: the next turn finds the head from the bytes, learns the
+    // record never landed, and logs it once.
+    nor.nor.borrow_mut().reboot();
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        publisher(&published),
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (1, false));
+    let head = ring.head();
+    let (oldest, newest, settled) = published.get();
+    assert!(settled && head.oldest == Some(oldest) && oldest > 1);
+    assert_eq!(
+        newest, before.next_seq,
+        "the record at the position the failed one had"
+    );
+}
+
+/// A site whose boot record is logged on `ring`, with one fault concern
+/// observed since.
+fn concern_on(ring: &mut o89_core::Ring<Pausing>, scratch: &mut [u8]) -> SimSite {
+    let site = SimSite::empty();
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+        .expect("a valid site");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        ring,
+        scratch,
+        None,
+        |_| {},
         &mut None,
     ));
-    assert_eq!(turn.landed, 1);
-    let (oldest, _, settled) = published.get();
-    assert!(settled && oldest == head.oldest.unwrap_or(0));
+    assert_eq!(turn.landed, 1, "the boot's topology record");
+    site.free(|site, now| site.observe(fault(), now))
+        .expect("admitted");
+    site
+}
+
+fn fault() -> ConcernReport {
+    ConcernReport {
+        subject: Subject::Part(Part::device(id(1))),
+        cond: Condition(0x0101),
+        sev: Severity::Fault,
+        code: None,
+    }
+}
+
+/// Every record the ring holds from `from`: its position and kind.
+fn logged(
+    ring: &mut o89_core::Ring<Pausing>,
+    from: u64,
+    scratch: &mut [u8],
+) -> Vec<(u64, EventKind)> {
+    let mut batch = o89_core::LogBatch::new();
+    block_on(o89_core::read_log(ring, from, 64, scratch, &mut batch)).expect("reads");
+    (0..batch.len())
+        .map(|index| {
+            let (seq, bytes) = batch.get(index).expect("taken");
+            (seq, km43::Event::decode(bytes).expect("an event").kind)
+        })
+        .collect()
+}
+
+#[test]
+fn p_180_a_raise_that_landed_though_its_append_erred_is_committed_and_its_clear_follows() {
+    // Capabilities: none. The part programs the raise's magic and then
+    // reports an error; the condition clears while the append is out.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let raise_at = ring.next_seq();
+    nor.hold.set(true);
+    nor.err_after.set(Some(1));
+    let mut unsettled = None;
+    let turn = held_turn(
+        &nor,
+        o89_core::record_owed(&site, &mut ring, &mut scratch, None, |_| {}, &mut unsettled),
+        || {
+            site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::None))
+                .expect("open");
+        },
+    );
+    assert_eq!(
+        (turn.landed, turn.adrift),
+        (2, false),
+        "found on the part and committed, then its clear owed and logged in the same tick"
+    );
+    assert!(unsettled.is_none());
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 0, "nothing more");
+    assert_eq!(
+        logged(&mut ring, raise_at, &mut scratch),
+        [
+            (raise_at, EventKind::CONCERN_RAISED),
+            (raise_at + 1, EventKind::CONCERN_CHANGED)
+        ],
+        "one raise, then its clear"
+    );
+    assert_eq!(
+        concerns_total(&site),
+        (0, raise_at + 1),
+        "the row left with its clear"
+    );
+}
+
+#[test]
+fn p_180_an_erred_append_whose_part_cannot_be_read_is_kept_until_it_can_and_nothing_goes_over_it() {
+    // Capabilities: none. As above, and the part loses power right after
+    // the error, so nothing can say whether the raise landed until it is
+    // back.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let raise_at = ring.next_seq();
+    nor.hold.set(true);
+    nor.err_after.set(Some(1));
+    nor.die_after_err.set(true);
+    let mut unsettled = None;
+    let turn = held_turn(
+        &nor,
+        o89_core::record_owed(&site, &mut ring, &mut scratch, None, |_| {}, &mut unsettled),
+        || {
+            site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::None))
+                .expect("open");
+        },
+    );
+    assert_eq!((turn.landed, turn.adrift), (0, true));
+    // Still dead: kept, and nothing appended over it.
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (0, true));
+    assert!(unsettled.is_some());
+    nor.nor.borrow_mut().reboot();
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.adrift),
+        (1, false),
+        "the raise found, then its clear logged"
+    );
+    assert_eq!(
+        logged(&mut ring, raise_at, &mut scratch),
+        [
+            (raise_at, EventKind::CONCERN_RAISED),
+            (raise_at + 1, EventKind::CONCERN_CHANGED)
+        ]
+    );
+    assert_eq!(concerns_total(&site), (0, raise_at + 1));
+}
+
+#[test]
+fn p_099_a_drop_that_fails_leaves_the_ring_unproven_and_the_next_read_finds_the_head_first() {
+    // Capabilities: none. The part loses power under a bench drop of the
+    // oldest block.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = ring_before_rollover(&nor, &mut scratch);
+    let newest = ring.next_seq().saturating_sub(1);
+    nor.nor.borrow_mut().cut_after(100);
+    assert!(block_on(ring.drop_oldest(&mut scratch)).is_err());
+    assert!(!ring.is_proven());
+    // Still dead: a read cannot prove the head, and says so.
+    let mut batch = o89_core::LogBatch::new();
+    assert!(
+        block_on(o89_core::read_log(
+            &mut ring,
+            1,
+            4,
+            &mut scratch,
+            &mut batch
+        ))
+        .is_err()
+    );
+    // Back: the read finds the head from the bytes first, with no manual
+    // recovery, and answers from what the part holds.
+    nor.nor.borrow_mut().reboot();
+    block_on(o89_core::read_log(
+        &mut ring,
+        1,
+        4,
+        &mut scratch,
+        &mut batch,
+    ))
+    .expect("reads");
+    assert!(ring.is_proven());
+    let first = batch.get(0).map(|(seq, _)| seq).expect("records remain");
+    assert!(
+        first > 1,
+        "the half-erased block's records are gone: {first}"
+    );
+    assert_eq!(batch.oldest(), first);
+    assert_eq!(
+        ring.next_seq().saturating_sub(1),
+        newest,
+        "nothing newer lost"
+    );
+}
+
+#[test]
+fn p_095_an_append_after_a_page_turn_that_failed_finds_the_head_before_it_writes() {
+    // Capabilities: none. The part loses power while a page turn erases the
+    // oldest block, before the ring learns the new oldest; power comes back
+    // and the next append is an ordinary one, as a diagnostic's is.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = ring_before_rollover(&nor, &mut scratch);
+    let filler = |seq: u64| {
+        let mut payload = [0u8; 64];
+        let len = km43::Event::new(
+            km43::LogSeq(seq),
+            None,
+            EventKind::BOOT,
+            &[
+                0xa1, 1, 0x58, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .expect("an event")
+        .encode(&mut payload)
+        .expect("fits");
+        (payload, len)
+    };
+    let (payload, len) = filler(ring.next_seq());
+    nor.nor.borrow_mut().cut_after(100);
+    assert!(block_on(ring.append(o89_core::Class::A, &payload[..len], &mut scratch)).is_err());
+    assert!(!ring.is_proven());
+    nor.nor.borrow_mut().reboot();
+    let (payload, len) = filler(ring.next_seq());
+    block_on(ring.append(o89_core::Class::A, &payload[..len], &mut scratch)).expect("appends");
+    assert!(ring.is_proven());
+    let oldest = ring.head().oldest.expect("records");
+    assert!(
+        oldest > 1,
+        "the half-erased block's records are not claimed: {oldest}"
+    );
+    let mut batch = o89_core::LogBatch::new();
+    block_on(o89_core::read_log(
+        &mut ring,
+        1,
+        1,
+        &mut scratch,
+        &mut batch,
+    ))
+    .expect("reads");
+    assert_eq!(
+        batch.get(0).map(|(seq, _)| seq),
+        Some(oldest),
+        "the first record held is the oldest said"
+    );
 }

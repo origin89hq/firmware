@@ -28,8 +28,9 @@ use km43::{
 };
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
-    LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
-    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map, time_expired,
+    LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing,
+    RecentCuts, Ring, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map,
+    time_expired,
 };
 
 use crate::fram::Lease;
@@ -245,16 +246,17 @@ impl CutsKeeper {
     }
 }
 
-/// The span of the log, as the ring last stood: zero for none (P-104's
-/// reading of an empty log), until the ring opens; and whether it is known
-/// to hold, which it is not while an append or a drop may be moving the
-/// oldest record, nor after one failed until the head is found again.
-static SPAN: Mutex<CriticalSectionRawMutex, Cell<(LogSpan, bool)>> = Mutex::new(Cell::new((
+/// The span of the log as last published, and what is known of it:
+/// nothing until the ring opens, held while the ring's head is proven,
+/// moving while an append or a drop may move the oldest record or one
+/// failed and the head is not yet found again, and no log at all when the
+/// part never opened.
+static SPAN: Mutex<CriticalSectionRawMutex, Cell<(LogSpan, LogKnown)>> = Mutex::new(Cell::new((
     LogSpan {
         oldest: LogSeq(0),
         newest: LogSeq(0),
     },
-    true,
+    LogKnown::Opening,
 )));
 
 /// The log's span, for a `Hello` (keys 7 and 8).
@@ -262,41 +264,52 @@ pub fn log_span() -> LogSpan {
     SPAN.lock(|cell| cell.get().0)
 }
 
-/// Whether [`log_span`] is known to hold: a `Subscribe` or a `Hello`
-/// answered while it is not would promise history the ring may be erasing.
-pub fn log_settled() -> bool {
+/// What is known of [`log_span`].
+pub fn log_known() -> LogKnown {
     SPAN.lock(|cell| cell.get().1)
 }
 
 /// Before anything that may move the oldest record: the span published is
-/// no longer known to hold until [`publish`] follows.
+/// no longer known to hold until [`publish`] finds the ring proven.
 pub fn unsettle() {
     SPAN.lock(|cell| {
-        let (span, _) = cell.get();
-        cell.set((span, false));
+        let (span, known) = cell.get();
+        let known = match known {
+            LogKnown::Held | LogKnown::Moving => LogKnown::Moving,
+            LogKnown::Opening | LogKnown::NoLog => known,
+        };
+        cell.set((span, known));
     });
 }
 
-/// The span of the log as the ring's head stands, known to hold: called
-/// only when the head describes the part, after an operation that landed or
-/// a [`reconcile`] that found it again.
+/// The span of the log as the ring's head stands, held, when the ring is
+/// proven; otherwise the last span stays published as moving.
 pub fn publish(ring: &Ring<Nor>) {
+    if !ring.is_proven() {
+        unsettle();
+        return;
+    }
     let head = ring.head();
     let span = LogSpan {
         oldest: LogSeq(head.oldest.unwrap_or(0)),
         newest: LogSeq(head.next_seq.saturating_sub(1)),
     };
-    SPAN.lock(|cell| cell.set((span, true)));
+    SPAN.lock(|cell| cell.set((span, LogKnown::Held)));
+}
+
+/// The part never opened: a log holding nothing, said deliberately.
+fn no_log() {
+    SPAN.lock(|cell| cell.set((cell.get().0, LogKnown::NoLog)));
 }
 
 /// After an operation on the ring failed: the head found again from the
 /// bytes, and the span published only if that succeeds. Otherwise it stays
-/// unsettled, and the next turn tries again.
+/// moving, and every later operation on the ring tries again first.
 pub async fn reconcile(ring: &mut Ring<Nor>, scratch: &mut [u8]) {
-    match ring.reconcile(scratch).await {
-        Ok(()) => publish(ring),
-        Err(error) => defmt::error!("recorder: the log's head was not found again: {}", error),
+    if let Err(error) = ring.reconcile(scratch).await {
+        defmt::error!("recorder: the log's head was not found again: {}", error);
     }
+    publish(ring);
 }
 
 /// The ladder's cuts as the boot read them, and the boot count they are
@@ -335,12 +348,15 @@ pub async fn run(
     let mut scratch = [0u8; SCRATCH];
     let ring = open_ring(nor, &mut scratch).await;
     let mut ring = ring;
-    if let Some(ring) = ring.as_mut() {
-        defmt::info!("recorder: writing the boot record");
-        boot_records(ring, &mut scratch, boot, calendar.now()).await;
-    }
-    if let Some(ring) = ring.as_ref() {
-        publish(ring);
+    // The head the open found, before the boot's records can move it; each
+    // of those publishes its own outcome.
+    match ring.as_mut() {
+        Some(ring) => {
+            publish(ring);
+            defmt::info!("recorder: writing the boot record");
+            boot_records(ring, &mut scratch, boot, calendar.now()).await;
+        }
+        None => no_log(),
     }
     let boot = cuts.boot.map_or(0, BootCount::get);
     // The client whose set is applied and owed to the log, and the clock it
@@ -416,7 +432,7 @@ pub async fn run(
                 // Every append and drop published its own outcome; a head
                 // left unproven by a failure is looked for again.
                 if let Some(ring) = ring.as_mut()
-                    && !log_settled()
+                    && log_known() == LogKnown::Moving
                 {
                     reconcile(ring, &mut scratch).await;
                 }

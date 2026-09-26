@@ -305,15 +305,24 @@ pub(crate) struct Bench {
     posted: Option<o89_core::LogWant>,
     /// A record's outcome the site has not been told, kept between turns.
     unsettled: Option<o89_core::Unsettled>,
-    /// Whether the log's span is known to hold, as the plane's turn left it.
-    extent: Extent,
+    /// What is known of the log's span, as the plane's turn left it.
+    log_known: o89_core::LogKnown,
 }
 
-/// Whether the log's span the bench tells the sessions is known to hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Extent {
-    Held,
-    Moving,
+/// The bench's transport as the sessions' events see it: every frame
+/// taken, and kept to be framed and pumped once the fan-out is done.
+#[derive(Default)]
+struct Taken(Vec<(o89_core::Reply, Vec<u8>)>);
+
+impl o89_core::EventSink for Taken {
+    fn send(
+        &mut self,
+        reply: o89_core::Reply,
+        frame: &[u8],
+    ) -> impl core::future::Future<Output = o89_core::Sent> {
+        self.0.push((reply, frame.to_vec()));
+        core::future::ready(o89_core::Sent::Yes)
+    }
 }
 
 impl Bench {
@@ -389,7 +398,7 @@ impl Bench {
             link_due: now,
             posted: None,
             unsettled: None,
-            extent: Extent::Held,
+            log_known: o89_core::LogKnown::Held,
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -460,7 +469,7 @@ impl Bench {
         Local {
             model: MODEL,
             log: span_of(self.log.as_ref()),
-            log_settled: self.extent == Extent::Held,
+            log_known: self.log_known,
             time_known: self.calendar.is_some(),
             pairing_open: self.window.is_open(self.now),
             topology: topology_of(&self.site),
@@ -494,21 +503,21 @@ impl Bench {
         if self.now.since(self.plane_due).is_some() {
             // The bench reads the span off the ring itself, so there is
             // nothing to publish as each record lands.
-            let mut held = self.extent;
+            let mut known = self.log_known;
             let turn = block_on(o89_core::record_owed(
                 &self.site,
                 ring,
                 &mut scratch,
                 None,
                 |extent| {
-                    held = match extent {
-                        o89_core::Extent::Moving => Extent::Moving,
-                        o89_core::Extent::Settled(_) => Extent::Held,
+                    known = match extent {
+                        o89_core::Extent::Moving => o89_core::LogKnown::Moving,
+                        o89_core::Extent::Settled(_) => o89_core::LogKnown::Held,
                     };
                 },
                 &mut self.unsettled,
             ));
-            self.extent = held;
+            self.log_known = known;
             assert_eq!(turn.unwritten, None, "the site wrote every record it owed");
             assert!(!turn.busy, "one owner never finds the site held");
             self.plane_due = self.now.after(PLANE_PERIOD).expect("fits");
@@ -537,19 +546,17 @@ impl Bench {
                 .sessions
                 .log_answered(want.ticket, &batch, &mut dst);
             self.answer(reply, &mut dst);
-            for conn in self.endpoint.sessions.subscribers().into_iter().flatten() {
-                for index in 0..batch.len() {
-                    let Ok(Some((reply, delivery))) =
-                        self.endpoint
-                            .sessions
-                            .event(conn, want.ticket, &batch, index, &mut dst)
-                    else {
-                        continue;
-                    };
-                    self.answer(reply, &mut dst);
-                    // The bench's transport takes every frame it is given.
-                    self.endpoint.sessions.delivered(delivery);
-                }
+            let mut taken = Taken::default();
+            let _ = block_on(self.endpoint.sessions.fan_out(
+                want.ticket,
+                &batch,
+                &mut dst,
+                &mut taken,
+            ));
+            for (reply, frame) in taken.0 {
+                let mut answer = [0u8; MAX_PAYLOAD];
+                answer[..frame.len()].copy_from_slice(&frame);
+                self.answer(reply, &mut answer);
             }
         }
         let span = self.log_span();
@@ -787,7 +794,7 @@ impl Bench {
                     let local = Local {
                         model: MODEL,
                         log: span_of(self.log.as_ref()),
-                        log_settled: self.extent == Extent::Held,
+                        log_known: self.log_known,
                         time_known: self.calendar.is_some(),
                         pairing_open: self.window.is_open(self.now),
                         topology: topology_of(&self.site),
