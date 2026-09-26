@@ -16,5 +16,6 @@ mod device;
 pub mod dialect;
 pub mod modbus;
 pub mod port;
+pub mod vedirect;
 
 pub use device::*;

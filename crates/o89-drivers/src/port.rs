@@ -78,6 +78,43 @@ pub trait Rs485 {
     ) -> impl Future<Output = Result<Burst, PortFault<Self::Error>>>;
 }
 
+/// A byte port the controller only listens on.
+///
+/// For a line whose device talks unprompted and must never be written to,
+/// such as a VE.Direct text port: the trait has no send and no discard, so a
+/// driver written against it cannot transmit by construction.
+///
+/// ```compile_fail
+/// use o89_drivers::port::Listener;
+///
+/// async fn speak<L: Listener>(port: &mut L) {
+///     let _ = port.send(b"\r\n").await;
+/// }
+/// ```
+///
+/// ```
+/// use o89_core::Millis;
+/// use o89_drivers::port::Listener;
+///
+/// async fn hear<L: Listener>(port: &mut L) {
+///     let _ = port.receive(&mut [0; 8], Millis::from_millis(1_500)).await;
+/// }
+/// ```
+pub trait Listener {
+    /// What the line reports.
+    type Error;
+
+    /// Wait at most `within` for the first byte, then return the burst that
+    /// arrived with it, with the same contract as [`Rs485::receive`]: every
+    /// byte until the line has been idle for the adapter's gap, or until
+    /// `into` is full, and which of the two ended it.
+    fn receive(
+        &mut self,
+        into: &mut [u8],
+        within: Millis,
+    ) -> impl Future<Output = Result<Burst, PortFault<Self::Error>>>;
+}
+
 /// The largest CAN 2.0 payload.
 pub const CAN_DATA_BYTES: usize = 8;
 
