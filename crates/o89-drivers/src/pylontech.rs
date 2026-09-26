@@ -6,9 +6,14 @@
 //! without being asked; the inverter's once-a-second `0x305` is its own
 //! frame on the bus and not the BMS's.
 //!
+//! One BMS or one string at address 0, on the standard identifiers below.
+//! V1.3's LV-HUB offsets every identifier by `0x1000` times a string's
+//! address, which takes addresses 1 to 7 past eleven bits; those frames are
+//! refused as [`FrameError::Unknown`], like any other node's.
+//!
 //! | Id | Bytes | What |
 //! | --- | --- | --- |
-//! | `0x351` | 6 (V1.2) or 8 (V1.3) | charge voltage 0.1 V `u16`, charge and discharge current limits 0.1 A `i16`, V1.3's discharge voltage 0.1 V `i16` |
+//! | `0x351` | 6 or 8 | charge voltage 0.1 V `u16`, charge and discharge current limits 0.1 A `i16`, then bytes 6 and 7: V1.3's discharge voltage 0.1 V `i16`, undefined in V1.2 |
 //! | `0x355` | 4 | state of charge and state of health, 1 % `u16` |
 //! | `0x356` | 6 | pack voltage 0.01 V, current 0.1 A, average cell temperature 0.1 °C, each `i16` |
 //! | `0x359` | 7 | protections, alarms, module count, then `"PN"` |
@@ -60,7 +65,8 @@ pub enum Channel {
     /// lowest current into the pack: a limit of 100 A out is −100 A.
     DischargeCurrentLimit,
     /// The lowest voltage the BMS will be discharged to, from V1.3's
-    /// `0x351`; `unsupported` from a V1.2 BMS, whose frame has no such field.
+    /// `0x351`; `unsupported` from a BMS configured as V1.2, and from a
+    /// six-byte frame.
     DischargeVoltageLimit,
     /// The BMS's own state of charge, from `0x355`.
     StateOfCharge,
@@ -223,6 +229,20 @@ pub enum CurrentDirection {
     Unknown,
 }
 
+/// The protocol version a BMS speaks, which the configuration states.
+///
+/// The two versions share every identifier and differ in `0x351`'s bytes 6
+/// and 7, which V1.3 defines and V1.2 leaves blank; neither document states
+/// a frame's length, so an eight-byte frame does not say which one it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Version {
+    /// V1.2 of 2018-04-08: no discharge voltage.
+    V12,
+    /// V1.3: a discharge voltage in `0x351`'s bytes 6 and 7.
+    V13,
+}
+
 /// The frames this table decodes, by standard identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -287,9 +307,23 @@ pub struct Limits {
     pub charge_current: i16,
     /// Discharge current limit, 0.1 A, positive out of the pack.
     pub discharge_current: i16,
-    /// Discharge voltage, 0.1 V: V1.3's eight-byte frame, `None` from V1.2's
-    /// six.
-    pub discharge_voltage: Option<i16>,
+    /// Bytes 6 and 7 as one little-endian word, when the frame carried
+    /// them: V1.3's discharge voltage, and undefined in V1.2, which leaves
+    /// them blank in its table. Read through [`Limits::discharge_voltage`].
+    pub tail: Option<u16>,
+}
+
+impl Limits {
+    /// The discharge voltage in 0.1 V, from a BMS speaking `version`:
+    /// `None` from V1.2, whatever bytes 6 and 7 held, and from a frame
+    /// without them.
+    #[must_use]
+    pub const fn discharge_voltage(self, version: Version) -> Option<i16> {
+        match (version, self.tail) {
+            (Version::V13, Some(word)) => Some(word.cast_signed()),
+            (Version::V13, None) | (Version::V12, _) => None,
+        }
+    }
 }
 
 /// `0x355`, in the vendor's units.
@@ -535,13 +569,13 @@ impl Frame {
                 charge_voltage: le(v0, v1),
                 charge_current: signed(c0, c1),
                 discharge_current: signed(d0, d1),
-                discharge_voltage: None,
+                tail: None,
             }),
             (FrameId::Limits, &[v0, v1, c0, c1, d0, d1, f0, f1]) => Self::Limits(Limits {
                 charge_voltage: le(v0, v1),
                 charge_current: signed(c0, c1),
                 discharge_current: signed(d0, d1),
-                discharge_voltage: Some(signed(f0, f1)),
+                tail: Some(le(f0, f1)),
             }),
             (FrameId::Charge, &[c0, c1, h0, h1]) => Self::Charge(Charge {
                 soc: le(c0, c1),
@@ -579,6 +613,7 @@ impl Frame {
     /// [`MOST_PER_FRAME`], in channel order.
     fn observations(
         &self,
+        version: Version,
         direction: CurrentDirection,
     ) -> Result<[Option<(Channel, Observation)>; MOST_PER_FRAME], SignalError> {
         let seen = |channel: Channel, raw: i32| Ok(Some((channel, channel.observe(raw)?)));
@@ -596,7 +631,7 @@ impl Frame {
                     Channel::DischargeCurrentLimit,
                     i32::from(limits.discharge_current),
                 )?,
-                match limits.discharge_voltage {
+                match limits.discharge_voltage(version) {
                     Some(raw) => seen(Channel::DischargeVoltageLimit, i32::from(raw))?,
                     None => Some((
                         Channel::DischargeVoltageLimit,
@@ -680,16 +715,18 @@ pub enum ReadError<E> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Pylontech {
     signals: ChannelIds,
+    version: Version,
     direction: CurrentDirection,
 }
 
 impl Pylontech {
     /// A BMS whose channels publish as consecutive signals from `first`, in
-    /// [`Channel::ALL`]'s order, and whose pack current counts positive in
-    /// `direction`; `None` when the signals would run past `0xFFFF`.
+    /// [`Channel::ALL`]'s order, which speaks `version` and whose pack
+    /// current counts positive in `direction`; `None` when the signals would
+    /// run past `0xFFFF`.
     /// Keeping devices' ranges apart is the configuration's to check.
     #[must_use]
-    pub fn new(first: Id, direction: CurrentDirection) -> Option<Self> {
+    pub fn new(first: Id, version: Version, direction: CurrentDirection) -> Option<Self> {
         let at = |offset: u16| Id::new(first.get().checked_add(offset)?).ok();
         Some(Self {
             signals: ChannelIds {
@@ -702,6 +739,7 @@ impl Pylontech {
                 pack_current: at(6)?,
                 temperature: at(7)?,
             },
+            version,
             direction,
         })
     }
@@ -734,7 +772,7 @@ impl Pylontech {
         now: Tick,
         store: &mut Signals<N>,
     ) -> Result<usize, SignalError> {
-        let seen = frame.observations(self.direction)?;
+        let seen = frame.observations(self.version, self.direction)?;
         for (channel, _) in seen.iter().flatten() {
             let _ = store.sample(self.signal(*channel), now)?;
         }
@@ -791,9 +829,10 @@ mod tests {
     }
 
     fn bms() -> Pylontech {
-        // These fixtures count positive into the pack; the direction test
-        // takes each setting in turn.
-        Pylontech::new(id(40), CurrentDirection::IntoPack).expect("room for eight signals")
+        // These fixtures speak V1.3 and count positive into the pack; the
+        // version and direction tests take each setting in turn.
+        Pylontech::new(id(40), Version::V13, CurrentDirection::IntoPack)
+            .expect("room for eight signals")
     }
 
     fn store() -> Signals<CHANNELS> {
@@ -904,7 +943,7 @@ mod tests {
                 charge_voltage: 532,
                 charge_current: 250,
                 discharge_current: 500,
-                discharge_voltage: Some(470),
+                tail: Some(470),
             })
         );
         let ok = |v| (Some(v), Validity::Ok, Provenance::Reported);
@@ -932,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_2_limits_frame_publishes_its_discharge_voltage_as_unsupported_and_no_value() {
+    fn a_six_byte_limits_frame_publishes_its_discharge_voltage_as_unsupported_and_no_value() {
         let mut store = store();
         let heard = read(
             &[Ok(frame(0x351, &LIMITS_V13[..6]))],
@@ -944,7 +983,7 @@ mod tests {
         let Frame::Limits(limits) = heard.frame else {
             panic!("{:?}", heard.frame);
         };
-        assert_eq!(limits.discharge_voltage, None);
+        assert_eq!(limits.tail, None);
         assert_eq!(
             value(&store, Channel::DischargeVoltageLimit, Tick::ZERO),
             (None, Validity::Unsupported, Provenance::None)
@@ -953,6 +992,54 @@ mod tests {
             value(&store, Channel::ChargeVoltageLimit, Tick::ZERO).0,
             Some(53_200)
         );
+    }
+
+    #[test]
+    fn a_v1_2_bms_s_padding_in_an_eight_byte_limits_frame_is_never_a_discharge_voltage() {
+        // Built by hand: V1.3's frame, and the same limits with zero padding
+        // where V1.2 leaves bytes 6 and 7 blank.
+        let padded = [0x14, 0x02, 0xFA, 0x00, 0xF4, 0x01, 0x00, 0x00];
+        for (version, data, tail, published) in [
+            (Version::V12, padded, 0, None),
+            (Version::V12, LIMITS_V13, 470, None),
+            (Version::V13, padded, 0, Some(0)),
+            (Version::V13, LIMITS_V13, 470, Some(47_000)),
+        ] {
+            let bms = Pylontech::new(id(40), version, CurrentDirection::Unknown).unwrap();
+            let receives = [Ok(frame(0x351, &data))];
+            let mut port = Script {
+                receives: &receives,
+                at: 0,
+                waited: None,
+            };
+            let mut store = store();
+            let heard = block_on(bms.read(
+                &mut port,
+                Millis::from_millis(1_500),
+                Tick::ZERO,
+                &mut store,
+            ))
+            .unwrap();
+            assert_eq!(heard.written, 4, "{version:?}");
+            let Frame::Limits(limits) = heard.frame else {
+                panic!("{:?}", heard.frame);
+            };
+            // The raw word is kept either way.
+            assert_eq!(limits.tail, Some(tail), "{version:?}");
+            let expected = match published {
+                Some(v) => (Some(v), Validity::Ok, Provenance::Reported),
+                None => (None, Validity::Unsupported, Provenance::None),
+            };
+            assert_eq!(
+                value(&store, Channel::DischargeVoltageLimit, Tick::ZERO),
+                expected,
+                "{version:?} {tail}"
+            );
+            assert_eq!(
+                value(&store, Channel::ChargeVoltageLimit, Tick::ZERO).0,
+                Some(53_200)
+            );
+        }
     }
 
     #[test]
@@ -978,7 +1065,7 @@ mod tests {
                     charge_voltage: 0xFFFF,
                     charge_current: raw,
                     discharge_current: raw,
-                    discharge_voltage: Some(raw),
+                    tail: Some(raw.cast_unsigned()),
                 }),
                 "{raw}"
             );
@@ -1103,7 +1190,7 @@ mod tests {
                     (None, Validity::Unsupported, Provenance::None),
                 ),
             ] {
-                let bms = Pylontech::new(id(40), direction).unwrap();
+                let bms = Pylontech::new(id(40), Version::V13, direction).unwrap();
                 let mut store = store();
                 let receives = [Ok(frame(0x356, &data))];
                 let mut port = Script {
@@ -1287,6 +1374,8 @@ mod tests {
             standard(0x350),
             standard(0x7FF),
             extended,
+            // V1.3's LV-HUB string 4 sends its SOC and SOH as `0x4355`.
+            CanId::extended(0x4355).unwrap(),
         ] {
             let mut store = store();
             let unknown = CanFrame::new(can_id, &LIMITS_V13).unwrap();
@@ -1420,8 +1509,14 @@ mod tests {
         for (offset, channel) in (0u16..).zip(Channel::ALL) {
             assert_eq!(bms.signal(channel), id(40 + offset), "{channel:?}");
         }
-        assert!(Pylontech::new(id(0xFFF8), CurrentDirection::Unknown).is_some());
-        assert_eq!(Pylontech::new(id(0xFFF9), CurrentDirection::Unknown), None);
-        assert_eq!(Pylontech::new(id(0xFFFF), CurrentDirection::Unknown), None);
+        assert!(Pylontech::new(id(0xFFF8), Version::V12, CurrentDirection::Unknown).is_some());
+        assert_eq!(
+            Pylontech::new(id(0xFFF9), Version::V12, CurrentDirection::Unknown),
+            None
+        );
+        assert_eq!(
+            Pylontech::new(id(0xFFFF), Version::V12, CurrentDirection::Unknown),
+            None
+        );
     }
 }
