@@ -2,8 +2,10 @@
 //!
 //! A closed set, so an enum: a dialect lands as a variant, and every match
 //! that has to answer for it stops compiling until it does. A bus task owns
-//! its port and calls the poll entry for its kind of bus; a device on
-//! another kind of bus is refused there rather than guessed at.
+//! its port and calls the poll entry for its kind of bus. Every device today
+//! is on RS-485; the first device on another bus brings its own entry and a
+//! refusal of devices on the wrong one, which configuration checks against
+//! [`Device::bus`] before either runs.
 
 use km43::Id;
 use o89_core::{SignalError, Signals, Tick};
@@ -92,8 +94,6 @@ pub enum Device {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a failed poll is a device whose readings were not refreshed"]
 pub enum PollError<E> {
-    /// The device is on another kind of bus than the port handed in.
-    WrongBus(BusKind),
     /// The read of the block at `block` failed.
     Modbus {
         /// The block's position in the map.
@@ -162,7 +162,7 @@ async fn poll_modbus<P: Rs485, const N: usize>(
     let mut buf = [0u8; RECEIVE_BYTES];
     for (block_at, block) in device.map.blocks.iter().enumerate() {
         let read = block.read(device.address);
-        let registers = modbus::read(port, &read, timing, &mut buf)
+        let registers = modbus::read(port, read, timing, &mut buf)
             .await
             .map_err(|error| PollError::Modbus {
                 block: block_at,
@@ -214,8 +214,8 @@ mod tests {
         Provenance::Reported,
     )];
     static BLOCKS: [Block; 2] = [
-        Block::checked(Function::ReadInput, 0x10, 2, &FIRST),
-        Block::checked(Function::ReadHolding, 0x40, 1, &SECOND),
+        crate::block!(Function::ReadInput, 0x10, 2, &FIRST),
+        crate::block!(Function::ReadHolding, 0x40, 1, &SECOND),
     ];
     static EMPTY: RegisterMap = RegisterMap {
         dialect: Dialect(0xF001),
@@ -224,6 +224,24 @@ mod tests {
     static MAP: RegisterMap = RegisterMap {
         dialect: Dialect(0xF000),
         blocks: &BLOCKS,
+    };
+
+    /// A counted state of charge in tenths of a percent, signed, built by
+    /// hand; not a vendor's row.
+    static SOC_CELLS: [crate::dialect::Cell; 1] = [crate::dialect::Cell {
+        sign: crate::dialect::Sign::Signed,
+        ..cell(
+            0x20,
+            Kind::StateOfCharge,
+            SignalDomain::Live,
+            -1,
+            Provenance::Counted,
+        )
+    }];
+    static SOC_BLOCKS: [Block; 1] = [crate::block!(Function::ReadInput, 0x20, 1, &SOC_CELLS)];
+    static SOC_MAP: RegisterMap = RegisterMap {
+        dialect: Dialect(0xF002),
+        blocks: &SOC_BLOCKS,
     };
 
     fn id(n: u16) -> Id {
@@ -283,6 +301,46 @@ mod tests {
             store.current(id(21), Tick::ZERO, ChargeSource::CountedOnly.accepts()),
             Err(Ineligible::Provenance(Provenance::Estimated))
         );
+    }
+
+    #[test]
+    fn an_implausible_state_of_charge_is_out_of_range_and_never_eligible() {
+        let soc =
+            Device::Modbus(ModbusDevice::new(Address::new(7).unwrap(), &SOC_MAP, id(30)).unwrap());
+        let read = SOC_BLOCKS[0].read(Address::new(7).unwrap());
+        for (raw, expected) in [
+            ((-1i16).cast_unsigned(), None),
+            (0, Some(0)),
+            (1000, Some(1000)),
+            (1001, None),
+            (0x7FFF, None),
+        ] {
+            let mut store = Signals::<1>::new();
+            let limits = Limits::new(Millis::from_millis(60_000), None).unwrap();
+            store.register(id(30), limits).unwrap();
+            let echo = read.encode();
+            let (frame, len) = reply(0x04, &[raw]);
+            let bursts: [&[u8]; 2] = [&echo, &frame[..len]];
+            let mut port = Scripted::new(&bursts);
+            let polled = block_on(soc.poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store));
+            assert_eq!(polled, Ok(Polled { written: 1 }), "{raw}");
+
+            let eligible = store.current(id(30), Tick::ZERO, ChargeSource::CountedOnly.accepts());
+            match expected {
+                Some(value) => {
+                    let eligible = eligible.unwrap();
+                    assert_eq!(
+                        (eligible.value(), eligible.provenance()),
+                        (value, Provenance::Counted)
+                    );
+                }
+                None => assert_eq!(
+                    eligible,
+                    Err(Ineligible::NoValue(Validity::OutOfRange)),
+                    "{raw}"
+                ),
+            }
+        }
     }
 
     #[test]

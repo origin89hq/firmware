@@ -20,6 +20,28 @@ pub enum PortFault<E> {
     Line(E),
 }
 
+/// Why a burst ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Ended {
+    /// The line went idle for the framing's inter-frame gap: the frame
+    /// ended here.
+    Gap,
+    /// The buffer filled before the line went idle: the frame may go on.
+    Full,
+}
+
+/// What one receive delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Burst {
+    /// The bytes written at the front of the buffer, at least one.
+    pub len: usize,
+    /// Why the burst ended. [`Ended::Full`] exactly when `len` is the
+    /// buffer's length.
+    pub ended: Ended,
+}
+
 /// An RS-485 byte port.
 ///
 /// The board's transceivers switch direction by themselves and keep the
@@ -34,29 +56,36 @@ pub trait Rs485 {
 
     /// Wait at most `within` for the first byte, then return the burst that
     /// arrived with it: every byte until the line has been idle for the
-    /// framing's inter-frame gap, or until `into` is full.
+    /// framing's inter-frame gap, or until `into` is full, and which of the
+    /// two ended it. A burst that ends at the gap is a whole frame, or the
+    /// frames the line carried back to back without a gap between them.
     ///
-    /// Returns the number of bytes written into `into`, at least one.
-    /// [`PortFault::Timeout`] when none arrived before the deadline.
+    /// [`PortFault::Timeout`] when nothing arrived before the deadline. A
+    /// reader refuses a burst of no bytes, more bytes than `into` holds, or
+    /// [`Ended::Full`] with room left, as the adapter's defect.
     fn receive(
         &mut self,
         into: &mut [u8],
         within: Millis,
-    ) -> impl Future<Output = Result<usize, PortFault<Self::Error>>>;
+    ) -> impl Future<Output = Result<Burst, PortFault<Self::Error>>>;
 }
 
 /// The largest CAN 2.0 payload.
 pub const CAN_DATA_BYTES: usize = 8;
 
-/// A CAN identifier, standard or extended, refused when it does not fit its
-/// width.
+/// A CAN identifier, standard or extended, that fits its width: built only
+/// through [`CanId::standard`] and [`CanId::extended`].
+///
+/// ```compile_fail
+/// use o89_drivers::port::CanId;
+///
+/// let too_wide = CanId { raw: 0x800, extended: false };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum CanId {
-    /// An 11-bit identifier.
-    Standard(u16),
-    /// A 29-bit identifier.
-    Extended(u32),
+pub struct CanId {
+    raw: u32,
+    extended: bool,
 }
 
 impl CanId {
@@ -67,22 +96,38 @@ impl CanId {
 
     /// An 11-bit identifier, or `None` when `id` needs more bits.
     #[must_use]
-    pub const fn standard(id: u16) -> Option<Self> {
+    pub fn standard(id: u16) -> Option<Self> {
         if id > Self::STANDARD_MAX {
-            None
-        } else {
-            Some(Self::Standard(id))
+            return None;
         }
+        Some(Self {
+            raw: u32::from(id),
+            extended: false,
+        })
     }
 
     /// A 29-bit identifier, or `None` when `id` needs more bits.
     #[must_use]
     pub const fn extended(id: u32) -> Option<Self> {
         if id > Self::EXTENDED_MAX {
-            None
-        } else {
-            Some(Self::Extended(id))
+            return None;
         }
+        Some(Self {
+            raw: id,
+            extended: true,
+        })
+    }
+
+    /// The identifier's value, within its width.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.raw
+    }
+
+    /// Whether it is a 29-bit identifier.
+    #[must_use]
+    pub const fn is_extended(self) -> bool {
+        self.extended
     }
 }
 
@@ -203,14 +248,17 @@ mod tests {
 
     #[test]
     fn a_can_identifier_is_refused_past_its_width_and_accepted_at_it() {
-        assert_eq!(CanId::standard(0x7FF), Some(CanId::Standard(0x7FF)));
+        let top = CanId::standard(0x7FF).unwrap();
+        assert_eq!((top.raw(), top.is_extended()), (0x7FF, false));
         assert_eq!(CanId::standard(0x800), None);
-        assert_eq!(
-            CanId::extended(0x1FFF_FFFF),
-            Some(CanId::Extended(0x1FFF_FFFF))
-        );
+        assert_eq!(CanId::standard(u16::MAX), None);
+        let top = CanId::extended(0x1FFF_FFFF).unwrap();
+        assert_eq!((top.raw(), top.is_extended()), (0x1FFF_FFFF, true));
         assert_eq!(CanId::extended(0x2000_0000), None);
-        assert_eq!(CanId::standard(0), Some(CanId::Standard(0)));
+        assert_eq!(CanId::extended(u32::MAX), None);
+        // The same number in either width is a different identifier.
+        assert_ne!(CanId::standard(0x351), CanId::extended(0x351));
+        assert_eq!(CanId::standard(0).map(CanId::raw), Some(0));
     }
 
     #[test]

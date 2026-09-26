@@ -377,14 +377,29 @@ impl<const N: usize> Signals<N> {
 }
 
 /// A value a behaviour may act on, with the provenance it was accepted at.
+///
+/// Only [`Signals::current`] makes one, so holding one is the proof that the
+/// store judged it current and from an accepted source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "an eligible reading is an input a behaviour was asked to decide on"]
 pub struct Eligible {
+    value: i32,
+    provenance: Provenance,
+}
+
+impl Eligible {
     /// The scaled integer, in the metric kind's unit and scale.
-    pub value: i32,
-    /// Where it came from.
-    pub provenance: Provenance,
+    #[must_use]
+    pub const fn value(self) -> i32 {
+        self.value
+    }
+
+    /// Where it came from, one of the provenances the caller accepted.
+    #[must_use]
+    pub const fn provenance(self) -> Provenance {
+        self.provenance
+    }
 }
 
 /// Why a reading is not one a behaviour may act on.

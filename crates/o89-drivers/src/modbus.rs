@@ -7,19 +7,18 @@
 //! is parsed (F-050); a frame heard back different from the one sent is a
 //! collision on the bus and is refused rather than parsed around.
 //!
-//! Every wait has a deadline: [`Timing::response`] for the device to start
-//! answering, [`Timing::gap`] for each burst after that. The receive loop
-//! runs at most once per byte of its buffer, because every burst is at least
-//! a byte, and each receive waits at most `response` until the reply begins
-//! and `gap` after: a device dribbling bytes holds the bus for a bounded
-//! time that a bus task's check-in period has to cover.
+//! A read is at most two receives, each bounded by [`Timing::response`]: the
+//! echo, alone or with the reply behind it, and then the reply if it came
+//! separately. The port ends a burst at the inter-frame gap, so a reply is
+//! one burst: a reply cut by a gap is short, and is never joined to what
+//! the line carries next.
 //!
 //! cites: F-050
 
 use crc::{CRC_16_MODBUS, Crc};
 use o89_core::Millis;
 
-use crate::port::{PortFault, Rs485};
+use crate::port::{Burst, Ended, PortFault, Rs485};
 
 /// The CRC every RTU frame ends with, sent low byte first.
 const CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
@@ -261,16 +260,17 @@ pub enum ModbusError<E> {
     Reply(ReplyError),
     /// The port reported an error while sending or receiving.
     Port(E),
+    /// The port reported a burst it cannot have received: no bytes, more
+    /// than the buffer holds, or a full buffer with room left.
+    Adapter,
 }
 
 /// How long a read waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Timing {
-    /// For the echo and then the first byte of the reply.
+    /// For the echo, and then for the reply to begin.
     pub response: Millis,
-    /// For each burst once the reply has begun.
-    pub gap: Millis,
 }
 
 /// A reply's registers, in the order asked for.
@@ -322,7 +322,7 @@ fn expected(head: &[u8]) -> Option<usize> {
 }
 
 /// Parse `frame`, the bytes after the echo, as the reply to `read`.
-pub fn parse<'a>(read: &Read, frame: &'a [u8]) -> Result<Registers<'a>, ReplyError> {
+pub fn parse(read: Read, frame: &[u8]) -> Result<Registers<'_>, ReplyError> {
     let want = expected(frame).ok_or(ReplyError::Short)?;
     if frame.len() < want {
         return Err(ReplyError::Short);
@@ -368,54 +368,59 @@ pub fn parse<'a>(read: &Read, frame: &'a [u8]) -> Result<Registers<'a>, ReplyErr
 
 /// Send `read` on `port` and return the registers it answers with.
 ///
-/// The request's echo is required and discarded (F-050); the reply is then
-/// read until its own header says it is complete, the line goes quiet, or
-/// `into` is full.
+/// The request's echo is required, byte for byte, and discarded (F-050).
+/// The reply is the rest of the echo's burst, or the next burst when the
+/// echo came alone.
 pub async fn read<'a, P: Rs485>(
     port: &mut P,
-    read: &Read,
+    read: Read,
     timing: Timing,
     into: &'a mut [u8; RECEIVE_BYTES],
 ) -> Result<Registers<'a>, ModbusError<P::Error>> {
     let request = read.encode();
     port.send(&request).await.map_err(ModbusError::Port)?;
-    let mut heard = 0usize;
-    // Every successful receive adds at least one byte, so this runs at most
-    // once per byte of `into`.
-    while heard < RECEIVE_BYTES {
-        let reply_begun = heard > REQUEST_BYTES;
-        let within = if reply_begun {
-            timing.gap
-        } else {
-            timing.response
-        };
-        let Some(free) = into.get_mut(heard..) else {
-            break;
-        };
-        match port.receive(free, within).await {
-            Ok(0) | Err(PortFault::Timeout) => break,
-            Ok(n) => heard = heard.saturating_add(n.min(free.len())),
-            Err(PortFault::Line(error)) => return Err(ModbusError::Port(error)),
-        }
-        let Some(echo) = into.get(..heard.min(REQUEST_BYTES)) else {
-            break;
-        };
-        if request.get(..echo.len()) != Some(echo) {
-            return Err(ModbusError::Echo);
-        }
-        let reply = into.get(REQUEST_BYTES..heard).unwrap_or(&[]);
-        if expected(reply).is_some_and(|want| reply.len() >= want) {
-            break;
-        }
-    }
-    if heard < REQUEST_BYTES {
+    let heard = match burst(port, into, timing.response).await {
+        Ok(len) => len,
+        // Nothing heard at all: the frame never reached the bus.
+        Err(ModbusError::Timeout) => return Err(ModbusError::Echo),
+        Err(error) => return Err(error),
+    };
+    let echo = into.get(..heard.min(REQUEST_BYTES)).unwrap_or(&[]);
+    if heard < REQUEST_BYTES || echo != request.as_slice() {
         return Err(ModbusError::Echo);
     }
+    let heard = if heard == REQUEST_BYTES {
+        let rest = into.get_mut(REQUEST_BYTES..).unwrap_or(&mut []);
+        REQUEST_BYTES.saturating_add(burst(port, rest, timing.response).await?)
+    } else {
+        heard
+    };
     let reply = into.get(REQUEST_BYTES..heard).unwrap_or(&[]);
-    if reply.is_empty() {
-        return Err(ModbusError::Timeout);
-    }
     parse(read, reply).map_err(ModbusError::Reply)
+}
+
+/// One receive into `into`, refusing a burst the port cannot have received.
+async fn burst<P: Rs485>(
+    port: &mut P,
+    into: &mut [u8],
+    within: Millis,
+) -> Result<usize, ModbusError<P::Error>> {
+    let room = into.len();
+    match port.receive(into, within).await {
+        Ok(Burst { len, ended }) => {
+            let consistent = match ended {
+                Ended::Gap => len > 0 && len <= room,
+                Ended::Full => len > 0 && len == room,
+            };
+            if consistent {
+                Ok(len)
+            } else {
+                Err(ModbusError::Adapter)
+            }
+        }
+        Err(PortFault::Timeout) => Err(ModbusError::Timeout),
+        Err(PortFault::Line(error)) => Err(ModbusError::Port(error)),
+    }
 }
 
 #[cfg(test)]
@@ -425,12 +430,17 @@ pub(crate) mod tests {
     use embassy_futures::block_on;
 
     /// A port that plays back scripted bursts and records what was sent.
+    ///
+    /// Each script entry is one burst ending at the gap, or ending `Full`
+    /// when it fills the buffer, as an honest adapter reports; `lie`
+    /// replaces the next report with one no adapter should make.
     pub(crate) struct Scripted<'a> {
         pub bursts: &'a [&'a [u8]],
         pub next: usize,
         pub sent: [u8; REQUEST_BYTES],
         pub fault: Option<u8>,
-        pub waits: [Option<Millis>; 8],
+        pub lie: Option<Burst>,
+        pub waits: [Option<Millis>; 4],
     }
 
     impl<'a> Scripted<'a> {
@@ -440,7 +450,8 @@ pub(crate) mod tests {
                 next: 0,
                 sent: [0; REQUEST_BYTES],
                 fault: None,
-                waits: [None; 8],
+                lie: None,
+                waits: [None; 4],
             }
         }
     }
@@ -457,32 +468,39 @@ pub(crate) mod tests {
             &mut self,
             into: &mut [u8],
             within: Millis,
-        ) -> impl Future<Output = Result<usize, PortFault<u8>>> {
+        ) -> impl Future<Output = Result<Burst, PortFault<u8>>> {
             ready(self.burst(into, within))
         }
     }
 
     impl Scripted<'_> {
-        fn burst(&mut self, into: &mut [u8], within: Millis) -> Result<usize, PortFault<u8>> {
+        fn burst(&mut self, into: &mut [u8], within: Millis) -> Result<Burst, PortFault<u8>> {
             if let Some(slot) = self.waits.get_mut(self.next) {
                 *slot = Some(within);
             }
             if let Some(fault) = self.fault.take() {
                 return Err(PortFault::Line(fault));
             }
+            if let Some(lie) = self.lie.take() {
+                return Ok(lie);
+            }
             let Some(burst) = self.bursts.get(self.next) else {
                 return Err(PortFault::Timeout);
             };
             self.next = self.next.checked_add(1).unwrap();
-            let n = burst.len().min(into.len());
-            into[..n].copy_from_slice(&burst[..n]);
-            Ok(n)
+            let len = burst.len().min(into.len());
+            into[..len].copy_from_slice(&burst[..len]);
+            let ended = if len == into.len() {
+                Ended::Full
+            } else {
+                Ended::Gap
+            };
+            Ok(Burst { len, ended })
         }
     }
 
     pub(crate) const TIMING: Timing = Timing {
         response: Millis::from_millis(200),
-        gap: Millis::from_millis(5),
     };
 
     /// Frames in these tests are built by hand from the Modbus application
@@ -557,7 +575,7 @@ pub(crate) mod tests {
     #[test]
     fn a_well_formed_reply_parses_to_its_registers_by_address() {
         let frame = reply();
-        let registers = parse(&input(0x3100, 2), &frame).unwrap();
+        let registers = parse(input(0x3100, 2), &frame).unwrap();
         assert_eq!(registers.len(), 2);
         assert_eq!(registers.at(0x3100), Some(0x04D2));
         assert_eq!(registers.at(0x3101), Some(0x0010));
@@ -570,7 +588,7 @@ pub(crate) mod tests {
         let frame = reply();
         for len in 0..frame.len() {
             assert_eq!(
-                parse(&input(0x3100, 2), &frame[..len]),
+                parse(input(0x3100, 2), &frame[..len]),
                 Err(ReplyError::Short),
                 "{len} bytes"
             );
@@ -581,7 +599,7 @@ pub(crate) mod tests {
     fn f_050_an_overlong_reply_is_refused() {
         let mut frame = [0u8; 10];
         frame[..9].copy_from_slice(&reply());
-        assert_eq!(parse(&input(0x3100, 2), &frame), Err(ReplyError::Overlong));
+        assert_eq!(parse(input(0x3100, 2), &frame), Err(ReplyError::Overlong));
     }
 
     #[test]
@@ -591,7 +609,7 @@ pub(crate) mod tests {
         for (byte, bit) in flips {
             let mut frame = good;
             frame[byte] ^= 1u8.rotate_left(bit);
-            let result = parse(&input(0x3100, 2), &frame);
+            let result = parse(input(0x3100, 2), &frame);
             // A flip in the byte count changes the length the header claims,
             // which is refused as a length before the CRC is reached.
             assert!(
@@ -608,7 +626,7 @@ pub(crate) mod tests {
     fn f_050_a_reply_from_another_server_is_refused() {
         let frame: [u8; 9] = with_crc(&[0x02, 0x04, 0x04, 0x04, 0xD2, 0x00, 0x10]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::WrongAddress(2))
         );
     }
@@ -617,13 +635,13 @@ pub(crate) mod tests {
     fn a_reply_with_another_function_or_byte_count_is_refused() {
         let frame: [u8; 9] = with_crc(&[0x01, 0x03, 0x04, 0x04, 0xD2, 0x00, 0x10]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::WrongFunction(0x03))
         );
         // A consistent frame carrying one register where two were asked.
         let frame: [u8; 7] = with_crc(&[0x01, 0x04, 0x02, 0x04, 0xD2]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::ByteCount(2))
         );
     }
@@ -632,21 +650,37 @@ pub(crate) mod tests {
     fn f_050_an_exception_reply_is_its_own_error_carrying_its_code() {
         let frame: [u8; 5] = with_crc(&[0x01, 0x84, 0x02]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::Exception(Exception::IllegalDataAddress))
         );
         let frame: [u8; 5] = with_crc(&[0x01, 0x84, 0x7F]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::Exception(Exception::Unallocated(0x7F)))
         );
         // An exception to a function that was not asked is the wrong
         // function, not an answer.
         let frame: [u8; 5] = with_crc(&[0x01, 0x83, 0x02]);
         assert_eq!(
-            parse(&input(0x3100, 2), &frame),
+            parse(input(0x3100, 2), &frame),
             Err(ReplyError::WrongFunction(0x83))
         );
+    }
+
+    fn run(port: &mut Scripted<'_>, read: Read) -> Result<[Option<u16>; 2], ModbusError<u8>> {
+        let mut buf = [0; RECEIVE_BYTES];
+        let registers = block_on(super::read(port, read, TIMING, &mut buf))?;
+        Ok([
+            registers.at(read.start()),
+            registers.at(read.start().checked_add(1).unwrap()),
+        ])
+    }
+
+    fn echo_then(reply: &[u8]) -> ([u8; RECEIVE_BYTES], usize) {
+        let mut joined = [0u8; RECEIVE_BYTES];
+        joined[..REQUEST_BYTES].copy_from_slice(&input(0x3100, 2).encode());
+        joined[REQUEST_BYTES..][..reply.len()].copy_from_slice(reply);
+        (joined, REQUEST_BYTES.checked_add(reply.len()).unwrap())
     }
 
     #[test]
@@ -657,47 +691,52 @@ pub(crate) mod tests {
 
         let bursts: [&[u8]; 2] = [&echo, &reply];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        let registers = block_on(super::read(&mut port, &read, TIMING, &mut buf)).unwrap();
-        assert_eq!(registers.at(0x3100), Some(0x04D2));
+        assert_eq!(run(&mut port, read), Ok([Some(0x04D2), Some(0x0010)]));
         assert_eq!(port.sent, echo);
+        // Two receives, each given the response deadline.
+        assert_eq!(
+            port.waits,
+            [Some(TIMING.response), Some(TIMING.response), None, None]
+        );
 
-        let mut joined = [0u8; 17];
-        joined[..8].copy_from_slice(&echo);
-        joined[8..].copy_from_slice(&reply);
-        let bursts: [&[u8]; 1] = [&joined];
+        let (joined, len) = echo_then(&reply);
+        let bursts: [&[u8]; 1] = [&joined[..len]];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        let registers = block_on(super::read(&mut port, &read, TIMING, &mut buf)).unwrap();
-        assert_eq!(registers.at(0x3101), Some(0x0010));
+        assert_eq!(run(&mut port, read), Ok([Some(0x04D2), Some(0x0010)]));
+        assert_eq!(port.waits, [Some(TIMING.response), None, None, None]);
+    }
 
-        // The reply split across bursts after the echo.
+    #[test]
+    fn f_050_a_reply_cut_by_a_gap_is_short_and_never_joined_to_the_next_burst() {
+        let read = input(0x3100, 2);
+        let echo = read.encode();
+        let reply = reply();
+        // The two halves together carry a valid CRC; the gap between them
+        // ended the frame, so they are two frames and the first is short.
         let bursts: [&[u8]; 3] = [&echo, &reply[..4], &reply[4..]];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        let registers = block_on(super::read(&mut port, &read, TIMING, &mut buf)).unwrap();
-        assert_eq!(registers.at(0x3100), Some(0x04D2));
-        // The first two waits are for the echo and the reply to begin; the
-        // third is inside the reply.
         assert_eq!(
-            port.waits[..3],
-            [
-                Some(TIMING.response),
-                Some(TIMING.response),
-                Some(TIMING.gap)
-            ]
+            run(&mut port, read),
+            Err(ModbusError::Reply(ReplyError::Short))
+        );
+        assert_eq!(port.next, 2, "the burst after the gap was never read");
+
+        let (joined, len) = echo_then(&reply[..4]);
+        let bursts: [&[u8]; 2] = [&joined[..len], &reply[4..]];
+        let mut port = Scripted::new(&bursts);
+        assert_eq!(
+            run(&mut port, read),
+            Err(ModbusError::Reply(ReplyError::Short))
         );
     }
 
     #[test]
-    fn f_050_a_reply_parsed_without_its_echo_discarded_would_be_refused() {
-        // The guard the discard exists for: the echo read as the reply is a
-        // request frame, which fails as a reply.
+    fn f_050_a_port_that_does_not_echo_is_refused_rather_than_read_as_the_reply() {
         let read = input(0x3100, 2);
-        let mut joined = [0u8; 17];
-        joined[..8].copy_from_slice(&read.encode());
-        joined[8..].copy_from_slice(&reply());
-        assert!(parse(&read, &joined).is_err());
+        let reply = reply();
+        let bursts: [&[u8]; 1] = [&reply];
+        let mut port = Scripted::new(&bursts);
+        assert_eq!(run(&mut port, read), Err(ModbusError::Echo));
     }
 
     #[test]
@@ -707,30 +746,18 @@ pub(crate) mod tests {
 
         // Nothing heard at all: the frame never reached the bus.
         let mut port = Scripted::new(&[]);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Echo)
-        );
+        assert_eq!(run(&mut port, read), Err(ModbusError::Echo));
 
         let bursts: [&[u8]; 1] = [&echo[..5]];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Echo)
-        );
+        assert_eq!(run(&mut port, read), Err(ModbusError::Echo));
 
         let mut garbled = echo;
         garbled[3] ^= 0x10;
         let reply = reply();
         let bursts: [&[u8]; 2] = [&garbled, &reply];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Echo)
-        );
+        assert_eq!(run(&mut port, read), Err(ModbusError::Echo));
     }
 
     #[test]
@@ -739,34 +766,44 @@ pub(crate) mod tests {
         let echo = read.encode();
         let bursts: [&[u8]; 1] = [&echo];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Timeout)
-        );
+        assert_eq!(run(&mut port, read), Err(ModbusError::Timeout));
     }
 
     #[test]
-    fn a_reply_that_stops_partway_is_short_and_a_line_fault_is_the_port_s() {
+    fn a_line_fault_is_the_port_s_error() {
         let read = input(0x3100, 2);
         let echo = read.encode();
-        let reply = reply();
-        let bursts: [&[u8]; 2] = [&echo, &reply[..6]];
-        let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Reply(ReplyError::Short))
-        );
-
         let bursts: [&[u8]; 1] = [&echo];
         let mut port = Scripted::new(&bursts);
         port.fault = Some(7);
-        let mut buf = [0; RECEIVE_BYTES];
-        assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
-            Err(ModbusError::Port(7))
-        );
+        assert_eq!(run(&mut port, read), Err(ModbusError::Port(7)));
+    }
+
+    #[test]
+    fn a_burst_no_adapter_can_have_received_is_refused_rather_than_clamped() {
+        let read = input(0x3100, 2);
+        for lie in [
+            Burst {
+                len: 0,
+                ended: Ended::Gap,
+            },
+            Burst {
+                len: RECEIVE_BYTES + 1,
+                ended: Ended::Gap,
+            },
+            Burst {
+                len: RECEIVE_BYTES + 1,
+                ended: Ended::Full,
+            },
+            Burst {
+                len: REQUEST_BYTES,
+                ended: Ended::Full,
+            },
+        ] {
+            let mut port = Scripted::new(&[]);
+            port.lie = Some(lie);
+            assert_eq!(run(&mut port, read), Err(ModbusError::Adapter), "{lie:?}");
+        }
     }
 
     #[test]
@@ -777,15 +814,30 @@ pub(crate) mod tests {
         long[..9].copy_from_slice(&reply());
         let bursts: [&[u8]; 2] = [&echo, &long];
         let mut port = Scripted::new(&bursts);
-        let mut buf = [0; RECEIVE_BYTES];
         assert_eq!(
-            block_on(super::read(&mut port, &read, TIMING, &mut buf)),
+            run(&mut port, read),
             Err(ModbusError::Reply(ReplyError::Overlong))
         );
     }
 
     #[test]
-    fn a_largest_read_fills_its_buffer_exactly() {
+    fn a_reply_that_fills_the_buffer_ends_the_read_and_is_judged_as_it_stands() {
+        let read = input(0x3100, 2);
+        let echo = read.encode();
+        // A babbling line: the buffer fills, the port says so, and what was
+        // heard is refused rather than waited on.
+        let babble = [0x01u8; FRAME_BYTES + 1];
+        let bursts: [&[u8]; 2] = [&echo, &babble];
+        let mut port = Scripted::new(&bursts);
+        assert_eq!(
+            run(&mut port, read),
+            Err(ModbusError::Reply(ReplyError::Overlong))
+        );
+        assert_eq!(port.next, 2);
+    }
+
+    #[test]
+    fn a_largest_read_decodes_all_its_registers() {
         let read = input(0, MAX_REGISTERS);
         let echo = read.encode();
         let mut body = [0u8; 253];
@@ -795,8 +847,10 @@ pub(crate) mod tests {
         let bursts: [&[u8]; 2] = [&echo, &reply];
         let mut port = Scripted::new(&bursts);
         let mut buf = [0; RECEIVE_BYTES];
-        let registers = block_on(super::read(&mut port, &read, TIMING, &mut buf)).unwrap();
+        let registers = block_on(super::read(&mut port, read, TIMING, &mut buf)).unwrap();
         assert_eq!(registers.len(), 125);
+        assert_eq!(registers.at(0), Some(u16::from_be_bytes([0, 1])));
         assert_eq!(registers.at(124), Some(u16::from_be_bytes([248, 249])));
+        assert_eq!(registers.at(125), None);
     }
 }

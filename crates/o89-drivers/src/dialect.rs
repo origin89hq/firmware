@@ -7,7 +7,7 @@
 //! covers a run of cells, and it is the only way a cell reaches a decode:
 //! [`Block::try_new`] refuses a cell whose unit is not its kind's, whose
 //! decade cannot be brought to the kind's scale, or whose provenance its
-//! kind cannot carry, and [`Block::checked`] makes the same refusal a build
+//! kind cannot carry, and [`block!`](crate::block) makes the same refusal a build
 //! error for a table declared `const`.
 //!
 //! [`REGISTER_MAPS`] is the table of every register map this build decodes,
@@ -15,6 +15,126 @@
 //! firmware supports (#6).
 //!
 //! cites: F-052, P-185
+
+/// A checked [`dialect::Block`](crate::dialect::Block), evaluated at
+/// compile time wherever it is written, so a refused declaration is a build
+/// error and never a panic on the part. Code that builds a block at runtime
+/// calls `Block::try_new` and handles its error.
+///
+/// ```compile_fail
+/// use km43::{Provenance, SignalDomain, Unit};
+/// use o89_drivers::block;
+/// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
+/// use o89_drivers::modbus::Function;
+///
+/// // A state of charge is never measured.
+/// const SOC: Block = block!(Function::ReadInput, 0x311A, 1, &[Cell {
+///     register: 0x311A,
+///     kind: Kind::StateOfCharge,
+///     domain: SignalDomain::Live,
+///     span: Span::One,
+///     sign: Sign::Unsigned,
+///     unit: Unit::Percent,
+///     decade: 0,
+///     absent: None,
+///     plausible: None,
+///     provenance: Provenance::Measured,
+/// }]);
+/// ```
+///
+/// ```compile_fail
+/// use km43::{Provenance, SignalDomain, Unit};
+/// use o89_drivers::block;
+/// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
+/// use o89_drivers::modbus::Function;
+///
+/// // A voltage in amperes.
+/// const VOLTS: Block = block!(Function::ReadInput, 0x3104, 1, &[Cell {
+///     register: 0x3104,
+///     kind: Kind::DcVoltage,
+///     domain: SignalDomain::Live,
+///     span: Span::One,
+///     sign: Sign::Unsigned,
+///     unit: Unit::Ampere,
+///     decade: -2,
+///     absent: None,
+///     plausible: None,
+///     provenance: Provenance::Measured,
+/// }]);
+/// ```
+///
+/// Written in a function body, it is still evaluated by the compiler:
+///
+/// ```compile_fail
+/// use km43::{Provenance, SignalDomain, Unit};
+/// use o89_drivers::block;
+/// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
+/// use o89_drivers::modbus::Function;
+///
+/// fn at_runtime() -> Block {
+///     block!(Function::ReadInput, 0x311A, 1, &[Cell {
+///         register: 0x311A,
+///         kind: Kind::StateOfCharge,
+///         domain: SignalDomain::Live,
+///         span: Span::One,
+///         sign: Sign::Unsigned,
+///         unit: Unit::Percent,
+///         decade: 0,
+///         absent: None,
+///         plausible: None,
+///         provenance: Provenance::Measured,
+///     }])
+/// }
+/// ```
+///
+/// The same declarations, corrected, build:
+///
+/// ```
+/// use km43::{Provenance, SignalDomain, Unit};
+/// use o89_drivers::block;
+/// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
+/// use o89_drivers::modbus::Function;
+///
+/// const SOC: Block = block!(Function::ReadInput, 0x311A, 1, &[Cell {
+///     register: 0x311A,
+///     kind: Kind::StateOfCharge,
+///     domain: SignalDomain::Live,
+///     span: Span::One,
+///     sign: Sign::Unsigned,
+///     unit: Unit::Percent,
+///     decade: 0,
+///     absent: None,
+///     plausible: None,
+///     provenance: Provenance::Estimated,
+/// }]);
+/// fn at_runtime() -> Block {
+///     block!(Function::ReadInput, 0x3104, 1, &[Cell {
+///         register: 0x3104,
+///         kind: Kind::DcVoltage,
+///         domain: SignalDomain::Live,
+///         span: Span::One,
+///         sign: Sign::Unsigned,
+///         unit: Unit::Volt,
+///         decade: -2,
+///         absent: None,
+///         plausible: None,
+///         provenance: Provenance::Measured,
+///     }])
+/// }
+/// assert_eq!(SOC.cells().len(), 1);
+/// assert_eq!(at_runtime().cells().len(), 1);
+/// ```
+#[macro_export]
+macro_rules! block {
+    ($function:expr, $start:expr, $count:expr, $cells:expr $(,)?) => {
+        const {
+            match $crate::dialect::Block::try_new($function, $start, $count, $cells) {
+                ::core::result::Result::Ok(block) => block,
+                ::core::result::Result::Err(error) => ::core::panic!("{}", error.why()),
+            }
+        }
+    };
+}
 
 use km43::{Dialect, MetricKind, Provenance, QualityError, SignalDomain, Unit, Validity};
 use o89_core::{Observation, ProvenanceSet};
@@ -100,6 +220,27 @@ impl Kind {
             | Self::TankLevel => -1,
             Self::AcFrequency => -2,
             Self::AcEnergy => 0,
+        }
+    }
+
+    /// The range the kind's meaning allows at its registry scale, whatever
+    /// the device: a percentage is 0 to 100 %. `None` where the bound
+    /// depends on the device, such as a current or a temperature; a cell
+    /// narrows those from its vendor's documentation with
+    /// [`Cell::plausible`].
+    #[must_use]
+    pub const fn intrinsic(self) -> Option<Plausible> {
+        match self {
+            Self::StateOfCharge | Self::TankLevel => Some(Plausible { low: 0, high: 1000 }),
+            Self::DcVoltage
+            | Self::DcCurrent
+            | Self::DcPower
+            | Self::AcVoltage
+            | Self::AcCurrent
+            | Self::AcPower
+            | Self::AcFrequency
+            | Self::AcEnergy
+            | Self::Temperature => None,
         }
     }
 
@@ -193,6 +334,24 @@ pub enum Sign {
     Signed,
 }
 
+/// An inclusive range of wire integers at a kind's registry scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Plausible {
+    /// The lowest value that can be true.
+    pub low: i32,
+    /// The highest value that can be true.
+    pub high: i32,
+}
+
+impl Plausible {
+    /// Whether `value` is inside.
+    #[must_use]
+    pub const fn holds(self, value: i32) -> bool {
+        self.low <= value && value <= self.high
+    }
+}
+
 /// One value in a register map.
 ///
 /// Built as a plain `const` and admitted only through [`Block`], which is
@@ -218,6 +377,10 @@ pub struct Cell {
     /// The raw pattern the vendor sends for *not available*, if it has one.
     /// It publishes `unsupported` and no value.
     pub absent: Option<u32>,
+    /// The range the vendor documents for this value, at the kind's scale,
+    /// inside the kind's own [`Kind::intrinsic`] range where it has one. A
+    /// decoded value outside either publishes `out_of_range` and no value.
+    pub plausible: Option<Plausible>,
     /// The provenance the vendor can justify for this value. There is no
     /// default: a cell says where its number comes from.
     pub provenance: Provenance,
@@ -241,6 +404,8 @@ pub enum CellError {
     AbsentPattern,
     /// The cell's registers are not all inside the block's read.
     OutsideBlock,
+    /// The plausible range is empty, or reaches outside the kind's own.
+    Plausible,
 }
 
 impl CellError {
@@ -253,6 +418,7 @@ impl CellError {
             Self::Provenance => "a cell declares a provenance its kind cannot carry",
             Self::AbsentPattern => "a cell's absent pattern does not fit its span",
             Self::OutsideBlock => "a cell's registers are outside its block's read",
+            Self::Plausible => "a cell's plausible range is empty or outside its kind's",
         }
     }
 }
@@ -331,89 +497,6 @@ impl Block {
         })
     }
 
-    /// [`Block::try_new`] for a table declared `const`, where a refused
-    /// declaration is a build error:
-    ///
-    /// ```compile_fail
-    /// use km43::{Provenance, SignalDomain, Unit};
-    /// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
-    /// use o89_drivers::modbus::Function;
-    ///
-    /// // A state of charge is never measured.
-    /// const SOC: Block = Block::checked(Function::ReadInput, 0x311A, 1, &[Cell {
-    ///     register: 0x311A,
-    ///     kind: Kind::StateOfCharge,
-    ///     domain: SignalDomain::Live,
-    ///     span: Span::One,
-    ///     sign: Sign::Unsigned,
-    ///     unit: Unit::Percent,
-    ///     decade: 0,
-    ///     absent: None,
-    ///     provenance: Provenance::Measured,
-    /// }]);
-    /// ```
-    ///
-    /// ```compile_fail
-    /// use km43::{Provenance, SignalDomain, Unit};
-    /// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
-    /// use o89_drivers::modbus::Function;
-    ///
-    /// // A voltage in amperes.
-    /// const VOLTS: Block = Block::checked(Function::ReadInput, 0x3104, 1, &[Cell {
-    ///     register: 0x3104,
-    ///     kind: Kind::DcVoltage,
-    ///     domain: SignalDomain::Live,
-    ///     span: Span::One,
-    ///     sign: Sign::Unsigned,
-    ///     unit: Unit::Ampere,
-    ///     decade: -2,
-    ///     absent: None,
-    ///     provenance: Provenance::Measured,
-    /// }]);
-    /// ```
-    ///
-    /// The same declarations, corrected, build:
-    ///
-    /// ```
-    /// use km43::{Provenance, SignalDomain, Unit};
-    /// use o89_drivers::dialect::{Block, Cell, Kind, Sign, Span};
-    /// use o89_drivers::modbus::Function;
-    ///
-    /// const SOC: Block = Block::checked(Function::ReadInput, 0x311A, 1, &[Cell {
-    ///     register: 0x311A,
-    ///     kind: Kind::StateOfCharge,
-    ///     domain: SignalDomain::Live,
-    ///     span: Span::One,
-    ///     sign: Sign::Unsigned,
-    ///     unit: Unit::Percent,
-    ///     decade: 0,
-    ///     absent: None,
-    ///     provenance: Provenance::Estimated,
-    /// }]);
-    /// assert_eq!(SOC.cells().len(), 1);
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// On a refused declaration, which a `const` table turns into a build
-    /// error rather than a panic at runtime.
-    #[must_use]
-    #[expect(
-        clippy::panic,
-        reason = "evaluated in a const, where a refused declaration fails the build"
-    )]
-    pub const fn checked(
-        function: Function,
-        start: u16,
-        count: u16,
-        cells: &'static [Cell],
-    ) -> Self {
-        match Self::try_new(function, start, count, cells) {
-            Ok(block) => block,
-            Err(error) => panic!("{}", error.why()),
-        }
-    }
-
     /// The cells, in declaration order.
     #[must_use]
     pub const fn cells(&self) -> &'static [Cell] {
@@ -446,6 +529,19 @@ impl Block {
     }
 
     /// Each cell's observation from `registers`, in declaration order.
+    ///
+    /// The only way to decode a cell: the decoder behind it is private, so a
+    /// cell nobody checked cannot reach it.
+    ///
+    /// ```compile_fail
+    /// use o89_drivers::dialect::decode;
+    /// ```
+    ///
+    /// ```
+    /// use o89_drivers::dialect::Block;
+    ///
+    /// let _ = Block::decode;
+    /// ```
     pub fn decode<'a>(
         &self,
         registers: &'a Registers<'a>,
@@ -464,6 +560,16 @@ const fn check(cell: &Cell, first: u16, last: u16) -> Result<(), CellError> {
     }
     if !cell.kind.accepts(cell.domain).contains(cell.provenance) {
         return Err(CellError::Provenance);
+    }
+    if let Some(range) = cell.plausible {
+        if range.low > range.high {
+            return Err(CellError::Plausible);
+        }
+        if let Some(own) = cell.kind.intrinsic()
+            && (range.low < own.low || range.high > own.high)
+        {
+            return Err(CellError::Plausible);
+        }
     }
     if let Some(pattern) = cell.absent
         && pattern > cell.span.max()
@@ -521,9 +627,10 @@ pub enum DecodeError {
 /// through the [`Block`] that checked it.
 ///
 /// The vendor's absent pattern publishes `unsupported`; a value
-/// that does not fit an `i32` at the kind's scale publishes `out_of_range`
-/// rather than a clamped number (P-185); anything else publishes with the
-/// cell's declared provenance and nothing else.
+/// that does not fit an `i32` at the kind's scale, or falls outside the
+/// kind's intrinsic range or the cell's plausible one, publishes
+/// `out_of_range` rather than a clamped number (P-185); anything else
+/// publishes with the cell's declared provenance and nothing else.
 fn decode(cell: &Cell, registers: &Registers<'_>) -> Result<Observation, DecodeError> {
     let word = |at: u16| {
         let register = cell
@@ -562,6 +669,13 @@ fn decode(cell: &Cell, registers: &Registers<'_>) -> Result<Observation, DecodeE
     let Ok(value) = i32::try_from(scaled) else {
         return Observation::missing(Validity::OutOfRange).map_err(DecodeError::Quality);
     };
+    let implausible = [cell.kind.intrinsic(), cell.plausible]
+        .into_iter()
+        .flatten()
+        .any(|range| !range.holds(value));
+    if implausible {
+        return Observation::missing(Validity::OutOfRange).map_err(DecodeError::Quality);
+    }
     Observation::value(value, cell.provenance).map_err(DecodeError::Quality)
 }
 
@@ -655,6 +769,7 @@ pub(crate) mod tests {
             unit: kind.unit(),
             decade,
             absent: None,
+            plausible: None,
             provenance,
         }
     }
@@ -662,7 +777,7 @@ pub(crate) mod tests {
     fn one(block: &Block, words: &[u16]) -> Observation {
         let read = block.read(Address::new(1).unwrap());
         let (frame, len) = reply(1, block.function().code(), words);
-        let registers = parse(&read, &frame[..len]).unwrap();
+        let registers = parse(read, &frame[..len]).unwrap();
         block.decode(&registers).next().unwrap().unwrap()
     }
 
@@ -824,6 +939,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_plausible_range_that_is_empty_or_outside_its_kind_s_fails_checked_construction() {
+        const SOC: Cell = cell(
+            0,
+            Kind::StateOfCharge,
+            SignalDomain::Live,
+            -1,
+            Provenance::Counted,
+        );
+        static EMPTY: [Cell; 1] = [Cell {
+            plausible: Some(Plausible { low: 10, high: 9 }),
+            ..VOLTS
+        }];
+        static BELOW: [Cell; 1] = [Cell {
+            plausible: Some(Plausible {
+                low: -1,
+                high: 1000,
+            }),
+            ..SOC
+        }];
+        static ABOVE: [Cell; 1] = [Cell {
+            plausible: Some(Plausible { low: 0, high: 1001 }),
+            ..SOC
+        }];
+        static INSIDE: [Cell; 2] = [
+            Cell {
+                plausible: Some(Plausible { low: 0, high: 1000 }),
+                ..SOC
+            },
+            Cell {
+                register: 1,
+                plausible: Some(Plausible { low: 7, high: 7 }),
+                ..VOLTS
+            },
+        ];
+        for cells in [&EMPTY, &BELOW, &ABOVE] {
+            assert_eq!(
+                Block::try_new(Function::ReadInput, 0, 1, cells),
+                Err(BlockError::Cell {
+                    index: 0,
+                    error: CellError::Plausible
+                })
+            );
+        }
+        assert!(Block::try_new(Function::ReadInput, 0, 2, &INSIDE).is_ok());
+    }
+
+    #[test]
+    fn a_value_outside_the_vendor_s_documented_range_is_out_of_range_and_the_edges_are_not() {
+        // A probe the vendor documents from −40.0 to 125.0 °C, built by hand.
+        static CELLS: [Cell; 1] = [Cell {
+            sign: Sign::Signed,
+            plausible: Some(Plausible {
+                low: -400,
+                high: 1250,
+            }),
+            ..cell(
+                0,
+                Kind::Temperature,
+                SignalDomain::Live,
+                -1,
+                Provenance::Measured,
+            )
+        }];
+        const BLOCK: Block = crate::block!(Function::ReadInput, 0, 1, &CELLS);
+        for (raw, expected) in [
+            (1250u16, Some(1250)),
+            ((-400i16).cast_unsigned(), Some(-400)),
+            (1251, None),
+            ((-401i16).cast_unsigned(), None),
+        ] {
+            let seen = one(&BLOCK, &[raw]);
+            assert_eq!(seen.reading(), expected, "{raw:#06x}");
+            if expected.is_none() {
+                assert_eq!(seen.quality().validity_of(), Validity::OutOfRange);
+            }
+        }
+    }
+
+    #[test]
     fn a_block_with_no_cells_or_an_impossible_read_is_refused() {
         static ONE: [Cell; 1] = [cell(
             0,
@@ -875,14 +1069,14 @@ pub(crate) mod tests {
             Provenance::Reported,
         ),
     ];
-    const FIXTURE: Block = Block::checked(Function::ReadInput, 0x10, 3, &FIXTURE_CELLS);
+    const FIXTURE: Block = crate::block!(Function::ReadInput, 0x10, 3, &FIXTURE_CELLS);
 
     #[test]
     fn f_052_decoding_writes_each_cell_s_declared_provenance_and_counted_only_refuses_the_estimate()
     {
         let read = FIXTURE.read(Address::new(1).unwrap());
         let (frame, len) = reply(1, 0x04, &[1325, 64, 5000]);
-        let registers = parse(&read, &frame[..len]).unwrap();
+        let registers = parse(read, &frame[..len]).unwrap();
 
         let mut store = Signals::<3>::new();
         let limits = Limits::new(Millis::from_millis(60_000), None).unwrap();
@@ -929,7 +1123,7 @@ pub(crate) mod tests {
                 Provenance::Measured,
             )
         }];
-        const BLOCK: Block = Block::checked(Function::ReadInput, 0, 1, &CELLS);
+        const BLOCK: Block = crate::block!(Function::ReadInput, 0, 1, &CELLS);
         let seen = one(&BLOCK, &[0xFFFF]);
         assert_eq!(seen.reading(), None);
         assert_eq!(seen.quality().validity_of(), Validity::Unsupported);
@@ -972,14 +1166,14 @@ pub(crate) mod tests {
                 )
             },
         ];
-        const BLOCK: Block = Block::checked(Function::ReadHolding, 0, 5, &CELLS);
+        const BLOCK: Block = crate::block!(Function::ReadHolding, 0, 5, &CELLS);
         let read = BLOCK.read(Address::new(1).unwrap());
         // −1.50 A; −70000 × 0.1 W, low word first; 0x0001_86A0 Wh.
         let power = (-70_000i32).to_le_bytes();
         let low = u16::from_le_bytes([power[0], power[1]]);
         let high = u16::from_le_bytes([power[2], power[3]]);
         let (frame, len) = reply(1, 0x03, &[0xFF6A, low, high, 0x0001, 0x86A0]);
-        let registers = parse(&read, &frame[..len]).unwrap();
+        let registers = parse(read, &frame[..len]).unwrap();
         let mut values = BLOCK.decode(&registers).map(|seen| seen.unwrap().reading());
         assert_eq!(values.next(), Some(Some(-1_500)));
         assert_eq!(values.next(), Some(Some(-70_000)));
@@ -999,7 +1193,7 @@ pub(crate) mod tests {
                 Provenance::Measured,
             )
         }];
-        const BLOCK: Block = Block::checked(Function::ReadInput, 0, 2, &CELLS);
+        const BLOCK: Block = crate::block!(Function::ReadInput, 0, 2, &CELLS);
         // 2 147 484 V is 2 147 484 000 at −3: one step past i32::MAX.
         let seen = one(&BLOCK, &[0xC49C, 0x0020]);
         assert_eq!(seen.reading(), None);
@@ -1031,7 +1225,7 @@ pub(crate) mod tests {
         )];
         let other = Read::new(Address::new(1).unwrap(), Function::ReadInput, 0, 1).unwrap();
         let (frame, len) = reply(1, 0x04, &[1]);
-        let registers = parse(&other, &frame[..len]).unwrap();
+        let registers = parse(other, &frame[..len]).unwrap();
         assert_eq!(decode(&CELLS[0], &registers), Err(DecodeError::Missing(5)));
     }
 
