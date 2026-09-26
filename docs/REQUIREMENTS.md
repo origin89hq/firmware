@@ -23,6 +23,7 @@ The reasoning behind a rule is in [`ARCHITECTURE.md`](ARCHITECTURE.md) or the
 issue it cites; this file is the list.
 
 [plan]: https://github.com/origin89hq/firmware/issues/3
+[i185]: https://github.com/origin89hq/firmware/issues/185
 [k31]: https://github.com/origin89hq/km43/issues/31
 
 ## The safety floor
@@ -346,18 +347,22 @@ knowing. Source: the GenStart manual's choke-actuator range,
 
 ## The bootloader and release
 
-**F-070** — At no instant are there zero bootable images: the selected bank
-is never erased, and the bank flip is the last step after the whole inactive
-bank has been written and verified. Source: [#3][plan] §9 item 2. M7.
+**F-070** — At no instant are there zero bootable images: the bootloader is
+never erased after manufacture and `nSWAP_BANK` stays 1, the application
+region is erased only once a verified image is staged on the NOR, a copy cut
+at any step resumes from that image on the next boot, and a copy is marked
+done only once the programmed region hashes to the manifest's digest. Source:
+[#3][plan] §9 item 2, [#185][i185]. M7.
 
-**F-071** — The bootloader is written at manufacture into both banks and
-never by an update: the updater refuses a manifest that covers the first 8 KB
-of a bank, and the bootloader checks its twin at boot. Source: [#3][plan] §9
-item 2. M7.
+**F-071** — The bootloader is written at manufacture and never by an update:
+the updater refuses a manifest that covers the first 32 KB. Source: [#3][plan]
+§9 item 2, [#185][i185]. M7.
 
-**F-072** — Trial boots of a new image are counted, and the flip back to the
-previous bank is performed by the bootloader, not the application. Source:
-[#3][plan] §4.2. M7.
+**F-072** — Trial boots of a new image are counted, and the rollback, a copy
+of the previous image back from the NOR, is performed by the bootloader, not
+the application. The image a unit is installed with is on the NOR too, so the
+first update has one to roll back to. Source: [#3][plan] §4.2,
+[#185][i185]. M7.
 
 **F-073** — The ESP32-C6's eFuse anti-rollback counter is left untouched;
 no-downgrade for the comms image is enforced at the controller's

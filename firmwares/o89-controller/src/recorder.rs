@@ -29,12 +29,12 @@ use km43::{
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
     LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
-    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, time_expired,
+    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map, time_expired,
 };
 
 use crate::fram::Lease;
 use crate::mailbox;
-use crate::nor::{JEDEC, Nor, SECTOR};
+use crate::nor::{CAPACITY, JEDEC, Nor, SECTOR};
 use crate::rtc::CalendarClock;
 use crate::selector;
 use crate::supervisor::check_in;
@@ -130,10 +130,11 @@ pub fn cancel_offers() {
     while TIME_ANSWER.try_receive().is_ok() {}
 }
 
-/// The ring's span: 14.5 MiB of the 16, in sectors. The rest is for the
-/// aggregates and, later, the last authorised comms image.
-pub const RING_BLOCKS: u32 = 3712;
-const _: () = assert!((RING_BLOCKS as usize) * SECTOR <= 16 * 1024 * 1024);
+// The core's map of the part describes this part.
+const _: () = {
+    assert!(nor_map::SECTOR_BYTES as usize == SECTOR);
+    assert!(nor_map::PART_BYTES as usize == CAPACITY);
+};
 
 /// How often the task looks at the mailbox and checks in; its window on
 /// the roll is thirty seconds.
@@ -683,7 +684,7 @@ async fn open_ring(mut nor: Nor, scratch: &mut [u8]) -> Option<Ring<Nor>> {
     match jedec {
         Ok(JEDEC) => {
             defmt::info!("recorder: opening the ring");
-            let opened = Ring::open(nor, 0, RING_BLOCKS, scratch).await;
+            let opened = Ring::open(nor, 0, nor_map::RING_BLOCKS, scratch).await;
             match opened {
                 Ok(ring) => {
                     defmt::info!(

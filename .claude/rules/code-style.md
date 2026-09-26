@@ -28,10 +28,10 @@ turn the first five into build failures outside `#[cfg(test)]`.
    a type handed out once, not a convention.
 9. **`unsafe` is denied at every crate root** and opened per item with
    `#[expect(unsafe_code, reason = "...")]` and a `// SAFETY:` line, or on
-   the module when the item is a handler an attribute macro rewrites. Five
-   places need it: the bootloader's option-byte write and its jump into the
-   application, the controller's hard-fault handler, and the polls of the
-   supervisor's and the control executor from their interrupts. The
+   the module when the item is a handler an attribute macro rewrites. Four
+   places need it: the bootloader's jump into the application, the
+   controller's hard-fault handler, and the polls of the supervisor's and
+   the control executor from their interrupts. The
    download window's register write is a field the register crate makes
    safe, and the comms processor holds no `unsafe` at all. Never `#[allow]`.
 10. **Type-state where a rule must hold in an order**: a sealed body that

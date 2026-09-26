@@ -192,7 +192,7 @@ fn boot_line(boot: &Boot) -> String {
             format!("panic at file {:#010x} line {}", site.file, site.line)
         }
         BootCause::PinReset => "pin reset".to_owned(),
-        BootCause::OptionByteReload => "option-byte reload (bank swap)".to_owned(),
+        BootCause::OptionByteReload => "option-byte reload".to_owned(),
         BootCause::WindowWatchdog => "window watchdog".to_owned(),
         BootCause::LowPowerEntry => "low-power entry".to_owned(),
     };

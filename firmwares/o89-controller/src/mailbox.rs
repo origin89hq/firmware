@@ -25,7 +25,9 @@ use km43::DownloadReason;
 use o89_core::mailbox::{
     DATA_BYTES, DownloadEntry, DropAnswer, MAGIC, Op, RING_BYTES, Ring, RingPage, Status, VERSION,
 };
-use o89_core::{Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, RingError, Wants};
+use o89_core::{
+    Address, FRAM_BYTES, Fram as FramSeam, Refused, Ring as NorRing, RingError, Wants, nor_map,
+};
 use portable_atomic::{AtomicU8, AtomicU32};
 
 use crate::fram::Lease;
@@ -419,8 +421,12 @@ async fn read_nor(ring: &mut NorRing<Nor>, at: u32, len: u32) -> (Status, u32) {
     }
 }
 
-/// A block outside the ring, erased; one of the ring's is refused (#78).
+/// A block outside the ring and the image regions, erased; one of the
+/// ring's is refused (#78), and one of an image region's (#185).
 async fn erase_nor(ring: &mut NorRing<Nor>, block: u32) -> (Status, u32) {
+    if nor_map::in_an_image_region(block) {
+        return (Status::ImageRegion, 0);
+    }
     match ring.erase_block(block).await {
         Ok(()) => (Status::Ok, 0),
         Err(RingError::OutOfRange) => (Status::OutOfRange, 0),

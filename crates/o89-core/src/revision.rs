@@ -15,6 +15,14 @@
 //! moving to one is the constant in the board module and a bench that
 //! confirms each arm, not a search.
 //!
+//! One difference cannot live here: the flash layout, which a linker script
+//! states and cannot read from a method. Revision A has one 480 KB
+//! application region behind a 32 KB bootloader and stages its updates on
+//! the NOR; revision B keeps A/B on a larger part (#185,
+//! origin89hq/hardware#57). The layout is in `o89-boot/memory.x`,
+//! `o89-controller/memory.x`, the bootloader's `APPLICATION` and the gate's
+//! budget in `xtask/src/images.rs`, and a revision B board gets its own.
+//!
 //! cites: F-005, F-012, F-014
 
 use crate::Millis;
