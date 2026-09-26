@@ -355,7 +355,11 @@ impl<const N: usize> Signals<N> {
         self.slots
             .iter()
             .take(self.len)
-            .flatten()
+            .filter_map(|slot| {
+                // `register` fills `0..len` and nothing empties it.
+                debug_assert!(slot.is_some(), "a registered slot is empty");
+                slot.as_ref()
+            })
             .map(move |slot| slot.sample(now))
     }
 
