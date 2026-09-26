@@ -23,7 +23,7 @@ use km43::{Event, LogSeq, MAX_LOG_PAGE_BYTES, MAX_LOG_PAGE_ENTRIES};
 
 use crate::record::{self, Class};
 use crate::ring::{Ring, RingError, Wants};
-use crate::site::{OwedError, RECORD_BODY, Site, TICK_RECORDS, Tally};
+use crate::site::{OwedError, RECORD_BODY, Site, TICK_RECORDS, Tally, Token};
 use crate::tick::Tick;
 
 /// The one site, behind whatever keeps its writers apart.
@@ -56,10 +56,43 @@ pub struct PlaneTurn {
     pub refused: bool,
     /// A record the site could not write: a defect, surfaced.
     pub unwritten: Option<OwedError>,
-    /// The site was held when the turn asked for it; what it owes waits a
-    /// tick. After a record landed this is a record the site was not told
-    /// about, which a single executor cannot produce.
+    /// The site was held when the turn asked for it. Nothing new was taken
+    /// after that; an outcome not yet told to the site waits in the
+    /// [`Unsettled`] the caller keeps, and is told first next turn.
     pub busy: bool,
+}
+
+/// What became of a record handed to the ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// It landed at this position.
+    Landed(u64),
+    /// The ring refused it.
+    Refused,
+}
+
+/// A record's outcome the site has not been told yet, because it was held
+/// when the outcome was known. Kept by the caller between turns: the
+/// record's announcement stays marked until the site hears which way it
+/// went, so nothing is owed twice and nothing is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsettled {
+    token: Token,
+    outcome: Outcome,
+    body: [u8; RECORD_BODY],
+    len: usize,
+}
+
+impl Unsettled {
+    /// Tell the site; whether it could be told.
+    fn settle(&self, site: &impl SiteCell) -> bool {
+        let body = self.body.get(..self.len).unwrap_or(&[]);
+        site.with(|site, _| match self.outcome {
+            Outcome::Landed(seq) => site.committed(&self.token, seq),
+            Outcome::Refused => site.not_committed(&self.token, body),
+        })
+        .is_ok()
+    }
 }
 
 /// One tick of the reading plane: every record the site owes, at most
@@ -69,14 +102,26 @@ pub struct PlaneTurn {
 /// append can yield, so whatever publishes the log's extent to the
 /// sessions does so before any of them can answer from an older one
 /// (P-104, P-095).
+///
+/// `unsettled` is the caller's across turns: an outcome the site was too
+/// held to hear is kept there and told first, and until it is, nothing new
+/// is taken.
 pub async fn record_owed<N: MultiwriteNorFlash>(
     site: &impl SiteCell,
     ring: &mut Ring<N>,
     scratch: &mut [u8],
     at: Option<u64>,
     mut landed: impl FnMut(&Ring<N>),
+    unsettled: &mut Option<Unsettled>,
 ) -> PlaneTurn {
     let mut done = PlaneTurn::default();
+    if let Some(pending) = unsettled.as_ref() {
+        if !pending.settle(site) {
+            done.busy = true;
+            return done;
+        }
+        *unsettled = None;
+    }
     let mut tally = Tally::new();
     let mut body = [0u8; RECORD_BODY];
     let mut payload = [0u8; record::MAX_PAYLOAD];
@@ -106,17 +151,24 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
                 .ok(),
             None => None,
         };
-        if let Some(seq) = appended {
-            done.busy |= site
-                .with(|site, _| site.committed(&owed.token, seq))
-                .is_err();
+        let pending = Unsettled {
+            token: owed.token,
+            outcome: appended.map_or(Outcome::Refused, Outcome::Landed),
+            body,
+            len: owed.len,
+        };
+        if appended.is_some() {
             landed(ring);
             done.landed = done.landed.saturating_add(1);
         } else {
-            done.busy |= site
-                .with(|site, _| site.not_committed(&owed.token, written))
-                .is_err();
             done.refused = true;
+        }
+        if !pending.settle(site) {
+            done.busy = true;
+            *unsettled = Some(pending);
+            break;
+        }
+        if appended.is_none() {
             break;
         }
     }

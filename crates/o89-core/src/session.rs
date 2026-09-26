@@ -4090,6 +4090,53 @@ mod tests {
     }
 
     #[test]
+    fn p_098_one_session_whose_send_failed_keeps_its_event_and_moves_nobody_else() {
+        let (mut rig, mut one, mut two) = two_phones(1, 4);
+        let _ = subscribe(&mut rig, &mut one, 3);
+        let _ = subscribe(&mut rig, &mut two, 3);
+        let want = rig.sessions.log_want(rig.log, rig.now).expect("owed");
+        let (a, a_len) = record(3);
+        let (b, b_len) = record(4);
+        let batch = LogBatch::of(&[(3, &a[..a_len]), (4, &b[..b_len])], 1, 4);
+        let mut dst = [0u8; MAX_FRAME];
+        let _ = rig.sessions.log_answered(want.ticket, &batch, &mut dst);
+        // The first session's first frame is refused by the UART: the link
+        // stops that session there and goes on to the next.
+        let _ = rig
+            .sessions
+            .event(conn(1), want.ticket, &batch, 0, &mut dst)
+            .expect("sealed");
+        for index in 0..batch.len() {
+            let (sent, delivery) = rig
+                .sessions
+                .event(conn(2), want.ticket, &batch, index, &mut dst)
+                .expect("owed");
+            let (kind, _) = two.open(&dst[..sent.answer.expect("sealed")]);
+            assert_eq!(kind, MessageType::EventResponse, "under its own keys");
+            rig.sessions.delivered(delivery);
+        }
+        // The first is still owed both, from 3; the second is caught up.
+        let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
+        assert_eq!(again.from, 3);
+        let _ = rig.sessions.log_answered(again.ticket, &batch, &mut dst);
+        assert!(
+            rig.sessions
+                .event(conn(2), again.ticket, &batch, 0, &mut dst)
+                .is_none()
+        );
+        let (sent, _) = rig
+            .sessions
+            .event(conn(1), again.ticket, &batch, 0, &mut dst)
+            .expect("the same event, sent again");
+        let (kind, _) = one.open(&dst[..sent.answer.expect("sealed")]);
+        assert_eq!(
+            kind,
+            MessageType::EventResponse,
+            "under a fresh nonce of its own"
+        );
+    }
+
+    #[test]
     fn p_098_a_session_owed_live_records_is_read_for_before_another_replays() {
         let (mut rig, mut one, mut two) = two_phones(1, 50);
         // One replays from the start; the other is live and one behind.

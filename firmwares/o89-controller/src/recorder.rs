@@ -317,6 +317,7 @@ pub async fn run(
     let mut client_waiting: Option<(u32, u64)> = None;
     mailbox::init();
     let mut plane_turn = 0u32;
+    let mut unsettled = None;
     let mut batch = o89_core::LogBatch::new();
     let mut ticker = Ticker::every(PERIOD);
     check_in(Task::Recorder);
@@ -371,7 +372,7 @@ pub async fn run(
                 if plane_turn >= PLANE_TURNS {
                     plane_turn = 0;
                     if let Some(ring) = ring.as_mut() {
-                        plane(site, ring, &mut scratch, calendar.now()).await;
+                        plane(site, ring, &mut scratch, calendar.now(), &mut unsettled).await;
                     }
                 }
                 mailbox::serve(mailbox::Parts {
@@ -403,9 +404,20 @@ async fn plane(
     ring: &mut Ring<Nor>,
     scratch: &mut [u8],
     at: Option<UnixMillis>,
+    unsettled: &mut Option<o89_core::Unsettled>,
 ) {
-    let turn =
-        o89_core::record_owed(&site, ring, scratch, at.map(UnixMillis::as_millis), publish).await;
+    let turn = o89_core::record_owed(
+        &site,
+        ring,
+        scratch,
+        at.map(UnixMillis::as_millis),
+        publish,
+        unsettled,
+    )
+    .await;
+    if turn.busy {
+        defmt::error!("plane: the site was held; its records wait a turn");
+    }
     if turn.refused {
         defmt::error!("plane: a record did not land; the next tick owes it again");
     }

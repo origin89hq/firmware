@@ -538,7 +538,9 @@ second the recorder compares that with what it is now: at most one
 `0x0102`, one `0x0902`, one `0x0901` and four concern records a tick, seven
 against a session queue of sixteen. What does not fit is still different
 next tick, so nothing is dropped, and a record the ring refuses is handed
-back and owed again. A record is as wide as one ring record, so a sweep
+back and owed again. An outcome the site was held for when it was known is
+kept by the recorder and told first next turn, before anything new is
+taken. A record is as wide as one ring record, so a sweep
 carries at most nineteen signals.
 
 **A subscription is a cursor into the log.** There is no outbox: a

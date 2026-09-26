@@ -362,6 +362,7 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
             &mut scratch,
             None,
             |_| {},
+            &mut None,
         ));
         assert_eq!((turn.landed, turn.refused), (0, true));
     }
@@ -374,6 +375,7 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
         &mut scratch,
         None,
         |_| {},
+        &mut None,
     ));
     assert_eq!(
         (turn.landed, turn.refused),
@@ -386,6 +388,7 @@ fn p_182_a_record_the_ring_refused_is_logged_once_the_ring_takes_it() {
         &mut scratch,
         None,
         |_| {},
+        &mut None,
     ));
     assert_eq!(again.landed, 0, "and not twice");
     assert_eq!(ring.next_seq(), 2);
@@ -415,6 +418,7 @@ fn p_104_p_095_the_log_extent_is_published_as_each_record_lands_not_at_the_end_o
         &mut scratch,
         None,
         |ring| published.push(ring.next_seq()),
+        &mut None,
     ));
     assert_eq!(turn.landed, 2, "the topology and the validity sweep");
     assert_eq!(published, [2, 3], "once per record, each as it landed");
@@ -528,4 +532,171 @@ fn p_098_p_182_eight_subscribers_keep_up_with_a_twelve_tick_burst_and_none_is_sh
             "handle {handle}: every record from its start, once, in order"
         );
     }
+}
+
+/// The site behind an owner that is held on one chosen call: what a
+/// holder on another executor would look like.
+struct HeldOnce {
+    inner: SimSite,
+    calls: std::cell::Cell<usize>,
+    held_on: usize,
+}
+
+impl o89_core::SiteCell for HeldOnce {
+    fn with<R>(
+        &self,
+        with: impl FnOnce(&mut o89_core::Site, o89_core::Tick) -> R,
+    ) -> Result<R, o89_core::SiteBusy> {
+        let call = self.calls.get().checked_add(1).expect("fits");
+        self.calls.set(call);
+        if call == self.held_on {
+            return Err(o89_core::SiteBusy);
+        }
+        self.inner.with(with)
+    }
+}
+
+/// A site whose boot record is logged, with one fault concern observed
+/// since, and the ring it was logged to.
+fn concern_owed(part: &mut SimNor<{ crate::link::LOG_BLOCK }>, scratch: &mut [u8]) -> SimSite {
+    let site = SimSite::empty();
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+        .expect("a valid site");
+    {
+        let mut ring = block_on(o89_core::Ring::open(Lent(part), 0, 8, scratch)).expect("opens");
+        let turn = block_on(o89_core::record_owed(
+            &site,
+            &mut ring,
+            scratch,
+            None,
+            |_| {},
+            &mut None,
+        ));
+        assert_eq!(turn.landed, 1, "the boot's topology record");
+    }
+    site.free(|site, now| {
+        site.observe(
+            ConcernReport {
+                subject: Subject::Part(Part::device(id(1))),
+                cond: Condition(0x0101),
+                sev: Severity::Fault,
+                code: None,
+            },
+            now,
+        )
+    })
+    .expect("admitted");
+    site
+}
+
+fn concerns_total(site: &SimSite) -> (u16, u64) {
+    site.free(|site, now| {
+        let mut dst = [0u8; 1024];
+        let len = site
+            .concerns_page(&km43::ReadConcerns::new(0, 0), now, &mut dst)
+            .expect("answers");
+        let header = ConcernsHeader::decode(&dst[..len]).expect("a page");
+        (header.total, header.seq)
+    })
+}
+
+#[test]
+fn p_180_a_raise_that_landed_while_the_site_was_held_is_told_to_it_next_turn_once() {
+    // Capabilities: none. The site is held when the raise's landing is known.
+    let mut part = SimNor::<{ crate::link::LOG_BLOCK }>::fresh(8);
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let site = HeldOnce {
+        inner: concern_owed(&mut part, &mut scratch),
+        calls: std::cell::Cell::new(0),
+        held_on: 2,
+    };
+    let mut ring =
+        block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
+    let mut unsettled = None;
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.busy), (1, true));
+    assert!(unsettled.is_some(), "the landing is kept, not lost");
+    assert_eq!(concerns_total(&site.inner), (0, 0), "not yet in the table");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.busy),
+        (0, false),
+        "told, and nothing appended twice"
+    );
+    assert!(unsettled.is_none());
+    assert_eq!(
+        concerns_total(&site.inner),
+        (1, 2),
+        "opened by the record at 2"
+    );
+    assert_eq!(ring.next_seq(), 3);
+}
+
+#[test]
+fn p_182_a_raise_the_ring_refused_while_the_site_was_held_is_owed_again_once() {
+    // Capabilities: none. The NOR loses power under the append, and the
+    // site is held when the refusal is known.
+    let mut part = SimNor::<{ crate::link::LOG_BLOCK }>::fresh(8);
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let site = HeldOnce {
+        inner: concern_owed(&mut part, &mut scratch),
+        calls: std::cell::Cell::new(0),
+        held_on: 2,
+    };
+    let mut unsettled = None;
+    {
+        part.cut_after(0);
+        let mut ring =
+            block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
+        let turn = block_on(o89_core::record_owed(
+            &site,
+            &mut ring,
+            &mut scratch,
+            None,
+            |_| {},
+            &mut unsettled,
+        ));
+        assert_eq!((turn.landed, turn.refused, turn.busy), (0, true, true));
+    }
+    assert!(unsettled.is_some(), "the refusal is kept, not lost");
+    part.reboot();
+    let mut ring =
+        block_on(o89_core::Ring::open(Lent(&mut part), 0, 8, &mut scratch)).expect("opens");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.busy),
+        (1, false),
+        "owed again, and logged once"
+    );
+    assert_eq!(concerns_total(&site.inner), (1, 2));
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 0);
 }
