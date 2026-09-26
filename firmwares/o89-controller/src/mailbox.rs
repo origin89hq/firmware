@@ -367,26 +367,27 @@ async fn read_ring(ring: &mut NorRing<Nor>, lo: u32, hi: u32, scratch: &mut [u8]
     let from = RingPage::from_args(lo, hi);
     let oldest = ring.head().oldest;
     let mut at = RingPage::HEADER;
-    let walked = ring
-        .read_from(from, scratch, |found| {
-            // The ring holds nothing longer than a record carries, so the
-            // head always builds; a page cut here says so by its length.
-            let Some(head) = RingPage::entry_head(found.seq, found.class, found.payload.len())
-            else {
-                return Wants::Enough;
-            };
-            put_at(at, &head);
-            put_at(at.saturating_add(RingPage::ENTRY_HEAD), found.payload);
-            at = at
-                .saturating_add(RingPage::ENTRY_HEAD)
-                .saturating_add(found.payload.len());
-            if RingPage::room_after(at) {
-                Wants::More
-            } else {
-                Wants::Enough
-            }
-        })
-        .await;
+    // One visitor type for every reader of the ring, so its walk is built
+    // once rather than once per caller.
+    let mut take = |found: &o89_core::Found<'_>| -> Wants {
+        // The ring holds nothing longer than a record carries, so the
+        // head always builds; a page cut here says so by its length.
+        let Some(head) = RingPage::entry_head(found.seq, found.class, found.payload.len()) else {
+            return Wants::Enough;
+        };
+        put_at(at, &head);
+        put_at(at.saturating_add(RingPage::ENTRY_HEAD), found.payload);
+        at = at
+            .saturating_add(RingPage::ENTRY_HEAD)
+            .saturating_add(found.payload.len());
+        if RingPage::room_after(at) {
+            Wants::More
+        } else {
+            Wants::Enough
+        }
+    };
+    let visit: &mut dyn FnMut(&o89_core::Found<'_>) -> Wants = &mut take;
+    let walked = ring.read_from(from, scratch, visit).await;
     match walked {
         Ok(next) => {
             let page = RingPage {
@@ -446,6 +447,9 @@ async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u3
                 "mailbox: the host dropped the ring's oldest block: {}",
                 dropped
             );
+            // The oldest moved: a `Subscribe` answered after this must see
+            // it, or its gap goes unreported (P-095).
+            crate::recorder::publish(ring);
             match DropAnswer::encode(dropped) {
                 Some(bytes) => {
                     put(&bytes);

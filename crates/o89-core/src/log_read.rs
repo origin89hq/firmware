@@ -31,9 +31,18 @@ use crate::tick::Tick;
 /// The tick is read inside the same exclusion every writer takes, so a
 /// reading is never asked about at a tick older than its last write.
 pub trait SiteCell {
-    /// Run `with` over the site at the current tick.
-    fn with<R>(&self, with: impl FnOnce(&mut Site, Tick) -> R) -> R;
+    /// Run `with` over the site at the current tick, or say it is held.
+    /// Every holder runs one synchronous call and never awaits inside it,
+    /// so on one cooperative executor it is never held when asked; a
+    /// caller answers `SiteBusy` as a retry rather than waiting on it.
+    fn with<R>(&self, with: impl FnOnce(&mut Site, Tick) -> R) -> Result<R, SiteBusy>;
 }
+
+/// The site was held by another task when it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a site that could not be read is a question left unanswered"]
+pub struct SiteBusy;
 
 /// What one turn of [`record_owed`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,17 +56,25 @@ pub struct PlaneTurn {
     pub refused: bool,
     /// A record the site could not write: a defect, surfaced.
     pub unwritten: Option<OwedError>,
+    /// The site was held when the turn asked for it; what it owes waits a
+    /// tick. After a record landed this is a record the site was not told
+    /// about, which a single executor cannot produce.
+    pub busy: bool,
 }
 
 /// One tick of the reading plane: every record the site owes, at most
 /// [`TICK_RECORDS`], appended in order under the wall-clock `at` when the
 /// controller holds one. The site is held only between appends, never
-/// across one.
+/// across one. `landed` runs after each record lands and before the next
+/// append can yield, so whatever publishes the log's extent to the
+/// sessions does so before any of them can answer from an older one
+/// (P-104, P-095).
 pub async fn record_owed<N: MultiwriteNorFlash>(
     site: &impl SiteCell,
     ring: &mut Ring<N>,
     scratch: &mut [u8],
     at: Option<u64>,
+    mut landed: impl FnMut(&Ring<N>),
 ) -> PlaneTurn {
     let mut done = PlaneTurn::default();
     let mut tally = Tally::new();
@@ -67,10 +84,14 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
         let seq = ring.next_seq();
         let owed = site.with(|site, now| site.next_owed(now, seq, &mut tally, &mut body));
         let owed = match owed {
-            Ok(Some(owed)) => owed,
-            Ok(None) => break,
-            Err(why) => {
+            Ok(Ok(Some(owed))) => owed,
+            Ok(Ok(None)) => break,
+            Ok(Err(why)) => {
                 done.unwritten = Some(why);
+                break;
+            }
+            Err(SiteBusy) => {
+                done.busy = true;
                 break;
             }
         };
@@ -78,18 +99,23 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
         let framed = Event::new(LogSeq(seq), at, owed.kind, written)
             .ok()
             .and_then(|event| event.encode(&mut payload).ok());
-        let landed = match framed {
+        let appended = match framed {
             Some(len) => ring
                 .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
                 .await
                 .ok(),
             None => None,
         };
-        if let Some(seq) = landed {
-            site.with(|site, _| site.committed(&owed.token, seq));
+        if let Some(seq) = appended {
+            done.busy |= site
+                .with(|site, _| site.committed(&owed.token, seq))
+                .is_err();
+            landed(ring);
             done.landed = done.landed.saturating_add(1);
         } else {
-            site.with(|site, _| site.not_committed(&owed.token, written));
+            done.busy |= site
+                .with(|site, _| site.not_committed(&owed.token, written))
+                .is_err();
             done.refused = true;
             break;
         }
@@ -186,6 +212,21 @@ impl LogBatch {
         self.next > self.newest
     }
 
+    /// A batch holding `records`, each an encoded `Event` and its
+    /// position, read from a log holding `oldest..=newest`: what the ring's
+    /// owner hands back, for tests that interleave it with the sessions.
+    #[cfg(test)]
+    pub(crate) fn of(records: &[(u64, &[u8])], oldest: u64, newest: u64) -> Self {
+        let mut batch = Self::new();
+        batch.oldest = oldest;
+        batch.newest = newest;
+        for (seq, payload) in records {
+            let _ = batch.take(*seq, payload, MAX_LOG_PAGE_ENTRIES);
+            batch.next = seq.saturating_add(1);
+        }
+        batch
+    }
+
     /// Take one record; whether another at its largest still fits.
     fn take(&mut self, seq: u64, payload: &[u8], most: usize) -> Wants {
         let end = self.used.saturating_add(payload.len());
@@ -230,11 +271,9 @@ pub async fn read_log<N: MultiwriteNorFlash>(
         batch.next = from.max(batch.oldest).max(1);
         return Ok(());
     }
-    let next = ring
-        .read_from(from, scratch, |found| {
-            batch.take(found.seq, found.payload, most)
-        })
-        .await?;
+    let mut take = |found: &record::Found<'_>| batch.take(found.seq, found.payload, most);
+    let visit: &mut dyn FnMut(&record::Found<'_>) -> Wants = &mut take;
+    let next = ring.read_from(from, scratch, visit).await?;
     batch.next = next;
     Ok(())
 }
