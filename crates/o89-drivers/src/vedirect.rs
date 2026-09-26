@@ -32,7 +32,7 @@
 //! line settings, 19200 8N1, are the controller port's to configure, with
 //! the pull-up policy per revision (F-051).
 
-use km43::{Condition, Id, Provenance, Validity, VendorCode, VendorNamespace};
+use km43::{Condition, Id, Provenance, SignalDomain, Validity, VendorCode, VendorNamespace};
 use o89_core::{Millis, Observation, SignalError, Signals, Tick};
 
 use crate::dialect::Kind;
@@ -170,13 +170,28 @@ impl<const N: usize> Text<N> {
 /// A field's value text.
 pub type Value = Text<VALUE_BYTES>;
 
-/// A value whose text is not the number its field carries: not a decimal
-/// integer, or one its field's type cannot hold. The raw text is still on
-/// the [`Frame`].
+/// A value whose text is not the number its field carries. The raw text is
+/// still on the [`Frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "an unreadable value is a reading that was not taken"]
-pub struct Malformed(pub Field);
+pub struct Malformed {
+    /// The field.
+    pub field: Field,
+    /// What is wrong with its text.
+    pub why: Unreadable,
+}
+
+/// Why a field's text is not its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Unreadable {
+    /// Not an optionally negative decimal integer, such as `---` or `13.2`.
+    NotANumber,
+    /// A decimal integer outside what the field's type holds, `i64` at
+    /// most.
+    OutOfRange,
+}
 
 /// The state of operation, as the protocol document's `CS` table lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,13 +483,19 @@ impl Frame {
     #[must_use]
     pub fn integer(&self, field: Field) -> Option<Result<i64, Malformed>> {
         self.raw(field)
-            .map(|text| decimal(text.as_bytes()).ok_or(Malformed(field)))
+            .map(|text| decimal(text.as_bytes()).map_err(|why| Malformed { field, why }))
     }
 
     /// `field`'s value as a `T`, if the block carried it.
     fn typed<T: TryFrom<i64>>(&self, field: Field) -> Option<Result<T, Malformed>> {
-        self.integer(field)
-            .map(|value| value.and_then(|value| T::try_from(value).map_err(|_| Malformed(field))))
+        self.integer(field).map(|value| {
+            value.and_then(|value| {
+                T::try_from(value).map_err(|_| Malformed {
+                    field,
+                    why: Unreadable::OutOfRange,
+                })
+            })
+        })
     }
 
     /// `V`, in mV.
@@ -525,29 +546,25 @@ impl Frame {
     }
 }
 
-/// `text` as an optionally negative decimal integer, or `None`.
-fn decimal(text: &[u8]) -> Option<i64> {
+/// `text` as an optionally negative decimal integer.
+fn decimal(text: &[u8]) -> Result<i64, Unreadable> {
     let (negative, digits) = match text {
         [b'-', rest @ ..] => (true, rest),
         rest => (false, rest),
     };
-    if digits.is_empty() {
-        return None;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(Unreadable::NotANumber);
     }
-    let mut value = 0i64;
-    for &digit in digits {
-        if !digit.is_ascii_digit() {
-            return None;
-        }
-        let digit = i64::from(digit.checked_sub(b'0')?);
-        let step = value.checked_mul(10)?;
-        value = if negative {
-            step.checked_sub(digit)?
+    digits.iter().try_fold(0i64, |value, &digit| {
+        let digit = i64::from(digit.checked_sub(b'0').ok_or(Unreadable::NotANumber)?);
+        let step = value.checked_mul(10);
+        let next = if negative {
+            step.and_then(|step| step.checked_sub(digit))
         } else {
-            step.checked_add(digit)?
+            step.and_then(|step| step.checked_add(digit))
         };
-    }
-    Some(value)
+        next.ok_or(Unreadable::OutOfRange)
+    })
 }
 
 /// Why a block was refused.
@@ -660,7 +677,7 @@ impl Parser {
                     self.hex = len.checked_add(1);
                     None
                 }
-                _ => self.lose(Refused::Hex),
+                _ => self.lose(Refused::Hex, byte),
             };
         }
         let at_checksum = matches!(self.state, State::Checksum | State::HuntChecksum);
@@ -717,7 +734,7 @@ impl Parser {
             (State::Label, b'\t') => {
                 let label = self.label.as_bytes();
                 if label.is_empty() {
-                    return self.lose(Refused::Framing);
+                    return self.lose(Refused::Framing, byte);
                 }
                 if label == CHECKSUM {
                     self.state = State::Checksum;
@@ -728,18 +745,18 @@ impl Parser {
             }
             (State::Label, 0x21..=0x7E) => {
                 if self.label.push(byte).is_err() {
-                    return self.lose(Refused::LabelTooLong);
+                    return self.lose(Refused::LabelTooLong, byte);
                 }
             }
             (State::Value, b'\r') => {
                 if let Err(refused) = self.close_field() {
-                    return self.lose(refused);
+                    return self.lose(refused, byte);
                 }
                 self.state = State::Lf;
             }
             (State::Value, 0x20..=0x7E) => {
                 if self.value.push(byte).is_err() {
-                    return self.lose(Refused::ValueTooLong);
+                    return self.lose(Refused::ValueTooLong, byte);
                 }
             }
             (State::Checksum, _) => {
@@ -763,7 +780,7 @@ impl Parser {
                 | State::Hunt { .. }
                 | State::HuntChecksum,
                 _,
-            ) => return self.lose(Refused::Framing),
+            ) => return self.lose(Refused::Framing, byte),
         }
         None
     }
@@ -788,11 +805,17 @@ impl Parser {
         Ok(())
     }
 
-    /// Give up the block in progress for `why` and hunt. Reported once: a
-    /// parser already hunting has nothing to refuse.
-    fn lose(&mut self, why: Refused) -> Option<Result<&Frame, Refused>> {
+    /// Give up the block in progress for `why`, at `byte`, and hunt.
+    /// Reported once: a parser already hunting has nothing to refuse. A
+    /// `\n` refused where a `\r` was due still begins a line, so the hunt
+    /// reads the label after it: that label may be the refused block's own
+    /// `Checksum`.
+    fn lose(&mut self, why: Refused, byte: u8) -> Option<Result<&Frame, Refused>> {
         let hunting = matches!(self.state, State::Hunt { .. } | State::HuntChecksum);
         self.resynchronise();
+        if byte == b'\n' {
+            self.state = State::Hunt { labelling: true };
+        }
         if hunting { None } else { Some(Err(why)) }
     }
 }
@@ -860,8 +883,8 @@ struct Published {
 }
 
 /// The fields [`publish`] writes. Each is a value the product's instrument
-/// reads directly, so `measured`, which the host tests hold to
-/// [`Kind::accepts`] (F-052).
+/// reads directly, so `measured`, which its kind must accept (F-052): a row
+/// that breaks [`Published::admissible`] fails the build.
 const PUBLISHED: [Published; 3] = [
     Published {
         field: Field::BatteryVoltage,
@@ -883,16 +906,48 @@ const PUBLISHED: [Published; 3] = [
     },
 ];
 
+// A table typo is a build error, never a reading published as
+// `out_of_range` at runtime.
+const _: () = {
+    let [voltage, current, power] = PUBLISHED;
+    assert!(voltage.admissible() && current.admissible() && power.admissible());
+};
+
 impl Published {
+    /// Whether the row's kind carries its provenance over a live value, and
+    /// its decade is at or above the kind's scale, within the nine decades
+    /// a rescale can span.
+    const fn admissible(self) -> bool {
+        let scale = self.kind.scale();
+        self.kind
+            .accepts(SignalDomain::Live)
+            .contains(self.provenance)
+            && self.decade >= scale
+            && self.decade.abs_diff(scale) <= 9
+    }
+
     /// What the frame says about this field, or `None` when it carried no
-    /// such field.
-    fn observe(self, frame: &Frame) -> Option<Result<Observation, PublishError>> {
+    /// such field, and the malformed text behind a value it could not read.
+    ///
+    /// A field present in a verified block always writes, so a value the
+    /// product withdrew never leaves the last one current: a number too
+    /// large for `i64` or for `i32` at the kind's scale is `out_of_range`
+    /// (P-185), and text that is no number is `sensor_fault`, the product
+    /// reporting the reading bad. Victron documents `---` as a no-value
+    /// pattern only for fields this driver does not publish.
+    fn observe(self, frame: &Frame) -> Option<(Observation, Option<Malformed>)> {
         let value = match frame.integer(self.field)? {
             Ok(value) => value,
-            Err(malformed) => return Some(Err(PublishError::Malformed(malformed))),
+            Err(malformed) => {
+                let validity = match malformed.why {
+                    Unreadable::NotANumber => Validity::SensorFault,
+                    Unreadable::OutOfRange => Validity::OutOfRange,
+                };
+                return Some((Observation::missing(validity).ok()?, Some(malformed)));
+            }
         };
-        // Every published decade is at or above its kind's scale, which the
-        // host tests hold; a table that broke that would publish nothing.
+        // `admissible` holds every published decade at or above its kind's
+        // scale, at build time.
         let factor = if self.decade >= self.kind.scale() {
             10i64.checked_pow(u32::from(self.decade.abs_diff(self.kind.scale())))
         } else {
@@ -905,58 +960,75 @@ impl Published {
             Some(value) => Observation::value(value, self.provenance),
             None => Observation::missing(Validity::OutOfRange),
         };
-        Some(seen.map_err(|_| PublishError::Quality))
+        // KM43 refuses only a value without a provenance, which
+        // `admissible` rules out, or a missing validity that carries one,
+        // which neither arm builds.
+        Some((seen.ok()?, None))
     }
 }
 
-/// Why a field of a verified frame was not written.
+/// Why a field of a verified frame did not publish a reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[must_use = "a field not written is a reading that was not recorded"]
+#[must_use = "a field without a reading is a reading that was not recorded"]
 pub enum PublishError {
-    /// Its text is not a number; nothing is written for it, and its signal
-    /// ages out.
+    /// Its text is not its number. Its signal was written with no value,
+    /// `sensor_fault` or `out_of_range`, so the last reading is withdrawn.
     Malformed(Malformed),
-    /// KM43 refused the observation. The published fields' provenance
-    /// always carries a value, so this is a defect surfaced rather than
-    /// hidden.
-    Quality,
-    /// The store refused the write.
+    /// The store refused the write, and the signal keeps what it held.
     Store(SignalError),
+}
+
+/// What [`publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "what was published is what the store now says about the product"]
+pub struct Written {
+    /// Signals the store accepted a write for, with a value or without.
+    pub count: usize,
+    /// The first field that did not publish a reading, and why.
+    pub first: Option<PublishError>,
 }
 
 /// Write the frame's `V`, `I` and `PPV` into `store` at `now`, each to its
 /// signal in `channels`, with the provenance its kind carries.
 ///
-/// A field the frame did not carry, or that has no signal, is not written.
-/// A value too large for the kind's scale writes `out_of_range` and no
-/// value. Every field is tried; the first failure is returned, and what
-/// was written before and after it stands.
+/// A field the frame did not carry, or that has no signal, is not written:
+/// a product sends its fields over several blocks. A field it carried
+/// always writes, a reading or the reason there is none. Every field is
+/// tried, and every write the store accepts stands.
 pub fn publish<const N: usize>(
     frame: &Frame,
     channels: &Channels,
     now: Tick,
     store: &mut Signals<N>,
-) -> Result<usize, PublishError> {
-    let mut written = 0usize;
-    let mut first = None;
+) -> Written {
+    let mut written = Written {
+        count: 0,
+        first: None,
+    };
     for published in PUBLISHED {
         let Some(sig) = channels.signal(published.field) else {
             continue;
         };
-        let outcome = match published.observe(frame) {
-            None => continue,
-            Some(Ok(seen)) => store.write(sig, now, seen).map_err(PublishError::Store),
-            Some(Err(error)) => Err(error),
+        let Some((seen, malformed)) = published.observe(frame) else {
+            continue;
         };
-        match outcome {
-            Ok(()) => written = written.saturating_add(1),
+        match store.write(sig, now, seen) {
+            Ok(()) => {
+                written.count = written.count.saturating_add(1);
+                if let Some(malformed) = malformed {
+                    written
+                        .first
+                        .get_or_insert(PublishError::Malformed(malformed));
+                }
+            }
             Err(error) => {
-                first.get_or_insert(error);
+                written.first.get_or_insert(PublishError::Store(error));
             }
         }
     }
-    first.map_or(Ok(written), Err)
+    written
 }
 
 /// What one [`listen`] heard.
@@ -970,11 +1042,10 @@ pub struct Heard {
     pub refused: usize,
     /// Why the last block refused in this burst was.
     pub last_refusal: Option<Refused>,
-    /// The last verified block, for its typed fields.
-    pub latest: Option<Frame>,
-    /// Signals written.
+    /// Signals the store accepted a write for.
     pub written: usize,
-    /// The first field of a verified block that was not written, and why.
+    /// The first field of a verified block that did not publish a reading,
+    /// and why.
     pub unwritten: Option<PublishError>,
 }
 
@@ -983,8 +1054,9 @@ pub struct Heard {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "a silent port is a product that is not heard"]
 pub enum ListenError<E> {
-    /// Nothing arrived within the wait; the parser keeps its place, since a
-    /// product pauses between blocks.
+    /// Nothing arrived within the wait. The parser keeps its place, since a
+    /// product pauses between blocks; see [`listen`] for a pause inside
+    /// one.
     Silent,
     /// The line reported an error; bytes may be lost, so the parser hunts
     /// for the next block.
@@ -995,11 +1067,21 @@ pub enum ListenError<E> {
 
 /// Receive one burst from `port`, waiting at most `within` for its first
 /// byte, and parse it: each verified block's `V`, `I` and `PPV` are written
-/// into `store` at `now` through `channels`.
+/// into `store` at `now` through `channels`, and every verified block is
+/// handed to `on_block`, in order, for its typed fields.
 ///
 /// One receive per call, so the caller's loop sets the pace. A block spread
 /// over several bursts is joined by `parser`, which the caller keeps for
-/// the port.
+/// the port; a burst of [`BURST_BYTES`] can end several blocks, and each
+/// reaches `on_block`.
+///
+/// Silence does not resynchronise the parser, so a block split by a pause
+/// still decodes. A product that restarts or is swapped mid-block leaves a
+/// partial block that the next block's bytes join; a repeated field or the
+/// checksum refuses that join, except for the one-in-256 damage the sum
+/// cannot see. A caller that knows the product changed, or that waits past
+/// several block intervals with nothing heard, calls
+/// [`Parser::resynchronise`].
 pub async fn listen<L: Listener, const N: usize>(
     port: &mut L,
     parser: &mut Parser,
@@ -1007,6 +1089,7 @@ pub async fn listen<L: Listener, const N: usize>(
     channels: &Channels,
     now: Tick,
     store: &mut Signals<N>,
+    mut on_block: impl FnMut(&Frame),
 ) -> Result<Heard, ListenError<L::Error>> {
     let mut buf = [0u8; BURST_BYTES];
     let len = match port.receive(&mut buf, within).await {
@@ -1031,7 +1114,6 @@ pub async fn listen<L: Listener, const N: usize>(
         blocks: 0,
         refused: 0,
         last_refusal: None,
-        latest: None,
         written: 0,
         unwritten: None,
     };
@@ -1040,13 +1122,12 @@ pub async fn listen<L: Listener, const N: usize>(
             None => {}
             Some(Ok(frame)) => {
                 heard.blocks = heard.blocks.saturating_add(1);
-                heard.latest = Some(*frame);
-                match publish(frame, channels, now, store) {
-                    Ok(written) => heard.written = heard.written.saturating_add(written),
-                    Err(error) => {
-                        heard.unwritten.get_or_insert(error);
-                    }
+                let written = publish(frame, channels, now, store);
+                heard.written = heard.written.saturating_add(written.count);
+                if let Some(error) = written.first {
+                    heard.unwritten.get_or_insert(error);
                 }
+                on_block(frame);
             }
             Some(Err(why)) => {
                 heard.refused = heard.refused.saturating_add(1);
@@ -1062,7 +1143,6 @@ mod tests {
     use super::*;
     use core::future::{Future, ready};
     use embassy_futures::block_on;
-    use km43::SignalDomain;
     use o89_core::Limits;
 
     /// A block built by hand in the shape of an MPPT charger's, from the
@@ -1255,11 +1335,11 @@ mod tests {
                 &channels,
                 Tick::ZERO,
                 &mut store,
+                |_| {},
             ))
             .unwrap();
             assert_eq!(heard.blocks, 0);
             assert_eq!(heard.written, 0);
-            assert_eq!(heard.latest, None);
             refused = refused.checked_add(heard.refused).unwrap();
         }
         assert_eq!(refused, 1);
@@ -1308,7 +1388,10 @@ mod tests {
         // Thirty-three digits are no i32.
         assert_eq!(
             got.battery_voltage(),
-            Some(Err(Malformed(Field::BatteryVoltage)))
+            Some(Err(Malformed {
+                field: Field::BatteryVoltage,
+                why: Unreadable::OutOfRange,
+            }))
         );
     }
 
@@ -1546,23 +1629,36 @@ mod tests {
             let got = frame(outcomes(stream.get()).0[0].as_ref());
             assert_eq!(
                 got.battery_voltage(),
-                Some(Err(Malformed(Field::BatteryVoltage))),
+                Some(Err(Malformed {
+                    field: Field::BatteryVoltage,
+                    why: Unreadable::NotANumber
+                })),
                 "{bad:?}"
             );
             assert_eq!(text(&got, Field::BatteryVoltage), bad);
             // 999 is no u8 code.
-            assert_eq!(got.charge_state(), Some(Err(Malformed(Field::ChargeState))));
+            assert_eq!(
+                got.charge_state(),
+                Some(Err(Malformed {
+                    field: Field::ChargeState,
+                    why: Unreadable::OutOfRange
+                }))
+            );
         }
     }
 
     #[test]
     fn decimal_reads_the_edges_of_i64_and_refuses_one_past() {
-        assert_eq!(decimal(b"9223372036854775807"), Some(i64::MAX));
-        assert_eq!(decimal(b"-9223372036854775808"), Some(i64::MIN));
-        assert_eq!(decimal(b"9223372036854775808"), None);
-        assert_eq!(decimal(b"-9223372036854775809"), None);
-        assert_eq!(decimal(b"0"), Some(0));
-        assert_eq!(decimal(b"-0"), Some(0));
+        assert_eq!(decimal(b"9223372036854775807"), Ok(i64::MAX));
+        assert_eq!(decimal(b"-9223372036854775808"), Ok(i64::MIN));
+        assert_eq!(decimal(b"9223372036854775808"), Err(Unreadable::OutOfRange));
+        assert_eq!(
+            decimal(b"-9223372036854775809"),
+            Err(Unreadable::OutOfRange)
+        );
+        assert_eq!(decimal(b"0"), Ok(0));
+        assert_eq!(decimal(b"-0"), Ok(0));
+        assert_eq!(decimal(b"1-"), Err(Unreadable::NotANumber));
     }
 
     #[test]
@@ -1682,7 +1778,13 @@ mod tests {
     #[test]
     fn f_052_a_verified_block_writes_v_i_and_ppv_as_measured_at_their_kinds_scales() {
         let (mut store, channels, ids) = site();
-        assert_eq!(publish(&mppt(), &channels, Tick::ZERO, &mut store), Ok(3));
+        assert_eq!(
+            publish(&mppt(), &channels, Tick::ZERO, &mut store),
+            Written {
+                count: 3,
+                first: None
+            }
+        );
         let expect = [13_250, -1_500, 480];
         for (id, value) in ids.into_iter().zip(expect) {
             let sample = store.sample(id, Tick::ZERO).unwrap();
@@ -1700,7 +1802,10 @@ mod tests {
         let only_voltage = Channels::new(Some(ids[0]), None, None).unwrap();
         assert_eq!(
             publish(&mppt(), &only_voltage, Tick::ZERO, &mut store),
-            Ok(1)
+            Written {
+                count: 1,
+                first: None
+            }
         );
         let (mut store, channels, ids) = site();
         let mut stream = Bytes::new();
@@ -1708,7 +1813,10 @@ mod tests {
         let only_current = frame(outcomes(stream.get()).0[0].as_ref());
         assert_eq!(
             publish(&only_current, &channels, Tick::ZERO, &mut store),
-            Ok(1)
+            Written {
+                count: 1,
+                first: None
+            }
         );
         assert_eq!(store.sample(ids[1], Tick::ZERO).unwrap().value(), Some(700));
         for id in [ids[0], ids[2]] {
@@ -1729,7 +1837,9 @@ mod tests {
             let mut stream = Bytes::new();
             stream.push(TAIL).push(block(&[(b"PPV", watts)]).get());
             let got = frame(outcomes(stream.get()).0[0].as_ref());
-            assert_eq!(publish(&got, &channels, Tick::ZERO, &mut store), Ok(1));
+            let written = publish(&got, &channels, Tick::ZERO, &mut store);
+            assert_eq!(written.count, 1);
+            assert_eq!(written.first, None);
             let sample = store.sample(ids[2], Tick::ZERO).unwrap();
             assert_eq!(sample.value(), expected);
             if expected.is_none() {
@@ -1739,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_value_writes_nothing_for_its_field_and_the_rest_are_written() {
+    fn a_malformed_value_is_written_without_a_value_and_the_rest_are_written() {
         let (mut store, channels, ids) = site();
         let mut stream = Bytes::new();
         stream
@@ -1748,12 +1858,83 @@ mod tests {
         let got = frame(outcomes(stream.get()).0[0].as_ref());
         assert_eq!(
             publish(&got, &channels, Tick::ZERO, &mut store),
-            Err(PublishError::Malformed(Malformed(Field::BatteryVoltage)))
+            Written {
+                count: 3,
+                first: Some(PublishError::Malformed(Malformed {
+                    field: Field::BatteryVoltage,
+                    why: Unreadable::NotANumber
+                }))
+            }
         );
         let voltage = store.sample(ids[0], Tick::ZERO).unwrap();
-        assert_eq!(voltage.q.validity_of(), Validity::Initialising);
+        assert_eq!(voltage.value(), None);
+        assert_eq!(voltage.q.validity_of(), Validity::SensorFault);
         assert_eq!(store.sample(ids[1], Tick::ZERO).unwrap().value(), Some(10));
         assert_eq!(store.sample(ids[2], Tick::ZERO).unwrap().value(), Some(50));
+    }
+
+    /// A good `V` at tick 0, then a verified block with `V` as `text` at
+    /// tick 1: what the signal says at tick 1.
+    fn after_good_voltage(text: &[u8]) -> (Option<i32>, Validity) {
+        let (mut store, channels, ids) = site();
+        let good = block(&[(b"V", b"13250")]);
+        let then = block(&[(b"V", text)]);
+        let mut stream = Bytes::new();
+        stream.push(TAIL).push(good.get()).push(then.get());
+        let (seen, n) = outcomes(stream.get());
+        assert_eq!(n, 2);
+        let first = publish(&frame(seen[0].as_ref()), &channels, Tick::ZERO, &mut store);
+        assert_eq!(first.count, 1);
+        let later = Tick::ZERO.after(Millis::from_millis(1_000)).unwrap();
+        let _ = publish(&frame(seen[1].as_ref()), &channels, later, &mut store);
+        let sample = store.sample(ids[0], later).unwrap();
+        (sample.value(), sample.q.validity_of())
+    }
+
+    #[test]
+    fn a_withdrawn_or_unreadable_voltage_invalidates_the_last_reading_at_once() {
+        // `---` is not documented for `V`; it is text that is no number.
+        assert_eq!(after_good_voltage(b"---"), (None, Validity::SensorFault));
+        assert_eq!(after_good_voltage(b"13.2"), (None, Validity::SensorFault));
+        // Too large for i32 at the kind's scale, and too large for i64:
+        // the same refusal either way.
+        assert_eq!(
+            after_good_voltage(b"9999999999"),
+            (None, Validity::OutOfRange)
+        );
+        assert_eq!(
+            after_good_voltage(b"99999999999999999999"),
+            (None, Validity::OutOfRange)
+        );
+        assert_eq!(after_good_voltage(b"12900"), (Some(12_900), Validity::Ok));
+    }
+
+    #[test]
+    fn a_block_without_a_field_leaves_its_reading_and_a_bad_checksum_leaves_all() {
+        let (mut store, channels, ids) = site();
+        let with_v = block(&[(b"V", b"13250"), (b"I", b"100")]);
+        let without_v = block(&[(b"I", b"200")]);
+        let mut bad = block(&[(b"V", b"1"), (b"I", b"1")]);
+        let last = bad.len.checked_sub(1).unwrap();
+        bad.buf[last] ^= 0x01;
+        let mut stream = Bytes::new();
+        stream
+            .push(TAIL)
+            .push(with_v.get())
+            .push(without_v.get())
+            .push(bad.get());
+        let (seen, n) = outcomes(stream.get());
+        assert_eq!(n, 3);
+        assert_eq!(seen[2], Some(Err(Refused::Checksum)));
+        for outcome in &seen[..2] {
+            let written = publish(&frame(outcome.as_ref()), &channels, Tick::ZERO, &mut store);
+            assert_eq!(written.first, None);
+        }
+        assert_eq!(
+            store.sample(ids[0], Tick::ZERO).unwrap().value(),
+            Some(13_250)
+        );
+        assert_eq!(store.sample(ids[1], Tick::ZERO).unwrap().value(), Some(200));
     }
 
     #[test]
@@ -1763,7 +1944,10 @@ mod tests {
         let channels = Channels::new(Some(stranger), Some(ids[1]), None).unwrap();
         assert_eq!(
             publish(&mppt(), &channels, Tick::ZERO, &mut store),
-            Err(PublishError::Store(SignalError::Unknown(stranger)))
+            Written {
+                count: 1,
+                first: Some(PublishError::Store(SignalError::Unknown(stranger)))
+            }
         );
         assert_eq!(
             store.sample(ids[1], Tick::ZERO).unwrap().value(),
@@ -1857,7 +2041,15 @@ mod tests {
     ) -> (usize, usize, usize) {
         let (mut blocks, mut refused, mut written) = (0usize, 0usize, 0usize);
         for _ in 0..4096 {
-            match block_on(listen(port, parser, WAIT, channels, Tick::ZERO, store)) {
+            match block_on(listen(
+                port,
+                parser,
+                WAIT,
+                channels,
+                Tick::ZERO,
+                store,
+                |_| {},
+            )) {
                 Ok(heard) => {
                     blocks = blocks.checked_add(heard.blocks).unwrap();
                     refused = refused.checked_add(heard.refused).unwrap();
@@ -1918,6 +2110,7 @@ mod tests {
                 &channels,
                 Tick::ZERO,
                 &mut store,
+                |_| {},
             )) {
                 Ok(heard) => blocks = blocks.checked_add(heard.blocks).unwrap(),
                 Err(ListenError::Silent) => silences = silences.checked_add(1).unwrap(),
@@ -1946,6 +2139,7 @@ mod tests {
                 &channels,
                 Tick::ZERO,
                 &mut store,
+                |_| {},
             )) {
                 Ok(heard) => blocks = blocks.checked_add(heard.blocks).unwrap(),
                 Err(ListenError::Line(7)) => errors = errors.checked_add(1).unwrap(),
@@ -1995,6 +2189,7 @@ mod tests {
                     &channels,
                     Tick::ZERO,
                     &mut store,
+                    |_| {},
                 )) {
                     Ok(heard) => blocks = blocks.checked_add(heard.blocks).unwrap(),
                     Err(ListenError::Adapter) => adapter = adapter.checked_add(1).unwrap(),
@@ -2005,28 +2200,112 @@ mod tests {
         }
     }
 
+    /// Two verified blocks, the first with `ERR 17` and the second with
+    /// only `V`, after a tail: 53 bytes, which fit one receive. Built by
+    /// hand; the checksum bytes `<` and `D` were worked out by hand.
+    const TWO_BLOCKS: &[u8] =
+        b"\r\nChecksum\t\x42\r\nERR\t17\r\nChecksum\t<\r\nV\t12000\r\nChecksum\tD";
+
     #[test]
-    fn listen_hands_back_the_latest_block_s_typed_fields() {
-        let mut stream = Bytes::new();
-        stream.push(TAIL).push(MPPT);
-        let mut port = Chunked::new(stream.get(), BURST_BYTES);
-        let (mut store, channels, _) = site();
-        let mut parser = Parser::new();
-        let mut latest = None;
-        while port.left() {
-            let heard = block_on(listen(
-                &mut port,
-                &mut parser,
-                WAIT,
-                &channels,
-                Tick::ZERO,
-                &mut store,
-            ))
-            .unwrap();
-            latest = heard.latest.or(latest);
+    fn every_verified_block_in_one_burst_reaches_the_caller_in_order() {
+        assert_eq!(TWO_BLOCKS.len(), 53);
+        let mut built = Bytes::new();
+        built
+            .push(TAIL)
+            .push(block(&[(b"ERR", b"17")]).get())
+            .push(block(&[(b"V", b"12000")]).get());
+        assert_eq!(built.get(), TWO_BLOCKS);
+        let first_ends = TAIL.len() + block(&[(b"ERR", b"17")]).len;
+        // One burst for both blocks, and a burst ending between them.
+        for chunk in [BURST_BYTES, first_ends] {
+            let mut port = Chunked::new(TWO_BLOCKS, chunk);
+            let (mut store, channels, ids) = site();
+            let mut parser = Parser::new();
+            let mut frames = [None; 4];
+            let mut n = 0usize;
+            let mut blocks = 0usize;
+            while port.left() {
+                let heard = block_on(listen(
+                    &mut port,
+                    &mut parser,
+                    WAIT,
+                    &channels,
+                    Tick::ZERO,
+                    &mut store,
+                    |frame| {
+                        frames[n] = Some(*frame);
+                        n += 1;
+                    },
+                ))
+                .unwrap();
+                blocks = blocks.checked_add(heard.blocks).unwrap();
+            }
+            assert_eq!((n, blocks), (2, 2), "bursts of {chunk}");
+            let [Some(first), Some(second), None, None] = frames else {
+                panic!("{frames:?}");
+            };
+            assert_eq!(
+                first.error(),
+                Some(Ok(VendorError::ChargerTemperatureTooHigh))
+            );
+            assert_eq!(first.battery_voltage(), None);
+            assert_eq!(second.battery_voltage(), Some(Ok(12_000)));
+            assert_eq!(second.error(), None);
+            assert_eq!(
+                store.sample(ids[0], Tick::ZERO).unwrap().value(),
+                Some(12_000)
+            );
         }
-        let latest = latest.expect("a block");
-        assert_eq!(latest.charge_state(), Some(Ok(ChargeState::Bulk)));
-        assert_eq!(latest.error(), Some(Ok(VendorError::None)));
+    }
+
+    #[test]
+    fn listen_counts_the_writes_of_a_block_with_one_unreadable_field() {
+        let mut stream = Bytes::new();
+        stream
+            .push(TAIL)
+            .push(block(&[(b"V", b"13.2"), (b"I", b"10"), (b"PPV", b"5")]).get());
+        let mut port = Chunked::new(stream.get(), BURST_BYTES);
+        let (mut store, channels, ids) = site();
+        let mut parser = Parser::new();
+        let heard = block_on(listen(
+            &mut port,
+            &mut parser,
+            WAIT,
+            &channels,
+            Tick::ZERO,
+            &mut store,
+            |_| {},
+        ))
+        .unwrap();
+        assert!(!port.left());
+        assert_eq!(heard.blocks, 1);
+        assert_eq!(heard.written, 3);
+        assert_eq!(
+            heard.unwritten,
+            Some(PublishError::Malformed(Malformed {
+                field: Field::BatteryVoltage,
+                why: Unreadable::NotANumber
+            }))
+        );
+        assert_eq!(store.sample(ids[1], Tick::ZERO).unwrap().value(), Some(10));
+    }
+
+    #[test]
+    fn a_line_feed_where_a_carriage_return_was_due_still_finds_the_block_s_end() {
+        // The `\r` before `\nChecksum` lost: the refusal comes at that `\n`,
+        // and the hunt must still read the `Checksum` label after it.
+        let at = MPPT.windows(10).position(|w| w == b"\r\nChecksum").unwrap();
+        let mut stream = Bytes::new();
+        stream
+            .push(TAIL)
+            .push(&MPPT[..at])
+            .push(&MPPT[at + 1..])
+            .push(MPPT)
+            .push(MPPT);
+        let (seen, n) = outcomes(stream.get());
+        assert_eq!(n, 3, "{seen:?}");
+        assert_eq!(seen[0], Some(Err(Refused::Framing)));
+        assert!(matches!(seen[1], Some(Ok(_))));
+        assert!(matches!(seen[2], Some(Ok(_))));
     }
 }
