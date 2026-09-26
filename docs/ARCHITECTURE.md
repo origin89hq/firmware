@@ -466,7 +466,11 @@ arithmetic, or `commanded`, which is not an observation. A cell may also
 carry the range its vendor documents, and a kind whose meaning bounds it (a
 percentage) carries its own; a decoded value outside either publishes
 `out_of_range` and no value, which is the driver's plausibility check and
-not the store's.
+not the store's. A VE.Direct text block has no register map, and holds its
+fields to the same rule: battery voltage, battery current and panel power
+publish as `measured` at their kinds' scales, and a field KM43 has no
+metric for, such as the charge state or a yield, stays a typed value on the
+decoded block and is never written as a signal.
 
 **A hung instrument is not a steady site.** A channel stops being true two
 ways, and only one looks like it. The bus goes quiet and nothing is written;
