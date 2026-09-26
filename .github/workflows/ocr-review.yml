@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   review:
-    uses: origin89hq/engineering/.github/workflows/ocr-review.yml@lemarier/open-review
+    # Pinned engineering commit; this job passes the secret to that code.
+    uses: origin89hq/engineering/.github/workflows/ocr-review.yml@d919dceb997db469d62f2a896ae6be55ece543ca
     secrets:
       OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
