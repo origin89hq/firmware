@@ -156,7 +156,8 @@ enum Cause {
 
 /// Looks at a start until it is ready, has exited, or has used `budget`.
 /// The clock is read before each look, so readiness seen at the budget
-/// counts; the loop ends at most one `pause` after the budget.
+/// counts and readiness first seen past it does not; the loop ends at most
+/// one `pause` after the budget.
 fn await_startup(
     budget: Duration,
     mut elapsed: impl FnMut() -> Duration,
@@ -166,8 +167,9 @@ fn await_startup(
     loop {
         let now = elapsed();
         match probe() {
-            Probe::Ready => return Startup::Ready(now),
             Probe::Exited(status) => return Startup::Failed(Cause::Exited(status), now),
+            Probe::Ready if now <= budget => return Startup::Ready(now),
+            Probe::Ready => return Startup::Failed(Cause::NeverReady, now),
             Probe::Pending if now >= budget => return Startup::Failed(Cause::NeverReady, now),
             Probe::Pending => pause(),
         }
@@ -514,5 +516,18 @@ fn a_start_never_ready_ends_at_its_budget() {
     assert_eq!(
         scripted(&[], POLL * 3),
         (Startup::Failed(Cause::NeverReady, POLL * 3), 3)
+    );
+}
+
+#[test]
+fn a_start_first_seen_ready_past_its_budget_is_not_ready() {
+    let looks = [Probe::Pending; 4].into_iter().chain([Probe::Ready]);
+    let looks: Vec<Probe> = looks.collect();
+    let budget = POLL
+        .saturating_mul(3)
+        .saturating_add(Duration::from_millis(5));
+    assert_eq!(
+        scripted(&looks, budget),
+        (Startup::Failed(Cause::NeverReady, POLL * 4), 4)
     );
 }
