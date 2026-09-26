@@ -23,8 +23,9 @@
 //!
 //! Taken from the self-test (`origin89hq/origin89`,
 //! `firmwares/o89-selftest/src/checks/adc.rs` and `calib.rs`): the
-//! reference scaling, the sixteen-sample average, and the board's ÷11
-//! dividers and 150 Ω sense resistor (`docs/BOARD-A.md`).
+//! reference scaling and the sixteen-sample average. The resistors are the
+//! board's, and the caller builds each [`Divider`] and [`Loop`] from its
+//! board module; the tests use board A's (`docs/BOARD-A.md`) as fixtures.
 
 use km43::{Id, Provenance, QualityError, SignalDomain, Validity};
 use o89_core::{Observation, SignalError, Signals, Tick};
@@ -135,8 +136,10 @@ impl Vdda {
     /// The supply in millivolts, rounded to the nearest.
     #[must_use]
     pub fn millivolts(self) -> u32 {
-        let rounded = divide_rounding(self.cal_product(), u64::from(self.reference));
-        u32::try_from(rounded).unwrap_or(u32::MAX)
+        // At most 3000 × 1682 over at least one: never past a `u32`.
+        divide_rounding(self.cal_product(), u64::from(self.reference))
+            .and_then(|mv| u32::try_from(mv).ok())
+            .unwrap_or(u32::MAX)
     }
 
     /// `CAL_VDDA_MV × VREFINT_CAL`: the supply times the reference's counts.
@@ -145,12 +148,13 @@ impl Vdda {
     }
 
     /// The voltage at a pin that converted to `counts`, exactly.
-    fn pin(self, counts: u16) -> Pin {
-        Pin {
-            numerator: u64::from(counts).saturating_mul(self.cal_product()),
-            denominator: u64::from(self.reference).saturating_mul(u64::from(FULL_SCALE)),
+    /// `None` only past a `u64`, which the calibration's bounds rule out.
+    fn pin(self, counts: u16) -> Option<Pin> {
+        Some(Pin {
+            numerator: u64::from(counts).checked_mul(self.cal_product())?,
+            denominator: u64::from(self.reference).checked_mul(u64::from(FULL_SCALE))?,
             saturated: counts >= FULL_SCALE,
-        }
+        })
     }
 }
 
@@ -173,17 +177,18 @@ pub struct Divider {
 }
 
 impl Divider {
-    /// Board A's battery dividers on `AIN_HOUSE` and `AIN_START`: 100 kΩ over
-    /// 10 kΩ, one eleventh (`A-29`).
-    pub const BOARD_A: Self = Self {
-        top_ohms: 100_000,
-        bottom_ohms: 10_000,
-    };
+    /// The largest resistance either side may have, 100 MΩ.
+    ///
+    /// An arithmetic bound of this API, not a fact about any board: it keeps
+    /// the exact pin fraction times the divider's total inside a `u64`, so a
+    /// scaling can never overflow into a wrong measurement.
+    pub const MAX_OHMS: u32 = 100_000_000;
 
-    /// `top_ohms` over `bottom_ohms`, or `None` for a zero bottom.
+    /// `top_ohms` over `bottom_ohms`, or `None` for a zero bottom or either
+    /// side above [`Divider::MAX_OHMS`].
     #[must_use]
     pub const fn new(top_ohms: u32, bottom_ohms: u32) -> Option<Self> {
-        if bottom_ohms == 0 {
+        if bottom_ohms == 0 || top_ohms > Self::MAX_OHMS || bottom_ohms > Self::MAX_OHMS {
             return None;
         }
         Some(Self {
@@ -197,14 +202,16 @@ impl Divider {
         if pin.saturated {
             return Observation::missing(Validity::OutOfRange);
         }
-        let total = u64::from(self.top_ohms).saturating_add(u64::from(self.bottom_ohms));
-        let millivolts = divide_rounding(
-            pin.numerator.saturating_mul(total),
-            pin.denominator.saturating_mul(u64::from(self.bottom_ohms)),
-        );
-        match i32::try_from(millivolts) {
-            Ok(millivolts) => Observation::value(millivolts, PROVENANCE),
-            Err(_) => Observation::missing(Validity::OutOfRange),
+        let total = u64::from(self.top_ohms).checked_add(u64::from(self.bottom_ohms));
+        let millivolts = total.and_then(|total| {
+            divide_rounding(
+                pin.numerator.checked_mul(total)?,
+                pin.denominator.checked_mul(u64::from(self.bottom_ohms))?,
+            )
+        });
+        match millivolts.and_then(|mv| i32::try_from(mv).ok()) {
+            Some(millivolts) => Observation::value(millivolts, PROVENANCE),
+            None => Observation::missing(Validity::OutOfRange),
         }
     }
 }
@@ -217,10 +224,6 @@ pub struct Loop {
 }
 
 impl Loop {
-    /// Board A's tank sender on `AIN_TANK`: R46, 150 Ω, so 4–20 mA is 0.6 to
-    /// 3.0 V at the pin (`A-27`).
-    pub const BOARD_A: Self = Self { sense_ohms: 150 };
-
     /// The loop's lowest current, an empty tank, in milliamperes.
     pub const EMPTY_MA: u64 = 4;
     /// The loop's highest current, a full tank, in milliamperes.
@@ -240,9 +243,18 @@ impl Loop {
         // `pin` millivolts across `sense` ohms is `pin / sense` milliamperes,
         // so a current of `ma` is a pin of `ma × sense × denominator` in the
         // numerator's terms, compared without rounding.
-        let per_ma = pin.denominator.saturating_mul(u64::from(self.sense_ohms));
-        let empty = per_ma.saturating_mul(Self::EMPTY_MA);
-        let full = per_ma.saturating_mul(Self::FULL_MA);
+        let bounds = pin
+            .denominator
+            .checked_mul(u64::from(self.sense_ohms))
+            .and_then(|per_ma| {
+                Some((
+                    per_ma.checked_mul(Self::EMPTY_MA)?,
+                    per_ma.checked_mul(Self::FULL_MA)?,
+                ))
+            });
+        let Some((empty, full)) = bounds else {
+            return Observation::missing(Validity::OutOfRange);
+        };
         if pin.saturated {
             // At the top, the pin is at least full scale: more than 20 mA
             // when full scale is, and otherwise unknown.
@@ -254,15 +266,18 @@ impl Loop {
         if pin.numerator < empty || pin.numerator > full {
             return Observation::missing(Validity::Absent);
         }
-        let span = full.saturating_sub(empty);
-        let tenths = divide_rounding(
-            pin.numerator.saturating_sub(empty).saturating_mul(1000),
-            span,
-        );
-        let tenths = i32::try_from(tenths).unwrap_or(i32::MAX);
-        match LOOP_KIND.intrinsic() {
-            Some(range) if !range.holds(tenths) => Observation::missing(Validity::OutOfRange),
-            Some(_) | None => Observation::value(tenths, PROVENANCE),
+        let tenths = pin
+            .numerator
+            .checked_sub(empty)
+            .and_then(|above| above.checked_mul(1000))
+            .and_then(|scaled| divide_rounding(scaled, full.checked_sub(empty)?))
+            .and_then(|tenths| i32::try_from(tenths).ok());
+        match (tenths, LOOP_KIND.intrinsic()) {
+            (Some(tenths), Some(range)) if range.holds(tenths) => {
+                Observation::value(tenths, PROVENANCE)
+            }
+            (Some(tenths), None) => Observation::value(tenths, PROVENANCE),
+            (Some(_) | None, Some(_)) | (None, None) => Observation::missing(Validity::OutOfRange),
         }
     }
 }
@@ -280,7 +295,9 @@ pub enum Scaling {
 impl Scaling {
     /// What an input that converted to `counts` against `vdda` publishes.
     pub fn observe(self, vdda: Vdda, counts: u16) -> Result<Observation, QualityError> {
-        let pin = vdda.pin(counts);
+        let Some(pin) = vdda.pin(counts) else {
+            return Observation::missing(Validity::OutOfRange);
+        };
         match self {
             Self::Divider(divider) => divider.observe(pin),
             Self::Loop(tank) => tank.observe(pin),
@@ -367,18 +384,17 @@ async fn average<S: Sampler>(sampler: &mut S, input: AdcInput) -> Result<u16, Ad
         }
         total = total.saturating_add(u64::from(counts));
     }
-    let mean = divide_rounding(total, u64::from(SAMPLES));
-    Ok(u16::try_from(mean).unwrap_or(FULL_SCALE))
+    // Sixteen counts of at most `FULL_SCALE` each: the mean fits.
+    let mean = divide_rounding(total, u64::from(SAMPLES)).and_then(|mean| u16::try_from(mean).ok());
+    mean.ok_or(AdcError::Counts(FULL_SCALE))
 }
 
-/// `numerator / denominator`, rounding half up; zero for a zero denominator,
-/// which no caller passes.
-fn divide_rounding(numerator: u64, denominator: u64) -> u64 {
-    let half = denominator / 2;
+/// `numerator / denominator`, rounding half up, or `None` for a zero
+/// denominator or a sum past a `u64`.
+fn divide_rounding(numerator: u64, denominator: u64) -> Option<u64> {
     numerator
-        .saturating_add(half)
+        .checked_add(denominator / 2)?
         .checked_div(denominator)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -437,8 +453,15 @@ mod tests {
         Id::new(n).unwrap()
     }
 
-    const DIVIDER: Scaling = Scaling::Divider(Divider::BOARD_A);
-    const TANK: Scaling = Scaling::Loop(Loop::BOARD_A);
+    /// Board A's battery divider, 100 kΩ over 10 kΩ (`A-29`): a fixture.
+    fn divider() -> Scaling {
+        Scaling::Divider(Divider::new(100_000, 10_000).unwrap())
+    }
+
+    /// Board A's tank sense resistor, R46, 150 Ω (`A-27`): a fixture.
+    fn tank() -> Scaling {
+        Scaling::Loop(Loop::new(150).unwrap())
+    }
 
     #[test]
     fn a_known_reference_reading_scales_exactly() {
@@ -450,7 +473,7 @@ mod tests {
         // At 3.0 V a count is 3000 / 4095 mV: 819 counts is 600 mV exactly,
         // and eleven times that is 6.6 V.
         assert_eq!(
-            value(DIVIDER.observe(vdda_at_cal(), 819)),
+            value(divider().observe(vdda_at_cal(), 819)),
             (Some(6600), Validity::Ok)
         );
     }
@@ -491,92 +514,120 @@ mod tests {
 
     #[test]
     fn a_divider_reads_zero_at_zero_and_refuses_its_full_scale() {
-        assert_eq!(value(DIVIDER.observe(vdda(), 0)), (Some(0), Validity::Ok));
+        assert_eq!(value(divider().observe(vdda(), 0)), (Some(0), Validity::Ok));
         // One count under the top: 4094 × 3300 / 4095 × 11 is 36 291.1 mV.
         assert_eq!(
-            value(DIVIDER.observe(vdda(), 4094)),
+            value(divider().observe(vdda(), 4094)),
             (Some(36_291), Validity::Ok)
         );
         // The top is the pin at or above the supply, not a voltage.
         assert_eq!(
-            value(DIVIDER.observe(vdda(), FULL_SCALE)),
+            value(divider().observe(vdda(), FULL_SCALE)),
             (None, Validity::OutOfRange)
         );
         // A 13.2 V bank is 1.2 V at the pin: 1489.09 counts at 3.3 V.
         assert_eq!(
-            value(DIVIDER.observe(vdda(), 1489)),
+            value(divider().observe(vdda(), 1489)),
             (Some(13_199), Validity::Ok)
         );
         assert_eq!(Divider::new(1, 0), None);
-        assert_eq!(Divider::new(100_000, 10_000), Some(Divider::BOARD_A));
+    }
+
+    #[test]
+    fn a_divider_at_the_largest_resistances_scales_exactly_and_one_ohm_more_is_refused() {
+        let max = Divider::MAX_OHMS;
+        let even = Scaling::Divider(Divider::new(max, max).unwrap());
+        // A ratio of two at the top of the range: 4094 counts at 3.3 V is
+        // 3299.19 mV at the pin and 6598.39 mV in front of the divider.
+        assert_eq!(
+            value(even.observe(vdda(), 4094)),
+            (Some(6598), Validity::Ok)
+        );
+        // The same ratio from small resistances gives the same answer.
+        let small = Scaling::Divider(Divider::new(1, 1).unwrap());
+        assert_eq!(
+            value(small.observe(vdda(), 4094)),
+            (Some(6598), Validity::Ok)
+        );
+        // The largest ratio the bound allows: 100 MΩ over 1 Ω.
+        let steep = Scaling::Divider(Divider::new(max, 1).unwrap());
+        assert_eq!(
+            value(steep.observe(vdda(), 4094)),
+            (None, Validity::OutOfRange)
+        );
+        assert_eq!(value(steep.observe(vdda(), 0)), (Some(0), Validity::Ok));
+        assert_eq!(Divider::new(max + 1, max), None);
+        assert_eq!(Divider::new(max, max + 1), None);
     }
 
     #[test]
     fn a_tank_loop_in_range_reads_its_level_with_both_ends_inclusive() {
         // At 3.0 V, 819 counts is 600 mV: 4 mA across 150 Ω, empty.
         assert_eq!(
-            value(TANK.observe(vdda_at_cal(), 819)),
+            value(tank().observe(vdda_at_cal(), 819)),
             (Some(0), Validity::Ok)
         );
         // 2457 counts is 1800 mV: 12 mA, half full.
         assert_eq!(
-            value(TANK.observe(vdda_at_cal(), 2457)),
+            value(tank().observe(vdda_at_cal(), 2457)),
             (Some(500), Validity::Ok)
         );
         // At 3.3 V, 3000 mV is 3722.73 counts: 3723 is 20.0015 mA and
         // 3722 is 19.9961 mA, 99.98 % rounded to 100.0.
         assert_eq!(
-            value(TANK.observe(vdda(), 3722)),
+            value(tank().observe(vdda(), 3722)),
             (Some(1000), Validity::Ok)
         );
         // 4 mA at 3.3 V is 744.68 counts: 745 is inside, 0.03 % rounded to 0.
-        assert_eq!(value(TANK.observe(vdda(), 745)), (Some(0), Validity::Ok));
+        assert_eq!(value(tank().observe(vdda(), 745)), (Some(0), Validity::Ok));
     }
 
     #[test]
     fn a_tank_loop_open_or_shorted_is_absent_not_a_level() {
         // Open: nothing flows.
-        assert_eq!(value(TANK.observe(vdda(), 0)), (None, Validity::Absent));
+        assert_eq!(value(tank().observe(vdda(), 0)), (None, Validity::Absent));
         // Just under 4 mA: 744 counts at 3.3 V is 3.9965 mA.
-        assert_eq!(value(TANK.observe(vdda(), 744)), (None, Validity::Absent));
+        assert_eq!(value(tank().observe(vdda(), 744)), (None, Validity::Absent));
         // Just over 20 mA: 3723 counts at 3.3 V is 20.0015 mA.
-        assert_eq!(value(TANK.observe(vdda(), 3723)), (None, Validity::Absent));
+        assert_eq!(
+            value(tank().observe(vdda(), 3723)),
+            (None, Validity::Absent)
+        );
         // Shorted to the rail: the converter tops out, and at 3.3 V full
         // scale is already 22 mA.
         assert_eq!(
-            value(TANK.observe(vdda(), FULL_SCALE)),
+            value(tank().observe(vdda(), FULL_SCALE)),
             (None, Validity::Absent)
         );
         // At 3.0 V full scale is 20 mA exactly, so the top says only "at
         // least 20 mA", which is no value either way.
         assert_eq!(
-            value(TANK.observe(vdda_at_cal(), FULL_SCALE)),
+            value(tank().observe(vdda_at_cal(), FULL_SCALE)),
             (None, Validity::OutOfRange)
         );
         // One count under is 19.995 mA, a level.
         assert_eq!(
-            value(TANK.observe(vdda_at_cal(), 4094)),
+            value(tank().observe(vdda_at_cal(), 4094)),
             (Some(1000), Validity::Ok)
         );
         assert_eq!(Loop::new(0), None);
-        assert_eq!(Loop::new(150), Some(Loop::BOARD_A));
     }
 
     fn inputs() -> [Input; 3] {
         [
             Input {
                 channel: 0,
-                scaling: DIVIDER,
+                scaling: divider(),
                 signal: id(50),
             },
             Input {
                 channel: 1,
-                scaling: DIVIDER,
+                scaling: divider(),
                 signal: id(51),
             },
             Input {
                 channel: 2,
-                scaling: TANK,
+                scaling: tank(),
                 signal: id(52),
             },
         ]
@@ -651,7 +702,7 @@ mod tests {
             inputs()[0],
             Input {
                 channel: 3,
-                scaling: DIVIDER,
+                scaling: divider(),
                 signal: id(53),
             },
         ];

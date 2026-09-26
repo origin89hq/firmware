@@ -81,15 +81,19 @@ pub const STANDARD: Slots = Slots {
     read_rest: 57,
 };
 
-/// Delay loops per microsecond, in sixteenths, from a timed count.
+/// Delay loops per microsecond, as the timed count itself.
 ///
 /// Built only from a count inside what the part can do, so a timer that did
 /// not run or a clock that is not the one configured is refused at
-/// construction rather than turned into slots of the wrong length.
+/// construction rather than turned into slots of the wrong length. The
+/// ratio is kept whole, and each delay is rounded up from it, so a slot is
+/// never shorter than asked, by the calibration's own measure, and never
+/// longer by more than one loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Calibration {
-    loops_per_16_us: u32,
+    loops: u32,
+    elapsed_us: u32,
 }
 
 /// Why a count was refused.
@@ -108,9 +112,9 @@ pub enum CalibrationError {
 }
 
 impl Calibration {
-    /// The fewest loops per microsecond accepted. At four, a delay is within
-    /// a quarter of a microsecond of its target, and the read slot's 3 µs and
-    /// 10 µs keep the sample well inside the device's 15 µs.
+    /// The fewest loops per microsecond accepted. At four, a delay is at
+    /// most a quarter of a microsecond longer than its target, and the read
+    /// slot's 3 µs and 10 µs keep the sample well inside the device's 15 µs.
     pub const SLOWEST: u32 = 4;
 
     /// The most loops per microsecond accepted. A loop takes at least one
@@ -119,41 +123,40 @@ impl Calibration {
     pub const FASTEST: u32 = 66;
 
     /// The calibration from `loops` delay loops that took `elapsed_us`
-    /// microseconds, or why not.
+    /// microseconds, or why not. Both bounds are inclusive and compared
+    /// without rounding.
     pub fn from_count(loops: u32, elapsed_us: u32) -> Result<Self, CalibrationError> {
         if elapsed_us == 0 {
             return Err(CalibrationError::NoTime);
         }
-        let per_16 = u64::from(loops)
-            .checked_mul(16)
-            .and_then(|scaled| scaled.checked_div(u64::from(elapsed_us)))
-            .ok_or(CalibrationError::NoTime)?;
-        if per_16 < u64::from(Self::SLOWEST.saturating_mul(16)) {
+        let (count, time) = (u64::from(loops), u64::from(elapsed_us));
+        if count < u64::from(Self::SLOWEST).saturating_mul(time) {
             return Err(CalibrationError::TooSlow);
         }
-        if per_16 > u64::from(Self::FASTEST.saturating_mul(16)) {
+        if count > u64::from(Self::FASTEST).saturating_mul(time) {
             return Err(CalibrationError::TooFast);
         }
-        let loops_per_16_us = u32::try_from(per_16).map_err(|_| CalibrationError::TooFast)?;
-        Ok(Self { loops_per_16_us })
+        Ok(Self { loops, elapsed_us })
     }
 
-    /// Delay loops per microsecond, in sixteenths.
+    /// The loops that take at least `us` microseconds at the measured rate:
+    /// rounded up, at least one, and `u32::MAX` past what a `u32` holds.
     #[must_use]
-    pub const fn loops_per_16_us(self) -> u32 {
-        self.loops_per_16_us
-    }
-
-    /// The loops that take `us` microseconds, at least one.
-    #[must_use]
-    pub const fn loops(self, us: u32) -> u32 {
-        let loops = us.saturating_mul(self.loops_per_16_us) / 16;
-        if loops == 0 { 1 } else { loops }
+    pub fn loops(self, us: u32) -> u32 {
+        let wanted = u64::from(us).saturating_mul(u64::from(self.loops));
+        let time = u64::from(self.elapsed_us);
+        let whole = wanted.checked_div(time).unwrap_or(u64::MAX);
+        let loops = if wanted.checked_rem(time).unwrap_or(0) == 0 {
+            whole
+        } else {
+            whole.saturating_add(1)
+        };
+        u32::try_from(loops.max(1)).unwrap_or(u32::MAX)
     }
 
     /// Each phase of `slots`, given in microseconds, in loops.
     #[must_use]
-    pub const fn delays(self, slots: &Slots) -> Slots {
+    pub fn delays(self, slots: &Slots) -> Slots {
         Slots {
             reset_low: self.loops(slots.reset_low),
             presence_sample: self.loops(slots.presence_sample),
@@ -271,8 +274,10 @@ impl Roms {
 pub enum SearchError<E> {
     /// The line reported a fault.
     Line(E),
-    /// A bit and its complement both read one: every device dropped out
-    /// mid-search, unplugged or disturbed.
+    /// A bit and its complement both read one, every device having dropped
+    /// out mid-search, or a pass found a device an earlier pass had found,
+    /// the device it was heading for having left between passes. Either way
+    /// the line changed under the search.
     Lost,
     /// A ROM code the search assembled was refused.
     Rom(RomError),
@@ -355,6 +360,9 @@ pub async fn search<W: OneWire>(line: &mut W) -> Result<Roms, SearchError<W::Err
             line.write_bit(go_one).await.map_err(SearchError::Line)?;
         }
         let found = Rom::new(rom).map_err(SearchError::Rom)?;
+        if roms.iter().any(|seen| *seen == found) {
+            return Err(SearchError::Lost);
+        }
         if !roms.push(found) {
             return Err(SearchError::TooMany);
         }
@@ -402,6 +410,12 @@ pub(crate) mod tests {
         pub pad: [u8; 9],
         /// When set, the device drops out of every search after this bit.
         pub vanish_at: Option<u8>,
+        /// When set, the device is unplugged once the line has seen this
+        /// many resets.
+        pub leaves_after: Option<usize>,
+        /// The device ignores a conversion command and never holds the line
+        /// busy.
+        pub ignores_convert: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -412,6 +426,7 @@ pub(crate) mod tests {
         Match,
         Function,
         Send,
+        Converting,
     }
 
     /// The fault the simulated line reports.
@@ -455,7 +470,7 @@ pub(crate) mod tests {
                 (State::Rom, 0xCC) => self.state = State::Function,
                 (State::Function, 0x44) => {
                     self.converts = self.converts.checked_add(1).unwrap();
-                    self.state = State::Idle;
+                    self.state = State::Converting;
                 }
                 (State::Function, 0xBE) => {
                     // Wired-AND of every selected device's scratchpad.
@@ -502,13 +517,17 @@ pub(crate) mod tests {
             self.state = State::Rom;
             self.command = 0;
             self.bits = 0;
+            let resets = self.resets;
             for (i, active) in self.active.iter_mut().enumerate() {
-                *active = i < self.devices.len();
+                *active = self
+                    .devices
+                    .get(i)
+                    .is_some_and(|device| device.leaves_after.is_none_or(|n| resets <= n));
             }
-            Ok(if self.devices.is_empty() {
-                Presence::Absent
-            } else {
+            Ok(if self.active.contains(&true) {
                 Presence::Present
+            } else {
+                Presence::Absent
             })
         }
 
@@ -559,7 +578,7 @@ pub(crate) mod tests {
                         self.state = State::Idle;
                     }
                 }
-                State::Idle | State::Send => {}
+                State::Idle | State::Send | State::Converting => {}
             }
             Ok(())
         }
@@ -587,6 +606,12 @@ pub(crate) mod tests {
                     self.bits = self.bits.checked_add(1).unwrap();
                     Ok(bit)
                 }
+                // A converting device holds the line low.
+                State::Converting => Ok(!self
+                    .devices
+                    .iter()
+                    .zip(self.active)
+                    .any(|(device, active)| active && !device.ignores_convert)),
                 State::Idle | State::Rom | State::Match | State::Function | State::Send => Ok(true),
             }
         }
@@ -606,6 +631,8 @@ pub(crate) mod tests {
             rom,
             pad: [0xFF; 9],
             vanish_at: None,
+            leaves_after: None,
+            ignores_convert: false,
         }
     }
 
@@ -645,12 +672,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every phase of the standard slots, in microseconds.
+    fn phases(slots: &Slots) -> [u32; 10] {
+        [
+            slots.reset_low,
+            slots.presence_sample,
+            slots.reset_rest,
+            slots.one_low,
+            slots.one_rest,
+            slots.zero_low,
+            slots.zero_rest,
+            slots.read_low,
+            slots.read_sample,
+            slots.read_rest,
+        ]
+    }
+
     #[test]
     fn a_calibration_from_a_normal_count_gives_each_slot_its_loops() {
         // 400 000 loops in 6 250 µs is 64 loops per microsecond: the core at
         // 64 MHz, one cycle a loop.
         let cal = Calibration::from_count(CALIBRATION_LOOPS, 6_250).unwrap();
-        assert_eq!(cal.loops_per_16_us(), 1024);
         assert_eq!(cal.loops(480), 30_720);
         assert_eq!(cal.loops(3), 192);
         let delays = cal.delays(&STANDARD);
@@ -660,26 +702,58 @@ pub(crate) mod tests {
         // Nothing rounds to no delay at all.
         let slow = Calibration::from_count(CALIBRATION_LOOPS, 100_000).unwrap();
         assert_eq!(slow.loops(0), 1);
+        assert_eq!(cal.loops(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn a_non_integral_rate_never_shortens_a_slot_and_lengthens_it_by_under_a_loop() {
+        // 400 000 loops in 93 751 µs is 4.2666 loops a microsecond.
+        let cal = Calibration::from_count(CALIBRATION_LOOPS, 93_751).unwrap();
+        // 480 µs is 2047.98 loops, so 2048, which the count says is 480.0005 µs.
+        assert_eq!(cal.loops(480), 2048);
+        assert_eq!(cal.loops(60), 256);
+        for (loops, elapsed) in [
+            (400_000u32, 93_751u32),
+            (400_000, 6_061),
+            (400_000, 7_001),
+            (399_999, 99_999),
+        ] {
+            let cal = Calibration::from_count(loops, elapsed).unwrap();
+            for (us, got) in phases(&STANDARD)
+                .into_iter()
+                .zip(phases(&cal.delays(&STANDARD)))
+            {
+                // The delay in microseconds, by the count: `got × elapsed / loops`.
+                let (count, time) = (u64::from(loops), u64::from(elapsed));
+                let at_least = u64::from(got) * time >= u64::from(us) * count;
+                let under_a_loop = (u64::from(got) - 1) * time < u64::from(us) * count;
+                assert!(
+                    at_least && under_a_loop,
+                    "{us} µs as {got} loops at {loops}/{elapsed}"
+                );
+            }
+        }
     }
 
     #[test]
     fn a_calibration_accepts_the_slowest_and_fastest_counts_and_refuses_past_them() {
         // Four loops per microsecond: 400 000 loops in 100 000 µs.
         let slowest = Calibration::from_count(CALIBRATION_LOOPS, 100_000).unwrap();
-        assert_eq!(slowest.loops_per_16_us(), 64);
         assert_eq!(slowest.loops(3), 12);
         assert_eq!(
             Calibration::from_count(CALIBRATION_LOOPS, 100_001),
             Err(CalibrationError::TooSlow)
         );
-        // Sixty-six loops per microsecond, rounded down to the sixteenth:
-        // 6 400 000 / 6 055 is 1056.99, and / 6 054 is 1057.16.
-        let fastest = Calibration::from_count(CALIBRATION_LOOPS, 6_055).unwrap();
-        assert_eq!(fastest.loops_per_16_us(), 1056);
+        // Sixty-six loops per microsecond: 400 000 in 6 061 µs is 65.995,
+        // and in 6 060 µs is 66.007.
+        let fastest = Calibration::from_count(CALIBRATION_LOOPS, 6_061).unwrap();
+        assert_eq!(fastest.loops(1), 66);
         assert_eq!(
-            Calibration::from_count(CALIBRATION_LOOPS, 6_054),
+            Calibration::from_count(CALIBRATION_LOOPS, 6_060),
             Err(CalibrationError::TooFast)
         );
+        // Exactly sixty-six is inside.
+        assert!(Calibration::from_count(66 * 6_000, 6_000).is_ok());
         assert_eq!(
             Calibration::from_count(CALIBRATION_LOOPS, 0),
             Err(CalibrationError::NoTime)
@@ -701,9 +775,8 @@ pub(crate) mod tests {
         pad[0] = 0b1000_0001;
         pad[1] = 0x5A;
         let devices = [Device {
-            rom: an27,
             pad,
-            vanish_at: None,
+            ..device(an27)
         }];
         let mut line = Line::new(&devices);
         block_on(async {
@@ -788,6 +861,31 @@ pub(crate) mod tests {
         });
         let mut line = Line::new(&over);
         assert_eq!(block_on(search(&mut line)), Err(SearchError::TooMany));
+    }
+
+    #[test]
+    fn a_device_unplugged_between_passes_is_lost_not_a_second_copy_of_another() {
+        // The two differ first at bit 8, where the first pass takes the
+        // zero and finds `kept`; `leaving` is gone before the second pass,
+        // which then walks back down to `kept`.
+        let kept = rom(0x28, [0x10, 0, 0, 0, 0, 0]);
+        let leaving = rom(0x28, [0x11, 0, 0, 0, 0, 0]);
+        let devices = [
+            device(kept),
+            Device {
+                leaves_after: Some(1),
+                ..device(leaving)
+            },
+        ];
+        let mut line = Line::new(&devices);
+        assert_eq!(block_on(search(&mut line)), Err(SearchError::Lost));
+        assert_eq!(line.resets, 2);
+        // With both staying, the same line finds both.
+        let both = [device(kept), device(leaving)];
+        assert_eq!(
+            block_on(search(&mut Line::new(&both))).map(|roms| roms.len()),
+            Ok(2)
+        );
     }
 
     #[test]

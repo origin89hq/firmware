@@ -4,6 +4,19 @@
 //! [`CONVERSION`] that is the caller's, then one scratchpad read per probe
 //! ([`Probe::read`]), which writes what it found into the store.
 //!
+//! A probe keeps its last conversion in its scratchpad, CRC and all, so a
+//! read with no conversion behind it would publish an old temperature as a
+//! new one. A read therefore takes the [`Conversion`] that `convert_all`
+//! returns only once the line has shown a probe converting, is refused
+//! before the conversion can have finished or after [`READ_WINDOW`], and
+//! writes at the tick the conversion finished, however late or often it is
+//! read. What that does not prove: the busy slot is one line for every
+//! probe, so it shows that some probe converted, not that each did, and a
+//! token says nothing about which line it came from. A probe that missed
+//! the command while another converted returns its previous scratchpad; the
+//! caller binds each token to its own line and gives each probe's signal a
+//! maximum unchanged run, which is what catches that (#196).
+//!
 //! What a read writes, and what it never does (F-053):
 //!
 //! - A scratchpad whose CRC fails writes nothing: the slot keeps its last
@@ -38,6 +51,14 @@ use o89_core::{Millis, Observation, SignalError, Signals, Tick};
 use crate::dialect::{Kind, Plausible};
 use crate::onewire::{self, Rom};
 use crate::port::{OneWire, Presence};
+
+/// How long after a conversion finishes its reads are accepted.
+///
+/// A named policy, not a measured one: eight probes read in well under
+/// 100 ms of slots, and the rest is the executor's scheduling, which the
+/// bench has not qualified. Past it, a read is refused rather than stamped
+/// with a conversion that may no longer describe the probe.
+pub const READ_WINDOW: Millis = Millis::from_millis(1_000);
 
 /// The DS18B20's family code, the first byte of its ROM.
 pub const FAMILY: u8 = 0x28;
@@ -85,19 +106,83 @@ const READ_SCRATCHPAD: u8 = 0xBE;
 const CONFIG_FIXED_MASK: u8 = 0x9F;
 const CONFIG_FIXED: u8 = 0x1F;
 
-/// Start a conversion on every probe on the line at once.
+/// A conversion the line showed under way, and when its reads are accepted.
 ///
-/// [`Presence::Absent`] when nothing answered, and nothing was sent. The
-/// probes on board A's connectors are powered from `OW_VCC`, not
-/// parasitically, so the line needs no strong pull-up while they convert.
-pub async fn convert_all<W: OneWire>(line: &mut W) -> Result<Presence, W::Error> {
-    match line.reset().await? {
-        Presence::Absent => return Ok(Presence::Absent),
+/// Built only by [`convert_all`].
+///
+/// ```compile_fail
+/// use o89_core::Tick;
+/// use o89_drivers::ds18b20::Conversion;
+///
+/// let forged = Conversion { ready: Tick::ZERO, until: Tick::ZERO };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a conversion nobody reads is a line polled for nothing"]
+pub struct Conversion {
+    ready: Tick,
+    until: Tick,
+}
+
+impl Conversion {
+    /// When the conversion has finished: the first tick a read is accepted,
+    /// and the tick every read of it is written at.
+    #[must_use]
+    pub const fn ready(&self) -> Tick {
+        self.ready
+    }
+
+    /// The last tick a read of it is accepted.
+    #[must_use]
+    pub const fn until(&self) -> Tick {
+        self.until
+    }
+}
+
+/// Why no conversion was started, or none can be vouched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a failed conversion is probes whose readings will not refresh"]
+pub enum ConvertError<E> {
+    /// The line reported a fault.
+    Line(E),
+    /// Nothing answered the reset, and nothing was sent. Every probe on the
+    /// line is unplugged; [`Probe::absent`] records that.
+    Absent,
+    /// The line read high straight after the command: no probe held it low
+    /// to say it was converting. A probe powered from the line itself cannot
+    /// say so either, and is refused the same way; board A's probes are
+    /// powered from `OW_VCC`.
+    NotConverting,
+    /// The tick is too close to its end to bound the reads.
+    Tick,
+}
+
+/// Start a conversion on every probe on the line at once, at `now`.
+///
+/// After the command, one read slot: a probe powered from `OW_VCC` holds it
+/// low while it converts, so a slot read high is refused as
+/// [`ConvertError::NotConverting`].
+pub async fn convert_all<W: OneWire>(
+    line: &mut W,
+    now: Tick,
+) -> Result<Conversion, ConvertError<W::Error>> {
+    let ready = now.after(CONVERSION).ok_or(ConvertError::Tick)?;
+    let until = ready.after(READ_WINDOW).ok_or(ConvertError::Tick)?;
+    match line.reset().await.map_err(ConvertError::Line)? {
+        Presence::Absent => return Err(ConvertError::Absent),
         Presence::Present => {}
     }
-    onewire::write_byte(line, SKIP_ROM).await?;
-    onewire::write_byte(line, CONVERT_T).await?;
-    Ok(Presence::Present)
+    onewire::write_byte(line, SKIP_ROM)
+        .await
+        .map_err(ConvertError::Line)?;
+    onewire::write_byte(line, CONVERT_T)
+        .await
+        .map_err(ConvertError::Line)?;
+    if line.read_bit().await.map_err(ConvertError::Line)? {
+        return Err(ConvertError::NotConverting);
+    }
+    Ok(Conversion { ready, until })
 }
 
 /// What nine scratchpad bytes say.
@@ -191,6 +276,12 @@ pub struct Probe {
 pub enum ProbeError<E> {
     /// The line reported a fault; nothing was written.
     Line(E),
+    /// The read came before the conversion had finished, or before it was
+    /// started; nothing was sent or written.
+    Early,
+    /// The read came after the conversion's [`READ_WINDOW`]; nothing was
+    /// sent or written.
+    Expired,
     /// The store refused the write.
     Store(SignalError),
     /// KM43 refused the observation: a defect surfaced rather than hidden.
@@ -260,18 +351,29 @@ impl Probe {
         self.crc_failures
     }
 
-    /// Read the last conversion and write it into `store` at `now`.
+    /// Read `conversion` at `now` and write it into `store` at the tick the
+    /// conversion finished.
     ///
-    /// Nothing answering the reset or the match writes `absent`. A CRC
-    /// failure writes nothing and counts toward [`ProbeRead::Failing`]; any
-    /// other outcome ends the run. A line fault writes nothing and leaves
-    /// the count as it was.
+    /// Refused, with nothing sent or written, before the conversion is
+    /// ready or after its window. Nothing answering the reset or the match
+    /// writes `absent`. A CRC failure writes nothing and counts toward
+    /// [`ProbeRead::Failing`]; any other outcome ends the run. A line fault
+    /// writes nothing and leaves the count as it was. Reading the same
+    /// conversion again writes at the same tick, so it never makes a
+    /// reading younger than it is.
     pub async fn read<W: OneWire, const N: usize>(
         &mut self,
         line: &mut W,
+        conversion: &Conversion,
         now: Tick,
         store: &mut Signals<N>,
     ) -> Result<ProbeRead, ProbeError<W::Error>> {
+        if now < conversion.ready {
+            return Err(ProbeError::Early);
+        }
+        if now > conversion.until {
+            return Err(ProbeError::Expired);
+        }
         let pad = self.scratchpad(line).await.map_err(ProbeError::Line)?;
         let decoded = pad.map_or(Pad::NoAnswer, |bytes| Pad::decode(&bytes));
         let Some(seen) = decoded.observation().map_err(ProbeError::Quality)? else {
@@ -289,9 +391,22 @@ impl Probe {
         };
         self.crc_failures = 0;
         store
-            .write(self.signal, now, seen)
+            .write(self.signal, conversion.ready, seen)
             .map_err(ProbeError::Store)?;
         Ok(ProbeRead::Wrote(seen))
+    }
+
+    /// Record at `now` that nothing answered on the probe's line, after
+    /// [`ConvertError::Absent`]: `absent` and no value, never 0 °C.
+    pub fn absent<const N: usize>(
+        &mut self,
+        now: Tick,
+        store: &mut Signals<N>,
+    ) -> Result<Observation, SignalError> {
+        let seen = Observation::missing(Validity::Absent).map_err(SignalError::Quality)?;
+        self.crc_failures = 0;
+        store.write(self.signal, now, seen)?;
+        Ok(seen)
     }
 
     /// The nine scratchpad bytes, or `None` when nothing answered the reset.
@@ -334,6 +449,13 @@ mod tests {
         Id::new(n).unwrap()
     }
 
+    fn at(millis: u64) -> Tick {
+        Tick::from_millis(millis)
+    }
+
+    /// When a conversion started at zero is ready.
+    const READY: u64 = 750;
+
     fn store() -> Signals<2> {
         let mut store = Signals::new();
         let limits = Limits::new(Millis::from_millis(60_000), None).unwrap();
@@ -357,8 +479,32 @@ mod tests {
         }]
     }
 
-    fn sample(store: &Signals<2>) -> Sample {
-        store.sample(id(40), Tick::ZERO).unwrap()
+    /// A conversion started at `start` on a line whose probe converts.
+    fn converted(start: u64) -> Conversion {
+        let devices = on_line(pad(0));
+        block_on(convert_all(&mut Line::new(&devices), at(start))).unwrap()
+    }
+
+    /// One read of `pad` through a conversion started at `start`, at its
+    /// ready tick.
+    fn read_once(
+        probe: &mut Probe,
+        pad: [u8; 9],
+        start: u64,
+        store: &mut Signals<2>,
+    ) -> Result<ProbeRead, ProbeError<HeldLow>> {
+        let devices = on_line(pad);
+        let conversion = converted(start);
+        block_on(probe.read(
+            &mut Line::new(&devices),
+            &conversion,
+            conversion.ready(),
+            store,
+        ))
+    }
+
+    fn sample(store: &Signals<2>, when: u64) -> Sample {
+        store.sample(id(40), at(when)).unwrap()
     }
 
     #[test]
@@ -381,13 +527,11 @@ mod tests {
 
     #[test]
     fn f_053_a_valid_negative_scratchpad_is_written_as_measured() {
-        let devices = on_line(pad(0xFF5E));
-        let mut line = Line::new(&devices);
         let mut store = store();
         let mut probe = probe();
-        let read = block_on(probe.read(&mut line, Tick::ZERO, &mut store)).unwrap();
+        let read = read_once(&mut probe, pad(0xFF5E), 0, &mut store).unwrap();
         assert!(matches!(read, ProbeRead::Wrote(_)));
-        let seen = sample(&store);
+        let seen = sample(&store, READY);
         assert_eq!(
             (seen.value(), seen.q.validity_of(), seen.q.provenance_of()),
             (Some(-101), Validity::Ok, Provenance::Measured)
@@ -396,36 +540,26 @@ mod tests {
 
     #[test]
     fn f_053_a_crc_failure_writes_no_value_and_keeps_the_last_one() {
-        let devices = on_line(pad(0x0191));
-        let mut line = Line::new(&devices);
         let mut store = store();
         let mut probe = probe();
-        let _ = block_on(probe.read(&mut line, Tick::ZERO, &mut store)).unwrap();
+        let _ = read_once(&mut probe, pad(0x0191), 0, &mut store).unwrap();
 
         let mut bad = pad(0x0191);
         bad[1] ^= 0x04;
-        let devices = on_line(bad);
-        let mut line = Line::new(&devices);
-        let later = Tick::from_millis(1_000);
         assert_eq!(
-            block_on(probe.read(&mut line, later, &mut store)),
+            read_once(&mut probe, bad, 10_000, &mut store),
             Ok(ProbeRead::Crc { consecutive: 1 })
         );
         // The slot still holds the good reading, from its own write.
-        let seen = store.sample(id(40), later).unwrap();
+        let seen = sample(&store, 10_750);
         assert_eq!(
             (seen.value(), seen.q.validity_of(), seen.q.provenance_of()),
             (Some(251), Validity::Ok, Provenance::Measured)
         );
         // The failed read refreshed nothing: the reading ages out a minute
-        // after its own write at zero, not after the failure.
-        let at_limit = Tick::from_millis(60_000);
-        assert_eq!(
-            store.sample(id(40), at_limit).unwrap().q.validity_of(),
-            Validity::Ok
-        );
-        let past = Tick::from_millis(60_001);
-        let seen = store.sample(id(40), past).unwrap();
+        // after its own write at 750 ms, not after the failure.
+        assert_eq!(sample(&store, 60_750).q.validity_of(), Validity::Ok);
+        let seen = sample(&store, 60_751);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (Some(251), Validity::Stale)
@@ -447,13 +581,12 @@ mod tests {
     fn f_053_eleven_crc_failures_in_a_row_raise_the_condition_and_write_nothing() {
         let mut bad = pad(0x0191);
         bad[8] ^= 0xFF;
-        let devices = on_line(bad);
-        let mut line = Line::new(&devices);
         let mut store = store();
         let mut probe = probe();
         let mut raised = 0u8;
         for n in 1..=11u8 {
-            let read = block_on(probe.read(&mut line, Tick::ZERO, &mut store)).unwrap();
+            let start = u64::from(n) * 10_000;
+            let read = read_once(&mut probe, bad, start, &mut store).unwrap();
             if n < CRC_FAILURES {
                 assert_eq!(read, ProbeRead::Crc { consecutive: n });
             } else {
@@ -470,7 +603,7 @@ mod tests {
         }
         assert_eq!(raised, 9);
         // Nothing was ever written: the slot has never had a value.
-        let seen = sample(&store);
+        let seen = sample(&store, 120_000);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (None, Validity::Initialising)
@@ -481,50 +614,149 @@ mod tests {
     fn f_053_a_good_read_ends_the_run_of_crc_failures() {
         let mut bad = pad(0x0191);
         bad[0] ^= 1;
-        let bad_line = on_line(bad);
-        let good_line = on_line(pad(0x0191));
         let mut store = store();
         let mut probe = probe();
         for _ in 0..CRC_FAILURES {
-            let _ = block_on(probe.read(&mut Line::new(&bad_line), Tick::ZERO, &mut store));
+            let _ = read_once(&mut probe, bad, 0, &mut store);
         }
         assert_eq!(probe.crc_failures(), CRC_FAILURES);
-        let read = block_on(probe.read(&mut Line::new(&good_line), Tick::ZERO, &mut store));
+        let read = read_once(&mut probe, pad(0x0191), 0, &mut store);
         assert!(matches!(read, Ok(ProbeRead::Wrote(_))));
         assert_eq!(probe.crc_failures(), 0);
         assert_eq!(
-            block_on(probe.read(&mut Line::new(&bad_line), Tick::ZERO, &mut store)),
+            read_once(&mut probe, bad, 0, &mut store),
             Ok(ProbeRead::Crc { consecutive: 1 })
         );
     }
 
     #[test]
     fn f_053_an_unplugged_probe_is_absent_never_zero() {
-        // Nothing on the line at all.
-        let mut line = Line::new(&[]);
+        // Nothing on the line at all: no conversion, and the caller records
+        // the probe absent.
         let mut store = store();
         let mut probe = probe();
-        let read = block_on(probe.read(&mut line, Tick::ZERO, &mut store)).unwrap();
-        assert!(matches!(read, ProbeRead::Wrote(_)));
-        let seen = sample(&store);
+        assert_eq!(
+            block_on(convert_all(&mut Line::new(&[]), at(0))),
+            Err(ConvertError::Absent)
+        );
+        let seen = probe.absent(at(0), &mut store).unwrap();
+        assert_eq!(seen.reading(), None);
+        let seen = sample(&store, 0);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (None, Validity::Absent)
         );
 
-        // Another probe answers the reset, and nothing answers the match.
+        // Another probe converts, and nothing answers this one's match.
         let other = [Device {
             pad: pad(0x0191),
             ..device(rom(FAMILY, [9, 9, 9, 9, 9, 9]))
         }];
         let mut line = Line::new(&other);
-        let later = Tick::from_millis(10);
-        let _ = block_on(probe.read(&mut line, later, &mut store)).unwrap();
-        let seen = store.sample(id(40), later).unwrap();
+        let conversion = block_on(convert_all(&mut line, at(10_000))).unwrap();
+        let _ = block_on(probe.read(&mut line, &conversion, at(10_750), &mut store)).unwrap();
+        let seen = sample(&store, 10_750);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (None, Validity::Absent)
         );
+
+        // Unplugged between the conversion and the read.
+        let gone = [Device {
+            leaves_after: Some(1),
+            ..on_line(pad(0x0191))[0]
+        }];
+        let mut line = Line::new(&gone);
+        let conversion = block_on(convert_all(&mut line, at(20_000))).unwrap();
+        let _ = block_on(probe.read(&mut line, &conversion, at(20_750), &mut store)).unwrap();
+        assert_eq!(sample(&store, 20_750).q.validity_of(), Validity::Absent);
+    }
+
+    #[test]
+    fn a_conversion_is_vouched_for_only_when_the_line_shows_a_probe_converting() {
+        // Every probe ignored the command: the busy slot reads high.
+        let deaf = [Device {
+            ignores_convert: true,
+            ..on_line(pad(0x0191))[0]
+        }];
+        let mut line = Line::new(&deaf);
+        assert_eq!(
+            block_on(convert_all(&mut line, at(0))),
+            Err(ConvertError::NotConverting)
+        );
+        assert_eq!(line.converts, 1);
+        // A line fault is its own error, and no token either way.
+        let devices = on_line(pad(0x0191));
+        let mut line = Line::new(&devices);
+        line.fault = true;
+        assert_eq!(
+            block_on(convert_all(&mut line, at(0))),
+            Err(ConvertError::Line(HeldLow))
+        );
+        // A tick too close to its end cannot bound the reads.
+        let mut line = Line::new(&devices);
+        assert_eq!(
+            block_on(convert_all(&mut line, Tick::from_millis(u64::MAX - 1_000))),
+            Err(ConvertError::Tick)
+        );
+        assert_eq!(line.resets, 0);
+        // A probe converting: ready after the datasheet's wait, open for
+        // the read window.
+        let conversion = converted(5_000);
+        assert_eq!(
+            (conversion.ready(), conversion.until()),
+            (at(5_750), at(6_750))
+        );
+    }
+
+    #[test]
+    fn a_read_is_refused_before_its_conversion_is_ready_and_after_its_window() {
+        let devices = on_line(pad(0x0191));
+        let conversion = converted(0);
+        let mut store = store();
+        let mut probe = probe();
+        let mut read = |when: u64, store: &mut Signals<2>| {
+            block_on(probe.read(&mut Line::new(&devices), &conversion, at(when), store))
+        };
+        assert_eq!(read(749, &mut store), Err(ProbeError::Early));
+        assert_eq!(read(1_751, &mut store), Err(ProbeError::Expired));
+        assert_eq!(sample(&store, 749).q.validity_of(), Validity::Initialising);
+        // Both ends of the window are inside.
+        assert!(matches!(read(750, &mut store), Ok(ProbeRead::Wrote(_))));
+        assert!(matches!(read(1_750, &mut store), Ok(ProbeRead::Wrote(_))));
+    }
+
+    #[test]
+    fn a_read_on_a_tick_before_the_conversion_started_is_refused() {
+        let devices = on_line(pad(0x0191));
+        let conversion = converted(10_000);
+        let mut store = store();
+        let mut probe = probe();
+        assert_eq!(
+            block_on(probe.read(&mut Line::new(&devices), &conversion, at(9_000), &mut store)),
+            Err(ProbeError::Early)
+        );
+        assert_eq!(
+            sample(&store, 9_000).q.validity_of(),
+            Validity::Initialising
+        );
+    }
+
+    #[test]
+    fn reading_one_conversion_again_never_makes_the_reading_younger() {
+        let devices = on_line(pad(0x0191));
+        let conversion = converted(0);
+        let mut store = store();
+        let mut probe = probe();
+        for when in [750, 1_200, 1_750] {
+            let read =
+                block_on(probe.read(&mut Line::new(&devices), &conversion, at(when), &mut store));
+            assert!(matches!(read, Ok(ProbeRead::Wrote(_))), "{when}");
+        }
+        // Every write was at 750 ms: stale a minute after that, not after
+        // the last read.
+        assert_eq!(sample(&store, 60_750).q.validity_of(), Validity::Ok);
+        assert_eq!(sample(&store, 60_751).q.validity_of(), Validity::Stale);
     }
 
     #[test]
@@ -538,26 +770,28 @@ mod tests {
                 .map(Observation::reading),
             Some(None)
         );
+        let conversion = converted(0);
         let mut line = Line::new(&[]);
         line.fault = true;
         let mut store = store();
         let mut probe = probe();
         assert_eq!(
-            block_on(probe.read(&mut line, Tick::ZERO, &mut store)),
+            block_on(probe.read(&mut line, &conversion, at(READY), &mut store)),
             Err(ProbeError::Line(HeldLow))
         );
-        assert_eq!(sample(&store).q.validity_of(), Validity::Initialising);
+        assert_eq!(
+            sample(&store, READY).q.validity_of(),
+            Validity::Initialising
+        );
     }
 
     #[test]
     fn the_power_on_value_is_no_reading() {
         assert_eq!(Pad::decode(&pad(0x0550)), Pad::PowerOn);
-        let devices = on_line(pad(0x0550));
-        let mut line = Line::new(&devices);
         let mut store = store();
         let mut probe = probe();
-        let _ = block_on(probe.read(&mut line, Tick::ZERO, &mut store)).unwrap();
-        let seen = sample(&store);
+        let _ = read_once(&mut probe, pad(0x0550), 0, &mut store).unwrap();
+        let seen = sample(&store, READY);
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (None, Validity::Initialising)
@@ -597,33 +831,26 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_is_only_a_ds18b20_and_converting_an_empty_line_sends_nothing() {
+    fn a_probe_is_only_a_ds18b20() {
         let ds18s20 = Rom::new(rom(0x10, [1, 2, 3, 4, 5, 6])).unwrap();
         assert_eq!(Probe::new(ds18s20, id(40)), None);
-
-        let mut line = Line::new(&[]);
-        assert_eq!(block_on(convert_all(&mut line)), Ok(Presence::Absent));
-        assert_eq!(line.converts, 0);
-
-        let devices = on_line(pad(0));
-        let mut line = Line::new(&devices);
-        assert_eq!(block_on(convert_all(&mut line)), Ok(Presence::Present));
-        assert_eq!(line.converts, 1);
-
-        let mut line = Line::new(&devices);
-        line.fault = true;
-        assert_eq!(block_on(convert_all(&mut line)), Err(HeldLow));
+        let probe = probe();
+        assert_eq!((probe.rom().bytes(), probe.signal()), (probe_rom(), id(40)));
     }
 
     #[test]
     fn a_write_to_a_signal_the_store_does_not_hold_is_refused() {
         let devices = on_line(pad(0x0191));
-        let mut line = Line::new(&devices);
+        let conversion = converted(0);
         let mut store = Signals::<1>::new();
         let mut probe = probe();
         assert_eq!(
-            block_on(probe.read(&mut line, Tick::ZERO, &mut store)),
+            block_on(probe.read(&mut Line::new(&devices), &conversion, at(READY), &mut store)),
             Err(ProbeError::Store(SignalError::Unknown(id(40))))
+        );
+        assert_eq!(
+            probe.absent(at(0), &mut store),
+            Err(SignalError::Unknown(id(40)))
         );
     }
 }
