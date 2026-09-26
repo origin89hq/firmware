@@ -150,29 +150,30 @@ impl Channel {
         }
     }
 
-    /// Whether the vendor states the value as a magnitude: a limit the
-    /// tables type as a signed integer without saying what a negative one
-    /// means, so a negative one is not a number this driver may interpret.
-    const fn magnitude(self) -> bool {
+    /// Whether a negative raw value is one this driver may not interpret:
+    /// a limit the tables type as a signed integer without saying what a
+    /// negative one means, and a pack's voltage, which its own BMS cannot
+    /// measure below zero across the pack's terminals.
+    const fn never_negative(self) -> bool {
         match self {
             Self::ChargeCurrentLimit
             | Self::DischargeCurrentLimit
-            | Self::DischargeVoltageLimit => true,
+            | Self::DischargeVoltageLimit
+            | Self::PackVoltage => true,
             Self::ChargeVoltageLimit
             | Self::StateOfCharge
-            | Self::PackVoltage
             | Self::PackCurrent
             | Self::Temperature => false,
         }
     }
 
     /// The channel's observation of `raw`: out of range when it is a
-    /// negative magnitude, does not fit an `i32` at the kind's scale or
+    /// negative value [`Channel::never_negative`] refuses, does not fit an `i32` at the kind's scale or
     /// leaves the kind's own range (P-185), never clamped.
     fn observe(self, raw: i32) -> Result<Observation, SignalError> {
         let value = raw
             .checked_mul(self.factor())
-            .filter(|_| !(self.magnitude() && raw < 0))
+            .filter(|_| !(self.never_negative() && raw < 0))
             .filter(|value| {
                 self.kind()
                     .intrinsic()
@@ -1220,6 +1221,42 @@ mod tests {
                     Some(51_230)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn p_185_a_negative_pack_voltage_is_out_of_range_and_its_raw_word_is_kept() {
+        // Built by hand: the voltage at zero, 0.01 V, the top of the word,
+        // −0.01 V and the bottom, the rest of the frame as in `PACK`.
+        for (raw, published) in [
+            (0i16, Some(0)),
+            (1, Some(10)),
+            (i16::MAX, Some(327_670)),
+            (-1, None),
+            (i16::MIN, None),
+        ] {
+            let [low, high] = raw.to_le_bytes();
+            let data = [low, high, 0x83, 0xFF, 0xDD, 0xFF];
+            let mut store = store();
+            let heard = read(&[Ok(frame(0x356, &data))], Tick::ZERO, &mut store).unwrap();
+            let Frame::Pack(pack) = heard.frame else {
+                panic!("{:?}", heard.frame);
+            };
+            assert_eq!(pack.voltage, raw);
+            let expected = match published {
+                Some(v) => (Some(v), Validity::Ok, Provenance::Measured),
+                None => (None, Validity::OutOfRange, Provenance::None),
+            };
+            assert_eq!(
+                value(&store, Channel::PackVoltage, Tick::ZERO),
+                expected,
+                "{raw}"
+            );
+            // The rest of the frame still publishes.
+            assert_eq!(
+                value(&store, Channel::PackCurrent, Tick::ZERO).0,
+                Some(-12_500)
+            );
         }
     }
 
