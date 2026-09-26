@@ -451,11 +451,16 @@ where
 }
 
 /// A `git` run on `dir` with nothing of the caller's configuration: no
-/// inherited `GIT_*` variable, no global or system file, no replacement
-/// refs, and no discovery of a repository above `dir`.
+/// inherited `GIT_*` variable, no global or system file, no personal ignore
+/// file, no replacement refs, and no discovery of a repository above `dir`.
 fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(dir);
+    // With no global file, git still reads `$XDG_CONFIG_HOME/git/ignore`
+    // unless `core.excludesFile` names another; `-c` outranks every file.
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.excludesFile=/dev/null"]);
     for variable in inherited_git(std::env::vars_os()) {
         command.env_remove(variable);
     }
@@ -1701,6 +1706,30 @@ mod tests {
         );
         assert!(error.contains("sub/"), "{error}");
         assert!(error.contains("empty/"), "{error}");
+    }
+
+    /// Only the repository's `.gitignore` files decide what is a leftover,
+    /// never an excludes file of the machine's or the repository's config.
+    #[test]
+    fn an_excludes_file_does_not_hide_a_stray_file() {
+        let (_repo, into, source) = staged("excludes");
+        let dir = into.0.join("src");
+        let excludes = into.0.join("ignore");
+        fs::write(&excludes, "*.log\n").expect("written");
+        git_ok(
+            &dir,
+            &[
+                "config",
+                "core.excludesFile",
+                excludes.to_str().expect("UTF-8"),
+            ],
+        );
+        fs::write(dir.join("build.log"), "").expect("written");
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::Ignored).expect_err("stray")
+        );
+        assert!(error.contains("build.log"), "{error}");
     }
 
     #[test]

@@ -63,8 +63,8 @@ cargo xtask sizes --from ../o89-release --record   # on main, after the merge
 A release is flashed or published from the recorded files after
 `reproducible-verify`, which refuses a directory holding anything but the
 three images and their manifest, never rebuilt at another path. `sizes --from --record` takes its row
-from such a directory, and only in a checkout of the commit it was built
-from. Ordinary builds keep their actual build time. The identity is
+from such a directory, and only in a clean checkout of the commit it was
+built from. Ordinary builds keep their actual build time. The identity is
 qualified for one platform at a time; the manifest names the one that built
 it.
 

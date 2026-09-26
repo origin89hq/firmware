@@ -108,7 +108,10 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             images::report(&measured);
             if record {
-                reproducible::recordable(&manifest, &reproducible::head(repo.root())?)?;
+                // The row pairs the artifacts' commit with this checkout's
+                // budgets, so the checkout has to be that commit exactly.
+                let checkout = reproducible::identify(repo.root())?;
+                reproducible::recordable(&manifest, &checkout.commit)?;
                 images::record(&repo, &manifest.source.commit.to_string(), &measured)?;
             }
         }
