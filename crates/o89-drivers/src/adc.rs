@@ -156,10 +156,12 @@ impl Vdda {
     /// of the range when `counts` is or any conversion behind it was.
     /// `None` only past a `u64`, which the calibration's bounds rule out.
     fn pin(self, counts: u16, clipped: bool) -> Option<Pin> {
+        let saturated = clipped || counts >= FULL_SCALE;
+        let counts = if saturated { FULL_SCALE } else { counts };
         Some(Pin {
             numerator: u64::from(counts).checked_mul(self.cal_product())?,
             denominator: u64::from(self.reference).checked_mul(u64::from(FULL_SCALE))?,
-            saturated: clipped || counts >= FULL_SCALE,
+            saturated,
         })
     }
 }
@@ -853,6 +855,24 @@ mod tests {
         assert_eq!(
             (seen.value(), seen.q.validity_of()),
             (Some(1000), Validity::Ok)
+        );
+        // At 3.3 V full scale is 22 mA: one clipped conversion says the loop
+        // went past 20 mA, however low the mean, and a loop past 20 mA is
+        // absent. Fifteen of 3000 and one of 4095 is a mean of 3068,
+        // 16.5 mA, which alone would read a level.
+        let mut sampler = Mixed {
+            reference: 1500,
+            low: 3000,
+            high: FULL_SCALE,
+            lows: SAMPLES - 1,
+            taken: 0,
+        };
+        let mut store = store();
+        let _ = block_on(read(&mut sampler, cal(), &[tank], Tick::ZERO, &mut store)).unwrap();
+        let seen = store.sample(tank.signal, Tick::ZERO).unwrap();
+        assert_eq!(
+            (seen.value(), seen.q.validity_of()),
+            (None, Validity::Absent)
         );
         // A single conversion at the top is enough.
         let seen = pass(1500, SAMPLES - 1, divider);
