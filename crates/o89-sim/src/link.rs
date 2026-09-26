@@ -303,6 +303,8 @@ pub(crate) struct Bench {
     /// The read of the log posted to the recorder, answered by the next
     /// link turn.
     posted: Option<o89_core::LogWant>,
+    /// A record's outcome the site has not been told, kept between turns.
+    unsettled: Option<o89_core::Unsettled>,
 }
 
 impl Bench {
@@ -377,6 +379,7 @@ impl Bench {
             plane_due: now,
             link_due: now,
             posted: None,
+            unsettled: None,
         };
         // A board whose rail stays on through a reset has a module already
         // powered at boot, which the adapter says at once.
@@ -486,6 +489,7 @@ impl Bench {
                 &mut scratch,
                 None,
                 |_| {},
+                &mut self.unsettled,
             ));
             assert_eq!(turn.unwritten, None, "the site wrote every record it owed");
             assert!(!turn.busy, "one owner never finds the site held");
