@@ -38,6 +38,36 @@ asks for: the board revision, the firmware hash, what was measured and with
 what. A build is not bench evidence. Flashing and actuation are never part of
 an ordinary check.
 
+## Release artifacts
+
+`just reproducible <out>` builds the three images as release artifacts: the
+commit at `HEAD` of a clean checkout, staged with nothing else at `/o89` in
+the container `xtask/reproducible/Dockerfile` pins, with an empty cargo home
+of its own and the `SOURCE_DATE_EPOCH` it requires. Any clean checkout of the
+commit, wherever it sits, builds the same bytes (#74); without the fixed
+path it cannot, because Cargo hashes the absolute path of every crate under
+`crates/` into the symbols. `<out>` holds the `.bin` and ELF of each image
+and `manifest.toml`: the commit and tree, the epoch, the environment and
+each file's SHA-256. It needs Docker and refuses a dirty checkout, a missing,
+zero, malformed or future epoch, and an `<out>` that exists. Ctrl-C stops the
+container but leaves the build's scratch directory,
+`o89-reproducible-<pid>-<time>` under `$TMPDIR`, to delete by hand.
+
+```sh
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) just reproducible ../o89-release
+just reproducible-verify ../o89-release
+just reproducible-compare ../o89-release ../o89-release-other-checkout
+cargo xtask sizes --from ../o89-release --record   # on main, after the merge
+```
+
+A release is flashed or published from the recorded files after
+`reproducible-verify`, which refuses a directory holding anything but the
+three images and their manifest, never rebuilt at another path. `sizes --from --record` takes its row
+from such a directory, and only in a clean checkout of the commit it was
+built from. Ordinary builds keep their actual build time. The identity is
+qualified for one platform at a time; the manifest names the one that built
+it.
+
 ## Protocol
 
 Wire numbers are allocated in [km43](https://github.com/origin89hq/km43) and

@@ -82,15 +82,57 @@ const IMAGES: &[Image] = &[
     },
 ];
 
+/// The packages of the three images, in the order they are built.
+pub fn packages() -> impl Iterator<Item = &'static str> {
+    IMAGES.iter().map(|image| image.package)
+}
+
 /// A measured image.
 pub struct Measured {
     package: &'static str,
     bytes: u64,
     budget: u64,
     margin: u64,
+    /// The ELF and the bytes that reach the part, where the build left them;
+    /// `None` for a size read back from a recorded artifact.
+    files: Option<Files>,
+}
+
+/// Where a build left an image.
+pub struct Files {
+    /// The linked ELF, with its symbols and the log's strings.
+    pub elf: PathBuf,
+    /// The bytes that reach the part: what is measured and flashed.
+    pub bin: PathBuf,
 }
 
 impl Measured {
+    /// The image's size as recorded beside a release artifact, against the
+    /// budget this checkout holds it to.
+    pub fn recorded(package: &str, bytes: u64) -> Result<Self> {
+        let image = IMAGES
+            .iter()
+            .find(|image| image.package == package)
+            .with_context(|| format!("{package} is not an image this checkout builds"))?;
+        Ok(Self {
+            package: image.package,
+            bytes,
+            budget: image.budget,
+            margin: image.margin,
+            files: None,
+        })
+    }
+
+    /// The package the image is built from.
+    pub fn package(&self) -> &'static str {
+        self.package
+    }
+
+    /// Where the build left the image, when this checkout built it.
+    pub fn files(&self) -> Option<&Files> {
+        self.files.as_ref()
+    }
+
     fn percent(&self) -> u64 {
         self.bytes
             .saturating_mul(100)
@@ -109,12 +151,17 @@ pub fn build_and_measure(repo: &Repo) -> Result<Vec<Measured>> {
             .filter(|artifact| artifact.target.name == image.package)
             .find_map(|artifact| artifact.executable.as_deref())
             .with_context(|| format!("{} built but reported no executable", image.package))?;
-        let bytes = measure(image, elf.as_std_path())?;
+        let elf = elf.as_std_path();
+        let (bin, bytes) = measure(image, elf)?;
         out.push(Measured {
             package: image.package,
             bytes,
             budget: image.budget,
             margin: image.margin,
+            files: Some(Files {
+                elf: elf.to_path_buf(),
+                bin,
+            }),
         });
     }
     Ok(out)
@@ -283,7 +330,7 @@ fn build(repo: &Repo, image: &Image) -> Result<Vec<Artifact>> {
     )
 }
 
-fn measure(image: &Image, elf: &Path) -> Result<u64> {
+fn measure(image: &Image, elf: &Path) -> Result<(PathBuf, u64)> {
     let bin: PathBuf = elf.with_extension("bin");
     match image.kind {
         Kind::RawBinary => {
@@ -313,7 +360,7 @@ fn measure(image: &Image, elf: &Path) -> Result<u64> {
     let bytes = fs::metadata(&bin)
         .with_context(|| format!("measuring {}", bin.display()))?
         .len();
-    Ok(bytes)
+    Ok((bin, bytes))
 }
 
 /// Print the table.
@@ -351,13 +398,15 @@ pub fn enforce(measured: &[Measured]) -> Result<()> {
     Ok(())
 }
 
-/// Append a row per image to `docs/sizes.tsv`, with the commit it measures.
+/// Append a row per image to `docs/sizes.tsv`, naming `commit`, the commit
+/// the images were built from.
 ///
 /// Run on `main` after a merge: a branch's commits are rewritten by the
 /// squash, and a row naming one of them names nothing afterwards.
-pub fn record(repo: &Repo, measured: &[Measured]) -> Result<()> {
+pub fn record(repo: &Repo, commit: &str, measured: &[Measured]) -> Result<()> {
     let sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "--short", "--verify"])
+        .arg(format!("{commit}^{{commit}}"))
         .current_dir(repo.root())
         .output()
         .context("running git rev-parse")?;
@@ -561,6 +610,28 @@ mod tests {
         assert!(error.contains("checkout/.cargo/config.toml"), "{error}");
         assert!(error.contains("#74"), "{error}");
         clean.expect("nothing to refuse where no config exists");
+    }
+
+    /// A size read back from a release artifact is held to this checkout's
+    /// budget for its package, and a package this checkout does not build is
+    /// refused rather than given no budget.
+    #[test]
+    fn a_recorded_size_takes_its_images_budget_or_is_refused() {
+        let controller = Measured::recorded("o89-controller", 244_472).expect("an image");
+        assert_eq!(controller.budget, 480 * KIB);
+        assert_eq!(controller.margin, 24 * KIB);
+        assert!(controller.files().is_none());
+        assert!(enforce(&[controller]).is_ok());
+        let over = Measured::recorded("o89-boot", 32 * KIB).expect("an image");
+        assert!(enforce(&[over]).is_err());
+        let error = format!(
+            "{:#}",
+            Measured::recorded("o89-dev", 1).err().expect("refused")
+        );
+        assert!(
+            error.contains("not an image this checkout builds"),
+            "{error}"
+        );
     }
 
     #[test]

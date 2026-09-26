@@ -53,8 +53,34 @@ gate:
 # image to docs/sizes.tsv named by the commit at HEAD: run it on `main` after
 # a merge, because a branch's commits are rewritten by the squash and a row
 # naming one of them names nothing. A pull request states its sizes in words.
+# `--from <dir>` measures a directory `just reproducible` wrote instead of
+# building, and names the commit its manifest names.
+[positional-arguments]
 sizes *args:
-    cargo xtask sizes {{args}}
+    cargo xtask sizes "$@"
+
+# Build the three images as release artifacts into `out`, which must not
+# exist, from the commit at HEAD of a clean checkout: staged at one fixed
+# path in the pinned container of `xtask/reproducible/Dockerfile`, with the
+# epoch the environment gives, so any clean checkout of the commit makes the
+# same bytes (#74). Needs Docker and SOURCE_DATE_EPOCH, usually
+# `SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)`. A release is flashed or
+# published from `out` after `reproducible-verify`, never rebuilt. Touches
+# no board. Arguments reach the command as they were given, spaces and
+# all, never through the shell's parsing.
+[positional-arguments]
+reproducible out *args:
+    out="$1"; shift; cargo xtask reproducible build --out "$out" "$@"
+
+# Check every file in a release directory against its manifest.
+[positional-arguments]
+reproducible-verify dir:
+    cargo xtask reproducible verify "$1"
+
+# Refuse two release directories that differ in any byte or input.
+[positional-arguments]
+reproducible-compare first second:
+    cargo xtask reproducible compare "$1" "$2"
 
 # Refresh the shared skills once at the start of a task.
 skills-sync:
