@@ -35,7 +35,7 @@
 use km43::{Condition, Id, Provenance, SignalDomain, Validity, VendorCode, VendorNamespace};
 use o89_core::{Millis, Observation, SignalError, Signals, Tick};
 
-use crate::dialect::Kind;
+use crate::dialect::{Kind, Plausible};
 use crate::port::{Burst, Ended, Listener, PortFault};
 
 /// The longest label a field may carry, from the protocol document's
@@ -880,6 +880,8 @@ struct Published {
     provenance: Provenance,
     /// The vendor's decimal exponent in the kind's unit.
     decade: i8,
+    /// The range the vendor documents, at the kind's scale.
+    plausible: Option<Plausible>,
 }
 
 /// The fields [`publish`] writes. Each is a value the product's instrument
@@ -891,18 +893,30 @@ const PUBLISHED: [Published; 3] = [
         kind: Kind::DcVoltage,
         provenance: Provenance::Measured,
         decade: -3,
+        // Unsigned on an MPPT (HEX protocol rev 18, 0xEDD5 `un16`) but
+        // signed on a BMV (BMV-7xx HEX protocol, 0xED8D `sn16`): the text
+        // field does not say which product sent it, so no bound here.
+        plausible: None,
     },
     Published {
         field: Field::BatteryCurrent,
         kind: Kind::DcCurrent,
         provenance: Provenance::Measured,
         decade: -3,
+        // Signed: a battery discharges.
+        plausible: None,
     },
     Published {
         field: Field::PanelPower,
         kind: Kind::DcPower,
         provenance: Provenance::Measured,
         decade: 0,
+        // Only MPPT chargers send `PPV`, and their panel power is unsigned
+        // (HEX protocol rev 18, 0xEDBC `un32`).
+        plausible: Some(Plausible {
+            low: 0,
+            high: i32::MAX,
+        }),
     },
 ];
 
@@ -914,16 +928,21 @@ const _: () = {
 };
 
 impl Published {
-    /// Whether the row's kind carries its provenance over a live value, and
+    /// Whether the row's kind carries its provenance over a live value,
     /// its decade is at or above the kind's scale, within the nine decades
-    /// a rescale can span.
+    /// a rescale can span, and its range is not empty.
     const fn admissible(self) -> bool {
         let scale = self.kind.scale();
+        let range = match self.plausible {
+            Some(range) => range.low <= range.high,
+            None => true,
+        };
         self.kind
             .accepts(SignalDomain::Live)
             .contains(self.provenance)
             && self.decade >= scale
             && self.decade.abs_diff(scale) <= 9
+            && range
     }
 
     /// What the frame says about this field, or `None` when it carried no
@@ -931,8 +950,8 @@ impl Published {
     ///
     /// A field present in a verified block always writes, so a value the
     /// product withdrew never leaves the last one current: a number too
-    /// large for `i64` or for `i32` at the kind's scale is `out_of_range`
-    /// (P-185), and text that is no number is `sensor_fault`, the product
+    /// large for `i64` or for `i32` at the kind's scale, or outside the
+    /// range the vendor documents, is `out_of_range` (P-185), and text that is no number is `sensor_fault`, the product
     /// reporting the reading bad. Victron documents `---` as a no-value
     /// pattern only for fields this driver does not publish.
     fn observe(self, frame: &Frame) -> Option<(Observation, Option<Malformed>)> {
@@ -955,7 +974,8 @@ impl Published {
         };
         let scaled = factor
             .and_then(|factor| value.checked_mul(factor))
-            .and_then(|scaled| i32::try_from(scaled).ok());
+            .and_then(|scaled| i32::try_from(scaled).ok())
+            .filter(|&value| self.plausible.is_none_or(|range| range.holds(value)));
         let seen = match scaled {
             Some(value) => Observation::value(value, self.provenance),
             None => Observation::missing(Validity::OutOfRange),
@@ -1842,6 +1862,28 @@ mod tests {
             assert_eq!(written.first, None);
             let sample = store.sample(ids[2], Tick::ZERO).unwrap();
             assert_eq!(sample.value(), expected);
+            if expected.is_none() {
+                assert_eq!(sample.q.validity_of(), Validity::OutOfRange);
+            }
+        }
+    }
+
+    #[test]
+    fn a_negative_panel_power_is_out_of_range_and_a_negative_voltage_is_not() {
+        let (mut store, channels, ids) = site();
+        for (fields, id, expected) in [
+            (&[(&b"PPV"[..], &b"-1"[..])][..], ids[2], None),
+            (&[(b"PPV", b"0")], ids[2], Some(0)),
+            // A BMV's main voltage is signed in its HEX protocol.
+            (&[(b"V", b"-1")], ids[0], Some(-1)),
+        ] {
+            let mut stream = Bytes::new();
+            stream.push(TAIL).push(block(fields).get());
+            let got = frame(outcomes(stream.get()).0[0].as_ref());
+            let written = publish(&got, &channels, Tick::ZERO, &mut store);
+            assert_eq!((written.count, written.first), (1, None), "{fields:?}");
+            let sample = store.sample(id, Tick::ZERO).unwrap();
+            assert_eq!(sample.value(), expected, "{fields:?}");
             if expected.is_none() {
                 assert_eq!(sample.q.validity_of(), Validity::OutOfRange);
             }
