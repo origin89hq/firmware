@@ -176,12 +176,12 @@ impl Slot {
             let q = SignalQuality::absent(Validity::Initialising).map_err(SignalError::Quality)?;
             return Sample::new(self.sig, q, None, None).map_err(SignalError::Quality);
         };
-        let Some(value) = held.seen.value else {
-            return Sample::new(self.sig, held.seen.q, None, None).map_err(SignalError::Quality);
-        };
         let since_write = now
             .since(held.written)
             .ok_or(SignalError::TickBehind(self.sig))?;
+        let Some(value) = held.seen.value else {
+            return Sample::new(self.sig, held.seen.q, None, None).map_err(SignalError::Quality);
+        };
         let since_change = now
             .since(held.run_from)
             .ok_or(SignalError::TickBehind(self.sig))?;
@@ -804,6 +804,18 @@ mod tests {
         );
         // The refused write left the value it would have replaced.
         assert_eq!(store.sample(sig(1), at(5_000)).unwrap().value(), Some(1));
+        // A missing reading gives the same answer for a tick behind it.
+        store
+            .write(
+                sig(1),
+                at(6_000),
+                Observation::missing(Validity::Absent).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.sample(sig(1), at(5_999)),
+            Err(SignalError::TickBehind(sig(1)))
+        );
     }
 
     #[test]
