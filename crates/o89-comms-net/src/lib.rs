@@ -5,9 +5,10 @@
 //! passes when the firmware's drifts (firmware #150). The firmware and
 //! `o89-sim`'s test of the DHCP resends both call [`station_dhcp`].
 //!
-//! Apart from `o89-comms-core` because this crate carries embassy-net, and
-//! `o89-comms-core` is also cross-compiled for the controller's target.
-//! `no_std` and no `alloc`.
+//! Apart from `o89-comms-core` so that the comms processor's decisions and
+//! their host tests stay free of the network stack. `cargo xtask check`
+//! still cross-compiles this crate for both targets, as it does every
+//! `no_std` crate of the host workspace. `no_std` and no `alloc`.
 
 #![no_std]
 

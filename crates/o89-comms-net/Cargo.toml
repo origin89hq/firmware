@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# A crate of its own so that `o89-comms-core`, which the controller's target
-# also builds, never carries a network stack. Never `o89-core`.
+# A crate of its own so that `o89-comms-core`, the comms processor's
+# decisions, never carries a network stack. Never `o89-core`.
 [dependencies]
 o89-comms-core = { path = "../o89-comms-core" }
 # The release `firmwares/o89-comms` and `o89-sim` build; a second release in
