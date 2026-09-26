@@ -1,0 +1,26 @@
+[package]
+name = "o89-drivers"
+version = "0.0.0"
+description = "The controller's device dialects behind port seams: host-testable, no allocator, names no peripheral"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `defmt::Format` on every public type, for the controller's log.
+defmt = ["dep:defmt", "km43/defmt", "o89-core/defmt"]
+
+[dependencies]
+# The store a decode writes into, and the tick every deadline is on.
+o89-core = { path = "../o89-core" }
+crc.workspace = true
+km43.workspace = true
+defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+embassy-futures.workspace = true
+
+[lints]
+workspace = true

@@ -61,6 +61,7 @@ live with, are in [origin89hq/hardware](https://github.com/origin89hq/hardware/i
 | `crates/o89-core` | The controller's decisions: `no_std`, no allocator, names no peripheral, host-tested |
 | `crates/o89-comms-core` | The comms processor's decisions: the download window's intake and the link-local state machine, `no_std`, no allocator, host-tested, never reaching `o89-core` |
 | `crates/o89-comms-net` | The comms processor's station DHCP configuration on embassy-net, which the firmware and `o89-sim`'s resend test both call; `no_std`, no allocator, kept apart so `o89-comms-core` stays free of the network stack |
+| `crates/o89-drivers` | The controller's device dialects behind port seams: Modbus RTU framing, the register maps with each cell's declared provenance, and the device enum; `no_std`, no allocator, names no peripheral |
 | `crates/o89-link` | The link's mechanics both cores share: the tick, the requests and beats in flight, the rules every link-local frame meets |
 | `crates/o89-sim` | The simulated site: the storage seams with a step counter, every write path crashed at every step |
 | `crates/o89-dev` | The bench tool: the FRAM, the NOR and the rail's pin over the probe, through the firmware's mailbox (`just dev-ping`) |
