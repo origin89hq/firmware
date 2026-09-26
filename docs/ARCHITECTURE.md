@@ -466,7 +466,14 @@ arithmetic, or `commanded`, which is not an observation. A cell may also
 carry the range its vendor documents, and a kind whose meaning bounds it (a
 percentage) carries its own; a decoded value outside either publishes
 `out_of_range` and no value, which is the driver's plausibility check and
-not the store's.
+not the store's. A vendor register no KM43 kind can carry, such as a charge
+stage whose enum space has no members, an alarm word, or an unsigned current
+where the kind is signed, is read from the same reply and handed back typed
+beside the poll; it never enters the store, and no kind is invented for it.
+A register whose representation the vendor leaves open, such as a current
+with no stated sign or a percentage two of its documents scale differently,
+publishes `unsupported` until the caller declares how that unit sends it,
+and its raw words come back beside the poll either way.
 
 **A hung instrument is not a steady site.** A channel stops being true two
 ways, and only one looks like it. The bus goes quiet and nothing is written;
