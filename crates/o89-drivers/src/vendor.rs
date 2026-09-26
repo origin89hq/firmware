@@ -93,8 +93,8 @@ pub(crate) fn word(registers: &Registers<'_>, register: u16) -> Result<u16, Cond
         .ok_or(ConditionError::Missing(register))
 }
 
-/// Two words low first from `register`, as both PZEM manuals order their
-/// 32-bit values. A pair that would reach past `0xFFFF` is missing at
+/// Two words low first from `register`, as both PZEM manuals and EPEVER's
+/// V2.5 (its note 5, "L and H register") order their 32-bit values. A pair that would reach past `0xFFFF` is missing at
 /// `register`, the only one of its two addresses that exists.
 pub(crate) fn low_first(registers: &Registers<'_>, register: u16) -> Result<u32, ConditionError> {
     let high = register
@@ -105,25 +105,28 @@ pub(crate) fn low_first(registers: &Registers<'_>, register: u16) -> Result<u32,
     Ok(low | (high << 16))
 }
 
-/// Write `block`'s cells from `registers` into `store` at `now`, the `n`th
-/// cell as `signal(n)`, and say how many were written.
+/// Write `block`'s cells from `registers` into `store` at `now`, where the
+/// block's first cell is its device's `from`th and the device's `n`th cell
+/// publishes as `signal(n)`; say how many were written.
 ///
 /// Stops at the first cell that fails; what it wrote before stands.
 pub(crate) fn publish<E, const N: usize>(
     block: &Block,
     registers: &Registers<'_>,
+    from: usize,
     signal: impl Fn(usize) -> Option<Id>,
     now: Tick,
     store: &mut Signals<N>,
-) -> Result<Polled, PollError<E>> {
-    let mut cell = 0usize;
+) -> Result<usize, PollError<E>> {
+    let mut written = 0usize;
     for seen in block.decode(registers) {
+        let cell = from.saturating_add(written);
         let seen = seen.map_err(|error| PollError::Decode { cell, error })?;
         let sig = signal(cell).ok_or(PollError::Signals)?;
         store.write(sig, now, seen).map_err(PollError::Store)?;
-        cell = cell.saturating_add(1);
+        written = written.saturating_add(1);
     }
-    Ok(Polled { written: cell })
+    Ok(written)
 }
 
 #[cfg(test)]

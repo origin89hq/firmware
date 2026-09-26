@@ -14,7 +14,9 @@
 //! registers come back as [`Words`] from the same reply, typed and never
 //! stored. The manual defines no *not available* word for any register: a
 //! meter with no voltage on its terminals and no USB supply does not answer
-//! at all, which leaves its signal without a value and ages it out.
+//! at all, which leaves its signal without a value and ages it out. The
+//! meter measures whatever it is wired into, so its component role is the
+//! installation's to name, not this table's.
 //!
 //! cites: F-050, F-052
 
@@ -25,7 +27,7 @@ use crate::dialect::{Block, Cell, Kind, Plausible, RegisterMap, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Registers, Timing};
 use crate::port::Rs485;
 use crate::vendor::{self, Alarm, ConditionError, Report, VendorError};
-use crate::{ModbusDevice, PollError};
+use crate::{ModbusDevice, PollError, Polled};
 
 /// The measurement registers, §2.3.
 const CELLS: [Cell; 1] = [
@@ -128,9 +130,12 @@ impl Meter {
             .await
             .map_err(|error| VendorError::Poll(PollError::Modbus { block: 0, error }))?;
         let conditions = Words::from_registers(&registers).map_err(VendorError::Condition)?;
-        let polled = vendor::publish(block, &registers, |cell| self.0.signal(cell), now, store)
+        let written = vendor::publish(block, &registers, 0, |cell| self.0.signal(cell), now, store)
             .map_err(VendorError::Poll)?;
-        Ok(Report { polled, conditions })
+        Ok(Report {
+            polled: Polled { written },
+            conditions,
+        })
     }
 }
 
