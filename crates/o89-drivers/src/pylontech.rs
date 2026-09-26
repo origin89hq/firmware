@@ -25,10 +25,14 @@
 //! (F-052): the BMS's charge and discharge limits are `reported`; its state
 //! of charge is its own count, `counted`, as the architecture treats a BMS's
 //! own figure beside a shunt's; the pack's voltage, current and temperature
-//! are `measured`. KM43 has no metric for a state of health, a protection,
-//! an alarm or a request, so those decode into [`Charge`], [`Status`] and
-//! [`Requests`], which a read hands back with every bit the frame carried,
-//! and nothing of them reaches the store.
+//! are `measured`, the current only once the caller states which way the
+//! BMS counts it positive ([`CurrentDirection`]), because the documents do
+//! not say. A negative limit publishes `out_of_range`: the documents type the
+//! limits as signed and give a negative one no meaning. KM43 has no metric
+//! for a state of health, a protection, an alarm or a request, so those
+//! decode into [`Charge`], [`Status`] and [`Requests`], which a read hands
+//! back with every bit the frame carried, and nothing of them reaches the
+//! store.
 //!
 //! cites: F-052, P-185, P-196
 
@@ -62,7 +66,8 @@ pub enum Channel {
     StateOfCharge,
     /// The pack's voltage, from `0x356`.
     PackVoltage,
-    /// The pack's current, from `0x356`.
+    /// The pack's current, from `0x356`, published only when the caller
+    /// says which way the BMS counts positive ([`CurrentDirection`]).
     PackCurrent,
     /// The average cell temperature, from `0x356`.
     Temperature,
@@ -139,15 +144,34 @@ impl Channel {
         }
     }
 
-    /// The channel's observation of `raw`: out of range when it does not fit
-    /// an `i32` at the kind's scale or leaves the kind's own range (P-185),
-    /// never clamped.
+    /// Whether the vendor states the value as a magnitude: a limit the
+    /// tables type as a signed integer without saying what a negative one
+    /// means, so a negative one is not a number this driver may interpret.
+    const fn magnitude(self) -> bool {
+        match self {
+            Self::ChargeCurrentLimit
+            | Self::DischargeCurrentLimit
+            | Self::DischargeVoltageLimit => true,
+            Self::ChargeVoltageLimit
+            | Self::StateOfCharge
+            | Self::PackVoltage
+            | Self::PackCurrent
+            | Self::Temperature => false,
+        }
+    }
+
+    /// The channel's observation of `raw`: out of range when it is a
+    /// negative magnitude, does not fit an `i32` at the kind's scale or
+    /// leaves the kind's own range (P-185), never clamped.
     fn observe(self, raw: i32) -> Result<Observation, SignalError> {
-        let value = raw.checked_mul(self.factor()).filter(|value| {
-            self.kind()
-                .intrinsic()
-                .is_none_or(|range| range.holds(*value))
-        });
+        let value = raw
+            .checked_mul(self.factor())
+            .filter(|_| !(self.magnitude() && raw < 0))
+            .filter(|value| {
+                self.kind()
+                    .intrinsic()
+                    .is_none_or(|range| range.holds(*value))
+            });
         match value {
             Some(value) => Observation::value(value, self.provenance()),
             None => Observation::missing(Validity::OutOfRange),
@@ -177,6 +201,27 @@ const _: () = assert!(
     declared(),
     "a channel declares a provenance its kind cannot carry"
 );
+
+/// Which way a BMS counts its pack current as positive.
+///
+/// The protocol documents type `0x356`'s current as a signed integer and do
+/// not say which direction is positive, so the driver never assumes one: the
+/// configuration states it for the BMS in front of it, from its own
+/// documentation or a bench reading, and until then says
+/// [`CurrentDirection::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CurrentDirection {
+    /// Positive while the pack charges: published as the BMS sends it,
+    /// since KM43 counts current positive into the component.
+    IntoPack,
+    /// Positive while the pack discharges: published negated.
+    OutOfPack,
+    /// Nobody has established it: the pack current publishes
+    /// `unsupported` and no value, and the decoded [`Pack`] keeps the raw
+    /// word.
+    Unknown,
+}
 
 /// The frames this table decodes, by standard identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +579,7 @@ impl Frame {
     /// [`MOST_PER_FRAME`], in channel order.
     fn observations(
         &self,
+        direction: CurrentDirection,
     ) -> Result<[Option<(Channel, Observation)>; MOST_PER_FRAME], SignalError> {
         let seen = |channel: Channel, raw: i32| Ok(Some((channel, channel.observe(raw)?)));
         Ok(match *self {
@@ -567,7 +613,22 @@ impl Frame {
             ],
             Self::Pack(pack) => [
                 seen(Channel::PackVoltage, i32::from(pack.voltage))?,
-                seen(Channel::PackCurrent, i32::from(pack.current))?,
+                match (direction, i32::from(pack.current).checked_neg()) {
+                    (CurrentDirection::IntoPack, _) => {
+                        seen(Channel::PackCurrent, i32::from(pack.current))?
+                    }
+                    (CurrentDirection::OutOfPack, Some(into)) => seen(Channel::PackCurrent, into)?,
+                    // Unreachable: every `i16` negates inside an `i32`.
+                    (CurrentDirection::OutOfPack, None) => Some((
+                        Channel::PackCurrent,
+                        Observation::missing(Validity::OutOfRange).map_err(SignalError::Quality)?,
+                    )),
+                    (CurrentDirection::Unknown, _) => Some((
+                        Channel::PackCurrent,
+                        Observation::missing(Validity::Unsupported)
+                            .map_err(SignalError::Quality)?,
+                    )),
+                },
                 seen(Channel::Temperature, i32::from(pack.temperature))?,
                 None,
             ],
@@ -619,15 +680,16 @@ pub enum ReadError<E> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Pylontech {
     signals: ChannelIds,
+    direction: CurrentDirection,
 }
 
 impl Pylontech {
     /// A BMS whose channels publish as consecutive signals from `first`, in
-    /// [`Channel::ALL`]'s order, or `None` when they would run past
-    /// `0xFFFF`. Keeping devices' ranges apart is the configuration's to
-    /// check.
+    /// [`Channel::ALL`]'s order, and whose pack current counts positive in
+    /// `direction`; `None` when the signals would run past `0xFFFF`.
+    /// Keeping devices' ranges apart is the configuration's to check.
     #[must_use]
-    pub fn new(first: Id) -> Option<Self> {
+    pub fn new(first: Id, direction: CurrentDirection) -> Option<Self> {
         let at = |offset: u16| Id::new(first.get().checked_add(offset)?).ok();
         Some(Self {
             signals: ChannelIds {
@@ -640,6 +702,7 @@ impl Pylontech {
                 pack_current: at(6)?,
                 temperature: at(7)?,
             },
+            direction,
         })
     }
 
@@ -671,7 +734,7 @@ impl Pylontech {
         now: Tick,
         store: &mut Signals<N>,
     ) -> Result<usize, SignalError> {
-        let seen = frame.observations()?;
+        let seen = frame.observations(self.direction)?;
         for (channel, _) in seen.iter().flatten() {
             let _ = store.sample(self.signal(*channel), now)?;
         }
@@ -728,7 +791,9 @@ mod tests {
     }
 
     fn bms() -> Pylontech {
-        Pylontech::new(id(40)).expect("room for eight signals")
+        // These fixtures count positive into the pack; the direction test
+        // takes each setting in turn.
+        Pylontech::new(id(40), CurrentDirection::IntoPack).expect("room for eight signals")
     }
 
     fn store() -> Signals<CHANNELS> {
@@ -891,29 +956,50 @@ mod tests {
     }
 
     #[test]
-    fn signed_limits_keep_their_sign_at_both_ends_of_the_word() {
-        // Built by hand: the signed fields at zero, −1 and both extremes.
-        for (raw, charge, floor) in [
-            (0i16, 0, 0),
-            (-1, -100, 100),
-            (i16::MAX, 3_276_700, -3_276_700),
-            (i16::MIN, -3_276_800, 3_276_800),
+    fn p_185_a_negative_limit_is_out_of_range_and_its_raw_bits_are_kept() {
+        // Built by hand: the signed limit fields at zero, one, both extremes
+        // and minus one. The tables type them as signed and give no meaning
+        // to a negative limit, so a negative one publishes no value.
+        for (raw, published) in [
+            (0i16, Some(0)),
+            (1, Some(100)),
+            (i16::MAX, Some(3_276_700)),
+            (-1, None),
+            (i16::MIN, None),
         ] {
             let [low, high] = raw.to_le_bytes();
             let data = [0xFF, 0xFF, low, high, low, high, low, high];
             let mut store = store();
-            let _ = read(&[Ok(frame(0x351, &data))], Tick::ZERO, &mut store).unwrap();
+            let heard = read(&[Ok(frame(0x351, &data))], Tick::ZERO, &mut store).unwrap();
+            assert_eq!(heard.written, 4, "{raw}");
             assert_eq!(
-                value(&store, Channel::ChargeCurrentLimit, Tick::ZERO).0,
-                Some(charge)
+                heard.frame,
+                Frame::Limits(Limits {
+                    charge_voltage: 0xFFFF,
+                    charge_current: raw,
+                    discharge_current: raw,
+                    discharge_voltage: Some(raw),
+                }),
+                "{raw}"
+            );
+            let expect = |value: Option<i32>| match value {
+                Some(value) => (Some(value), Validity::Ok, Provenance::Reported),
+                None => (None, Validity::OutOfRange, Provenance::None),
+            };
+            assert_eq!(
+                value(&store, Channel::ChargeCurrentLimit, Tick::ZERO),
+                expect(published),
+                "{raw}"
             );
             assert_eq!(
-                value(&store, Channel::DischargeCurrentLimit, Tick::ZERO).0,
-                Some(floor)
+                value(&store, Channel::DischargeCurrentLimit, Tick::ZERO),
+                expect(published.map(|v| -v)),
+                "{raw}"
             );
             assert_eq!(
-                value(&store, Channel::DischargeVoltageLimit, Tick::ZERO).0,
-                Some(i32::from(raw) * 100)
+                value(&store, Channel::DischargeVoltageLimit, Tick::ZERO),
+                expect(published),
+                "{raw}"
             );
             // The charge voltage is unsigned: 0xFFFF is 6553.5 V, not −0.1.
             assert_eq!(
@@ -988,6 +1074,66 @@ mod tests {
         assert_eq!(value(&store, Channel::PackVoltage, Tick::ZERO), ok(51_230));
         assert_eq!(value(&store, Channel::PackCurrent, Tick::ZERO), ok(-12_500));
         assert_eq!(value(&store, Channel::Temperature, Tick::ZERO), ok(-35));
+    }
+
+    #[test]
+    fn the_pack_current_publishes_only_in_the_direction_the_caller_states() {
+        // Built by hand: the current at zero, ±1 and both extremes, the rest
+        // of the frame as in `PACK`.
+        for (raw, into) in [
+            (0i16, 0),
+            (1, 100),
+            (-1, -100),
+            (i16::MAX, 3_276_700),
+            (i16::MIN, -3_276_800),
+        ] {
+            let [low, high] = raw.to_le_bytes();
+            let data = [0x03, 0x14, low, high, 0xDD, 0xFF];
+            for (direction, expected) in [
+                (
+                    CurrentDirection::IntoPack,
+                    (Some(into), Validity::Ok, Provenance::Measured),
+                ),
+                (
+                    CurrentDirection::OutOfPack,
+                    (Some(-into), Validity::Ok, Provenance::Measured),
+                ),
+                (
+                    CurrentDirection::Unknown,
+                    (None, Validity::Unsupported, Provenance::None),
+                ),
+            ] {
+                let bms = Pylontech::new(id(40), direction).unwrap();
+                let mut store = store();
+                let receives = [Ok(frame(0x356, &data))];
+                let mut port = Script {
+                    receives: &receives,
+                    at: 0,
+                    waited: None,
+                };
+                let heard = block_on(bms.read(
+                    &mut port,
+                    Millis::from_millis(1_500),
+                    Tick::ZERO,
+                    &mut store,
+                ))
+                .unwrap();
+                let Frame::Pack(pack) = heard.frame else {
+                    panic!("{:?}", heard.frame);
+                };
+                assert_eq!(pack.current, raw, "{direction:?}");
+                assert_eq!(
+                    value(&store, Channel::PackCurrent, Tick::ZERO),
+                    expected,
+                    "{raw} {direction:?}"
+                );
+                // The rest of the frame does not depend on it.
+                assert_eq!(
+                    value(&store, Channel::PackVoltage, Tick::ZERO).0,
+                    Some(51_230)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1274,8 +1420,8 @@ mod tests {
         for (offset, channel) in (0u16..).zip(Channel::ALL) {
             assert_eq!(bms.signal(channel), id(40 + offset), "{channel:?}");
         }
-        assert!(Pylontech::new(id(0xFFF8)).is_some());
-        assert_eq!(Pylontech::new(id(0xFFF9)), None);
-        assert_eq!(Pylontech::new(id(0xFFFF)), None);
+        assert!(Pylontech::new(id(0xFFF8), CurrentDirection::Unknown).is_some());
+        assert_eq!(Pylontech::new(id(0xFFF9), CurrentDirection::Unknown), None);
+        assert_eq!(Pylontech::new(id(0xFFFF), CurrentDirection::Unknown), None);
     }
 }
