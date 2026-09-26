@@ -76,7 +76,9 @@ installs them on the first cargo command. `espflash` measures the comms image
 
 `just check` runs what CI runs: formatting, Clippy with the restriction lints
 that make the house rules build failures, the host tests, and `cargo xtask
-check`. `just sizes` prints the three images against their budgets. Flashing
+check`. `just sizes` prints the three images against their budgets, and
+`just reproducible` builds them as release artifacts any clean checkout
+rebuilds byte for byte. Flashing
 and actuation are never part of `check`; those recipes arrive with the first
 image that touches a pin. `just skills-sync` fetches the shared engineering
 skills at the start of a task. See [CONTRIBUTING.md](CONTRIBUTING.md).

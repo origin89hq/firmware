@@ -8,6 +8,8 @@
 //! the last, and builds the three images in release and measures the bytes
 //! that reach the part. Each check here is one that has been watched go red.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -34,6 +36,7 @@ mod deps;
 mod images;
 mod pins;
 mod repo;
+mod reproducible;
 mod traceability;
 
 #[derive(Parser)]
@@ -54,11 +57,21 @@ enum Command {
         /// Append a row per image to `docs/sizes.tsv`.
         #[arg(long)]
         record: bool,
+        /// Measure the release artifacts in this directory, which
+        /// `reproducible build` wrote, instead of building: the row names
+        /// the commit their manifest names.
+        #[arg(long)]
+        from: Option<PathBuf>,
     },
     /// Print the flags every image is built with, as
     /// `CARGO_ENCODED_RUSTFLAGS` takes them, for a recipe that builds an
     /// image with `cargo run`.
     Rustflags,
+    /// Release artifacts rebuilt byte for byte from any clean checkout.
+    Reproducible {
+        #[command(subcommand)]
+        action: reproducible::Action,
+    },
 }
 
 fn main() -> Result<()> {
@@ -76,13 +89,29 @@ fn main() -> Result<()> {
             println!("xtask check: clear");
         }
         Command::Rustflags => print!("{}", images::rustflags(&repo)?),
-        Command::Sizes { record } => {
+        Command::Sizes { record, from: None } => {
             let measured = images::build_and_measure(&repo)?;
             images::report(&measured);
             if record {
-                images::record(&repo, &measured)?;
+                images::record(&repo, "HEAD", &measured)?;
             }
         }
+        Command::Sizes {
+            record,
+            from: Some(dir),
+        } => {
+            let manifest = reproducible::verify(&dir)?;
+            let measured = manifest
+                .images
+                .iter()
+                .map(|image| images::Measured::recorded(&image.package, image.bin.bytes))
+                .collect::<Result<Vec<_>>>()?;
+            images::report(&measured);
+            if record {
+                images::record(&repo, &manifest.source.commit.to_string(), &measured)?;
+            }
+        }
+        Command::Reproducible { action } => reproducible::run_action(&repo, action)?,
     }
     Ok(())
 }
