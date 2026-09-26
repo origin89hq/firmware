@@ -601,9 +601,10 @@ The recorder publishes the log's extent from the ring's head only while it
 is proven, marks it moving before every append and drop, and has nothing to
 publish before the ring opens. While it moves a `Subscribe`, whose answer
 promises history from the oldest record, is asked to retry (P-104, P-095); a
-`Hello` is asked to retry only before the ring has opened (P-075), and
-otherwise reports the last extent published, which it promises nothing
-from.
+`Hello` is asked to retry only before the ring has opened (P-075). A unit
+whose ring never opened answers a `ReadLog` with an empty page and refuses a
+`Subscribe`, since no event could reach it. A `Hello` otherwise reports
+the last extent published, which it promises nothing from.
 
 ### Behaviours: parameters, not an engine
 

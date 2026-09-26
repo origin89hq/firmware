@@ -365,7 +365,6 @@ async fn write_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
 /// next never passes a record the page left out.
 async fn read_ring(ring: &mut NorRing<Nor>, lo: u32, hi: u32, scratch: &mut [u8]) -> (Status, u32) {
     let from = RingPage::from_args(lo, hi);
-    let oldest = ring.head().oldest;
     let mut at = RingPage::HEADER;
     // One visitor type for every reader of the ring, so its walk is built
     // once rather than once per caller.
@@ -390,9 +389,11 @@ async fn read_ring(ring: &mut NorRing<Nor>, lo: u32, hi: u32, scratch: &mut [u8]
     let walked = ring.read_from(from, scratch, visit).await;
     match walked {
         Ok(next) => {
+            // Read after the walk, which finds an unproven head again first:
+            // the page never names an oldest the part no longer holds.
             let page = RingPage {
                 ring_next: ring.next_seq(),
-                oldest,
+                oldest: ring.head().oldest,
                 next,
             };
             put_at(0, &page.header());

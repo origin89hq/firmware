@@ -1742,11 +1742,7 @@ impl Sessions {
         binding.heard = now;
         let payload = opened.inner();
         let mask = keys.mask(binding);
-        // The log's span, when history may be promised from it.
-        let settled = match plane.2 {
-            LogKnown::Held | LogKnown::NoLog => Some(plane.1),
-            LogKnown::Opening | LogKnown::Moving => None,
-        };
+        let (settled, deliverable) = spans(plane.2, plane.1);
         let reply = match Request::of(kind) {
             Request::Goodbye => goodbye(to, binding, payload, dst),
             Request::Wifi => {
@@ -1769,7 +1765,7 @@ impl Sessions {
             Request::Read => {
                 read_answer(to, binding, mask, (kind, payload), (plane.0, plane.1), dst)
             }
-            Request::Subscribe => subscribed(to, binding, mask, payload, settled, dst),
+            Request::Subscribe => subscribed(to, binding, mask, payload, deliverable, dst),
             Request::ReadLog => read_log(to, binding, mask, payload, settled, dst),
             Request::Clients => clients_answer(to, binding, (keys, mask), payload, now, dst),
             Request::Invite => match signed(to, binding, &opened, dst) {
@@ -3057,6 +3053,17 @@ fn read_answer<S: SiteCell>(
         .get(..len)
         .and_then(|body| binding.channel.tx.seal(to.header(answer), body, dst).ok());
     answered(sealed)
+}
+
+/// The log's span as a `ReadLog` may page it and as a `Subscribe` may be
+/// answered from it: both only when history may be promised from it, and
+/// a subscription only when a ring exists to deliver its events.
+const fn spans(known: LogKnown, log: LogSpan) -> (Option<LogSpan>, Option<LogSpan>) {
+    match known {
+        LogKnown::Held => (Some(log), Some(log)),
+        LogKnown::NoLog => (Some(log), None),
+        LogKnown::Opening | LogKnown::Moving => (None, None),
+    }
 }
 
 /// What the log holds, as P-104 reads it: nothing at all under P-144's 0.
@@ -4808,14 +4815,20 @@ mod tests {
     }
 
     #[test]
-    fn p_144_with_no_log_a_subscribe_is_answered_from_an_empty_one() {
+    fn p_098_with_no_log_a_subscribe_is_refused_and_a_read_log_is_an_empty_page() {
         let (mut rig, mut phone) = subscribed_rig(0, 0);
         rig.log_known = LogKnown::NoLog;
-        let ack = subscribe(&mut rig, &mut phone, 0);
-        assert_eq!(
-            (ack.accepted_from_seq(), ack.current_seq()),
-            (LogSeq(1), LogSeq(0))
-        );
+        // No ring delivers events: a subscription would be a silent stream.
+        let frame = phone.sealed(MessageType::Subscribe, &[0xa1, 1, 0]);
+        let (_, answer) = rig.send(&frame);
+        assert_eq!(sealed_code(&mut phone, &answer), ErrorCode::BusyRetry as u8);
+        assert_eq!(rig.sessions.subscribers().iter().flatten().count(), 0);
+        let frame = phone.sealed(MessageType::ReadLog, &[0xa2, 1, 0, 2, 4]);
+        let (_, answer) = rig.send(&frame);
+        let (kind, body) = phone.open(&answer);
+        assert_eq!(kind, MessageType::ReadLogResponse);
+        let page = km43::LogPage::decode(&body).expect("a page");
+        assert!(page.complete && page.entries().is_empty());
     }
 
     #[test]
