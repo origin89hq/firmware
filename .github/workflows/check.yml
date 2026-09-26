@@ -24,6 +24,21 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
+      # The registry, git dependencies and the dependencies' artifacts in both
+      # target directories; never the workspace's own crates, which cargo
+      # rebuilds from the checkout, and never the toolchain, which only the
+      # step above installs. Keyed on the rustc it reports, both lockfiles
+      # and rust-toolchain.toml. Saved from `main` alone: a pull request
+      # restores and writes nothing (#201). Cargo fingerprints every
+      # dependency by version, target and flags, so a restored artifact is
+      # reused only where a clean build would compile the same one.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            .
+            firmwares
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # `espflash save-image` is how the comms image is measured: the bytes
       # the bootloader loads, not the ELF. Its release asset, pinned by version
       # and digest; the static musl build needs no library on the runner.
