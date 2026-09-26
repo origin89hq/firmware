@@ -55,8 +55,9 @@ gate:
 # naming one of them names nothing. A pull request states its sizes in words.
 # `--from <dir>` measures a directory `just reproducible` wrote instead of
 # building, and names the commit its manifest names.
+[positional-arguments]
 sizes *args:
-    cargo xtask sizes {{args}}
+    cargo xtask sizes "$@"
 
 # Build the three images as release artifacts into `out`, which must not
 # exist, from the commit at HEAD of a clean checkout: staged at one fixed

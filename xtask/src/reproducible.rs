@@ -600,12 +600,23 @@ pub fn check_stage(dir: &Path, source: &Source, leftovers: Leftovers) -> Result<
 /// One entry of `git ls-tree -r -z`.
 struct Entry<'a> {
     mode: &'a [u8],
+    /// The object's type, or the stage in `ls-files -s`.
+    kind: &'a [u8],
     id: &'a [u8],
     path: &'a [u8],
 }
 
-/// Parse `git ls-tree -r -z` output: `<mode> <type> <id>\t<path>\0` each.
-fn entries(listing: &[u8]) -> Result<Vec<Entry<'_>>> {
+/// Which listing `entries` reads.
+#[derive(Clone, Copy)]
+enum Layout {
+    /// `git ls-tree -r -z`: `<mode> <type> <id>\t<path>\0` each.
+    Tree,
+    /// `git ls-files -s -z`: `<mode> <id> <stage>\t<path>\0` each.
+    Index,
+}
+
+/// Parse a listing of `layout`.
+fn entries(listing: &[u8], layout: Layout) -> Result<Vec<Entry<'_>>> {
     listing
         .split(|&b| b == 0)
         .filter(|record| !record.is_empty())
@@ -617,15 +628,24 @@ fn entries(listing: &[u8]) -> Result<Vec<Entry<'_>>> {
             let (meta, path) = record.split_at(tab);
             let path = path.get(1..).context("a git ls-tree record with no tab")?;
             let mut fields = meta.split(|&b| b == b' ');
-            let (Some(mode), Some(_kind), Some(id), None) =
+            let (Some(mode), Some(first), Some(second), None) =
                 (fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 bail!(
-                    "a git ls-tree record that is not `mode type id`: {}",
+                    "a git listing record with other than three fields: {}",
                     String::from_utf8_lossy(meta)
                 );
             };
-            Ok(Entry { mode, id, path })
+            let (kind, id) = match layout {
+                Layout::Tree => (first, second),
+                Layout::Index => (second, first),
+            };
+            Ok(Entry {
+                mode,
+                kind,
+                id,
+                path,
+            })
         })
         .collect()
 }
@@ -681,6 +701,44 @@ fn mismatch(dir: &Path, entry: &Entry<'_>, sha256: bool) -> Result<Option<&'stat
     Ok((blob_id(sha256, &content).as_bytes() != entry.id).then_some("content"))
 }
 
+/// Where the index, as `git ls-files -s -z` lists it, is not `tracked`: an
+/// entry the tree lacks, one it holds differently, a conflict, or a tree
+/// entry the index has lost. The index is what the next commit, `status` and
+/// `ls-files --others` read, so a file added to it would otherwise ride
+/// along unseen.
+fn index_differences(tracked: &[Entry<'_>], index: &[u8]) -> Result<Vec<String>> {
+    let mut expected: Vec<(&[u8], &[u8], &[u8])> =
+        tracked.iter().map(|e| (e.path, e.mode, e.id)).collect();
+    expected.sort_unstable();
+    let mut differing = Vec::new();
+    let mut found = Vec::new();
+    for entry in entries(index, Layout::Index)? {
+        let path = String::from_utf8_lossy(entry.path);
+        if entry.kind != b"0" {
+            differing.push(format!("{path}: an unresolved conflict in the index"));
+        } else if expected
+            .binary_search(&(entry.path, entry.mode, entry.id))
+            .is_ok()
+        {
+            found.push(entry.path);
+        } else if expected.iter().any(|(p, _, _)| *p == entry.path) {
+            differing.push(format!("{path}: the index holds another version"));
+        } else {
+            differing.push(format!("{path}: in the index, not in the tree"));
+        }
+    }
+    found.sort_unstable();
+    for (path, _, _) in &expected {
+        if found.binary_search(path).is_err() {
+            differing.push(format!(
+                "{}: in the tree, not in the index",
+                String::from_utf8_lossy(path)
+            ));
+        }
+    }
+    Ok(differing)
+}
+
 /// Refuse a working tree at `dir` whose files are not `tree`'s: every
 /// tracked file is read and hashed as git hashes a blob, with its mode, so
 /// no timestamp, index or checkout conversion can vouch for a changed byte,
@@ -701,12 +759,15 @@ pub fn check_tree(dir: &Path, tree: &ObjectId, leftovers: Leftovers) -> Result<(
             .arg(tree.to_string()),
         "git ls-tree",
     )?;
+    let tracked = entries(&listing, Layout::Tree)?;
     let mut differing = Vec::new();
-    for entry in entries(&listing)? {
-        if let Some(why) = mismatch(dir, &entry, sha256)? {
+    for entry in &tracked {
+        if let Some(why) = mismatch(dir, entry, sha256)? {
             differing.push(format!("{}: {why}", String::from_utf8_lossy(entry.path)));
         }
     }
+    let index = capture_bytes(git(dir).args(["ls-files", "-s", "-z"]), "git ls-files -s")?;
+    differing.extend(index_differences(&tracked, &index)?);
     ensure!(
         differing.is_empty(),
         "{} differs from tree {tree} in {} files:\n{}",
@@ -722,7 +783,8 @@ pub fn check_tree(dir: &Path, tree: &ObjectId, leftovers: Leftovers) -> Result<(
     let mut others = git(dir);
     others.args(["ls-files", "--others", "--directory"]);
     if leftovers == Leftovers::Ignored {
-        others.arg("--exclude-standard");
+        // A directory holding only ignored files, or nothing, is no file.
+        others.args(["--exclude-standard", "--no-empty-directory"]);
     }
     let untracked = capture(&mut others, "git ls-files --others")?;
     ensure!(
@@ -1552,6 +1614,66 @@ mod tests {
         assert!(error.contains("stray.rs"), "{error}");
     }
 
+    /// A file added to the index is invisible to `ls-files --others` and
+    /// absent from the tree the raw check walks.
+    #[test]
+    fn a_stage_with_a_file_only_in_its_index_is_refused_under_both_policies() {
+        let (_repo, into, source) = staged("indexed");
+        let dir = into.0.join("src");
+        fs::write(dir.join("stray.rs"), "").expect("written");
+        git_ok(&dir, &["add", "stray.rs"]);
+        for leftovers in [Leftovers::None, Leftovers::Ignored] {
+            let error = format!(
+                "{:#}",
+                check_stage(&dir, &source, leftovers).expect_err("indexed")
+            );
+            assert!(
+                error.contains("stray.rs: in the index, not in the tree"),
+                "{leftovers:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stage_whose_index_holds_another_version_or_lost_a_file_is_refused() {
+        let (_repo, into, source) = staged("index-version");
+        let dir = into.0.join("src");
+        fs::write(dir.join("a.txt"), "two\n").expect("written");
+        git_ok(&dir, &["add", "a.txt"]);
+        fs::write(dir.join("a.txt"), "one\n").expect("the tree's bytes again");
+        git_ok(&dir, &["rm", "-q", "--cached", "run.sh"]);
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::Ignored).expect_err("index")
+        );
+        assert!(
+            error.contains("a.txt: the index holds another version"),
+            "{error}"
+        );
+        assert!(
+            error.contains("run.sh: in the tree, not in the index"),
+            "{error}"
+        );
+    }
+
+    /// After a build, a directory whose only contents are ignored, or that is
+    /// empty, is no leftover; before one, the stage holds nothing at all.
+    #[test]
+    fn directories_holding_nothing_or_only_ignored_files_count_only_before_a_build() {
+        let (_repo, into, source) = staged("ignored-dirs");
+        let dir = into.0.join("src");
+        fs::create_dir_all(dir.join("sub/target")).expect("created");
+        fs::write(dir.join("sub/target/x"), "built").expect("written");
+        fs::create_dir(dir.join("empty")).expect("created");
+        check_stage(&dir, &source, Leftovers::Ignored).expect("nothing but ignored output");
+        let error = format!(
+            "{:#}",
+            check_stage(&dir, &source, Leftovers::None).expect_err("before a build")
+        );
+        assert!(error.contains("sub/"), "{error}");
+        assert!(error.contains("empty/"), "{error}");
+    }
+
     #[test]
     fn a_stage_at_another_commit_is_refused() {
         let (_repo, into, source) = staged("moved");
@@ -1569,13 +1691,24 @@ mod tests {
     #[test]
     fn a_git_ls_tree_listing_is_read_and_a_malformed_one_refused() {
         let listing = b"100644 blob abc\ta b.txt\x00120000 blob def\tlink\x00";
-        let parsed = entries(listing).expect("parses");
+        let parsed = entries(listing, Layout::Tree).expect("parses");
         let paths: Vec<&[u8]> = parsed.iter().map(|e| e.path).collect();
         assert_eq!(paths, [b"a b.txt".as_slice(), b"link"]);
         assert_eq!(parsed.first().map(|e| e.mode), Some(b"100644".as_slice()));
-        assert!(entries(b"").expect("empty").is_empty());
-        assert!(entries(b"100644 blob abc a.txt\0").is_err(), "no tab");
-        assert!(entries(b"100644 abc\ta.txt\0").is_err(), "no type");
+        assert!(entries(b"", Layout::Tree).expect("empty").is_empty());
+        assert!(
+            entries(b"100644 blob abc a.txt\0", Layout::Tree).is_err(),
+            "no tab"
+        );
+        assert!(
+            entries(b"100644 abc\ta.txt\0", Layout::Tree).is_err(),
+            "no type"
+        );
+        let index = entries(b"100755 abc 2\trun.sh\0", Layout::Index).expect("parses");
+        assert_eq!(
+            index.first().map(|e| (e.id, e.kind)),
+            Some((b"abc".as_slice(), b"2".as_slice()))
+        );
     }
 
     #[test]
