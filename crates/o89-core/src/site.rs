@@ -452,6 +452,21 @@ impl Site {
         }
     }
 
+    /// The record `token` announced, whose body is `body`, may have landed
+    /// at `seq`, and retention erased that position before the part could
+    /// say. A raise is taken as told, since a client may hold its `cid`:
+    /// its row is opened at `seq` and leaves only by a clear that commits
+    /// (P-180). Anything else states the site as it is and is owed again;
+    /// if it had landed, a client hears the same state twice.
+    pub fn maybe_committed(&mut self, token: &Token, seq: u64, body: &[u8]) {
+        match token {
+            Token::Concern(record) => self.concerns.maybe_committed(record, seq),
+            Token::Validity | Token::Presence(_) | Token::Topology(_) => {
+                self.not_committed(token, body);
+            }
+        }
+    }
+
     /// The `Inventory 0x8D` body for `request`.
     pub fn inventory(
         &self,
@@ -867,6 +882,39 @@ mod tests {
                 EventKind::SIGNAL_VALIDITY_CHANGED
             ),
             0
+        );
+    }
+
+    #[test]
+    fn p_182_a_sweep_whose_position_was_erased_unproven_is_owed_again() {
+        let mut site = site(2);
+        site.write(sig(1), at(1), reading(5)).expect("registered");
+        let mut tally = Tally::new();
+        let mut body = [0u8; RECORD_BODY];
+        let lost = loop {
+            let owed = site
+                .next_owed(at(2), 1, &mut tally, &mut body)
+                .expect("writes")
+                .expect("owed");
+            if owed.kind == EventKind::SIGNAL_VALIDITY_CHANGED {
+                break owed;
+            }
+            site.committed(&owed.token, 1);
+        };
+        site.maybe_committed(&lost.token, 1, &body[..lost.len]);
+        let again = tick(&mut site, at(3));
+        assert_eq!(
+            again.sigs[0].map(|(n, _, _)| n),
+            Some(1),
+            "restated, since nothing proves it was told"
+        );
+        assert_eq!(
+            count(
+                &tick(&mut site, at(4)).kinds,
+                EventKind::SIGNAL_VALIDITY_CHANGED
+            ),
+            0,
+            "once"
         );
     }
 

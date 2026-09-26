@@ -477,6 +477,9 @@ async fn plane(
     if turn.refused {
         defmt::error!("plane: a record did not land; the next tick owes it again");
     }
+    if turn.gone > 0 {
+        defmt::warn!("plane: retention erased a record's position before it could be proven");
+    }
     if let Some(error) = turn.unwritten {
         defmt::error!("plane: a record the site owes did not write: {}", error);
     }

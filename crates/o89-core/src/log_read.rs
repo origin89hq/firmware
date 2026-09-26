@@ -75,6 +75,10 @@ pub struct PlaneTurn {
     /// its record landed: the outcome is kept, the extent stays unsettled,
     /// and the next turn asks again before anything else.
     pub adrift: bool,
+    /// Uncertain records whose position retention erased before the part
+    /// could say whether they landed: a raise is counted as told, anything
+    /// else is owed again.
+    pub gone: usize,
 }
 
 /// What became of a record handed to the ring, once the part has said.
@@ -84,6 +88,9 @@ enum Known {
     Landed(u64),
     /// It is not in the log.
     Refused,
+    /// Retention erased this position before the part could say: it may
+    /// have landed, and a client may have read it.
+    Gone(u64),
 }
 
 /// What became of a record handed to the ring.
@@ -131,10 +138,10 @@ impl Unsettled {
     /// Ask the part what an uncertain append did: landed if the exact
     /// record is at its position; not there if the log ends before it or
     /// something else is at it, since positions are unique. A position
-    /// retention has already erased is taken as not there: nothing can
-    /// prove it landed, and the record is owed again rather than the plane
-    /// held for good, at the cost of announcing it twice if it had landed.
-    /// `None` while the part cannot answer.
+    /// retention has already erased is neither: nothing can say whether it
+    /// landed, and the site hears it as [`Site::maybe_committed`] rather
+    /// than the plane being held for good. `None` while the part cannot
+    /// answer.
     async fn resolve<N: MultiwriteNorFlash>(
         &self,
         ring: &mut Ring<N>,
@@ -147,7 +154,8 @@ impl Unsettled {
         let payload = self.payload.get(..self.payload_len).unwrap_or(&[]);
         match ring.holds(seq, payload, scratch).await {
             Ok(Holding::Present) => Some(Known::Landed(seq)),
-            Ok(Holding::Absent | Holding::Other | Holding::Gone) => Some(Known::Refused),
+            Ok(Holding::Absent | Holding::Other) => Some(Known::Refused),
+            Ok(Holding::Gone) => Some(Known::Gone(seq)),
             Err(_) => None,
         }
     }
@@ -158,6 +166,7 @@ impl Unsettled {
         site.with(|site, _| match known {
             Known::Landed(seq) => site.committed(&self.token, seq),
             Known::Refused => site.not_committed(&self.token, body),
+            Known::Gone(seq) => site.maybe_committed(&self.token, seq, body),
         })
         .is_ok()
     }
@@ -195,6 +204,7 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
             done.adrift = true;
             return done;
         };
+        done.gone = usize::from(matches!(known, Known::Gone(_)));
         if ring.is_proven() {
             extent(Extent::Settled(ring));
         }
@@ -265,10 +275,10 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
         }
         pending.outcome = Outcome::Known(known);
         let landed = matches!(known, Known::Landed(_));
-        if landed {
-            done.landed = done.landed.saturating_add(1);
-        } else {
-            done.refused = true;
+        match known {
+            Known::Landed(_) => done.landed = done.landed.saturating_add(1),
+            Known::Refused => done.refused = true,
+            Known::Gone(_) => done.gone = done.gone.saturating_add(1),
         }
         if !pending.settle(site, known) {
             done.busy = true;

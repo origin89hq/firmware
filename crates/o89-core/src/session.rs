@@ -5150,9 +5150,9 @@ mod tests {
                 .fan_out(want.ticket, &batch, &mut dst, &mut sink),
         );
         assert_eq!(
-            (done.sent, sink.taken),
-            (0, 0),
-            "record 2 did not overtake record 1"
+            (done.sent, sink.taken, done.unsealed),
+            (0, 0, true),
+            "record 2 did not overtake record 1, and the unsealed one is said"
         );
         let again = rig.sessions.log_want(rig.log, rig.now).expect("still owed");
         assert_eq!(again.from, 1);

@@ -1406,3 +1406,166 @@ fn p_182_a_diagnostic_that_landed_though_it_erred_is_not_overwritten_or_waited_o
         "the diagnostic kept at its position, the raise after it"
     );
 }
+
+/// A raise at the ring's next position whose magic lands before the part
+/// reports an error and dies, so nothing can say whether it landed; the
+/// part comes back, diagnostics carry the head into the next block, and a
+/// bench drop erases the block the raise is in. The raise's position and
+/// its `cid`, read from the part before the drop.
+fn raise_erased_unproven(
+    nor: &Pausing,
+    ring: &mut o89_core::Ring<Pausing>,
+    site: &SimSite,
+    unsettled: &mut Option<o89_core::Unsettled>,
+    clear: bool,
+    scratch: &mut [u8],
+) -> (u64, Id) {
+    let n = ring.next_seq();
+    nor.err_after.set(Some(1));
+    nor.die_after_err.set(true);
+    let turn = block_on(o89_core::record_owed(
+        site,
+        ring,
+        scratch,
+        None,
+        |_| {},
+        unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (0, true), "left unknown");
+    if clear {
+        site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::None))
+            .expect("open");
+    }
+    nor.nor.borrow_mut().reboot();
+    let raised = km43::ConcernRaised::decode(&body_at(ring, n, scratch)).expect("the raise landed");
+    for _ in 0..10_000 {
+        if ring.head().block == 1 {
+            break;
+        }
+        assert!(diagnostic(ring, scratch).is_ok(), "the part is back");
+    }
+    assert_eq!(ring.head().block, 1, "newer records past the raise's block");
+    assert!(unsettled.is_some(), "the plane has not asked yet");
+    assert!(block_on(ring.drop_oldest(scratch)).is_ok());
+    assert!(
+        ring.head().oldest.is_some_and(|oldest| oldest > n),
+        "the raise's position is erased and newer records remain"
+    );
+    (n, raised.concern.cid)
+}
+
+#[test]
+fn p_180_a_cleared_raise_whose_position_was_erased_unproven_is_cleared_before_its_cid_is_free() {
+    // Capabilities: none. The raise may have been read before its block
+    // was dropped, so its clear is owed and the cid held until it commits.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = HeldOnce {
+        inner: concern_on(&mut ring, &mut scratch),
+        calls: std::cell::Cell::new(0),
+        held_on: 2,
+    };
+    let mut unsettled = None;
+    let (n, cid) = raise_erased_unproven(
+        &nor,
+        &mut ring,
+        &site.inner,
+        &mut unsettled,
+        true,
+        &mut scratch,
+    );
+    // The site hears the outcome, then is held before the clear is taken.
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.gone, turn.busy, turn.refused),
+        (0, 1, true, false)
+    );
+    assert!(unsettled.is_none(), "told");
+    assert_eq!(
+        concerns_total(&site.inner),
+        (1, n),
+        "the row is held open at the raise's position until its clear commits"
+    );
+    let clear_at = ring.next_seq();
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.gone), (1, 0), "the clear");
+    let changed = km43::ConcernChanged::decode(&body_at(&mut ring, clear_at, &mut scratch))
+        .expect("a change");
+    assert_eq!(
+        (changed.cid, changed.state, changed.prev),
+        (cid, km43::ConcernState::Cleared, km43::ConcernState::Active)
+    );
+    assert_eq!(
+        concerns_total(&site.inner),
+        (0, clear_at),
+        "the row left with its clear"
+    );
+}
+
+#[test]
+fn p_180_an_active_raise_whose_position_was_erased_unproven_is_not_raised_again() {
+    // Capabilities: none. As above, and the condition holds: the raise may
+    // have been read, so it is not announced a second time.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let mut unsettled = None;
+    let (n, cid) =
+        raise_erased_unproven(&nor, &mut ring, &site, &mut unsettled, false, &mut scratch);
+    let from = ring.next_seq();
+    for _ in 0..2 {
+        let turn = block_on(o89_core::record_owed(
+            &site,
+            &mut ring,
+            &mut scratch,
+            None,
+            |_| {},
+            &mut unsettled,
+        ));
+        assert_eq!(
+            (turn.landed, turn.refused),
+            (0, false),
+            "nothing raised again"
+        );
+    }
+    assert_eq!(logged(&mut ring, from, &mut scratch), []);
+    assert_eq!(
+        concerns_total(&site),
+        (1, n),
+        "read as opened at its position"
+    );
+    site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::None))
+        .expect("open");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 1);
+    let changed =
+        km43::ConcernChanged::decode(&body_at(&mut ring, from, &mut scratch)).expect("a change");
+    assert_eq!(
+        (changed.cid, changed.state, changed.prev),
+        (cid, km43::ConcernState::Cleared, km43::ConcernState::Active)
+    );
+    assert_eq!(concerns_total(&site), (0, from));
+}

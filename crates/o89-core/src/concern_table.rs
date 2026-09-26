@@ -347,6 +347,20 @@ impl ConcernTable {
         }
     }
 
+    /// A record [`ConcernTable::owed`] handed out may have committed at
+    /// `seq`; retention erased the position before anything could say. A
+    /// raise is committed, since a client may have read it: an active row
+    /// is not raised again, and a cleared one owes its clear and keeps its
+    /// `cid` until that commits (P-180). A change is owed again: a clear not
+    /// known to be in the log must be logged before its `cid` is free, and a
+    /// repeat restates what a client already holds.
+    pub fn maybe_committed(&mut self, record: &ConcernRecord, seq: u64) {
+        match record {
+            ConcernRecord::Raised(_) => self.committed(record, seq),
+            ConcernRecord::Changed(_) => self.unannounced(record),
+        }
+    }
+
     /// The `Concerns 0x8F` body for `request` at topology revision `rev`,
     /// in P-199's order, over the rows whose raise has committed, in `cid`
     /// order (P-209).
@@ -602,6 +616,86 @@ mod tests {
             "the clear and the new raise"
         );
         assert_eq!(table.state(first), None, "released once its clear landed");
+    }
+
+    /// The one record owed now for a table holding a single row.
+    fn take_one(table: &mut ConcernTable, now: Tick) -> Option<ConcernRecord> {
+        let mut taken = None;
+        table
+            .owed(1, now, 1, |record| taken = Some(record))
+            .expect("owes");
+        taken
+    }
+
+    #[test]
+    fn p_180_a_raise_whose_position_was_erased_unproven_keeps_its_cid_until_its_clear_commits() {
+        let mut table = ConcernTable::new();
+        let cid = table
+            .observe(report(1, Severity::Fault), at(0))
+            .expect("admitted");
+        let raised = take_one(&mut table, at(1)).expect("the raise");
+        table
+            .gone(
+                Subject::Part(Part::device(dev(1))),
+                Condition(0x0101),
+                Latch::None,
+            )
+            .expect("open");
+        table.maybe_committed(&raised, 7);
+        assert_eq!(
+            table.state(cid),
+            Some(ConcernState::Cleared),
+            "a client may hold it: the row stays"
+        );
+        let owed = take_one(&mut table, at(2));
+        let Some(ConcernRecord::Changed(changed)) = owed else {
+            panic!("the clear is owed, not {owed:?}");
+        };
+        assert_eq!(
+            (changed.cid, changed.state, changed.prev),
+            (cid, ConcernState::Cleared, ConcernState::Active)
+        );
+        table.committed(&ConcernRecord::Changed(changed), 8);
+        assert_eq!(table.state(cid), None, "free once its clear committed");
+    }
+
+    #[test]
+    fn p_180_an_active_raise_whose_position_was_erased_is_not_raised_again_and_is_read() {
+        let mut table = ConcernTable::new();
+        let cid = table
+            .observe(report(1, Severity::Fault), at(0))
+            .expect("admitted");
+        let raised = take_one(&mut table, at(1)).expect("the raise");
+        table.maybe_committed(&raised, 7);
+        assert_eq!(take_one(&mut table, at(2)), None, "nothing owed again");
+        assert_eq!(table.state(cid), Some(ConcernState::Active));
+        let (dst, len) = page(&table, 1, 1);
+        let header = ConcernsHeader::decode(&dst[..len]).expect("decodes");
+        assert_eq!((header.total, header.seq), (1, 7), "readable, opened there");
+    }
+
+    #[test]
+    fn p_180_a_clear_whose_position_was_erased_unproven_is_owed_again_before_its_cid_is_free() {
+        let mut table = ConcernTable::new();
+        let cid = table
+            .observe(report(1, Severity::Fault), at(0))
+            .expect("admitted");
+        assert_eq!(commit_all(&mut table, at(1), 3), 1, "the raise");
+        table
+            .gone(
+                Subject::Part(Part::device(dev(1))),
+                Condition(0x0101),
+                Latch::None,
+            )
+            .expect("open");
+        let clear = take_one(&mut table, at(2)).expect("the clear");
+        table.maybe_committed(&clear, 7);
+        assert_eq!(
+            table.state(cid),
+            Some(ConcernState::Cleared),
+            "held: nothing proves the clear is in the log"
+        );
+        assert_eq!(take_one(&mut table, at(3)), Some(clear), "owed again");
     }
 
     #[test]

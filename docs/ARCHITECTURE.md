@@ -594,9 +594,14 @@ exact record is at its position, commits it if it is, and owes it again if
 the log ends before it or holds something else there, since positions are
 unique. The plane appends nothing while it waits; the recorder's other
 writers may, and one of theirs at that position is such proof. A position
-retention has erased before the part could answer is taken as not there:
-nothing can prove it landed, and owing it again, at the cost of announcing
-it twice if it had, is chosen over holding the plane for good.
+retention has erased before the part could answer, by a page turn or a bench
+drop, is neither: the record may have landed and been read, so it is not
+treated as one that never reached anybody, and the plane is not held for
+good either. A concern raise is taken as told: its row opens at that
+position, an active concern is not raised again, and a cleared one keeps its
+`cid` until its clear commits (P-180). Every other record states the site as
+it is now and is owed again; if it had landed, a client hears the same state
+twice.
 The recorder publishes the log's extent from the ring's head only while it
 is proven, marks it moving before every append and drop, and has nothing to
 publish before the ring opens. While it moves a `Subscribe`, whose answer
