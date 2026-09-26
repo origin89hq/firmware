@@ -1826,8 +1826,8 @@ dependencies = [
  "esp-wifi-sys-esp32c6",
  "km43",
  "o89-comms-core",
+ "o89-comms-net",
  "o89-link",
- "smoltcp",
  "static_cell",
  "trouble-host",
 ]
@@ -1839,6 +1839,15 @@ dependencies = [
  "km43",
  "o89-link",
  "sha1",
+]
+
+[[package]]
+name = "o89-comms-net"
+version = "0.0.0"
+dependencies = [
+ "embassy-net",
+ "o89-comms-core",
+ "smoltcp",
 ]
 
 [[package]]

@@ -34,9 +34,9 @@ embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname", "dn
 embassy-time = { version = "=0.5.1", features = ["mock-driver", "generic-queue-8"] }
 # The mock clock takes a critical section; on the host, a mutex.
 critical-section = { version = "=1.2.0", features = ["std"] }
-# The DHCP client's retry timings in `tests/comms_dhcp.rs`, set as
-# `firmwares/o89-comms` sets them: the release embassy-net resolves.
-smoltcp = { version = "=0.13.1", default-features = false }
+# The station's DHCP configuration, the one `firmwares/o89-comms` builds,
+# whose resends `tests/comms_dhcp.rs` times.
+o89-comms-net = { path = "../o89-comms-net" }
 
 [lints]
 workspace = true

@@ -128,6 +128,10 @@ crates/
   o89-comms-core/          no_std, no alloc. The comms processor's decisions:
                            the download window's intake and its link-local
                            state machine. Never reaches o89-core. Host-tested.
+  o89-comms-net/           no_std, no alloc. The station's DHCP configuration
+                           on embassy-net, kept out of o89-comms-core, which
+                           the controller's target builds too. o89-sim times
+                           the resends of this configuration, not a copy.
   o89-link/                no_std, no alloc. The link's mechanics both cores
                            share and neither decides by: the tick, the
                            requests and beats in flight, the rules every

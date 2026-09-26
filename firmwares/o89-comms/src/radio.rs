@@ -159,20 +159,14 @@ fn station_config(record: &Credential) -> Option<(StationConfig, DhcpConfig, &st
     else {
         return None;
     };
-    let name = hostname;
-    let (Ok(ssid), Ok(password), Ok(hostname)) =
-        (ssid.try_into(), psk.try_into(), hostname.try_into())
-    else {
+    let (Ok(ssid), Ok(password)) = (ssid.try_into(), psk.try_into()) else {
         return None;
     };
     let config = StationConfig::default()
         .with_ssid(ssid)
         .with_authentication(AuthenticationMethodConfig::Wpa2Personal(password));
-    let mut dhcp = DhcpConfig::default();
-    dhcp.hostname = Some(hostname);
-    dhcp.retry_config.discover_timeout =
-        smoltcp::time::Duration::from_millis(o89_comms_core::DHCP_DISCOVER_RESEND.as_millis());
-    Some((config, dhcp, country, name))
+    let dhcp = o89_comms_net::station_dhcp(hostname).ok()?;
+    Some((config, dhcp, country, hostname))
 }
 
 fn seed() -> u64 {
