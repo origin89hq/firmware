@@ -68,9 +68,13 @@ impl ModbusDevice {
         self.map
     }
 
-    /// The signal the map's `index`th cell publishes as.
+    /// The signal the map's `index`th cell publishes as, or `None` past the
+    /// map's last cell.
     #[must_use]
     pub fn signal(&self, index: usize) -> Option<Id> {
+        if index >= self.map.cells().count() {
+            return None;
+        }
         let offset = u16::try_from(index).ok()?;
         Id::new(self.first.get().checked_add(offset)?).ok()
     }
@@ -413,7 +417,7 @@ mod tests {
         let Device::Modbus(device) = device();
         assert_eq!(
             device.bus_signals(),
-            [Some(id(20)), Some(id(21)), Some(id(22))]
+            [Some(id(20)), Some(id(21)), Some(id(22)), None]
         );
         assert_eq!(Device::Modbus(device).bus(), BusKind::Rs485);
         assert!(ModbusDevice::new(Address::new(7).unwrap(), &MAP, id(0xFFFD)).is_some());
@@ -428,8 +432,13 @@ mod tests {
     }
 
     impl ModbusDevice {
-        fn bus_signals(&self) -> [Option<Id>; 3] {
-            [self.signal(0), self.signal(1), self.signal(2)]
+        fn bus_signals(&self) -> [Option<Id>; 4] {
+            [
+                self.signal(0),
+                self.signal(1),
+                self.signal(2),
+                self.signal(3),
+            ]
         }
     }
 }
