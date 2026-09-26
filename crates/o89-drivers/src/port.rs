@@ -37,8 +37,8 @@ pub enum Ended {
 pub struct Burst {
     /// The bytes written at the front of the buffer, at least one.
     pub len: usize,
-    /// Why the burst ended. [`Ended::Full`] exactly when `len` is the
-    /// buffer's length.
+    /// Why the burst ended: [`Ended::Full`] exactly when `len` is the
+    /// buffer's length, and [`Ended::Gap`] only with room left.
     pub ended: Ended,
 }
 
@@ -51,6 +51,11 @@ pub trait Rs485 {
     /// What the line reports.
     type Error;
 
+    /// Drop every byte received before this call and not yet handed out,
+    /// returning at once without waiting on the line: what a refused or
+    /// late exchange left behind never reaches the next one.
+    fn discard(&mut self) -> impl Future<Output = Result<(), Self::Error>>;
+
     /// Send `bytes` as one frame, returning once the last one has left.
     fn send(&mut self, bytes: &[u8]) -> impl Future<Output = Result<(), Self::Error>>;
 
@@ -60,9 +65,12 @@ pub trait Rs485 {
     /// two ended it. A burst that ends at the gap is a whole frame, or the
     /// frames the line carried back to back without a gap between them.
     ///
+    /// `within` bounds only the wait for the first byte; the burst then
+    /// takes its wire time and the gap, which the framing decides.
     /// [`PortFault::Timeout`] when nothing arrived before the deadline. A
-    /// reader refuses a burst of no bytes, more bytes than `into` holds, or
-    /// [`Ended::Full`] with room left, as the adapter's defect.
+    /// reader refuses a burst of no bytes, more bytes than `into` holds,
+    /// [`Ended::Full`] with room left, or [`Ended::Gap`] with none, as the
+    /// adapter's defect.
     fn receive(
         &mut self,
         into: &mut [u8],
@@ -96,12 +104,13 @@ impl CanId {
 
     /// An 11-bit identifier, or `None` when `id` needs more bits.
     #[must_use]
-    pub fn standard(id: u16) -> Option<Self> {
+    pub const fn standard(id: u16) -> Option<Self> {
         if id > Self::STANDARD_MAX {
             return None;
         }
+        let [high, low] = id.to_be_bytes();
         Some(Self {
-            raw: u32::from(id),
+            raw: u32::from_be_bytes([0, 0, high, low]),
             extended: false,
         })
     }

@@ -7,11 +7,17 @@
 //! is parsed (F-050); a frame heard back different from the one sent is a
 //! collision on the bus and is refused rather than parsed around.
 //!
-//! A read is at most two receives, each bounded by [`Timing::response`]: the
-//! echo, alone or with the reply behind it, and then the reply if it came
-//! separately. The port ends a burst at the inter-frame gap, so a reply is
-//! one burst: a reply cut by a gap is short, and is never joined to what
-//! the line carries next.
+//! A read discards what the port still holds from before, sends, and makes
+//! at most two receives: the echo, alone or with the reply behind it, and
+//! then the reply if it came separately. [`Timing::response`] bounds each
+//! receive's wait for its first byte; the send, each burst's wire time and
+//! the gap that ends it add what the bus's framing makes them. The port ends
+//! a burst at the inter-frame gap, so a reply is one burst: a reply cut by a
+//! gap is short, and is never joined to what the line carries next.
+//!
+//! The discard assumes a device answers within `response` or not at all, as
+//! Modbus servers do. A reply later than the next exchange's discard is
+//! indistinguishable from that exchange's own and is not caught here.
 //!
 //! cites: F-050
 
@@ -368,7 +374,8 @@ pub fn parse(read: Read, frame: &[u8]) -> Result<Registers<'_>, ReplyError> {
 
 /// Send `read` on `port` and return the registers it answers with.
 ///
-/// The request's echo is required, byte for byte, and discarded (F-050).
+/// Anything the port held from an earlier exchange is dropped first. The
+/// request's echo is required, byte for byte, and discarded (F-050).
 /// The reply is the rest of the echo's burst, or the next burst when the
 /// echo came alone.
 pub async fn read<'a, P: Rs485>(
@@ -378,6 +385,7 @@ pub async fn read<'a, P: Rs485>(
     into: &'a mut [u8; RECEIVE_BYTES],
 ) -> Result<Registers<'a>, ModbusError<P::Error>> {
     let request = read.encode();
+    port.discard().await.map_err(ModbusError::Port)?;
     port.send(&request).await.map_err(ModbusError::Port)?;
     let heard = match burst(port, into, timing.response).await {
         Ok(len) => len,
@@ -409,7 +417,7 @@ async fn burst<P: Rs485>(
     match port.receive(into, within).await {
         Ok(Burst { len, ended }) => {
             let consistent = match ended {
-                Ended::Gap => len > 0 && len <= room,
+                Ended::Gap => len > 0 && len < room,
                 Ended::Full => len > 0 && len == room,
             };
             if consistent {
@@ -435,6 +443,8 @@ pub(crate) mod tests {
     /// when it fills the buffer, as an honest adapter reports; `lie`
     /// replaces the next report with one no adapter should make.
     pub(crate) struct Scripted<'a> {
+        /// What the port holds from before the read, until discarded.
+        pub stale: &'a [&'a [u8]],
         pub bursts: &'a [&'a [u8]],
         pub next: usize,
         pub sent: [u8; REQUEST_BYTES],
@@ -446,6 +456,7 @@ pub(crate) mod tests {
     impl<'a> Scripted<'a> {
         pub(crate) fn new(bursts: &'a [&'a [u8]]) -> Self {
             Self {
+                stale: &[],
                 bursts,
                 next: 0,
                 sent: [0; REQUEST_BYTES],
@@ -458,6 +469,11 @@ pub(crate) mod tests {
 
     impl Rs485 for Scripted<'_> {
         type Error = u8;
+
+        fn discard(&mut self) -> impl Future<Output = Result<(), u8>> {
+            self.stale = &[];
+            ready(Ok(()))
+        }
 
         fn send(&mut self, bytes: &[u8]) -> impl Future<Output = Result<(), u8>> {
             self.sent.copy_from_slice(bytes);
@@ -484,10 +500,16 @@ pub(crate) mod tests {
             if let Some(lie) = self.lie.take() {
                 return Ok(lie);
             }
-            let Some(burst) = self.bursts.get(self.next) else {
-                return Err(PortFault::Timeout);
+            let burst = if let [held, rest @ ..] = self.stale {
+                self.stale = rest;
+                *held
+            } else {
+                let Some(burst) = self.bursts.get(self.next) else {
+                    return Err(PortFault::Timeout);
+                };
+                self.next = self.next.checked_add(1).unwrap();
+                *burst
             };
-            self.next = self.next.checked_add(1).unwrap();
             let len = burst.len().min(into.len());
             into[..len].copy_from_slice(&burst[..len]);
             let ended = if len == into.len() {
@@ -707,6 +729,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn what_an_earlier_exchange_left_on_the_port_is_never_read_as_this_one_s_reply() {
+        let read = input(0x3100, 2);
+        let echo = read.encode();
+        // The previous poll's answer, 0x0001 and 0x0002, still queued.
+        let old: [u8; 9] = with_crc(&[0x01, 0x04, 0x04, 0x00, 0x01, 0x00, 0x02]);
+        let reply = reply();
+        let bursts: [&[u8]; 2] = [&echo, &reply];
+
+        // A stale reply alone, then a stale echo and reply pair, which is
+        // byte for byte what this read's own echo and a reply look like.
+        let stale_reply: [&[u8]; 1] = [&old];
+        let stale_pair: [&[u8]; 2] = [&echo, &old];
+        for stale in [&stale_reply[..], &stale_pair[..]] {
+            let mut port = Scripted::new(&bursts);
+            port.stale = stale;
+            assert_eq!(run(&mut port, read), Ok([Some(0x04D2), Some(0x0010)]));
+        }
+
+        // With nothing current behind it, the stale pair still is not
+        // published: the read times out on the echo.
+        let mut port = Scripted::new(&[]);
+        port.stale = &stale_pair;
+        assert_eq!(run(&mut port, read), Err(ModbusError::Echo));
+    }
+
+    #[test]
     fn f_050_a_reply_cut_by_a_gap_is_short_and_never_joined_to_the_next_burst() {
         let read = input(0x3100, 2);
         let echo = read.encode();
@@ -785,6 +833,10 @@ pub(crate) mod tests {
         for lie in [
             Burst {
                 len: 0,
+                ended: Ended::Gap,
+            },
+            Burst {
+                len: RECEIVE_BYTES,
                 ended: Ended::Gap,
             },
             Burst {

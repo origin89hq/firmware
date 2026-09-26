@@ -799,6 +799,21 @@ pub(crate) mod tests {
                 other => panic!("{kind:?} publishes {other:?}, which no kind here uses"),
             };
             assert_eq!((row.1, row.2), (symbol, kind.scale()), "{kind:?}");
+            // A percentage's own range is 0 to 100 % at the registry's scale.
+            if symbol == "%" {
+                let steps = u32::from(kind.scale().unsigned_abs());
+                let hundred = 100i32.checked_mul(10i32.pow(steps)).unwrap();
+                assert_eq!(
+                    kind.intrinsic(),
+                    Some(Plausible {
+                        low: 0,
+                        high: hundred
+                    }),
+                    "{kind:?}"
+                );
+            } else {
+                assert_eq!(kind.intrinsic(), None, "{kind:?}");
+            }
         }
     }
 
@@ -1014,6 +1029,28 @@ pub(crate) mod tests {
             if expected.is_none() {
                 assert_eq!(seen.quality().validity_of(), Validity::OutOfRange);
             }
+        }
+    }
+
+    #[test]
+    fn a_tank_level_past_full_or_below_empty_is_out_of_range() {
+        static CELLS: [Cell; 1] = [Cell {
+            sign: Sign::Signed,
+            ..cell(
+                0,
+                Kind::TankLevel,
+                SignalDomain::Live,
+                -1,
+                Provenance::Measured,
+            )
+        }];
+        const BLOCK: Block = crate::block!(Function::ReadInput, 0, 1, &CELLS);
+        assert_eq!(one(&BLOCK, &[1000]).reading(), Some(1000));
+        assert_eq!(one(&BLOCK, &[0]).reading(), Some(0));
+        for raw in [1001u16, (-1i16).cast_unsigned()] {
+            let seen = one(&BLOCK, &[raw]);
+            assert_eq!(seen.reading(), None, "{raw}");
+            assert_eq!(seen.quality().validity_of(), Validity::OutOfRange);
         }
     }
 
