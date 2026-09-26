@@ -19,7 +19,8 @@
 //! cannot keep the ones after it waiting for ever.
 //!
 //! A record that does not reach the log is given back with
-//! [`Site::not_committed`], and what it announced is owed again. A record is
+//! [`Site::not_committed`], and what it announced is owed again; one whose
+//! body fails to encode is given back before the error is returned. A record is
 //! as wide as one ring record allows, so a sweep carries at most
 //! [`SWEEP_ENTRIES`] signals and the rest wait a tick.
 //!
@@ -343,19 +344,26 @@ impl Site {
     /// The next record this tick owes, written into `body`, or `None` when
     /// the tick owes nothing more or has handed out all it may. `seq` is the
     /// position the log will give it, which a raise carries as its row's
-    /// key 13.
+    /// key 13. `body` is [`RECORD_BODY`] wide, the widest a ring record
+    /// holds; a record whose body does not fit is refused and owed again.
     pub fn next_owed(
         &mut self,
         now: Tick,
         seq: u64,
         tally: &mut Tally,
-        body: &mut [u8; RECORD_BODY],
+        body: &mut [u8],
     ) -> Result<Option<Owed>, OwedError> {
         if !tally.topology
             && let Some(changed) = self.boot_owed.take().or_else(|| self.topology_owed.take())
         {
             tally.topology = true;
-            let len = changed.encode(body).map_err(OwedError::Change)?;
+            let len = match changed.encode(body) {
+                Ok(len) => len,
+                Err(why) => {
+                    self.owe_topology(changed);
+                    return Err(OwedError::Change(why));
+                }
+            };
             return Ok(Some(Owed {
                 kind: EventKind::TOPOLOGY_CHANGED,
                 len,
@@ -390,19 +398,22 @@ impl Site {
                 .map_err(OwedError::Concern)?;
             if let Some(mut record) = record {
                 tally.concerns = tally.concerns.saturating_add(1);
-                let (kind, len) = match &mut record {
+                let (kind, encoded) = match &mut record {
                     ConcernRecord::Raised(raised) => {
                         // Key 13 is the record that opens the row: this one.
                         raised.concern.seq = seq;
-                        (
-                            EventKind::CONCERN_RAISED,
-                            raised.encode(body).map_err(OwedError::Concern)?,
-                        )
+                        (EventKind::CONCERN_RAISED, raised.encode(body))
                     }
-                    ConcernRecord::Changed(changed) => (
-                        EventKind::CONCERN_CHANGED,
-                        changed.encode(body).map_err(OwedError::Concern)?,
-                    ),
+                    ConcernRecord::Changed(changed) => {
+                        (EventKind::CONCERN_CHANGED, changed.encode(body))
+                    }
+                };
+                let len = match encoded {
+                    Ok(len) => len,
+                    Err(why) => {
+                        self.concerns.unannounced(&record);
+                        return Err(OwedError::Concern(why));
+                    }
                 };
                 return Ok(Some(Owed {
                     kind,
@@ -562,18 +573,15 @@ impl Site {
     }
 
     /// One `0x0102` of the signals whose quality differs from what was last
-    /// announced, from where the last sweep stopped; each taken is marked
-    /// announced.
-    fn validity_sweep(
-        &mut self,
-        now: Tick,
-        body: &mut [u8; RECORD_BODY],
-    ) -> Result<Option<usize>, OwedError> {
+    /// announced, from where the last sweep stopped. Each it carries is
+    /// marked announced only once its body is written, from what the body
+    /// holds, so a sweep that fails marks nothing.
+    fn validity_sweep(&mut self, now: Tick, body: &mut [u8]) -> Result<Option<usize>, OwedError> {
         let mut sweep = ValidityChanged::new(self.topology.rev());
-        let mut taken = 0usize;
         let start = self.cursor;
+        let mut cursor = start;
         for step in 0..SITE_SIGNALS {
-            if taken >= SWEEP_ENTRIES {
+            if sweep.len() >= SWEEP_ENTRIES {
                 break;
             }
             let at = start.saturating_add(step) % SITE_SIGNALS;
@@ -595,27 +603,27 @@ impl Site {
             if !sweep.push(&change).map_err(OwedError::Change)? {
                 break;
             }
-            if let Some(Some(slot)) = self.announced.get_mut(at) {
-                slot.q = sample.q;
-            }
-            self.cursor = at.saturating_add(1) % SITE_SIGNALS;
-            taken = taken.saturating_add(1);
+            cursor = at.saturating_add(1) % SITE_SIGNALS;
         }
         if sweep.is_empty() {
             return Ok(None);
         }
-        sweep.encode(body).map(Some).map_err(OwedError::Change)
+        let len = sweep.encode(body).map_err(OwedError::Change)?;
+        for change in sweep.entries().flatten() {
+            if let Some(announced) = self.announced_mut(change.sig) {
+                announced.q = change.q;
+            }
+        }
+        self.cursor = cursor;
+        Ok(Some(len))
     }
 
     /// One `0x0902` of every device whose presence differs from what was
-    /// last announced, each marked announced.
-    fn presence_sweep(
-        &mut self,
-        body: &mut [u8; RECORD_BODY],
-    ) -> Result<Option<(usize, Prevs)>, OwedError> {
+    /// last announced. Each it carries is marked announced only once its
+    /// body is written, as [`Site::validity_sweep`] marks its signals.
+    fn presence_sweep(&mut self, body: &mut [u8]) -> Result<Option<(usize, Prevs)>, OwedError> {
         let mut sweep = PresenceChanged::new(self.topology.rev());
-        let mut prevs = [None; SITE_DEVICES];
-        for (seen, prev) in self.presence.iter_mut().flatten().zip(prevs.iter_mut()) {
+        for seen in self.presence.iter().flatten() {
             if seen.held == seen.announced {
                 continue;
             }
@@ -631,16 +639,27 @@ impl Site {
                 presence: seen.held,
                 prev: seen.before,
             };
-            if !sweep.push(&change).map_err(OwedError::Change)? {
-                continue;
-            }
-            *prev = Some((seen.dev, seen.announced));
-            seen.announced = seen.held;
+            let taken = sweep.push(&change).map_err(OwedError::Change)?;
+            // One that did not fit would stay owed for the next sweep, but
+            // `PRESENCE_ENTRIES` holds every device.
+            debug_assert!(taken, "a presence sweep holds every device");
         }
         if sweep.is_empty() {
             return Ok(None);
         }
         let len = sweep.encode(body).map_err(OwedError::Change)?;
+        let mut prevs = [None; SITE_DEVICES];
+        for (change, prev) in sweep.entries().flatten().zip(prevs.iter_mut()) {
+            if let Some(seen) = self
+                .presence
+                .iter_mut()
+                .flatten()
+                .find(|seen| seen.dev == change.dev.get())
+            {
+                *prev = Some((seen.dev, seen.announced));
+                seen.announced = change.presence;
+            }
+        }
         Ok(Some((len, prevs)))
     }
 
@@ -677,11 +696,12 @@ pub enum OwedError {
 #[cfg(test)]
 mod tests {
     use km43::{
-        Condition, MetricKind, Part, Provenance, ReadingsHeader, Sel, Severity, Subject, Transport,
+        ConcernState, Condition, MetricKind, Part, Provenance, ReadingsHeader, Sel, Severity,
+        Subject, Transport,
     };
 
     use super::*;
-    use crate::concern_table::ConcernReport;
+    use crate::concern_table::{ConcernReport, Latch};
     use crate::tick::Millis;
     use crate::topology::tests::{bus, device, signal};
 
@@ -1174,5 +1194,159 @@ mod tests {
             panic!("the topology: {:?}", merged.token);
         };
         assert_eq!((merged.rev, merged.added), (5, 2), "both moves counted");
+    }
+
+    /// Too narrow for any record's body.
+    const NARROW: usize = 2;
+
+    /// The next record owed into a body too narrow for it: the error.
+    fn refused(site: &mut Site, now: Tick) -> OwedError {
+        let mut tally = Tally::new();
+        let mut narrow = [0u8; NARROW];
+        site.next_owed(now, 1, &mut tally, &mut narrow)
+            .expect_err("nothing fits two bytes")
+    }
+
+    /// The next record owed at a fresh turn, and its body.
+    fn next(site: &mut Site, now: Tick, seq: u64) -> (Owed, [u8; RECORD_BODY]) {
+        let mut tally = Tally::new();
+        let mut body = [0u8; RECORD_BODY];
+        let owed = site
+            .next_owed(now, seq, &mut tally, &mut body)
+            .expect("writes")
+            .expect("owed");
+        (owed, body)
+    }
+
+    fn fault(cond: u16) -> ConcernReport {
+        ConcernReport {
+            subject: Subject::Part(Part::device(sig(1))),
+            cond: Condition(cond),
+            sev: Severity::Fault,
+            code: None,
+        }
+    }
+
+    #[test]
+    fn p_213_a_topology_record_that_fails_to_encode_is_owed_again_boot_and_move() {
+        let mut site = site(1);
+        assert!(matches!(refused(&mut site, at(1)), OwedError::Change(_)));
+        let (owed, _) = next(&mut site, at(1), 1);
+        let Token::Topology(boot) = owed.token else {
+            panic!("the boot again: {:?}", owed.token);
+        };
+        assert_eq!(
+            (boot.reason, boot.rev, boot.added),
+            (TopologyChangeReason::Boot, 1, 3)
+        );
+        site.committed(&owed.token, 1);
+        site.apply(TopologyChangeReason::ConfigWrite, &[signal(2, 1)])
+            .expect("applies");
+        assert!(matches!(refused(&mut site, at(2)), OwedError::Change(_)));
+        let (moved, _) = next(&mut site, at(2), 2);
+        let Token::Topology(moved) = moved.token else {
+            panic!("the move again: {:?}", moved.token);
+        };
+        assert_eq!(
+            (moved.reason, moved.rev, moved.added),
+            (TopologyChangeReason::ConfigWrite, 2, 1)
+        );
+    }
+
+    #[test]
+    fn p_182_a_sweep_that_fails_to_encode_marks_no_signal_announced() {
+        let mut site = site(2);
+        let _ = tick(&mut site, at(1));
+        site.write(sig(1), at(1), reading(5)).expect("registered");
+        site.write(sig(2), at(1), reading(6)).expect("registered");
+        assert!(matches!(refused(&mut site, at(2)), OwedError::Change(_)));
+        let again = tick(&mut site, at(2));
+        let named = again
+            .sigs
+            .map(|entry| entry.map(|(n, _, prev)| (n, prev.validity_of())));
+        assert_eq!(
+            named.get(..3),
+            Some(
+                &[
+                    Some((1, Validity::Initialising)),
+                    Some((2, Validity::Initialising)),
+                    None
+                ][..]
+            ),
+            "both owed again, from what was last announced"
+        );
+    }
+
+    #[test]
+    fn p_182_a_presence_sweep_that_fails_to_encode_marks_no_device_announced() {
+        let mut site = site(0);
+        let _ = tick(&mut site, at(1));
+        site.presence(1, Presence::Online).expect("a device");
+        assert!(matches!(refused(&mut site, at(2)), OwedError::Change(_)));
+        let (owed, body) = next(&mut site, at(2), 1);
+        assert_eq!(owed.kind, EventKind::DEVICE_PRESENCE_CHANGED);
+        let (_, mut entries) = PresenceChanged::decode(&body[..owed.len]).expect("a sweep");
+        let change = entries.next().expect("one").expect("reads");
+        assert_eq!(
+            (change.dev.get(), change.presence, change.prev),
+            (1, Presence::Online, Presence::NeverSeen)
+        );
+        assert!(entries.next().is_none());
+        // What it names is still given back whole if it then does not land.
+        site.not_committed(&owed.token, &body[..owed.len]);
+        let (again, _) = next(&mut site, at(3), 2);
+        assert_eq!(again.kind, EventKind::DEVICE_PRESENCE_CHANGED);
+    }
+
+    #[test]
+    fn p_182_a_raise_and_a_change_that_fail_to_encode_are_owed_again() {
+        let mut site = site(1);
+        let _ = tick(&mut site, at(1));
+        let cid = site.observe(fault(1), at(1)).expect("admitted");
+        assert!(matches!(refused(&mut site, at(2)), OwedError::Concern(_)));
+        let (raised, _) = next(&mut site, at(2), 7);
+        let Token::Concern(ConcernRecord::Raised(record)) = raised.token else {
+            panic!("the raise again: {:?}", raised.token);
+        };
+        assert_eq!((record.concern.cid, record.concern.seq), (cid, 7));
+        site.committed(&raised.token, 7);
+        site.acknowledge(cid).expect("a row");
+        assert!(matches!(refused(&mut site, at(3)), OwedError::Concern(_)));
+        let (changed, _) = next(&mut site, at(3), 8);
+        let Token::Concern(ConcernRecord::Changed(record)) = changed.token else {
+            panic!("the change again: {:?}", changed.token);
+        };
+        assert_eq!(
+            (record.cid, record.state, record.prev),
+            (cid, ConcernState::ActiveAcked, ConcernState::Active)
+        );
+    }
+
+    #[test]
+    fn p_180_a_clear_that_fails_to_encode_is_owed_again_and_frees_its_cid_only_once_it_lands() {
+        let mut site = site(1);
+        let _ = tick(&mut site, at(1));
+        let cid = site.observe(fault(1), at(1)).expect("admitted");
+        let (raised, _) = next(&mut site, at(2), 1);
+        site.committed(&raised.token, 1);
+        site.gone(
+            Subject::Part(Part::device(sig(1))),
+            Condition(1),
+            Latch::None,
+        )
+        .expect("a row");
+        assert!(matches!(refused(&mut site, at(3)), OwedError::Concern(_)));
+        assert_eq!(
+            site.concerns().state(cid),
+            Some(ConcernState::Cleared),
+            "held until its clear lands"
+        );
+        let (cleared, _) = next(&mut site, at(3), 2);
+        let Token::Concern(ConcernRecord::Changed(record)) = cleared.token else {
+            panic!("the clear again: {:?}", cleared.token);
+        };
+        assert_eq!((record.cid, record.state), (cid, ConcernState::Cleared));
+        site.committed(&cleared.token, 2);
+        assert_eq!(site.concerns().state(cid), None, "free once it landed");
     }
 }
