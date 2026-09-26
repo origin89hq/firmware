@@ -1329,6 +1329,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "o89-comms-net"
+version = "0.0.0"
+dependencies = [
+ "embassy-net",
+ "o89-comms-core",
+ "smoltcp",
+]
+
+[[package]]
 name = "o89-core"
 version = "0.0.0"
 dependencies = [
@@ -1382,9 +1391,9 @@ dependencies = [
  "embedded-storage-async",
  "km43",
  "o89-comms-core",
+ "o89-comms-net",
  "o89-core",
  "serde_json",
- "smoltcp",
 ]
 
 [[package]]

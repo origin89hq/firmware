@@ -1,0 +1,24 @@
+[package]
+name = "o89-comms-net"
+version = "0.0.0"
+description = "The comms processor's station DHCP configuration, built once for the firmware and the host test that times its resends"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A crate of its own so that `o89-comms-core`, the comms processor's
+# decisions, never carries a network stack. Never `o89-core`.
+[dependencies]
+o89-comms-core = { path = "../o89-comms-core" }
+# The release `firmwares/o89-comms` and `o89-sim` build; a second release in
+# either build would make `DhcpConfig` a different type there and fail to
+# compile. The two features are the ones `DhcpConfig::hostname` needs.
+embassy-net = { version = "=0.9.1", features = ["dhcpv4", "dhcpv4-hostname"] }
+# The DHCP client's retry timings: embassy-net takes smoltcp's `Duration`
+# without re-exporting it. Pinned to the release embassy-net resolves.
+smoltcp = { version = "=0.13.1", default-features = false }
+
+[lints]
+workspace = true

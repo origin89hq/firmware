@@ -19,6 +19,7 @@ mod dhcp {
     use embassy_net::{Config, DhcpConfig, StackResources};
     use embassy_time::{Duration, Instant, MockDriver};
     use o89_comms_core::{DHCP_DISCOVER_RESEND, NO_IP};
+    use o89_comms_net::station_dhcp;
 
     /// How far the mock clock moves between polls of the runner.
     const STEP: Duration = Duration::from_millis(10);
@@ -142,14 +143,6 @@ mod dhcp {
         false
     }
 
-    /// The station's DHCP configuration as `radio::station_config` builds it.
-    fn station_dhcp() -> DhcpConfig {
-        let mut dhcp = DhcpConfig::default();
-        dhcp.retry_config.discover_timeout =
-            smoltcp::time::Duration::from_millis(DHCP_DISCOVER_RESEND.as_millis());
-        dhcp
-    }
-
     /// Runs the stack for `HORIZON` on the mock clock, the link coming up after
     /// the first poll, and returns when each DISCOVER left relative to the
     /// first.
@@ -199,7 +192,8 @@ mod dhcp {
     #[test]
     fn f_092_a_lost_discover_is_resent_inside_the_no_ip_bound() {
         let resend = DHCP_DISCOVER_RESEND.as_millis();
-        let (longest, last) = longest_gap(&discovers(station_dhcp()));
+        let (longest, last) =
+            longest_gap(&discovers(station_dhcp("o89").expect("a short hostname")));
         assert!(
             longest < NO_IP.as_millis(),
             "a lost DISCOVER waited {longest} ms, past `no_ip` at {} ms",

@@ -5,6 +5,7 @@
 resolver = "3"
 members = [
     "crates/o89-comms-core",
+    "crates/o89-comms-net",
     "crates/o89-core",
     "crates/o89-dev",
     "crates/o89-link",
