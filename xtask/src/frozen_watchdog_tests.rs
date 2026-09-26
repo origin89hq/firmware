@@ -47,14 +47,15 @@ impl Bench {
         fs::create_dir_all(&dir).expect("a scratch directory");
         // Fails when its arguments end in $FAKE_FAIL; runs until stopped,
         // as `probe-rs run` does, when they end in $FAKE_SLEEP, and logs
-        // `stopped` when a signal ends it, stopping its own sleep. Logs
+        // `stopped` when a signal ends it, stopping and reaping its own
+        // sleep. Logs
         // every call first. A run sleeps $FAKE_STALL seconds between its log
         // line and its trap, and creates $FAKE_READY once the trap is in
         // place.
         let fake = "#!/bin/sh\n\
             echo \"$*\" >> \"$FAKE_LOG\"\n\
             case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && [ -n \"$FAKE_STALL\" ] && sleep \"$FAKE_STALL\";; esac\n\
-            trap 'kill $! 2>/dev/null; echo stopped >> \"$FAKE_LOG\"; exit 143' TERM\n\
+            trap 'kill $! 2>/dev/null; wait $!; echo stopped >> \"$FAKE_LOG\"; exit 143' TERM\n\
             case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && { : > \"$FAKE_READY\"; sleep 60 & wait $!; };; esac\n\
             case \"$*\" in *\"$FAKE_FAIL\") [ -n \"$FAKE_FAIL\" ] && exit 3;; esac\n\
             exit 0\n";
@@ -260,17 +261,22 @@ impl Drop for Launched<'_> {
     }
 }
 
-/// Whether any process of group `pgid` is left, once init has had
-/// `REAP_BOUND` to reap the orphans of a kill.
+/// Whether any live process of group `pgid` is left, once init has had
+/// `REAP_BOUND` to reap the orphans of a kill. A zombie is not live: where
+/// init does not reap, as in some containers, one keeps the group id.
 fn group_survives(pgid: u32) -> bool {
     let started = Instant::now();
     loop {
-        let alive = Command::new("kill")
-            .args(["-0", "--", &format!("-{pgid}")])
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill")
-            .success();
+        let table = Command::new("ps")
+            .args(["-A", "-o", "pgid=", "-o", "stat="])
+            .output()
+            .expect("ps");
+        assert!(table.status.success(), "ps failed");
+        let alive = String::from_utf8_lossy(&table.stdout).lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(pgid.to_string().as_str())
+                && fields.next().is_some_and(|stat| !stat.starts_with('Z'))
+        });
         if !alive || started.elapsed() >= REAP_BOUND {
             return alive;
         }
