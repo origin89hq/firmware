@@ -242,6 +242,14 @@ mod tests {
             magic(*b"SHED"),
             magic(*b"LADR"),
             magic(*b"SROT"),
+            magic(*b"BUD1"),
+            magic(*b"BUD2"),
+            magic(*b"BUD3"),
+            magic(*b"BUD4"),
+            magic(*b"BUD5"),
+            magic(*b"BUD6"),
+            magic(*b"BUD7"),
+            magic(*b"BUD8"),
         ];
         for (i, a) in magics.iter().enumerate() {
             // Never zero: zero is a slot's magic while a record lands over
