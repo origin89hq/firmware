@@ -470,6 +470,9 @@ not the store's. A vendor register no KM43 kind can carry, such as a charge
 stage whose enum space has no members, an alarm word, or an unsigned current
 where the kind is signed, is read from the same reply and handed back typed
 beside the poll; it never enters the store, and no kind is invented for it.
+A register whose representation the vendor leaves open, such as a current
+with no stated sign, publishes `unsupported` until the caller declares how
+that unit sends it, and its raw words come back beside the poll either way.
 
 **A hung instrument is not a steady site.** A channel stops being true two
 ways, and only one looks like it. The bus goes quiet and nothing is written;

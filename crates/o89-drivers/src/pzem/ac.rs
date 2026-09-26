@@ -13,6 +13,8 @@
 //! The meter is powered from the voltage it measures, so with no AC it does
 //! not answer at all, and the manual defines no *not available* word: a
 //! stopped generator leaves the signals without a value and ages them out.
+//! The meter measures whatever it is wired into, so its component role is
+//! the installation's to name, not this table's.
 //!
 //! [`RegisterMap`]: crate::dialect::RegisterMap
 //! [`REGISTER_MAPS`]: crate::dialect::REGISTER_MAPS
@@ -22,11 +24,11 @@
 use km43::{Id, Provenance, SignalDomain, Unit};
 use o89_core::{Signals, Tick};
 
-use crate::PollError;
 use crate::dialect::{Block, Cell, Kind, Plausible, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Registers, Timing};
 use crate::port::Rs485;
 use crate::vendor::{self, Alarm, ConditionError, Report, VendorError};
+use crate::{PollError, Polled};
 
 /// The measurement registers, §2.3, with the PZEM-016's ranges from §1.
 const CELLS: [Cell; 5] = [
@@ -209,9 +211,12 @@ impl Meter {
             .await
             .map_err(|error| VendorError::Poll(PollError::Modbus { block: 0, error }))?;
         let conditions = Words::from_registers(&registers).map_err(VendorError::Condition)?;
-        let polled = vendor::publish(&BLOCK, &registers, |cell| self.signal(cell), now, store)
+        let written = vendor::publish(&BLOCK, &registers, 0, |cell| self.signal(cell), now, store)
             .map_err(VendorError::Poll)?;
-        Ok(Report { polled, conditions })
+        Ok(Report {
+            polled: Polled { written },
+            conditions,
+        })
     }
 }
 

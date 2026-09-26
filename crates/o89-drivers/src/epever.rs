@@ -20,16 +20,22 @@
 //! (origin89hq/km43#2) and are not read. Neither document defines a
 //! *not available* word for any register read here, and none is declared.
 //!
+//! Neither says whether the battery current is signed or which way is
+//! positive, so it is not in [`MAP`]: it publishes `unsupported` unless the
+//! caller declares a [`BatteryCurrent`] for the unit, and its raw words come
+//! back in [`Words`] either way. [`ROLES`] names the component each of the
+//! map's cells describes.
+//!
 //! cites: F-050, F-052
 
-use km43::{Dialect, Id, Provenance, SignalDomain, Unit};
-use o89_core::{Signals, Tick};
+use km43::{ComponentRole, Dialect, Id, Provenance, SignalDomain, Unit, Validity};
+use o89_core::{Observation, Signals, Tick};
 
-use crate::dialect::{Block, Cell, Kind, RegisterMap, Sign, Span};
+use crate::dialect::{Block, Cell, DecodeError, Kind, RegisterMap, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Read, Registers, Timing};
 use crate::port::Rs485;
 use crate::vendor::{self, ConditionError, Report, VendorError};
-use crate::{Device, ModbusDevice};
+use crate::{ModbusDevice, PollError, Polled};
 
 /// A cell in hundredths, which is how V2.5 scales every voltage, current
 /// and power read here.
@@ -79,21 +85,11 @@ const SOC: [Cell; 1] = [Cell {
     provenance: Provenance::Estimated,
 }];
 
-/// `0x331A` to `0x331C`: the battery's voltage and its net current, low
-/// word first.
-///
-/// The tables give the current as one 32-bit value in hundredths of an
-/// ampere without saying it is signed. It is read as two's complement,
-/// negative while the bank discharges, as the earlier `cabin-epever`
-/// driver and the two implementations it cites read it; that is not the
-/// vendor's word. A controller that sent a magnitude instead would read
-/// the same while charging and wrongly while discharging, which is a bench
-/// check before anything decides on it.
-const BATTERY: [Cell; 2] = [
-    centi(0x331A, Kind::DcVoltage, Span::One, Sign::Unsigned),
-    centi(0x331B, Kind::DcCurrent, Span::TwoLowFirst, Sign::Signed),
-];
+/// `0x331A`: the battery's voltage.
+const BATTERY: [Cell; 1] = [centi(0x331A, Kind::DcVoltage, Span::One, Sign::Unsigned)];
 
+/// The battery block reads on to `0x331C` for the battery current beside
+/// the voltage; see [`BatteryCurrent`].
 const BLOCKS: [Block; 4] = [
     crate::block!(Function::ReadInput, 0x3100, 4, &PV),
     crate::block!(Function::ReadInput, 0x310C, 4, &LOAD),
@@ -103,11 +99,59 @@ const BLOCKS: [Block; 4] = [
 
 /// The EPEVER B-series register map. Its cells publish in this order: PV
 /// voltage, current and power; load voltage, current and power; state of
-/// charge; battery voltage and current.
+/// charge; battery voltage.
 pub const MAP: RegisterMap = RegisterMap {
     dialect: Dialect::EPEVER_B,
     blocks: &BLOCKS,
 };
+
+/// The component each of [`MAP`]'s cells describes, by register, in the
+/// map's order. The PV cells are the tracker's input, where the current
+/// flows in, rather than the array's output, where it flows out; KM43's DC
+/// current is positive into its component.
+pub const ROLES: [(u16, ComponentRole); 8] = [
+    (0x3100, ComponentRole::MPPT_TRACKER),
+    (0x3101, ComponentRole::MPPT_TRACKER),
+    (0x3102, ComponentRole::MPPT_TRACKER),
+    (0x310C, ComponentRole::LOAD_OUTPUT),
+    (0x310D, ComponentRole::LOAD_OUTPUT),
+    (0x310E, ComponentRole::LOAD_OUTPUT),
+    (0x311A, ComponentRole::BATTERY_BANK),
+    (0x331A, ComponentRole::BATTERY_BANK),
+];
+
+/// The battery current's registers, `0x331B` low and `0x331C` high.
+const BATTERY_CURRENT: u16 = 0x331B;
+
+/// The battery current read as two's complement, positive into the bank.
+const SIGNED_CURRENT: [Cell; 1] = [centi(
+    BATTERY_CURRENT,
+    Kind::DcCurrent,
+    Span::TwoLowFirst,
+    Sign::Signed,
+)];
+
+/// The battery block's read, decoding only the battery current.
+const SIGNED_CURRENT_BLOCK: Block = crate::block!(Function::ReadInput, 0x331A, 3, &SIGNED_CURRENT);
+
+/// What the caller has established about the battery current at `0x331B`
+/// and `0x331C`, one 32-bit value in hundredths of an ampere, low word
+/// first.
+///
+/// Neither vendor document says whether it is signed or which way is
+/// positive, and KM43's DC current needs both: a magnitude would read a
+/// discharging bank as a charging one. So there is no default reading. The
+/// signal publishes `unsupported` until the caller declares what this
+/// unit sends, and the raw words come back in [`Words`] either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BatteryCurrent {
+    /// Not established: the signal publishes `unsupported` and no value.
+    Unsupported,
+    /// Established for this unit, on the bench or from its documentation:
+    /// two's complement, positive while the bank charges.
+    SignedPositiveCharging,
+}
 
 /// The charging equipment status register.
 const CHARGING_STATUS: u16 = 0x3201;
@@ -162,51 +206,145 @@ impl Status {
     }
 }
 
+/// What a poll read that no KM43 kind carries, or that only the caller can
+/// say how to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Words {
+    /// The charging equipment status.
+    pub status: Status,
+    /// `0x331B` and `0x331C` as sent, low word first, whatever
+    /// [`BatteryCurrent`] the charger was given.
+    pub battery_current_raw: u32,
+}
+
+/// The signals a charger publishes: [`MAP`]'s cells, then the battery
+/// current.
+const SIGNALS: usize = 9;
+
 /// An EPEVER B-series controller on an RS-485 port at 115200 8N1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Charger(ModbusDevice);
+pub struct Charger {
+    device: ModbusDevice,
+    current: Id,
+    battery_current: BatteryCurrent,
+}
 
 impl Charger {
     /// The controller at `address`, whose cells publish as consecutive
-    /// signals from `first` in [`MAP`]'s order.
+    /// signals from `first` in [`MAP`]'s order, followed by the battery
+    /// current read as `battery_current` says.
     ///
-    /// `None` only where [`ModbusDevice::new`] refuses.
+    /// `None` when the signals would run past `0xFFFF`.
     #[must_use]
-    pub fn new(address: Address, first: Id) -> Option<Self> {
-        ModbusDevice::new(address, &MAP, first).map(Self)
+    pub fn new(address: Address, first: Id, battery_current: BatteryCurrent) -> Option<Self> {
+        let device = ModbusDevice::new(address, &MAP, first)?;
+        let offset = u16::try_from(SIGNALS.checked_sub(1)?).ok()?;
+        let current = Id::new(first.get().checked_add(offset)?).ok()?;
+        Some(Self {
+            device,
+            current,
+            battery_current,
+        })
     }
 
-    /// The device and its signals.
+    /// The device and the signals of its map's cells.
     #[must_use]
     pub const fn device(&self) -> &ModbusDevice {
-        &self.0
+        &self.device
     }
 
-    /// Read every block of [`MAP`] into `store` at `now`, then the charging
-    /// status.
+    /// The signal the battery current publishes as.
+    #[must_use]
+    pub const fn battery_current_signal(&self) -> Id {
+        self.current
+    }
+
+    /// Read every block of [`MAP`] and the battery current into `store` at
+    /// `now`, then the charging status.
     ///
-    /// Five exchanges, each bounded by `timing`. The map's poll stops at its
-    /// first failure, as [`Device::poll_rs485`] does; a failed status read
-    /// leaves the cells written and the status unknown.
+    /// Five exchanges, each bounded by `timing`. The poll stops at the first
+    /// failure, and what it wrote before stands; a failed status read leaves
+    /// every signal written and the words unknown.
     pub async fn poll<P: Rs485, const N: usize>(
         &self,
         port: &mut P,
         timing: Timing,
         now: Tick,
         store: &mut Signals<N>,
-    ) -> Result<Report<Status>, VendorError<P::Error>> {
-        let polled = Device::Modbus(self.0)
-            .poll_rs485(port, timing, now, store)
-            .await
-            .map_err(VendorError::Poll)?;
-        let read = Status::read(self.0.address());
+    ) -> Result<Report<Words>, VendorError<P::Error>> {
+        let address = self.device.address();
+        let signal = |cell| self.device.signal(cell);
         let mut buf = [0u8; RECEIVE_BYTES];
-        let registers = modbus::read(port, read, timing, &mut buf)
+        let [pv, load, soc, battery] = &BLOCKS;
+        let mut written = 0usize;
+        for (at, block) in [pv, load, soc].into_iter().enumerate() {
+            let registers = modbus::read(port, block.read(address), timing, &mut buf)
+                .await
+                .map_err(|error| VendorError::Poll(PollError::Modbus { block: at, error }))?;
+            let cells = vendor::publish(block, &registers, written, signal, now, store)
+                .map_err(VendorError::Poll)?;
+            written = written.saturating_add(cells);
+        }
+        let registers = modbus::read(port, battery.read(address), timing, &mut buf)
+            .await
+            .map_err(|error| VendorError::Poll(PollError::Modbus { block: 3, error }))?;
+        let battery_current_raw =
+            vendor::low_first(&registers, BATTERY_CURRENT).map_err(VendorError::Condition)?;
+        let cells = vendor::publish(battery, &registers, written, signal, now, store)
+            .map_err(VendorError::Poll)?;
+        written = written.saturating_add(cells);
+        let cells = self.publish_current(&registers, written, now, store)?;
+        written = written.saturating_add(cells);
+
+        let mut buf = [0u8; RECEIVE_BYTES];
+        let registers = modbus::read(port, Status::read(address), timing, &mut buf)
             .await
             .map_err(VendorError::Conditions)?;
-        let conditions = Status::from_registers(&registers).map_err(VendorError::Condition)?;
-        Ok(Report { polled, conditions })
+        let status = Status::from_registers(&registers).map_err(VendorError::Condition)?;
+        Ok(Report {
+            polled: Polled { written },
+            conditions: Words {
+                status,
+                battery_current_raw,
+            },
+        })
+    }
+
+    /// Write the battery current as the charger's [`BatteryCurrent`] says,
+    /// `unsupported` or decoded as the caller declared it, and say how many
+    /// signals were written.
+    fn publish_current<E, const N: usize>(
+        &self,
+        registers: &Registers<'_>,
+        cell: usize,
+        now: Tick,
+        store: &mut Signals<N>,
+    ) -> Result<usize, VendorError<E>> {
+        match self.battery_current {
+            BatteryCurrent::Unsupported => {
+                let seen = Observation::missing(Validity::Unsupported).map_err(|error| {
+                    VendorError::Poll(PollError::Decode {
+                        cell,
+                        error: DecodeError::Quality(error),
+                    })
+                })?;
+                store
+                    .write(self.current, now, seen)
+                    .map_err(|error| VendorError::Poll(PollError::Store(error)))?;
+                Ok(1)
+            }
+            BatteryCurrent::SignedPositiveCharging => vendor::publish(
+                &SIGNED_CURRENT_BLOCK,
+                registers,
+                cell,
+                |_| Some(self.current),
+                now,
+                store,
+            )
+            .map_err(VendorError::Poll),
+        }
     }
 }
 
@@ -230,8 +368,8 @@ mod tests {
         Address::new(1).unwrap()
     }
 
-    fn charger() -> Charger {
-        Charger::new(address(), id(FIRST)).unwrap()
+    fn charger(battery_current: BatteryCurrent) -> Charger {
+        Charger::new(address(), id(FIRST), battery_current).unwrap()
     }
 
     fn store() -> Signals<9> {
@@ -277,14 +415,22 @@ mod tests {
         bursts
     }
 
-    fn poll_with(
+    fn poll_as(
+        battery_current: BatteryCurrent,
         words: &[&[u16]; 5],
         store: &mut Signals<9>,
-    ) -> Result<Report<Status>, VendorError<u8>> {
+    ) -> Result<Report<Words>, VendorError<u8>> {
         let (echoes, replies) = (echoes(), frames(words));
         let bursts = interleaved(&echoes, &replies);
         let mut port = Scripted::new(&bursts);
-        block_on(charger().poll(&mut port, TIMING, Tick::ZERO, store))
+        block_on(charger(battery_current).poll(&mut port, TIMING, Tick::ZERO, store))
+    }
+
+    fn poll_with(
+        words: &[&[u16]; 5],
+        store: &mut Signals<9>,
+    ) -> Result<Report<Words>, VendorError<u8>> {
+        poll_as(BatteryCurrent::Unsupported, words, store)
     }
 
     fn published(store: &Signals<9>) -> [(Option<i32>, Provenance); 9] {
@@ -316,13 +462,16 @@ mod tests {
     #[test]
     fn f_052_a_poll_publishes_every_cell_with_its_declared_provenance() {
         let mut store = store();
-        let report = poll_with(&WORDS, &mut store).unwrap();
+        let report = poll_as(BatteryCurrent::SignedPositiveCharging, &WORDS, &mut store).unwrap();
         assert_eq!(report.polled.written, 9);
         assert_eq!(
             report.conditions,
-            Status {
-                stage: ChargeStage::Boost,
-                fault: false
+            Words {
+                status: Status {
+                    stage: ChargeStage::Boost,
+                    fault: false
+                },
+                battery_current_raw: 0xFFFF_FEBB,
             }
         );
         let measured = Provenance::Measured;
@@ -397,7 +546,11 @@ mod tests {
             let status = [word];
             words[4] = &status;
             let report = poll_with(&words, &mut store).unwrap();
-            assert_eq!(report.conditions, Status { stage, fault }, "{word:#06x}");
+            assert_eq!(
+                report.conditions.status,
+                Status { stage, fault },
+                "{word:#06x}"
+            );
         }
     }
 
@@ -411,7 +564,12 @@ mod tests {
         bursts[5] = &wrong[..wrong_len];
         let mut port = Scripted::new(&bursts[..6]);
         assert_eq!(
-            block_on(charger().poll(&mut port, TIMING, Tick::ZERO, &mut store)),
+            block_on(charger(BatteryCurrent::Unsupported).poll(
+                &mut port,
+                TIMING,
+                Tick::ZERO,
+                &mut store
+            )),
             Err(VendorError::Poll(PollError::Modbus {
                 block: 2,
                 error: ModbusError::Reply(ReplyError::ByteCount(4))
@@ -441,7 +599,12 @@ mod tests {
         bursts[7] = &refusal;
         let mut port = Scripted::new(&bursts[..8]);
         assert_eq!(
-            block_on(charger().poll(&mut port, TIMING, Tick::ZERO, &mut store)),
+            block_on(charger(BatteryCurrent::SignedPositiveCharging).poll(
+                &mut port,
+                TIMING,
+                Tick::ZERO,
+                &mut store
+            )),
             Err(VendorError::Poll(PollError::Modbus {
                 block: 3,
                 error: ModbusError::Reply(ReplyError::Exception(Exception::IllegalDataAddress))
@@ -460,10 +623,90 @@ mod tests {
         // The status read's echo, and nothing behind it.
         let mut port = Scripted::new(&bursts[..9]);
         assert_eq!(
-            block_on(charger().poll(&mut port, TIMING, Tick::ZERO, &mut store)),
+            block_on(charger(BatteryCurrent::SignedPositiveCharging).poll(
+                &mut port,
+                TIMING,
+                Tick::ZERO,
+                &mut store
+            )),
             Err(VendorError::Conditions(ModbusError::Timeout))
         );
         assert_eq!(published(&store)[8].0, Some(-3_250));
+    }
+
+    #[test]
+    fn a_battery_current_nobody_has_qualified_publishes_unsupported_and_keeps_its_raw_words() {
+        let mut store = store();
+        let report = poll_with(&WORDS, &mut store).unwrap();
+        assert_eq!(report.polled.written, 9);
+        assert_eq!(report.conditions.battery_current_raw, 0xFFFF_FEBB);
+        let current = store.sample(id(FIRST + 8), Tick::ZERO).unwrap();
+        assert_eq!(current.value(), None);
+        assert_eq!(current.q.validity_of(), Validity::Unsupported);
+        // The cells beside it publish as ever.
+        assert_eq!(published(&store)[7].0, Some(12_300));
+    }
+
+    #[test]
+    fn p_185_a_declared_signed_battery_current_decodes_to_its_edges_and_refuses_past_them() {
+        // (low word, high word, what publishes at −3), built by hand.
+        let cases: [(u16, u16, Option<i32>); 7] = [
+            (0x0000, 0x0000, Some(0)),
+            (0xFFFF, 0xFFFF, Some(-10)),
+            // ±214 748 364 hundredths is the widest that fits at −3.
+            (0xCCCC, 0x0CCC, Some(2_147_483_640)),
+            (0x3334, 0xF333, Some(-2_147_483_640)),
+            (0xCCCD, 0x0CCC, None),
+            (0x3333, 0xF333, None),
+            (0x0000, 0x8000, None),
+        ];
+        for (low, high, expected) in cases {
+            let mut store = store();
+            let mut words = WORDS;
+            let battery = [1230, low, high];
+            words[3] = &battery;
+            let report =
+                poll_as(BatteryCurrent::SignedPositiveCharging, &words, &mut store).unwrap();
+            assert_eq!(
+                report.conditions.battery_current_raw,
+                u32::from(low) | (u32::from(high) << 16)
+            );
+            let current = store.sample(id(FIRST + 8), Tick::ZERO).unwrap();
+            assert_eq!(current.value(), expected, "{high:#06x}{low:04x}");
+            match expected {
+                Some(_) => assert_eq!(current.q.provenance_of(), Provenance::Measured),
+                None => assert_eq!(current.q.validity_of(), Validity::OutOfRange),
+            }
+        }
+    }
+
+    #[test]
+    fn a_charger_s_signals_run_past_its_map_by_one_and_are_refused_past_the_top() {
+        let charger = charger(BatteryCurrent::Unsupported);
+        assert_eq!(charger.device().signal(7), Some(id(FIRST + 7)));
+        assert_eq!(charger.device().signal(8), None);
+        assert_eq!(charger.battery_current_signal(), id(FIRST + 8));
+        assert!(Charger::new(address(), id(0xFFF7), BatteryCurrent::Unsupported).is_some());
+        assert_eq!(
+            Charger::new(address(), id(0xFFF8), BatteryCurrent::Unsupported),
+            None
+        );
+    }
+
+    #[test]
+    fn every_map_cell_has_its_component_role_in_the_map_s_order() {
+        let registers: [u16; 8] = ROLES.map(|(register, _)| register);
+        assert!(MAP.cells().map(|cell| cell.register).eq(registers));
+        assert!(
+            ROLES[..3]
+                .iter()
+                .all(|(_, role)| *role == ComponentRole::MPPT_TRACKER)
+        );
+        assert!(
+            ROLES[6..]
+                .iter()
+                .all(|(_, role)| *role == ComponentRole::BATTERY_BANK)
+        );
     }
 
     #[test]
