@@ -206,7 +206,7 @@ why exercise runs and quiet hours wait (below).
 
 Everything is swappable, but the mechanism differs by boundary, because the
 naive traits-everywhere version costs real resources on this part. The
-image budget on revision A is 496 KB, not 512; generics monomorphise, so
+image budget on revision A is 480 KB, not 512; generics monomorphise, so
 every instantiation duplicates code; `dyn Trait` in `no_std` means vtables,
 no inlining and usually a heap.
 
@@ -313,7 +313,7 @@ Three rules come with it:
    below every task that times anything (P-243, below). The failure mode of a cooperative executor is one task
    starving the rest, and it looks exactly like a dead controller.
 3. **The image is measured every time the gate runs**, the `.bin` against
-   the 496 KB region with a stated margin, and a change that moves it records
+   the 480 KB region with a stated margin, and a change that moves it records
    the row in `sizes.tsv`. The number is wanted early, not in November.
 
 Exact pins on every firmware dependency, because Embassy and `esp-hal` move
@@ -1294,44 +1294,59 @@ evidence yet.
 ## The bootloader and updates
 
 Revision A's part has 512 KB of flash in two 256 KB banks, and it does not
-swap them. The bootloader owns the bottom 16 KB and the application links at
-`0x08004000` into one region of 496 KB that runs across the bank boundary;
-the bank-swap option bit is never set, so bank 1 is always at the bottom.
-A/B across the two banks would leave the image one bank less the bootloader,
-248 KB, and the controller outgrew that with invites and removal (#184),
-before RS-485 devices, the generator behaviours, readings and history
-([#185](https://github.com/origin89hq/firmware/issues/185)). Revision B keeps
-A/B on a part with at least 1 MB of dual-bank flash
-([origin89hq/hardware#57](https://github.com/origin89hq/hardware/issues/57)),
-so the layout is per revision: `o89-boot/memory.x`, `o89-controller/memory.x`,
+swap them. The bootloader owns the bottom 32 KB and the application links at
+`0x08008000` into one region of 480 KB that runs across the bank boundary at
+`0x08040000`. `nSWAP_BANK` in `FLASH_OPTR` stays 1, which maps bank 1, with the
+bootloader, at `0x08000000`; nothing of ours writes an option byte, and
+`just check-option-bytes` reads the bit on a board before it leaves the bench
+(board A read `0xFFFFFEAA` on 2026-09-26: `nSWAP_BANK` 1, `DUAL_BANK` 1, RDP
+level 0). A/B across the two banks would leave the image one bank less the
+bootloader, 248 KB, and the controller outgrew that with invites and removal
+(#184), before RS-485 devices, the generator behaviours, readings and history
+([#185](https://github.com/origin89hq/firmware/issues/185)).
+
+Revision A units are development boards and a few installed units that still
+have to take an update without a visit; the product ships on revision B,
+which keeps A/B on a part with at least 1 MB of dual-bank flash
+([origin89hq/hardware#57](https://github.com/origin89hq/hardware/issues/57)).
+So the layout is per revision: `o89-boot/memory.x`, `o89-controller/memory.x`,
 the bootloader's `APPLICATION` and the gate's budget in `xtask/src/images.rs`
-state revision A's, and a revision B board gets its own.
+state revision A's, and a revision B board gets its own. An update never
+rewrites the bootloader, so an installed unit keeps the bootloader it was
+flashed with until someone visits it with a probe. The 32 KB is reserved for
+that reason: the bootloader is estimated at 16 KB and nothing has measured it
+yet, and one that outgrew its region would move the application, which on an
+installed unit is a visit.
 
 **An update is staged on the NOR.** The application writes the image the
 comms processor delivers into the free one of two 512 KiB image regions on
-the W25Q128, just past the log ring (`recorder.rs` names them so the ring
-cannot grow into them). The bootloader verifies the manifest's signature over
-NOR reads, and only then erases the application region and copies the image
-in. The image it replaced stays in the other region as the rollback target.
-`embassy-boot`'s copy-based scheme was declined for A/B because its
-interrupted copy was an empty-flash window; with the bootloader never erased
-that reason is gone, and its external-flash DFU partition is weighed again in
-M7.
+the W25Q128, just past the log ring (`o89_core::nor_map`, whose erase the
+bench tool refuses in both regions). The bootloader verifies the manifest's
+signature over NOR reads, and only then erases the application region and
+copies the image in. After the copy it hashes the programmed region against
+the manifest's digest before it marks the copy done, so a second NOR read that
+differs from the first, or a program that did not land, is retried or rolled
+back and never booted. The image it replaced stays in the other region as the
+rollback target; the image a unit is installed with is written into a region
+too, so the first update has something to roll back to. `embassy-boot`'s
+copy-based scheme was declined for A/B because its interrupted copy was an
+empty-flash window; with the bootloader never erased that reason is gone, and
+its external-flash DFU partition is weighed again in M7.
 
 The invariants that make this what it claims:
 
 - **At no instant are there zero bootable images.** The bootloader is never
-  erased after manufacture, so the flash never reads empty and the empty
-  check that starts the system bootloader
+  erased after manufacture and `nSWAP_BANK` stays 1, so the bottom of flash
+  never reads empty and the empty check that starts the system bootloader
   ([origin89hq/hardware#30](https://github.com/origin89hq/hardware/issues/30))
-  cannot fire. Which word that check reads with the part in dual-bank mode
-  is settled against RM0444 in M7, before this is relied on. The application
-  region is erased only by the bootloader and only once a verified image is on
-  the NOR, and a copy cut at any step resumes on the next boot from a journal
-  and that image, so no boot finds a half-copied region and nothing to finish
-  it with.
+  cannot fire. ST's answer on its forum has that check read the bank mapped at
+  `0x08000000`, which is why the bit matters: bank 2 may hold nothing, since
+  an image smaller than 224 KB ends below it; RM0444 settles it in M7, before
+  this is relied on. The application region is erased only by the bootloader
+  and only once a verified image is on the NOR, and a copy cut at any step
+  resumes on the next boot from a journal and that image.
 - **The bootloader is written at manufacture and never by an update.** The
-  updater refuses a manifest that covers the first 16 KB. Without that rule
+  updater refuses a manifest that covers the first 32 KB. Without that rule
   a bad release puts a broken bootloader on the part and nothing ever rolls
   back.
 - **Trial boots are counted and the rollback is performed by the
@@ -1342,15 +1357,19 @@ The invariants that make this what it claims:
   below it is refused without the gesture.
 
 What it costs. The bootloader carries a NOR driver, a signature check over
-NOR reads and a journaled copy; 16 KB is the estimate, against 8 KB for a bank
-flip. An update is about ten seconds of erase and program with no application
-running, so the bootloader's copy is bounded per page and keeps the watchdog
-fed. On revision A any reset already opens the contact, so the exposure is a
-longer reboot. A NOR that fails stops updates and rollback, and the running
-image keeps running. No option byte is ever written, so the audited
-option-byte function A/B needed is not an `unsafe` site. The bench test is
-an update cut at every step of the copy, and a rollback cut at every step, on
-board A.
+NOR reads and a journaled copy, against 8 KB for a bank flip. An update is
+about ten seconds of erase and program with no application running, and a
+rollback as long again, so the bootloader's copy is bounded per page and keeps
+the watchdog fed. On revision A any reset already opens the contact, so the
+exposure is a longer reboot. A NOR that fails outside a copy stops updates and
+rollback, and the running image keeps running. A NOR that fails during a copy,
+after the application region is erased, leaves no image to finish it with: the
+bootloader holds `RUN` and `KICK` low and waits, which is the fail state, and
+the unit stays there until someone reaches it with a probe. A/B had no such
+mode, and it is what an installed revision A unit accepts for its room. No
+option byte is ever written, so the audited option-byte function A/B needed
+is not an `unsafe` site. The bench test is an update cut at every step of the
+copy, a rollback cut at every step, and a NOR removed mid-copy, on board A.
 
 The bootloader does four things: drives `RUN` and `KICK` low, finishes or
 rolls back an update staged on the NOR, counts trial boots, and jumps. It is

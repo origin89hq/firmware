@@ -52,6 +52,7 @@ mod link;
 pub mod mailbox;
 pub mod map;
 mod network;
+pub mod nor_map;
 mod pairing_report;
 mod panic_record;
 mod provision;

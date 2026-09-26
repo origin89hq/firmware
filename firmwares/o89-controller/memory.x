@@ -3,14 +3,14 @@
  * The STM32G0B1RE has 512 KB in two banks. Revision A does not swap them: an
  * update is staged and verified on the NOR and copied into this one region by
  * the bootloader, with the previous image kept on the NOR for a rollback
- * (#185). So the budget is 512 KB less the 16 KB at the bottom that the
+ * (#185). So the budget is 512 KB less the 32 KB at the bottom that the
  * bootloader owns, and the region runs across the bank boundary at
  * 0x08040000. Revision B keeps A/B on a larger part (origin89hq/hardware#57)
  * and will have its own map.
  */
 MEMORY
 {
-  FLASH : ORIGIN = 0x08004000, LENGTH = 496K
+  FLASH : ORIGIN = 0x08008000, LENGTH = 480K
   RAM   : ORIGIN = 0x20000000, LENGTH = 136K
   /* The bench tool's mailbox and the bridge's rings: the last 8 KiB, out
    * of the stack's way and never loaded or zeroed by the runtime, at the

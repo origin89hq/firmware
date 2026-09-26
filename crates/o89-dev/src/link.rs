@@ -103,6 +103,9 @@ impl Answer {
             Status::InsideTheRing => bail!(
                 "{what}: the block is the ring's; only the oldest goes, with `drop-ring` (#78)"
             ),
+            Status::ImageRegion => bail!(
+                "{what}: the block is in an image region, which only the updater and the bootloader erase (#185)"
+            ),
         }
     }
 }
@@ -332,7 +335,8 @@ impl Link {
             | Status::NoStore
             | Status::BridgeRefused
             | Status::ModuleRefused
-            | Status::InsideTheRing => Err(Refused::Bus(anyhow!(
+            | Status::InsideTheRing
+            | Status::ImageRegion => Err(Refused::Bus(anyhow!(
                 "writing the FRAM: {:?}",
                 answer.status
             ))),

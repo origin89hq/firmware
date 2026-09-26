@@ -132,8 +132,9 @@ enum Command {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         count: u32,
     },
-    /// Erase NOR blocks of 4 KiB outside the event ring, one per request;
-    /// a block of the ring's own is refused (#78).
+    /// Erase NOR blocks of 4 KiB outside the event ring and the image
+    /// regions, one per request; a block of the ring's own is refused (#78),
+    /// and so is one of an image region's (#185).
     EraseNor {
         /// The first block, counted from the part's start.
         block: u32,

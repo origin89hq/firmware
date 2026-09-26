@@ -4,7 +4,8 @@
 //! stays on the laptop, and reading `ls -l` on it reports an image four times
 //! the flash it goes into. On revision A an update is staged on the NOR and
 //! copied into the one application region, so the controller's budget is
-//! the part's 512 KB less the bootloader's 16 KB: 496 KB, not 512 (#185).
+//! the part's 512 KB less the 32 KB kept for the bootloader: 480 KB, not
+//! 512 (#185).
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -62,14 +63,14 @@ const IMAGES: &[Image] = &[
         package: "o89-boot",
         target: CORTEX_M0,
         kind: Kind::RawBinary,
-        budget: 16 * KIB,
+        budget: 32 * KIB,
         margin: KIB,
     },
     Image {
         package: "o89-controller",
         target: CORTEX_M0,
         kind: Kind::RawBinary,
-        budget: 496 * KIB,
+        budget: 480 * KIB,
         margin: 24 * KIB,
     },
     Image {

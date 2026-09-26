@@ -1,13 +1,13 @@
 /* The bench map: boots straight from the bottom of flash on a blank board.
  *
- * 496K, not the part's 512K, on purpose: every size measured here is only
+ * 480K, not the part's 512K, on purpose: every size measured here is only
  * worth anything to the shipped image if both are measured against the same
  * budget. An image linked here has nowhere for the bootloader to live and
  * must never be flashed onto a unit that will take an update.
  */
 MEMORY
 {
-  FLASH : ORIGIN = 0x08000000, LENGTH = 496K
+  FLASH : ORIGIN = 0x08000000, LENGTH = 480K
   RAM   : ORIGIN = 0x20000000, LENGTH = 136K
   /* The bench tool's mailbox and the bridge's rings: the last 8 KiB, out
    * of the stack's way and never loaded or zeroed by the runtime, at the

@@ -76,8 +76,8 @@ and the plan with its milestones is
 ## Target constraints
 
 - STM32G0B1RE: Cortex-M0+, no FPU, no compare-and-swap, 144 KB RAM.
-  Revision A stages updates on the NOR, so the image budget is 496 KB behind
-  a 16 KB bootloader, never 512 (#185). Account for monomorphisation; enum
+  Revision A stages updates on the NOR, so the image budget is 480 KB behind
+  a 32 KB bootloader, never 512 (#185). Account for monomorphisation; enum
   dispatch for closed sets, traits at target seams. No floating point in
   interrupts or hot paths.
 - ESP32-C6: RISC-V, bare-metal `esp-hal`. Wi-Fi and BLE are Espressif blobs

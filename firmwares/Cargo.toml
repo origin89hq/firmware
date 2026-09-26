@@ -59,7 +59,7 @@ panic-probe = { version = "=1.0.0", features = ["print-defmt"] }
 
 # At the workspace root, because cargo ignores a member's profile and says so
 # in a warning that is easy to read past. Every byte is worth something in a
-# 496 KB region, and `debug = true` costs nothing there: DWARF stays in the ELF.
+# 480 KB region, and `debug = true` costs nothing there: DWARF stays in the ELF.
 [profile.release]
 opt-level = "z"
 lto = "fat"

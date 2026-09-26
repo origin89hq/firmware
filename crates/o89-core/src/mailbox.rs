@@ -49,8 +49,9 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"O89M");
 /// added firmware-owned secret replacement. Version 5 carries the whole
 /// manufacturing transaction, the controller key and the generator's first
 /// state with the secret: an older tool would stage 48 bytes the firmware no
-/// longer reads as one.
-pub const VERSION: u32 = 5;
+/// longer reads as one. Version 6 refuses to erase the image regions of the
+/// [`nor_map`](crate::nor_map) as well as the ring's blocks (#185).
+pub const VERSION: u32 = 6;
 
 /// Bytes of data a request or an answer carries: enough for the client
 /// table's record in one write.
@@ -126,8 +127,10 @@ pub enum Op {
     WriteFram,
     /// `ARG1` bytes of the NOR from `ARG0`.
     ReadNor,
-    /// Erase the NOR block `ARG0`, which has to lie outside the ring:
-    /// the ring's own are refused with [`Status::InsideTheRing`] (#78).
+    /// Erase the NOR block `ARG0`, which has to lie outside the ring and
+    /// the image regions: the ring's own are refused with
+    /// [`Status::InsideTheRing`] (#78), an image region's with
+    /// [`Status::ImageRegion`] (#185).
     EraseNorBlock,
     /// Answer, then reset the part.
     Reboot,
@@ -262,6 +265,9 @@ pub enum Status {
     ModuleRefused,
     /// A block of the ring's own, which only [`Op::DropOldest`] erases.
     InsideTheRing,
+    /// A block of an image region, which only the updater and the
+    /// bootloader erase (#185).
+    ImageRegion,
 }
 
 impl Status {
@@ -281,6 +287,7 @@ impl Status {
             Self::BridgeRefused => 9,
             Self::ModuleRefused => 10,
             Self::InsideTheRing => 11,
+            Self::ImageRegion => 12,
         }
     }
 
@@ -300,6 +307,7 @@ impl Status {
             9 => Some(Self::BridgeRefused),
             10 => Some(Self::ModuleRefused),
             11 => Some(Self::InsideTheRing),
+            12 => Some(Self::ImageRegion),
             _ => None,
         }
     }
@@ -816,12 +824,13 @@ mod tests {
             Status::BridgeRefused,
             Status::ModuleRefused,
             Status::InsideTheRing,
+            Status::ImageRegion,
         ] {
             assert_eq!(Status::of(status.code()), Some(status));
         }
         assert_eq!(Op::of(0), None);
         assert_eq!(Op::of(12), None);
-        assert_eq!(Status::of(12), None);
+        assert_eq!(Status::of(13), None);
         for entry in [
             DownloadEntry::Reset,
             DownloadEntry::Knock,

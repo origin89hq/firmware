@@ -84,17 +84,17 @@ chip := "STM32G0B1RETx"
 controller_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-controller"
 comms_elf := "firmwares/target/riscv32imac-unknown-none-elf/release/o89-comms"
 boot_elf := "firmwares/target/thumbv6m-none-eabi/release/o89-boot"
+boot_bin := "firmwares/target/thumbv6m-none-eabi/release/o89-boot.bin"
 
 # Flash the bootloader at 0x08000000, then reset the part, because
 # `probe-rs download` leaves the part halted in its flash loader with every
 # pin an input, and the transceivers drive their buses low on a floating DI
 # (origin89hq/hardware#28). Effect: the part boots through the bootloader,
-# which drives RUN and KICK low and jumps to 0x08004000. Recovery:
+# which drives RUN and KICK low and jumps to 0x08008000. Recovery:
 # `just flash-controller` if the application is not there yet; the part
 # waits with the lines low until it is. A board flashed before #185 has an
-# 8 KB bootloader that jumps to 0x08002000: run this before its first
-# `flash-controller`, or its old bootloader jumps into the middle of the
-# new image.
+# 8 KB bootloader that jumps to 0x08002000, and needs this before its first
+# production flash; `flash-controller` refuses it until then.
 #
 # Flash the bootloader into the controller, then reset it.
 flash-boot: sizes
@@ -102,41 +102,46 @@ flash-boot: sizes
       probe-rs download --chip {{chip}} --verify {{boot_elf}} && \
       probe-rs reset --chip {{chip}}'
 
-# Flash the production controller image at 0x08004000, then reset the part:
+# Flash the production controller image at 0x08008000, then reset the part:
 # `probe-rs download` alone leaves it halted in its flash loader with every
 # pin an input, which is a controller that runs nothing and buses driven low
 # by floating DIs (origin89hq/hardware#28). Needs the bootloader in front of
-# it (`just flash-boot`); on its own the part waits at the bootloader with
-# the lines low. Effect: the controller boots in the order the hazards
-# dictate. Recovery: `just flash-controller` again, or
-# `just run-controller-bench` to bypass the bootloader, after which
-# `just flash-boot` has to come before the next production flash.
+# it (`just flash-boot`): the bootloader is read back first and the flash
+# refused unless it is this checkout's (`firmwares/boot-matches.sh`), so a
+# board with another bootloader is never left jumping into the wrong image.
+# Effect: the controller boots in the order the hazards dictate. Recovery:
+# `just flash-controller` again, or `just run-controller-bench` to bypass
+# the bootloader, after which `just flash-boot` has to come before the next
+# production flash.
 #
-# Flash the production controller image at 0x08004000 and reset the part.
+# Flash the production controller image at 0x08008000 and reset the part.
 flash-controller: sizes
     firmwares/frozen-watchdog.sh sh -c '\
+      firmwares/boot-matches.sh {{boot_bin}} && \
       probe-rs download --chip {{chip}} --verify {{controller_elf}} && \
       probe-rs reset --chip {{chip}}'
 
 # Flash and run the production controller image with the log on the probe.
 # The runner is `probe-rs run`, which flashes the ELF's own regions only, so
-# the bootloader stays. Effect: as `flash-controller`, then the defmt log.
+# the bootloader stays, and it is checked first as `flash-controller` checks
+# it. Effect: as `flash-controller`, then the defmt log.
 # Every recipe here that builds an image takes the gate's flags from
 # `cargo xtask rustflags` (the path remapping, SHA-256's compact backend), so
 # the bytes a bench flashes are the bytes the gate measured.
 #
 # Flash and run the production controller image with the log on the probe.
-run-controller:
+run-controller: sizes
+    firmwares/frozen-watchdog.sh firmwares/boot-matches.sh {{boot_bin}}
     flags="$(cargo xtask rustflags)" && cd firmwares/o89-controller && CARGO_ENCODED_RUSTFLAGS="$flags" cargo run --release
 
 # Flash and run the BENCH image: linked at 0x08000000 with no bootloader, and
-# carrying the one-shot proofs. Effect: overwrites the bootloader's 16 KB,
+# carrying the one-shot proofs. Effect: overwrites the bootloader's 32 KB,
 # starves the watchdog fifteen seconds into a boot the watchdog did
 # not cause, panics fifteen seconds into the boot after a watchdog reset, and
 # runs from the boot after that. Never on a unit that will take an update.
 # Recovery: `just flash-boot` then `just flash-controller` restore the
 # production layout. `flash-controller` alone does not: it writes from
-# 0x08004000 up, the bench image's vector table stays at the bottom, and every
+# 0x08008000 up, the bench image's vector table stays at the bottom, and every
 # reset jumps into the production image's code at the bench image's
 # addresses. That reads as a firmware fault: a reset loop or a lockup at a PC
 # inside no function's first instruction (bench 2026-09-25). Check with
@@ -178,6 +183,28 @@ run-comms-devkit:
 # Read the controller's log without flashing or resetting it.
 attach-controller elf=controller_elf:
     firmwares/frozen-watchdog.sh probe-rs attach --chip {{chip}} --no-catch-reset --no-catch-hardfault {{elf}}
+
+# Read the controller's flash option register and refuse a part whose
+# banks are swapped. Revision A's layout needs nSWAP_BANK = 1 (bit 20 of
+# FLASH_OPTR), which maps bank 1, with the bootloader, at 0x08000000; with
+# it 0 the part maps bank 2 there, which may be blank, and a blank bottom of
+# flash starts ST's system bootloader (origin89hq/hardware#30, #185). Reads
+# only. Run it on a board before it leaves the bench.
+#
+# Check the controller's flash option bytes; reads only.
+check-option-bytes:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    optr=$(firmwares/frozen-watchdog.sh probe-rs read --chip {{chip}} b32 0x40022020 1 | awk 'END {print $2}')
+    value=$((16#$optr))
+    swap=$(( (value >> 20) & 1 ))
+    dual=$(( (value >> 21) & 1 ))
+    rdp=$(( value & 0xFF ))
+    printf 'FLASH_OPTR %s: nSWAP_BANK %d, DUAL_BANK %d, RDP 0x%02X\n' "$optr" "$swap" "$dual" "$rdp"
+    if [ "$swap" -ne 1 ]; then
+        echo "check-option-bytes: nSWAP_BANK is 0, so bank 2 is at 0x08000000; revision A needs 1 (#185)" >&2
+        exit 1
+    fi
 
 # Reset the controller through the probe. Effect: a pin-class reset; the
 # boot record on the next attach says so.

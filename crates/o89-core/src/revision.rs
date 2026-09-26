@@ -16,8 +16,8 @@
 //! confirms each arm, not a search.
 //!
 //! One difference cannot live here: the flash layout, which a linker script
-//! states and cannot read from a method. Revision A has one 496 KB
-//! application region behind a 16 KB bootloader and stages its updates on
+//! states and cannot read from a method. Revision A has one 480 KB
+//! application region behind a 32 KB bootloader and stages its updates on
 //! the NOR; revision B keeps A/B on a larger part (#185,
 //! origin89hq/hardware#57). The layout is in `o89-boot/memory.x`,
 //! `o89-controller/memory.x`, the bootloader's `APPLICATION` and the gate's

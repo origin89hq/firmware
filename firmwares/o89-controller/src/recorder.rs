@@ -29,7 +29,7 @@ use km43::{
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
     LinkEvent, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing, RecentCuts, Ring,
-    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, time_expired,
+    SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map, time_expired,
 };
 
 use crate::fram::Lease;
@@ -130,25 +130,10 @@ pub fn cancel_offers() {
     while TIME_ANSWER.try_receive().is_ok() {}
 }
 
-/// The ring's span: 14.5 MiB of the 16, in sectors, from the bottom of the
-/// part. What sits above it is [`IMAGE_REGIONS`].
-pub const RING_BLOCKS: u32 = 3712;
-
-/// Where revision A stages a controller update and keeps the image it
-/// replaced, in bytes from the bottom of the part: just past the ring, 512 KiB
-/// each, which holds the 496 KB application region with room for a manifest
-/// (#185). The updater and the bootloader that use them are M7; they are
-/// named here so the ring cannot grow into them.
-const IMAGE_REGIONS: [usize; 2] = [RING_END, RING_END + IMAGE_REGION];
-const IMAGE_REGION: usize = 512 * 1024;
-const RING_END: usize = RING_BLOCKS as usize * SECTOR;
+// The core's map of the part describes this part.
 const _: () = {
-    // Back to back from the ring's end, and both on the part.
-    assert!(IMAGE_REGIONS[1] + IMAGE_REGION <= CAPACITY);
-    // Whole 64 KiB blocks, so an image region erases by the block.
-    assert!(IMAGE_REGIONS[0].is_multiple_of(64 * 1024) && IMAGE_REGION.is_multiple_of(64 * 1024));
-    // Room for the application region the bootloader copies into.
-    assert!(IMAGE_REGION >= 496 * 1024);
+    assert!(nor_map::SECTOR_BYTES as usize == SECTOR);
+    assert!(nor_map::PART_BYTES as usize == CAPACITY);
 };
 
 /// How often the task looks at the mailbox and checks in; its window on
@@ -699,7 +684,7 @@ async fn open_ring(mut nor: Nor, scratch: &mut [u8]) -> Option<Ring<Nor>> {
     match jedec {
         Ok(JEDEC) => {
             defmt::info!("recorder: opening the ring");
-            let opened = Ring::open(nor, 0, RING_BLOCKS, scratch).await;
+            let opened = Ring::open(nor, 0, nor_map::RING_BLOCKS, scratch).await;
             match opened {
                 Ok(ring) => {
                     defmt::info!(

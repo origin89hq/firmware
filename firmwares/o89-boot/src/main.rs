@@ -11,7 +11,7 @@
 //! Today it does the first and the last. The generator lines go low as the
 //! first statement of `main`, which on this runtime is a few instructions
 //! after the reset vector, once the (empty) RAM image is laid out. Then it
-//! jumps to the application at the fixed address past its own 16 KB. An
+//! jumps to the application at the fixed address past its own 32 KB. An
 //! application whose first two words are not a stack pointer in RAM and a
 //! reset vector in flash is not jumped to: the part waits with the lines
 //! low, where a probe can reach it. The NOR copy, the manifest and the
@@ -33,10 +33,10 @@ use cortex_m_rt::entry;
 use stm32_metapac::gpio::vals::{Moder, Ot};
 use stm32_metapac::{GPIOD, RCC};
 
-/// Where the application's vector table sits: past the bootloader's 16 KB.
+/// Where the application's vector table sits: past the bootloader's 32 KB.
 /// `o89-controller/memory.x` says the same number, and the application sets
 /// its own `VTOR` from it on the way in.
-const APPLICATION: usize = 0x0800_4000;
+const APPLICATION: usize = 0x0800_8000;
 
 /// The part's RAM, which is where an initial stack pointer has to point.
 /// The top is included: the runtime puts the first stack at the very end
@@ -44,10 +44,10 @@ const APPLICATION: usize = 0x0800_4000;
 const RAM: RangeInclusive<u32> = 0x2000_0000..=0x2002_4000;
 
 /// The application region, which is where a reset vector has to point: past
-/// this image's 16 KB to the end of the part's 512 KB. Both banks, read as
-/// one: the bank-swap option bit is never set, so bank 1 is always at the
-/// bottom and bank 2 follows it.
-const APPLICATION_FLASH: Range<u32> = 0x0800_4000..0x0808_0000;
+/// this image's 32 KB to the end of the part's 512 KB. Both banks, read as
+/// one: `nSWAP_BANK` stays 1, which maps bank 1 at the bottom and bank 2
+/// after it, and nothing of ours writes an option byte.
+const APPLICATION_FLASH: Range<u32> = 0x0800_8000..0x0808_0000;
 
 /// Whether two words could be an application's initial stack pointer and
 /// reset vector. The reset vector's Thumb bit is not judged: `bootload`
@@ -65,16 +65,16 @@ const fn plausible(stack: u32, reset: u32) -> bool {
 const _: () = {
     // The real application: the stack at the top of RAM, the reset handler
     // just past the vector table and the build-id note.
-    assert!(plausible(0x2002_4000, 0x0800_4101));
-    assert!(plausible(0x2001_0000, 0x0800_4100));
+    assert!(plausible(0x2002_4000, 0x0800_8101));
+    assert!(plausible(0x2001_0000, 0x0800_8100));
     // A reset vector in the second bank, where a large image's code goes.
     assert!(plausible(0x2002_4000, 0x0807_FFF1));
     // A stack past the top of RAM, or below it.
-    assert!(!plausible(0x2002_4004, 0x0800_4101));
-    assert!(!plausible(0x1FFF_FFFC, 0x0800_4101));
-    // A reset vector into this image's own 16 KB, or past the part's flash.
+    assert!(!plausible(0x2002_4004, 0x0800_8101));
+    assert!(!plausible(0x1FFF_FFFC, 0x0800_8101));
+    // A reset vector into this image's own 32 KB, or past the part's flash.
     assert!(!plausible(0x2002_4000, 0x0800_0101));
-    assert!(!plausible(0x2002_4000, 0x0800_3FFF));
+    assert!(!plausible(0x2002_4000, 0x0800_7FFF));
     assert!(!plausible(0x2002_4000, 0x0808_0001));
     // Erased flash.
     assert!(!plausible(0xFFFF_FFFF, 0xFFFF_FFFF));
@@ -139,10 +139,14 @@ fn jump_to_the_application() -> ! {
 }
 
 /// No application to run: hold the lines low and wait for somebody with a
-/// probe. `wfi` is not a stop mode, so the probe still connects (F-012).
+/// probe, spinning rather than sleeping. In `wfi` the probe still attaches
+/// and flashes, but on board A every read over the bus returned zero, flash,
+/// option bytes and RAM alike, so the bootloader could not be read back
+/// before a flash (bench 2026-09-26, #185). Spinning keeps the bus readable
+/// and enters no low-power mode (F-012).
 fn wait_for_a_probe() -> ! {
     loop {
-        asm::wfi();
+        asm::nop();
     }
 }
 
