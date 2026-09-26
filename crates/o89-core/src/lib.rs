@@ -20,7 +20,9 @@
 //! [`Generator`] every challenge and ephemeral key is drawn from, the run
 //! reason with the [`Declared`] an output cannot move without, the secret
 //! and the controller key, the panic record, the boot count, the log's byte
-//! budget, the authorised comms release and the network master copy. Then
+//! budget, the authorised comms release and the network master copy. The
+//! reading store, [`Signals`], holds every signal with its quality and
+//! turns it stale on its maximum age or unchanged run. Then
 //! the link to the comms processor, the connection rows and the
 //! [`Sessions`] bound onto them, with the [`Job`]s of key agreement an
 //! [`Agreement`] runs off the control loop, and the [`Endpoint`] that sends
@@ -69,6 +71,7 @@ mod rollcall;
 mod run_reason;
 mod secret;
 mod session;
+mod signals;
 mod store;
 mod text;
 mod tick;
@@ -110,6 +113,7 @@ pub use rollcall::*;
 pub use run_reason::*;
 pub use secret::*;
 pub use session::*;
+pub use signals::*;
 pub use store::*;
 pub use text::*;
 pub use tick::*;

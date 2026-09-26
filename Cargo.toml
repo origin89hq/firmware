@@ -8,6 +8,7 @@ members = [
     "crates/o89-comms-net",
     "crates/o89-core",
     "crates/o89-dev",
+    "crates/o89-drivers",
     "crates/o89-link",
     "crates/o89-sim",
     "xtask",

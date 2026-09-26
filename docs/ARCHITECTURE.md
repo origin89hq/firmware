@@ -454,6 +454,20 @@ state of charge may drive display and coarse inputs; it may drive generator
 autostart only when somebody has explicitly accepted that it is an estimate,
 which is a named parameter rather than a flag because that is what it is.
 
+**A register map says where its numbers come from.** Each cell in a
+dialect's map declares the provenance the vendor can justify, and the
+driver writes exactly that; nothing publishes as measured by default
+(F-052). The kind and its window bound the choice, checked when the map is
+built and at compile time for a `const` table: a limit or a setpoint a
+device states is `reported`, a total over a window is `counted`, a state of
+charge is `counted` or `estimated` and never `measured`, and a direct
+reading is `measured`. No cell is `derived`, which is this controller's own
+arithmetic, or `commanded`, which is not an observation. A cell may also
+carry the range its vendor documents, and a kind whose meaning bounds it (a
+percentage) carries its own; a decoded value outside either publishes
+`out_of_range` and no value, which is the driver's plausibility check and
+not the store's.
+
 **A hung instrument is not a steady site.** A channel stops being true two
 ways, and only one looks like it. The bus goes quiet and nothing is written;
 a **maximum age** on the last write catches that. Or the probe stays powered,

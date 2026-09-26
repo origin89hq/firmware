@@ -1373,6 +1373,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "o89-drivers"
+version = "0.0.0"
+dependencies = [
+ "crc",
+ "defmt",
+ "embassy-futures",
+ "km43",
+ "o89-core",
+]
+
+[[package]]
 name = "o89-link"
 version = "0.0.0"
 dependencies = [
