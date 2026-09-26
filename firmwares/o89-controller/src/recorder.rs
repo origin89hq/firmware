@@ -583,6 +583,18 @@ async fn append_body(
     body: &[u8],
     at: Option<UnixMillis>,
 ) -> Result<(), ()> {
+    // The head proven before it numbers the record: a stale one would frame
+    // it at a position the part has already used, and the record would be
+    // refused and lost.
+    if let Err(error) = ring.prove(scratch).await {
+        defmt::error!(
+            "record {=u16:#06x}: the log's head is unproven: {}",
+            kind.0,
+            error
+        );
+        publish(ring);
+        return Err(());
+    }
     let mut payload = [0u8; MAX_PAYLOAD];
     let Ok(event) = Event::new(
         LogSeq(ring.next_seq()),
@@ -610,8 +622,10 @@ async fn append_body(
             Ok(())
         }
         Err(error) => {
+            // The ring stays unproven, and the next operation finds its head
+            // first; the span stays moving until one does.
             defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error);
-            reconcile(ring, scratch).await;
+            publish(ring);
             Err(())
         }
     }

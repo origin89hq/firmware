@@ -425,11 +425,16 @@ pub trait EventSink {
     fn send(&mut self, reply: Reply, frame: &[u8]) -> impl core::future::Future<Output = Sent>;
 }
 
-/// Frames one [`Sessions::fan_out`] puts on the wire at most. Each can take
-/// the transport's write deadline, and the link checks in between turns, so
-/// this bounds how long a turn can go without one; what is left stays owed
-/// and is read for again.
+/// Frames one [`Sessions::fan_out`] has the transport take at most. What
+/// is left stays owed and is read for again.
 pub const SENDS_PER_FAN_OUT: usize = 16;
+
+/// Frames one [`Sessions::fan_out`] offers the transport at most: its sends,
+/// and one refused frame per session, after which that session gets
+/// nothing more from the batch. Each can take the transport's write
+/// deadline, and the link checks in between turns, so this is what bounds
+/// the fan-out's share of a turn.
+pub const FAN_OUT_ATTEMPTS: usize = SENDS_PER_FAN_OUT + CONNECTIONS;
 
 /// What one [`Sessions::fan_out`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -442,6 +447,8 @@ pub struct FannedOut {
     pub spent: bool,
     /// The transport stalled.
     pub stalled: bool,
+    /// An event a session was owed could not be sealed for it.
+    pub unsealed: bool,
 }
 
 /// Whether a batch read from `from` up to `next` holds everything a
@@ -2109,7 +2116,10 @@ impl Sessions {
                 let (reply, delivery) = match self.event(*conn, ticket, batch, index, dst) {
                     Ok(Some(owed)) => owed,
                     Ok(None) => continue,
-                    Err(Unsealed) => break,
+                    Err(Unsealed) => {
+                        done.unsealed = true;
+                        break;
+                    }
                 };
                 match sink.send(reply, dst).await {
                     Sent::Yes => {

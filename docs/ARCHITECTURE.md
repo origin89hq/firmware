@@ -570,10 +570,14 @@ is served by that cursor alone. A session owed live records is read for
 first; below it a `ReadLog` and a replay take turns, so neither holds the
 other off for more than one read. A read takes up to sixteen records, as
 many as fit the 896 bytes of a `LogPage`'s entries while one more at its
-largest still does. One fan-out sends at most sixteen frames, starting with
-the session the read was for so the sessions take turns; at the transport's
-200 ms write deadline that is 3.2 s, half the link task's check-in window,
-and a compile-time assertion holds it there. What is left stays owed. An event moves its session's cursor only
+largest still does. One fan-out has the transport take at most sixteen
+frames, starting with the session the read was for so the sessions take
+turns, and offers at most one more per session that refuses one: at the
+transport's 200 ms write deadline that is at most 4.8 s, at most half the
+link task's 10 s check-in window, and a compile-time assertion holds it
+there. The rest of a turn, its fixed replies and the actions a tick asks
+for, is bounded frame by frame by the same deadline and not by that
+assertion. What is left stays owed. An event moves its session's cursor only
 once the UART took the frame: one refused or stalled stays owed and is sent
 again, under a new nonce, and a client drops a repeated `seq`. A session
 owed more live records than a session queue holds (sixteen) is closed as
@@ -583,10 +587,16 @@ a replay of thousands of records during steady production can be shed and
 resumes from the client's last `seq`. The ring owns whether its head is proven: an
 append, a page turn or a drop that fails after touching the part leaves it
 unproven, and every later append, read and drop finds the head again from the
-bytes first. An append that returned an error is not taken for an absent
-record: the reading plane keeps it, with its record, until the part says
-whether that exact record is at its position, commits it if it is and owes it
-again only if the log ends before it, and appends nothing over it meanwhile.
+bytes first. A record is numbered only from a proven head. An append that
+failed after touching the part is not taken for an absent record: the
+reading plane keeps it, with its record, until the part says whether that
+exact record is at its position, commits it if it is, and owes it again if
+the log ends before it or holds something else there, since positions are
+unique. The plane appends nothing while it waits; the recorder's other
+writers may, and one of theirs at that position is such proof. A position
+retention has erased before the part could answer is taken as not there:
+nothing can prove it landed, and owing it again, at the cost of announcing
+it twice if it had, is chosen over holding the plane for good.
 The recorder publishes the log's extent from the ring's head only while it
 is proven, marks it moving before every append and drop, and has nothing to
 publish before the ring opens. While it moves a `Subscribe`, whose answer

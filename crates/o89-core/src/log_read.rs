@@ -77,23 +77,46 @@ pub struct PlaneTurn {
     pub adrift: bool,
 }
 
-/// What became of a record handed to the ring.
+/// What became of a record handed to the ring, once the part has said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+enum Known {
     /// It landed at this position.
     Landed(u64),
     /// It is not in the log.
     Refused,
-    /// The append at this position returned an error, which does not say
-    /// whether the record reached the part: only the bytes can.
+}
+
+/// What became of a record handed to the ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Known.
+    Known(Known),
+    /// The append at this position failed after it touched the part, which
+    /// does not say whether the record reached it: only the bytes can.
     Uncertain(u64),
+}
+
+/// What an append's error says of its record: an error from before the
+/// part was touched is a record that is not there; one from the part is a
+/// record that may be.
+const fn after<E>(error: &RingError<E>, seq: u64) -> Outcome {
+    match error {
+        RingError::Flash(_) | RingError::OutOfRange => Outcome::Uncertain(seq),
+        RingError::TooFewBlocks(_)
+        | RingError::BlockTooSmall(_)
+        | RingError::WriteSizeNotOne(_)
+        | RingError::ScratchTooSmall(_)
+        | RingError::Unframed(_)
+        | RingError::NotTheNextEvent
+        | RingError::InsideTheRing(_) => Outcome::Known(Known::Refused),
+    }
 }
 
 /// A record's outcome the site has not been told yet: one the site was
 /// held for when it was known, or one the part has not yet said. Kept by
 /// the caller between turns; the record's announcement stays marked until
-/// the site hears which way it went, so nothing is owed twice, nothing is
-/// lost, and nothing is appended over an outcome still unknown.
+/// the site hears which way it went, so nothing is owed twice and nothing
+/// is lost, and the plane appends nothing while one is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsettled {
     token: Token,
@@ -106,32 +129,35 @@ pub struct Unsettled {
 
 impl Unsettled {
     /// Ask the part what an uncertain append did: landed if the exact
-    /// record is at its position, refused if the log ends before it. An
-    /// answer the part cannot give leaves it uncertain. Whether it is now
-    /// known.
+    /// record is at its position; not there if the log ends before it or
+    /// something else is at it, since positions are unique. A position
+    /// retention has already erased is taken as not there: nothing can
+    /// prove it landed, and the record is owed again rather than the plane
+    /// held for good, at the cost of announcing it twice if it had landed.
+    /// `None` while the part cannot answer.
     async fn resolve<N: MultiwriteNorFlash>(
-        &mut self,
+        &self,
         ring: &mut Ring<N>,
         scratch: &mut [u8],
-    ) -> bool {
-        let Outcome::Uncertain(seq) = self.outcome else {
-            return true;
+    ) -> Option<Known> {
+        let seq = match self.outcome {
+            Outcome::Known(known) => return Some(known),
+            Outcome::Uncertain(seq) => seq,
         };
         let payload = self.payload.get(..self.payload_len).unwrap_or(&[]);
         match ring.holds(seq, payload, scratch).await {
-            Ok(Holding::Present) => self.outcome = Outcome::Landed(seq),
-            Ok(Holding::Absent) => self.outcome = Outcome::Refused,
-            Ok(Holding::Other) | Err(_) => return false,
+            Ok(Holding::Present) => Some(Known::Landed(seq)),
+            Ok(Holding::Absent | Holding::Other | Holding::Gone) => Some(Known::Refused),
+            Err(_) => None,
         }
-        true
     }
 
     /// Tell the site a known outcome; whether it could be told.
-    fn settle(&self, site: &impl SiteCell) -> bool {
+    fn settle(&self, site: &impl SiteCell, known: Known) -> bool {
         let body = self.body.get(..self.len).unwrap_or(&[]);
-        site.with(|site, _| match self.outcome {
-            Outcome::Landed(seq) => site.committed(&self.token, seq),
-            Outcome::Refused | Outcome::Uncertain(_) => site.not_committed(&self.token, body),
+        site.with(|site, _| match known {
+            Known::Landed(seq) => site.committed(&self.token, seq),
+            Known::Refused => site.not_committed(&self.token, body),
         })
         .is_ok()
     }
@@ -140,7 +166,8 @@ impl Unsettled {
 /// One tick of the reading plane: every record the site owes, at most
 /// [`TICK_RECORDS`], appended in order under the wall-clock `at` when the
 /// controller holds one. The site is held only between appends, never
-/// across one.
+/// across one. The ring is proven before a record is numbered, so a stale
+/// head never frames one.
 ///
 /// `extent` hears [`Extent::Moving`] before each append and
 /// [`Extent::Settled`] only while the ring is proven, after the append
@@ -148,11 +175,12 @@ impl Unsettled {
 /// can yield: whatever answers from the log's extent never answers from one
 /// an append is changing or has left unproven (P-104, P-095).
 ///
-/// `unsettled` is the caller's across turns. An append that returned an
-/// error is kept there, with its record, until the part says whether it
-/// landed; a known outcome the site was too held to hear is kept until it
-/// hears it. Either is dealt with first, and until it is, nothing new is
-/// taken or appended.
+/// `unsettled` is the caller's across turns. An append that failed after
+/// touching the part is kept there, with its record, until the part says
+/// whether it landed; a known outcome the site was too held to hear is kept
+/// until it hears it. Either is dealt with first, and until it is, the plane
+/// takes and appends nothing new. Other writers may append meanwhile; a
+/// record of theirs at the kept position proves the plane's is not there.
 pub async fn record_owed<N: MultiwriteNorFlash>(
     site: &impl SiteCell,
     ring: &mut Ring<N>,
@@ -162,20 +190,30 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
     unsettled: &mut Option<Unsettled>,
 ) -> PlaneTurn {
     let mut done = PlaneTurn::default();
-    if let Some(pending) = unsettled.as_mut() {
-        if !pending.resolve(ring, scratch).await {
+    if let Some(pending) = unsettled.as_ref() {
+        let Some(known) = pending.resolve(ring, scratch).await else {
             done.adrift = true;
             return done;
-        }
+        };
         if ring.is_proven() {
             extent(Extent::Settled(ring));
         }
-        if !pending.settle(site) {
+        if !pending.settle(site, known) {
+            // Kept, now known, for the site to hear next turn.
+            let mut known_pending = *pending;
+            known_pending.outcome = Outcome::Known(known);
+            *unsettled = Some(known_pending);
             done.busy = true;
             return done;
         }
         *unsettled = None;
     }
+    if ring.prove(scratch).await.is_err() {
+        // Nothing taken: the site still owes it all, next turn.
+        done.adrift = true;
+        return done;
+    }
+    extent(Extent::Settled(ring));
     let mut tally = Tally::new();
     let mut body = [0u8; RECORD_BODY];
     let mut payload = [0u8; record::MAX_PAYLOAD];
@@ -200,7 +238,7 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
             .and_then(|event| event.encode(&mut payload).ok());
         let mut pending = Unsettled {
             token: owed.token,
-            outcome: Outcome::Refused,
+            outcome: Outcome::Known(Known::Refused),
             body,
             len: owed.len,
             payload,
@@ -212,26 +250,27 @@ pub async fn record_owed<N: MultiwriteNorFlash>(
                 .append(Class::A, payload.get(..len).unwrap_or(&[]), scratch)
                 .await
             {
-                Ok(landed) => Outcome::Landed(landed),
-                Err(_) => Outcome::Uncertain(seq),
+                Ok(landed) => Outcome::Known(Known::Landed(landed)),
+                Err(error) => after(&error, seq),
             };
-            if !pending.resolve(ring, scratch).await {
-                done.adrift = true;
-                done.refused = true;
-                *unsettled = Some(pending);
-                break;
-            }
-            if ring.is_proven() {
-                extent(Extent::Settled(ring));
-            }
         }
-        let landed = matches!(pending.outcome, Outcome::Landed(_));
+        let Some(known) = pending.resolve(ring, scratch).await else {
+            done.adrift = true;
+            done.refused = true;
+            *unsettled = Some(pending);
+            break;
+        };
+        if framed.is_some() && ring.is_proven() {
+            extent(Extent::Settled(ring));
+        }
+        pending.outcome = Outcome::Known(known);
+        let landed = matches!(known, Known::Landed(_));
         if landed {
             done.landed = done.landed.saturating_add(1);
         } else {
             done.refused = true;
         }
-        if !pending.settle(site) {
+        if !pending.settle(site, known) {
             done.busy = true;
             *unsettled = Some(pending);
             break;

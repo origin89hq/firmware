@@ -39,8 +39,8 @@ use km43::{
 };
 use o89_core::mailbox::DownloadEntry;
 use o89_core::{
-    Action, Actions, Clock, Endpoint, EventSink, Identity, Keys, KnockAnswer, Link, Local,
-    ModuleBoot, ModuleReset, Note, Recovery, Reply, SENDS_PER_FAN_OUT, Sent, SessionNote, Sessions,
+    Action, Actions, Clock, Endpoint, EventSink, FAN_OUT_ATTEMPTS, Identity, Keys, KnockAnswer,
+    Link, Local, ModuleBoot, ModuleReset, Note, Recovery, Reply, Sent, SessionNote, Sessions,
     SiteCell, Task, knock_answer,
 };
 use portable_atomic::{AtomicU32, Ordering};
@@ -717,11 +717,13 @@ impl EventSink for Uplink<'_, '_> {
     }
 }
 
-// A fan-out's sends, each at most a write deadline, stay inside half the
-// link task's check-in window, with the rest of its turn in the other half.
+// Everything a fan-out offers the transport, each at most a write deadline,
+// takes at most half the link task's check-in window (4.8 s of 10 s). The
+// rest of a turn, its fixed replies and the actions a tick asks for, is
+// bounded by the same deadline per frame and not by this assertion.
 const _: () = assert!(
-    SENDS_PER_FAN_OUT as u64 * WRITE_DEADLINE.as_millis() * 2 <= Task::Link.window().as_millis(),
-    "a fan-out at its budget of stalled-just-short sends must not starve the link's check-in"
+    FAN_OUT_ATTEMPTS as u64 * WRITE_DEADLINE.as_millis() * 2 <= Task::Link.window().as_millis(),
+    "a fan-out offering all it may, each frame stalled just short, must not starve the link's check-in"
 );
 
 /// A client's answer onto the wire, and what became of it.
@@ -1565,6 +1567,9 @@ async fn serve_log(
             .sessions
             .fan_out(ticket, &batch, answer, &mut Uplink { tx, writer })
             .await;
+        if fanned.unsealed {
+            defmt::error!("link: an event did not seal; it stays owed");
+        }
         if fanned.stalled {
             return Some(Ended::Stalled);
         }

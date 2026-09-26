@@ -431,8 +431,8 @@ fn p_104_p_095_the_log_extent_is_published_as_each_record_lands_not_at_the_end_o
     assert_eq!(turn.landed, 2, "the topology and the validity sweep");
     assert_eq!(
         published,
-        [None, Some(2), None, Some(3)],
-        "moving before each append, settled as each landed"
+        [Some(1), None, Some(2), None, Some(3)],
+        "settled once proven before anything is taken, moving before each append, settled as each landed"
     );
 }
 
@@ -1267,5 +1267,142 @@ fn p_095_an_append_after_a_page_turn_that_failed_finds_the_head_before_it_writes
         batch.get(0).map(|(seq, _)| seq),
         Some(oldest),
         "the first record held is the oldest said"
+    );
+}
+
+/// A diagnostic appended as the recorder's `append_body` appends one: the
+/// head proven first, then numbered from it.
+fn diagnostic(ring: &mut o89_core::Ring<Pausing>, scratch: &mut [u8]) -> Result<u64, ()> {
+    block_on(ring.prove(scratch)).map_err(|_| ())?;
+    let mut payload = [0u8; 32];
+    let len = km43::Event::new(
+        km43::LogSeq(ring.next_seq()),
+        None,
+        EventKind::BOOT,
+        &[0xa0],
+    )
+    .expect("an event")
+    .encode(&mut payload)
+    .expect("fits");
+    block_on(ring.append(o89_core::Class::A, &payload[..len], scratch)).map_err(|_| ())
+}
+
+/// The body of the record at `seq`.
+fn body_at(ring: &mut o89_core::Ring<Pausing>, seq: u64, scratch: &mut [u8]) -> Vec<u8> {
+    let mut batch = o89_core::LogBatch::new();
+    block_on(o89_core::read_log(ring, seq, 1, scratch, &mut batch)).expect("reads");
+    let (at, bytes) = batch.get(0).expect("a record");
+    assert_eq!(at, seq);
+    km43::Event::decode(bytes)
+        .expect("an event")
+        .body()
+        .to_vec()
+}
+
+#[test]
+fn p_180_a_torn_raise_then_a_diagnostic_at_its_position_is_owed_again_after_it_with_its_identity() {
+    // Capabilities: none. The raise's append is torn and the part dies;
+    // it comes back, the recorder appends a diagnostic first, as its turn
+    // does, then the plane runs.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let n = ring.next_seq();
+    let mut unsettled = None;
+    nor.nor.borrow_mut().cut_after(0);
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (0, true));
+    nor.nor.borrow_mut().reboot();
+    assert_eq!(
+        diagnostic(&mut ring, &mut scratch),
+        Ok(n),
+        "the diagnostic takes the torn position"
+    );
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.adrift),
+        (1, false),
+        "not there, owed again, logged after it"
+    );
+    let raised =
+        km43::ConcernRaised::decode(&body_at(&mut ring, n + 1, &mut scratch)).expect("a raise");
+    assert_eq!(
+        raised.concern.seq,
+        n + 1,
+        "opened by the record that carries it"
+    );
+    assert_eq!(concerns_total(&site), (1, n + 1));
+    site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::None))
+        .expect("open");
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 1);
+    let changed =
+        km43::ConcernChanged::decode(&body_at(&mut ring, n + 2, &mut scratch)).expect("a change");
+    assert_eq!(
+        (changed.cid, changed.state, changed.prev),
+        (
+            raised.concern.cid,
+            km43::ConcernState::Cleared,
+            km43::ConcernState::Active
+        )
+    );
+    assert_eq!(
+        concerns_total(&site),
+        (0, n + 2),
+        "the row left with its clear"
+    );
+}
+
+#[test]
+fn p_182_a_diagnostic_that_landed_though_it_erred_is_not_overwritten_or_waited_on_by_the_plane() {
+    // Capabilities: none. A diagnostic's magic lands and the part reports
+    // an error and dies; it comes back and the plane runs first.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let n = ring.next_seq();
+    nor.err_after.set(Some(1));
+    nor.die_after_err.set(true);
+    assert!(diagnostic(&mut ring, &mut scratch).is_err());
+    assert!(!ring.is_proven());
+    nor.nor.borrow_mut().reboot();
+    let mut unsettled = None;
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (1, false));
+    assert!(unsettled.is_none(), "nothing left unknown");
+    assert_eq!(
+        logged(&mut ring, n, &mut scratch),
+        [(n, EventKind::BOOT), (n + 1, EventKind::CONCERN_RAISED)],
+        "the diagnostic kept at its position, the raise after it"
     );
 }

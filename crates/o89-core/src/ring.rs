@@ -207,8 +207,12 @@ pub enum Holding {
     Present,
     /// Nothing at that position: the log ends before it.
     Absent,
-    /// Something else at that position, which no append of ours made.
+    /// Something else at that position. Positions are unique, so the
+    /// record asked about is not in the log.
     Other,
+    /// The position is older than the oldest the ring still holds: whatever
+    /// was there, retention has erased it, and the part can no longer say.
+    Gone,
 }
 
 /// The ring on a part.
@@ -402,8 +406,10 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         self.proven
     }
 
-    /// The head found again first, if it is not proven.
-    async fn prove(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
+    /// The head found again first, if it is not proven: what a caller does
+    /// before it takes [`next_seq`](Self::next_seq) to frame a record, so a
+    /// stale head never numbers one.
+    pub async fn prove(&mut self, scratch: &mut [u8]) -> Result<(), RingError<N::Error>> {
         if self.proven {
             return Ok(());
         }
@@ -422,6 +428,9 @@ impl<N: MultiwriteNorFlash> Ring<N> {
         self.prove(scratch).await?;
         if seq >= self.head.next_seq {
             return Ok(Holding::Absent);
+        }
+        if self.head.oldest.is_none_or(|oldest| seq < oldest) {
+            return Ok(Holding::Gone);
         }
         let mut holding = Holding::Other;
         let _ = self
