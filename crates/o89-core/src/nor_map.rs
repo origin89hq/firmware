@@ -31,8 +31,9 @@ const RING_END: u32 = RING_BLOCKS * SECTOR_BYTES;
 const APPLICATION_BYTES: u32 = 480 * 1024;
 
 const _: () = {
-    assert!(IMAGE_REGIONS[1] + IMAGE_REGION_BYTES <= PART_BYTES);
-    assert!(IMAGE_REGIONS[0].is_multiple_of(64 * 1024));
+    let [first, second] = IMAGE_REGIONS;
+    assert!(second + IMAGE_REGION_BYTES <= PART_BYTES);
+    assert!(first.is_multiple_of(64 * 1024));
     assert!(IMAGE_REGION_BYTES.is_multiple_of(64 * 1024));
     assert!(IMAGE_REGION_BYTES >= APPLICATION_BYTES);
 };
