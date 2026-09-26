@@ -1160,6 +1160,34 @@ pub fn recordable(manifest: &Manifest, head: &ObjectId) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a release directory holding anything but its manifest and the
+/// files it lists: a stale or stray image beside them is one a consumer
+/// could take without its hash ever being checked.
+fn only_listed(dir: &Path, manifest: &Manifest) -> Result<()> {
+    let mut listed: Vec<&str> = manifest
+        .images
+        .iter()
+        .flat_map(|image| [image.bin.file.as_str(), image.elf.file.as_str()])
+        .collect();
+    listed.push(MANIFEST);
+    let mut unlisted = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let name = entry
+            .with_context(|| format!("listing {}", dir.display()))?
+            .file_name();
+        if !name.to_str().is_some_and(|name| listed.contains(&name)) {
+            unlisted.push(name.to_string_lossy().into_owned());
+        }
+    }
+    unlisted.sort();
+    ensure!(
+        unlisted.is_empty(),
+        "{} holds files its manifest does not list: {unlisted:?}",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Read the manifest in `dir` and check every file it lists.
 pub fn verify(dir: &Path) -> Result<Manifest> {
     let path = dir.join(MANIFEST);
@@ -1174,6 +1202,7 @@ pub fn verify(dir: &Path) -> Result<Manifest> {
         manifest.format
     );
     check_shape(&manifest).with_context(|| format!("checking {}", path.display()))?;
+    only_listed(dir, &manifest)?;
     for image in &manifest.images {
         image.bin.read_checked(dir)?;
         image.elf.read_checked(dir)?;
@@ -1841,6 +1870,19 @@ mod tests {
         assert!(error.contains("zero"), "{error}");
         let error = refused(text.replace("format = 1", "format = 2"));
         assert!(error.contains("format 2"), "{error}");
+    }
+
+    #[test]
+    fn a_release_directory_with_an_unlisted_file_is_refused() {
+        let dir = built("unlisted", b"\x00", 1_758_900_000);
+        fs::write(dir.0.join("old-controller.bin"), b"\x01").expect("written");
+        let error = format!("{:#}", verify(&dir.0).expect_err("unlisted"));
+        assert!(error.contains("[\"old-controller.bin\"]"), "{error}");
+        fs::remove_file(dir.0.join("old-controller.bin")).expect("removed");
+        fs::create_dir(dir.0.join("extra")).expect("created");
+        assert!(verify(&dir.0).is_err(), "a directory counts too");
+        fs::remove_dir(dir.0.join("extra")).expect("removed");
+        verify(&dir.0).expect("only the listed files again");
     }
 
     #[test]
