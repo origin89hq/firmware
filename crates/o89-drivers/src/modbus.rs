@@ -15,9 +15,10 @@
 //! a burst at the inter-frame gap, so a reply is one burst: a reply cut by a
 //! gap is short, and is never joined to what the line carries next.
 //!
-//! The discard assumes a device answers within `response` or not at all, as
-//! Modbus servers do. A reply later than the next exchange's discard is
-//! indistinguishable from that exchange's own and is not caught here.
+//! The discard rests on a configured assumption, that a device answers
+//! within `response` or not at all. A reply later than the next exchange's
+//! discard is indistinguishable from that exchange's own and is not caught
+//! here.
 //!
 //! cites: F-050
 
