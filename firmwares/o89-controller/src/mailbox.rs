@@ -460,6 +460,15 @@ async fn drop_oldest(ring: &mut NorRing<Nor>, scratch: &mut [u8]) -> (Status, u3
                 None => (Status::Ok, 0),
             }
         }
+        Err(RingError::Kept(seq)) => {
+            // Refused before the erase: the ring is as it was.
+            defmt::warn!(
+                "mailbox: the drop would erase seq {}, whose outcome is not yet read",
+                seq
+            );
+            crate::recorder::publish(ring);
+            (Status::Unresolved, 0)
+        }
         Err(error) => {
             defmt::error!("mailbox: the drop failed: {}", error);
             crate::recorder::reconcile(ring, scratch).await;

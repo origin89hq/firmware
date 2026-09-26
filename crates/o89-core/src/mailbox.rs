@@ -268,6 +268,9 @@ pub enum Status {
     /// A block of an image region, which only the updater and the
     /// bootloader erase (#185).
     ImageRegion,
+    /// The oldest block holds a record whose outcome the reading plane has
+    /// not yet read from the part; it can be dropped once it has.
+    Unresolved,
 }
 
 impl Status {
@@ -288,6 +291,7 @@ impl Status {
             Self::ModuleRefused => 10,
             Self::InsideTheRing => 11,
             Self::ImageRegion => 12,
+            Self::Unresolved => 13,
         }
     }
 
@@ -308,6 +312,7 @@ impl Status {
             10 => Some(Self::ModuleRefused),
             11 => Some(Self::InsideTheRing),
             12 => Some(Self::ImageRegion),
+            13 => Some(Self::Unresolved),
             _ => None,
         }
     }
@@ -825,12 +830,13 @@ mod tests {
             Status::ModuleRefused,
             Status::InsideTheRing,
             Status::ImageRegion,
+            Status::Unresolved,
         ] {
             assert_eq!(Status::of(status.code()), Some(status));
         }
         assert_eq!(Op::of(0), None);
         assert_eq!(Op::of(12), None);
-        assert_eq!(Status::of(13), None);
+        assert_eq!(Status::of(14), None);
         for entry in [
             DownloadEntry::Reset,
             DownloadEntry::Knock,

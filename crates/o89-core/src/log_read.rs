@@ -105,7 +105,8 @@ enum Outcome {
 
 /// What an append's error says of its record: an error from before the
 /// part was touched is a record that is not there; one from the part is a
-/// record that may be.
+/// record that may be. A page turn refused for a kept position is refused
+/// before anything is erased or written.
 const fn after<E>(error: &RingError<E>, seq: u64) -> Outcome {
     match error {
         RingError::Flash(_) | RingError::OutOfRange => Outcome::Uncertain(seq),
@@ -115,7 +116,8 @@ const fn after<E>(error: &RingError<E>, seq: u64) -> Outcome {
         | RingError::ScratchTooSmall(_)
         | RingError::Unframed(_)
         | RingError::NotTheNextEvent
-        | RingError::InsideTheRing(_) => Outcome::Known(Known::Refused),
+        | RingError::InsideTheRing(_)
+        | RingError::Kept(_) => Outcome::Known(Known::Refused),
     }
 }
 
@@ -140,8 +142,9 @@ impl Unsettled {
     /// something else is at it, since positions are unique. A position
     /// retention has already erased is neither: nothing can say whether it
     /// landed, and the site hears it as [`Site::maybe_committed`] rather
-    /// than the plane being held for good. `None` while the part cannot
-    /// answer.
+    /// than the plane being held for good. The ring keeps the position from
+    /// every erase while it is asked ([`Ring::keep`]), so that is a defence
+    /// rather than a path. `None` while the part cannot answer.
     async fn resolve<N: MultiwriteNorFlash>(
         &self,
         ring: &mut Ring<N>,
@@ -152,12 +155,15 @@ impl Unsettled {
             Outcome::Uncertain(seq) => seq,
         };
         let payload = self.payload.get(..self.payload_len).unwrap_or(&[]);
-        match ring.holds(seq, payload, scratch).await {
-            Ok(Holding::Present) => Some(Known::Landed(seq)),
-            Ok(Holding::Absent | Holding::Other) => Some(Known::Refused),
-            Ok(Holding::Gone) => Some(Known::Gone(seq)),
-            Err(_) => None,
-        }
+        ring.keep(Some(seq));
+        let known = match ring.holds(seq, payload, scratch).await {
+            Ok(Holding::Present) => Known::Landed(seq),
+            Ok(Holding::Absent | Holding::Other) => Known::Refused,
+            Ok(Holding::Gone) => Known::Gone(seq),
+            Err(_) => return None,
+        };
+        ring.keep(None);
+        Some(known)
     }
 
     /// Tell the site a known outcome; whether it could be told.

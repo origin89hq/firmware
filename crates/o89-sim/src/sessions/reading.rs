@@ -1273,7 +1273,15 @@ fn p_095_an_append_after_a_page_turn_that_failed_finds_the_head_before_it_writes
 /// A diagnostic appended as the recorder's `append_body` appends one: the
 /// head proven first, then numbered from it.
 fn diagnostic(ring: &mut o89_core::Ring<Pausing>, scratch: &mut [u8]) -> Result<u64, ()> {
-    block_on(ring.prove(scratch)).map_err(|_| ())?;
+    diagnostic_or(ring, scratch).map_err(|_| ())
+}
+
+/// As [`diagnostic`], answering what the ring said.
+fn diagnostic_or(
+    ring: &mut o89_core::Ring<Pausing>,
+    scratch: &mut [u8],
+) -> Result<u64, o89_core::RingError<crate::NorError>> {
+    block_on(ring.prove(scratch))?;
     let mut payload = [0u8; 32];
     let len = km43::Event::new(
         km43::LogSeq(ring.next_seq()),
@@ -1284,7 +1292,7 @@ fn diagnostic(ring: &mut o89_core::Ring<Pausing>, scratch: &mut [u8]) -> Result<
     .expect("an event")
     .encode(&mut payload)
     .expect("fits");
-    block_on(ring.append(o89_core::Class::A, &payload[..len], scratch)).map_err(|_| ())
+    block_on(ring.append(o89_core::Class::A, &payload[..len], scratch))
 }
 
 /// The body of the record at `seq`.
@@ -1410,7 +1418,8 @@ fn p_182_a_diagnostic_that_landed_though_it_erred_is_not_overwritten_or_waited_o
 /// A raise at the ring's next position whose magic lands before the part
 /// reports an error and dies, so nothing can say whether it landed; the
 /// part comes back, diagnostics carry the head into the next block, and a
-/// bench drop erases the block the raise is in. The raise's position and
+/// bench drop, refused while the ring keeps the position, erases the block
+/// the raise is in once the keep is lost. The raise's position and
 /// its `cid`, read from the part before the drop.
 fn raise_erased_unproven(
     nor: &Pausing,
@@ -1446,6 +1455,14 @@ fn raise_erased_unproven(
     }
     assert_eq!(ring.head().block, 1, "newer records past the raise's block");
     assert!(unsettled.is_some(), "the plane has not asked yet");
+    assert_eq!(
+        block_on(ring.drop_oldest(scratch)).err(),
+        Some(o89_core::RingError::Kept(n)),
+        "the ring keeps it from the drop"
+    );
+    // The defence behind that: a ring that lost the keep, as one opened
+    // again would, lets the drop take it.
+    ring.keep(None);
     assert!(block_on(ring.drop_oldest(scratch)).is_ok());
     assert!(
         ring.head().oldest.is_some_and(|oldest| oldest > n),
@@ -1568,4 +1585,191 @@ fn p_180_an_active_raise_whose_position_was_erased_unproven_is_not_raised_again(
         (cid, km43::ConcernState::Cleared, km43::ConcernState::Active)
     );
     assert_eq!(concerns_total(&site), (0, from));
+}
+
+/// The plane's next record at the ring's next position lands, the part
+/// reports an error and dies, and nothing can say whether it landed; then
+/// `meanwhile` runs, the part comes back, and a client reads the record.
+/// Diagnostics fill the ring until a page turn would erase the record's
+/// block and is refused, and a bench drop of that block is refused too.
+/// The record's position and its body as the client read it.
+fn uncertain_then_held(
+    nor: &Pausing,
+    ring: &mut o89_core::Ring<Pausing>,
+    site: &SimSite,
+    unsettled: &mut Option<o89_core::Unsettled>,
+    meanwhile: impl FnOnce(),
+    scratch: &mut [u8],
+) -> (u64, Vec<u8>) {
+    let n = ring.next_seq();
+    nor.err_after.set(Some(1));
+    nor.die_after_err.set(true);
+    let turn = block_on(o89_core::record_owed(
+        site,
+        ring,
+        scratch,
+        None,
+        |_| {},
+        unsettled,
+    ));
+    assert_eq!((turn.landed, turn.adrift), (0, true), "left unknown");
+    assert_eq!(ring.kept(), Some(n), "its position kept from every erase");
+    meanwhile();
+    nor.nor.borrow_mut().reboot();
+    let read = body_at(ring, n, scratch);
+    let mut refused = None;
+    for _ in 0..10_000 {
+        if let Err(error) = diagnostic_or(ring, scratch) {
+            refused = Some(error);
+            break;
+        }
+    }
+    assert_eq!(
+        refused,
+        Some(o89_core::RingError::Kept(n)),
+        "the page turn onto its block is refused"
+    );
+    assert_eq!(
+        block_on(ring.drop_oldest(scratch)).err(),
+        Some(o89_core::RingError::Kept(n)),
+        "and so is a drop of it"
+    );
+    assert!(ring.is_proven(), "nothing was erased");
+    assert_eq!(body_at(ring, n, scratch), read, "still there to be asked");
+    (n, read)
+}
+
+#[test]
+fn p_180_a_change_that_may_have_been_read_is_corrected_when_its_concern_returns() {
+    // Capabilities: none. A latched clear goes out and may have been read;
+    // the condition returns before the plane can ask the part, which the
+    // ring keeps from erasing it until the plane has.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = concern_on(&mut ring, &mut scratch);
+    let mut unsettled = None;
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 1, "the raise");
+    site.free(|site, _| site.gone(fault().subject, fault().cond, o89_core::Latch::Holding))
+        .expect("open");
+    let (_, read) = uncertain_then_held(
+        &nor,
+        &mut ring,
+        &site,
+        &mut unsettled,
+        || {
+            site.free(|site, now| site.observe(fault(), now))
+                .expect("the same row");
+        },
+        &mut scratch,
+    );
+    let latched = km43::ConcernChanged::decode(&read).expect("a change");
+    assert_eq!(
+        (latched.state, latched.prev),
+        (
+            km43::ConcernState::LatchedCleared,
+            km43::ConcernState::Active
+        )
+    );
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.gone, turn.adrift),
+        (1, 0, false),
+        "found and committed, and the correction logged"
+    );
+    assert_eq!(ring.kept(), None, "given back");
+    let at = ring.next_seq() - 1;
+    let back =
+        km43::ConcernChanged::decode(&body_at(&mut ring, at, &mut scratch)).expect("a change");
+    assert_eq!(
+        (back.cid, back.state, back.prev),
+        (
+            latched.cid,
+            km43::ConcernState::Active,
+            km43::ConcernState::LatchedCleared
+        ),
+        "a client that read the latched clear hears the concern is back"
+    );
+    assert!(
+        diagnostic_or(&mut ring, &mut scratch).is_ok(),
+        "the page turns once the position is given back"
+    );
+}
+
+#[test]
+fn p_182_a_presence_change_that_may_have_been_read_is_corrected_when_it_moves_back() {
+    // Capabilities: none. As above for a device going offline and coming
+    // back before the plane can ask the part.
+    let nor = pausing();
+    let mut scratch = [0u8; o89_core::SCRATCH];
+    let mut ring = block_on(o89_core::Ring::open(nor.clone(), 0, 3, &mut scratch)).expect("opens");
+    let site = SimSite::empty();
+    site.free(|site, _| site.apply(TopologyChangeReason::Boot, &charger(1)))
+        .expect("a valid site");
+    site.free(|site, _| site.presence(1, km43::Presence::Online))
+        .expect("a device");
+    let mut unsettled = None;
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(turn.landed, 2, "the boot's topology, then online");
+    site.free(|site, _| site.presence(1, km43::Presence::Offline))
+        .expect("a device");
+    let (_, read) = uncertain_then_held(
+        &nor,
+        &mut ring,
+        &site,
+        &mut unsettled,
+        || {
+            site.free(|site, _| site.presence(1, km43::Presence::Online))
+                .expect("a device");
+        },
+        &mut scratch,
+    );
+    let from = ring.next_seq();
+    let turn = block_on(o89_core::record_owed(
+        &site,
+        &mut ring,
+        &mut scratch,
+        None,
+        |_| {},
+        &mut unsettled,
+    ));
+    assert_eq!(
+        (turn.landed, turn.gone),
+        (1, 0),
+        "found and committed, and the correction logged"
+    );
+    // The correction's own page turn may now take the block the offline
+    // record was in, so it is compared with what the client read.
+    assert_eq!(
+        logged(&mut ring, from, &mut scratch),
+        [(from, EventKind::DEVICE_PRESENCE_CHANGED)],
+        "the correction after the one a client may have read"
+    );
+    assert_ne!(
+        body_at(&mut ring, from, &mut scratch),
+        read,
+        "back online, not the offline record again"
+    );
 }

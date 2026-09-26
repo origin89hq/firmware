@@ -29,8 +29,8 @@ use km43::{
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
     LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing,
-    RecentCuts, Ring, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map,
-    time_expired,
+    RecentCuts, Ring, RingError, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock,
+    nor_map, time_expired,
 };
 
 use crate::fram::Lease;
@@ -554,7 +554,7 @@ async fn append_record(
     scratch: &mut [u8],
     record: ControllerRecord,
     at: Option<UnixMillis>,
-) -> Result<(), ()> {
+) -> Result<(), NotAppended> {
     let mut body = [0; CONTROLLER_RECORD_MAX_BYTES];
     match record.encode(&mut body) {
         Ok(len) => {
@@ -573,7 +573,7 @@ async fn append_record(
                 record.kind().0,
                 error
             );
-            Err(())
+            Err(NotAppended::Unbuilt)
         }
     }
 }
@@ -585,7 +585,7 @@ async fn append_body(
     kind: EventKind,
     body: &[u8],
     at: Option<UnixMillis>,
-) -> Result<(), ()> {
+) -> Result<(), NotAppended> {
     // The head proven before it numbers the record: a stale one would frame
     // it at a position the part has already used, and the record would be
     // refused and lost.
@@ -596,7 +596,7 @@ async fn append_body(
             error
         );
         publish(ring);
-        return Err(());
+        return Err(NotAppended::Unproven);
     }
     let mut payload = [0u8; MAX_PAYLOAD];
     let Ok(event) = Event::new(
@@ -606,11 +606,11 @@ async fn append_body(
         body,
     ) else {
         defmt::error!("record {=u16:#06x}: the event did not build", kind.0);
-        return Err(());
+        return Err(NotAppended::Unbuilt);
     };
     let Ok(len) = event.encode(&mut payload) else {
         defmt::error!("record {=u16:#06x}: the event did not encode", kind.0);
-        return Err(());
+        return Err(NotAppended::Unbuilt);
     };
     // An append may turn the page and erase the oldest records: nothing
     // answers from the span until it is known again (P-104, P-095).
@@ -624,14 +624,40 @@ async fn append_body(
             publish(ring);
             Ok(())
         }
+        Err(RingError::Kept(seq)) => {
+            // Refused before anything was erased or written: the page turn
+            // would erase the plane's record whose outcome it has not yet
+            // read. Not retried; the ring appends again once it has.
+            defmt::warn!(
+                "record {=u16:#06x}: not appended: the page turn would erase seq {}, not yet resolved",
+                kind.0,
+                seq
+            );
+            publish(ring);
+            Err(NotAppended::Kept(seq))
+        }
         Err(error) => {
             // The ring stays unproven, and the next operation finds its head
             // first; the span stays moving until one does.
             defmt::error!("record {=u16:#06x}: not appended: {}", kind.0, error);
             publish(ring);
-            Err(())
+            Err(NotAppended::Refused)
         }
     }
+}
+
+/// Why a record the recorder wrote is not in the log. Each is logged where
+/// it happens; none is retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotAppended {
+    /// The head could not be proven, so nothing could number it.
+    Unproven,
+    /// The event did not build or encode.
+    Unbuilt,
+    /// The page turn would erase the position the plane keeps.
+    Kept(u64),
+    /// The ring refused it, or the part failed under it.
+    Refused,
 }
 
 /// A failed floor scan or calendar write produces no successful acknowledgement.

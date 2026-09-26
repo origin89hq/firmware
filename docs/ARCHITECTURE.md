@@ -593,9 +593,21 @@ reading plane keeps it, with its record, until the part says whether that
 exact record is at its position, commits it if it is, and owes it again if
 the log ends before it or holds something else there, since positions are
 unique. The plane appends nothing while it waits; the recorder's other
-writers may, and one of theirs at that position is such proof. A position
-retention has erased before the part could answer, by a page turn or a bench
-drop, is neither: the record may have landed and been read, so it is not
+writers may, and one of theirs at that position is such proof. **No erase
+takes a position the plane is still asking about.** The ring keeps it
+(`Ring::keep`): a page turn or a bench drop that would erase its block is
+refused before anything is written or erased (`RingError::Kept`; the
+mailbox answers `Unresolved`), and finding the head again after a torn
+write leaves that block for the next page turn rather than erasing it
+ahead. On a ring of many blocks this never touches an ordinary page turn,
+since the position is at the head when it is kept; a ring that fills all
+the way round to it refuses appends until the part can be read and the
+outcome is known. A diagnostic refused this way is reported and not
+retried. So a record that may have been read and whose state has since
+moved back is found on the part, committed, and followed by its
+correction, instead of being rolled back to a state that looks unchanged.
+A position retention has nonetheless erased before the part could answer
+is neither: the record may have landed and been read, so it is not
 treated as one that never reached anybody, and the plane is not held for
 good either. A concern raise is taken as told: its row opens at that
 position, an active concern is not raised again, and a cleared one keeps its
