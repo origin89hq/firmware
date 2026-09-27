@@ -34,7 +34,8 @@ The station guarantees, for one file:
   finds one should treat the file as damaged.
 - A `controller_fp` can appear under more than one `device_id`. After
   `write-secret --replace` gives a unit a new device id and keeps its key,
-  the new id is recorded with the fingerprint the station recorded earlier.
+  the new id is recorded with the fingerprint the station recorded earlier,
+  and only when this file's journal holds that replace.
   The old id's printed secret no longer works on the unit.
 - A line is written only after the part confirmed it applied the key the
   station drew, and the fingerprint comes from that drawn key, never from

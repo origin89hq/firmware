@@ -203,7 +203,14 @@ fn resume_after_failed_reboot_prints_the_staged_secret_once() {
     link.reboot = Reboot::Fails;
     let mut output = Vec::new();
     let error = run_secret(&mut link, &ledger, None, false, false, &mut output).unwrap_err();
-    assert!(format!("{error:#}").contains("o89-dev store write-secret --resume"));
+    // A command the operator can run as printed: the export is required.
+    assert!(
+        error.to_string().ends_with(&format!(
+            "o89-dev store write-secret --resume --export {}",
+            scratch.0.join("units.jsonl").display()
+        )),
+        "{error}"
+    );
     assert!(output.is_empty());
     let SecretChange::Pending(staged, Some(_)) = link.transaction() else {
         panic!("pending, with the unit's birth")

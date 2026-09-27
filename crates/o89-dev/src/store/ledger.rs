@@ -194,14 +194,16 @@ impl Ledger {
             held: None,
             of_key: None,
         };
+        // Sixteen bytes per record, bounded by the file being read.
+        let mut seen = std::collections::HashSet::new();
         scan(&self.export, EXPORT_KINDS, |_, line| {
+            if !seen.insert(*line.device_id.as_bytes()) {
+                bail!(
+                    "device id {} is recorded twice",
+                    hex::encode(line.device_id.as_bytes())
+                );
+            }
             if line.device_id == record.device_id {
-                if found.held.is_some() {
-                    bail!(
-                        "device id {} is recorded twice",
-                        hex::encode(line.device_id.as_bytes())
-                    );
-                }
                 found.held = Some(*line);
             }
             if line.fingerprint == record.fingerprint {
@@ -243,19 +245,22 @@ impl Ledger {
                 match kind {
                     Kind::Drawn if line.fingerprint == applied => drawn = Some(*line),
                     Kind::Drawn => drawn_other = true,
-                    Kind::Replaced => replaced = true,
-                    Kind::Exported => {}
+                    Kind::Replaced if line.fingerprint == applied => replaced = true,
+                    // A replace journaled onto another key is not this one's.
+                    Kind::Replaced | Kind::Exported => {}
                 }
             }
             Ok(())
         })?;
         let source = match (drawn, found.of_key) {
             (Some(record), _) => record,
-            (None, Some(earlier)) => Record {
+            // Only a replace this ledger journaled for this key reuses the
+            // earlier record; another file's transaction does not.
+            (None, Some(earlier)) if replaced => Record {
                 device_id,
                 fingerprint: earlier.fingerprint,
             },
-            (None, None) if drawn_other => bail!(
+            (None, _) if drawn_other => bail!(
                 "the part applied a controller key with fingerprint {} that this station did not \
                  draw for device id {}; nothing exported. The unit needs a key the station \
                  draws: o89-dev store blank --yes, then write-secret",
@@ -263,7 +268,7 @@ impl Ledger {
                 hex::encode(device_id.as_bytes())
             ),
             (None, None) if replaced => return Ok(Exported::NoStationRecord),
-            (None, None) => bail!(
+            (None, _) => bail!(
                 "{} has no entry for device id {}'s transaction; resume with the --export file \
                  the write used. Nothing exported",
                 self.journal.display(),
@@ -593,6 +598,13 @@ pub(super) mod tests {
             Exported::Appended(record(7, 2))
         );
         assert_eq!(exported(&ledger).len(), 2);
+        // The key's record in an export whose journal never saw this
+        // transaction is not a source: that is another file's replace.
+        let elsewhere = Scratch::new();
+        let other = elsewhere.ledger();
+        std::fs::copy(&ledger.export, &other.export).unwrap();
+        assert!(confirm(&other, record(8, 2)).is_err());
+        assert_eq!(exported(&other).len(), 2);
         // The same device id replaced with the key it has: nothing new.
         ledger.note_replace(record(1, 2)).unwrap();
         assert_eq!(
@@ -651,6 +663,14 @@ pub(super) mod tests {
             good.replace("0101\",", "01\","),
             good.replace('}', ",\"secret\":\"00\"}"),
             good.replace("02020202\"", "02020203\""),
+            good.replace(
+                "01010101010101010101010101010101",
+                "05050505050505050505050505050505",
+            ) + "\n"
+                + &good.replace(
+                    "01010101010101010101010101010101",
+                    "05050505050505050505050505050505",
+                ),
             good.to_owned() + &" ".repeat(600),
         ] {
             let scratch = Scratch::new();

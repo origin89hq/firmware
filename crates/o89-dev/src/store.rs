@@ -264,9 +264,9 @@ fn run_secret(
     output: &mut impl std::io::Write,
 ) -> Result<()> {
     if resume {
-        return resume_secret(link, ledger, output).context(RESUME);
+        return resume_secret(link, ledger, output).with_context(|| resume_hint(ledger));
     }
-    ensure_no_transaction(link)?;
+    ensure_no_transaction(link).with_context(|| resume_hint(ledger))?;
     let secret = generate_secret(link, device_id, replace)?;
     let device_id = DeviceId::new(secret.device_id_bytes());
     let birth = if born(link)? {
@@ -306,19 +306,28 @@ fn run_secret(
     // `Birth` is `Copy` and has no way to clear itself; the encoded body is
     // the copy that crosses to the controller, and it is cleared below.
     let mut body = Zeroizing::new(SecretChange::Pending(secret, birth).encode());
-    link.stage_and_reboot(&body[..], replace).context(RESUME)?;
+    link.stage_and_reboot(&body[..], replace)
+        .with_context(|| resume_hint(ledger))?;
     body.zeroize();
-    show_applied(link, ledger, secret, output).context(RESUME)
+    show_applied(link, ledger, secret, output).with_context(|| resume_hint(ledger))
 }
 
-const RESUME: &str = "secret write interrupted; run: o89-dev store write-secret --resume";
+/// The command that recovers an interrupted write: the same export file.
+fn resume_hint(ledger: &Ledger) -> String {
+    format!(
+        "secret write interrupted; run: o89-dev store write-secret --resume --export {}",
+        ledger.export().display()
+    )
+}
 
 type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
 
 fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<()> {
     match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
     {
-        Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => bail!(RESUME),
+        Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => {
+            bail!("a secret transaction is unfinished")
+        }
         Held::Absent | Held::Present(SecretChange::Complete) => Ok(()),
         Held::Corrupt | Held::Malformed(_) => {
             bail!("unreadable secret transaction; reboot before provisioning")
