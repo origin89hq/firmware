@@ -40,10 +40,46 @@ fn USB_UCPD1_2() {
 }
 
 /// Start the control executor, below the supervisor's and above thread
-/// mode, and hand back what spawns onto it.
+/// mode, held until [`release`], and hand back what spawns onto it.
+///
+/// Held, because `main` spawns onto it from inside its own poll, whose
+/// frame is 32 KB on the stack, and a task spawned here preempts it at once:
+/// the link task's first poll, 31 KB of its own, on top of that frame ran
+/// the stack through the statics below it and wrote over the clock the HAL
+/// keeps for SPI1 (#217). `start` unmasks the line; it is masked again
+/// before anything is spawned, so a spawn only pends it.
 pub fn start() -> SendSpawner {
     interrupt::USB_UCPD1_2.set_priority(crate::supervisor::CONTROL);
-    EXECUTOR.start(interrupt::USB_UCPD1_2)
+    let spawner = EXECUTOR.start(interrupt::USB_UCPD1_2);
+    interrupt::USB_UCPD1_2.disable();
+    spawner
+}
+
+pub use held::release;
+
+/// The one task that ends the hold, alone in a module so the lint it needs
+/// excused reaches the function the task macro generates from it.
+#[expect(
+    clippy::unused_async,
+    reason = "an embassy task is an async fn, and this one has nothing to wait for"
+)]
+mod held {
+    use embassy_stm32::interrupt;
+    use embassy_stm32::interrupt::InterruptExt;
+
+    /// Let the control executor run, from a thread-mode task `main` spawns
+    /// last: it is polled once `main`'s poll has returned, so every task on
+    /// the control executor starts on a stack `main`'s frame has left. The
+    /// gate's stack check counts the two apart on that promise (F-094).
+    #[embassy_executor::task]
+    pub async fn release() {
+        // SAFETY: the line `start` unmasked once and masked again, so the
+        // executor it drives is initialised; its priority was set before
+        // `start` and is not touched here; and no critical section on this
+        // image masks this line, since `critical-section` is the
+        // single-core PRIMASK implementation, so unmasking it breaks none.
+        unsafe { interrupt::USB_UCPD1_2.enable() };
+    }
 }
 
 /// Every output this image drives, at its declared fail state.

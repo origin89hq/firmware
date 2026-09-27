@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 /// The firmwares' build-time version text, compiled here for its tests: a
@@ -37,6 +37,7 @@ mod images;
 mod pins;
 mod repo;
 mod reproducible;
+mod stack;
 mod traceability;
 
 #[derive(Parser)]
@@ -86,6 +87,12 @@ fn main() -> Result<()> {
             let measured = images::build_and_measure(&repo)?;
             images::report(&measured);
             images::enforce(&measured)?;
+            let controller = measured
+                .iter()
+                .find(|image| image.package() == "o89-controller")
+                .and_then(images::Measured::files)
+                .context("this build left no controller ELF to measure the stack of")?;
+            stack::check(&controller.elf)?;
             println!("xtask check: clear");
         }
         Command::Rustflags => print!("{}", images::rustflags(&repo)?),

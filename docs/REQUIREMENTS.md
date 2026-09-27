@@ -524,6 +524,20 @@ Source: owner decision 2026-09-24, temporary until
 [k36]: https://github.com/origin89hq/km43/issues/36
 [p58]: https://github.com/origin89hq/firmware/pull/58
 
+**F-094** — The controller's deepest stack, measured on every commit from
+its release image as the frames of its direct calls under each task and
+handler that can be live at once, stays 2 KB under the room between its
+statics and its mailbox; no task of the control executor starts on the frame
+of `main`, which holds that executor until it has returned. Source:
+[#217](https://github.com/origin89hq/firmware/issues/217). M0.
+
+**F-095** — The NOR's bus is built only when the clock the HAL recorded for
+it can carry the part's serial clock. Otherwise it is refused, the chip
+select is held high, and the recorder runs without a ring, as it does for a
+part that does not answer; the controller keeps its store, its tasks and its
+rollcall, and nothing panics. Source:
+[#217](https://github.com/origin89hq/firmware/issues/217). M2.
+
 **F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller
 core. The adapter submits each due KM43 `0x0806` to the existing bounded
 recorder queue; diagnostics do not write configuration or grant authority.

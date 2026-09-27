@@ -15,11 +15,13 @@
 //! declared fail state; the rail task and the link; the recorder with the
 //! NOR; then the control tick. Every one of those runs on the control
 //! executor, from an interrupt above thread mode, and thread mode is left
-//! to key agreement alone (P-243). The other buses arrive with the
-//! milestones that name them. The `bench` build adds
-//! the one-shot proofs: a starvation on a boot the watchdog did not cause,
-//! and a panic on the boot that follows, so three boots in a row show the
-//! watchdog, the blame it leaves, the panic path and the site it leaves.
+//! to key agreement alone (P-243). The control executor is held until this
+//! function has returned, so none of its tasks starts on this frame (#217).
+//! The other buses arrive with the milestones that name them. The `bench`
+//! build adds the one-shot proofs: a starvation on a boot the watchdog did
+//! not cause, and a panic on the boot that follows, so three boots in a row
+//! show the watchdog, the blame it leaves, the panic path and the site it
+//! leaves.
 
 #![no_std]
 #![no_main]
@@ -29,7 +31,7 @@ mod board;
 mod clock;
 #[expect(
     unsafe_code,
-    reason = "the control executor is polled from the interrupt started for it; the one call is under a SAFETY line"
+    reason = "the control executor is polled from the interrupt started for it, and that interrupt unmasked once main has returned; each call is under a SAFETY line"
 )]
 mod control;
 #[expect(
@@ -60,11 +62,9 @@ mod supervisor;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Flex, Input, Level, Output, Pull, Speed};
-use embassy_stm32::i2c::I2c;
-use embassy_stm32::spi::Spi;
+use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::wdg::IndependentWatchdog;
-use embassy_stm32::{i2c, spi};
 use embassy_time::{Duration, Timer};
 use o89_core::{
     Agreement, Blame, BootId, BootRecord, Bus, CarriedCuts, Clock, ControllerKey, CutsOnPart,
@@ -454,11 +454,10 @@ async fn main(spawner: Spawner) {
     }
 
     // 9b. The recorder, with the NOR: the ring is opened and the boot
-    // record written once the outputs are where they must be.
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz::mhz(8);
-    let spi = Spi::new_blocking(b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, spi_config);
-    let nor = Nor::new(spi, Output::new(b.nor_cs, Level::High, Speed::VeryHigh));
+    // record written once the outputs are where they must be. A bus the
+    // clocks cannot carry is refused, and the recorder runs without a ring
+    // rather than the HAL panicking on every boot (F-095).
+    let nor = Nor::build(&b.rcc, b.spi1, b.nor_sck, b.nor_mosi, b.nor_miso, b.nor_cs);
     supervisor::check_in(Task::Recorder);
     if let Ok(token) = recorder::run(cuts, fram, nor, record.body(), calendar, site) {
         tasks.spawn(token);
@@ -484,5 +483,15 @@ async fn main(spawner: Spawner) {
         } else {
             defmt::error!("the agreement worker did not spawn; the watchdog will reset the part");
         }
+    }
+
+    // 12. The control executor, let run once this poll has returned, so no
+    // task on it starts on top of this function's frame (#217, F-094).
+    // One that did not spawn leaves every task on it off the roll: the
+    // watchdog resets the part.
+    if let Ok(token) = control::release() {
+        spawner.spawn(token);
+    } else {
+        defmt::error!("the control executor was not released; the watchdog will reset the part");
     }
 }

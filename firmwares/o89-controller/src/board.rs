@@ -110,6 +110,9 @@ pub struct Module {
 
 /// The board, split into what each task owns.
 pub struct Board {
+    /// The clock tree, held so the clocks the HAL recorded can be read
+    /// without its panicking accessors (`nor::Nor::build`).
+    pub rcc: Peri<'static, p::RCC>,
     /// The independent watchdog.
     pub iwdg: Peri<'static, p::IWDG>,
     /// The five retained backup words for calendar validity and pending audit.
@@ -203,6 +206,7 @@ impl Board {
     #[must_use]
     pub fn split(p: Peripherals) -> Self {
         Self {
+            rcc: p.RCC,
             iwdg: p.IWDG,
             rtc: p.RTC,
             tamp: p.TAMP,

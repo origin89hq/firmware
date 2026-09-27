@@ -18,6 +18,12 @@
 # compilation measures each AP at 47 bytes, not a qualified heap margin.
 # Wi-Fi diagnostics (#138): controller P-216–P-221, L-200/L-203/L-207
 # have wrapped-read, state-machine, published-vector and HostileComms tests.
+# F-094: f_094_* in xtask test the stack check's reading of frames, calls,
+# recursion and the margin, and the gate runs it over the release ELF. It
+# follows no call through a pointer, and it takes the hold of the control
+# executor on the promise of `control::release`, which only board A shows.
+# F-095: f_095_* in o89-core cover the NOR bus's refusal; that the recorder
+# serves without a ring after one is a bench step for #217, not yet run.
 # F-093's deadline decisions are host tested; the adapter queues their record.
 # No bench evidence is claimed: join failures, DHCP withheld, AP loss, scan
 # during BLE, and unwritten-network scans remain the issue's bench exit.

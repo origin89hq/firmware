@@ -47,7 +47,7 @@ use crate::repo::{Repo, artifacts};
 use crate::{cross, images};
 
 /// The checks of the gate an untestable rule may nominate as its test.
-const GATE_CHECKS: &[&str] = &["cross", "deps", "pins", "images", "traceability"];
+const GATE_CHECKS: &[&str] = &["cross", "deps", "pins", "images", "stack", "traceability"];
 
 /// The macros whose invocation makes a test able to fail.
 const ASSERTIONS: &[&str] = &[

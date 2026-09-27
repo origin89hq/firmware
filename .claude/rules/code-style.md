@@ -29,9 +29,10 @@ turn the first five into build failures outside `#[cfg(test)]`.
 9. **`unsafe` is denied at every crate root** and opened per item with
    `#[expect(unsafe_code, reason = "...")]` and a `// SAFETY:` line, or on
    the module when the item is a handler an attribute macro rewrites. The
-   STM32 side needs it in six places: the bootloader's jump into the
+   STM32 side needs it in seven places: the bootloader's jump into the
    application, the controller's hard-fault handler, the polls of the
-   supervisor's and the control executor from their interrupts, and the
+   supervisor's and the control executor from their interrupts, the unmask
+   that lets the control executor run once `main` has returned (#217), and the
    `link_section` attributes that keep the last words and the host mailbox
    in memory the runtime never zeroes. An `unsafe(...)` attribute carries
    its justification in the `expect` reason, which names the section and
