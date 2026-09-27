@@ -772,6 +772,9 @@ fn session_note(note: SessionNote) {
             defmt::warn!("session: no challenge to give; the unit is not provisioned");
         }
         SessionNote::TooLarge => defmt::error!("session: an answer did not fit its buffer"),
+        SessionNote::ReadFailed(failure) => {
+            defmt::error!("session: the site wrote no page: {}", failure);
+        }
         // P-237's `entropy unavailable`, until the concern table records it
         // (#100).
         SessionNote::EntropyUnavailable => {

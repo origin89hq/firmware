@@ -61,13 +61,14 @@
 //! L-072, L-080, L-180, L-182, L-195
 
 use km43::{
-    ClientConnected, ClientDisconnected, ClientId, ClientKind, CloseReason, CommandAck, Conn,
-    ControllerChannel, DeviceId, EmptyBody, EnrolAnswer, EnrolAwaiting, Envelope, EnvelopeError,
-    Epoch, ErrorBody, ErrorCode, Generation, Header, HelloArrival, Incoming, LinkEnvelope,
-    LinkErrorCode, LogSeq, MAX_AUTH_FAILURES, MAX_COMMAND_ACK_BYTES, MAX_EVENT_QUEUE, MAX_PAYLOAD,
-    MAX_SESSIONS, MAX_TIME_ACK_BYTES, MessageType, Outcome, PairArrival, PairRefusal, Prologue,
-    PrologueFields, PublicKey, Refusal as Code, ReqId, Sealed, SessionId, SignedWrite, TimeAck,
-    TimeOperation, Version, VouchAnswer, VouchRequest,
+    ClientConnected, ClientDisconnected, ClientId, ClientKind, CloseReason, CommandAck,
+    ConcernsError, Conn, ControllerChannel, DeviceId, EmptyBody, EnrolAnswer, EnrolAwaiting,
+    Envelope, EnvelopeError, Epoch, ErrorBody, ErrorCode, Generation, Header, HelloArrival,
+    Incoming, InventoryError, LinkEnvelope, LinkErrorCode, LogSeq, MAX_AUTH_FAILURES,
+    MAX_COMMAND_ACK_BYTES, MAX_EVENT_QUEUE, MAX_PAYLOAD, MAX_SESSIONS, MAX_TIME_ACK_BYTES,
+    MessageType, Outcome, PairArrival, PairRefusal, Prologue, PrologueFields, PublicKey,
+    Refusal as Code, ReqId, Sealed, SessionId, SignedWrite, TimeAck, TimeOperation, Version,
+    VouchAnswer, VouchRequest,
 };
 
 use crate::agreement::{Bytes, Computed, Done, Job, Report, ReportText, Task, Ticket};
@@ -77,10 +78,11 @@ use crate::drbg::{CHALLENGE_BYTES, Generator};
 use crate::epoch::{EPOCH_BYTES, ResetFailed, reset_clients};
 use crate::fram::Fram;
 use crate::link::{Compat, Rows};
-use crate::log_read::{LogBatch, SiteCell};
+use crate::log_read::{LogBatch, SiteBusy, SiteCell};
 use crate::membership::{self, Answer, Approval, Removal, Sender};
 use crate::request::{Admission, Executed, Permit, admit};
 use crate::secret::Secret;
+use crate::site::ReadingsFailed;
 use crate::tick::{Millis, Tick};
 
 /// Connection rows: one per session the protocol permits, so a row that
@@ -282,6 +284,9 @@ pub enum SessionNote {
     NotKept,
     /// The answer did not fit the buffer: a bug in a cap.
     TooLarge,
+    /// The site could not write a reading-plane page it should always be
+    /// able to: a defect, answered error 7 and named here.
+    ReadFailed(ReadFailure),
     /// A sealed request dropped unanswered for its `req_id`, replayed or
     /// below the window (P-022): nothing acted, nothing was counted, and the
     /// session was not refreshed.
@@ -290,6 +295,20 @@ pub enum SessionNote {
     Stale,
     /// A `ReadLog` waits for the log's owner to read the ring.
     LogAsked(Conn),
+}
+
+/// Why the site wrote no page for a `ReadInventory`, `ReadSignals` or
+/// `ReadConcerns` it had already accepted: every one is a body the
+/// controller built itself or a store defect, so none goes away on retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ReadFailure {
+    /// The `Inventory 0x8D` page.
+    Inventory(InventoryError),
+    /// The `Readings 0x8E` page.
+    Readings(ReadingsFailed),
+    /// The `Concerns 0x8F` page.
+    Concerns(ConcernsError),
 }
 
 /// What the adapter does with one client frame.
@@ -3020,39 +3039,63 @@ fn read_answer<S: SiteCell>(
         MessageType::Inventory => match km43::ReadInventory::decode(payload) {
             Ok(request) => (
                 MessageType::InventoryResponse,
-                site.with(|site, _| site.inventory(&request, &mut body).ok()),
+                site.with(|site, _| {
+                    site.inventory(&request, &mut body)
+                        .map_err(ReadFailure::Inventory)
+                }),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         MessageType::Readings => match km43::ReadSignals::decode(payload) {
             Ok(request) => (
                 MessageType::ReadingsResponse,
-                site.with(|site, now| site.readings(&request, log.newest.0, now, &mut body).ok()),
+                site.with(|site, now| {
+                    site.readings(&request, log.newest.0, now, &mut body)
+                        .map_err(ReadFailure::Readings)
+                }),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         MessageType::Concerns => match km43::ReadConcerns::decode(payload) {
             Ok(request) => (
                 MessageType::ConcernsResponse,
-                site.with(|site, now| site.concerns_page(&request, now, &mut body).ok()),
+                site.with(|site, now| {
+                    site.concerns_page(&request, now, &mut body)
+                        .map_err(ReadFailure::Concerns)
+                }),
             ),
             Err(why) => return refused_under(to, binding, why.refusal(), dst),
         },
         _ => return sealed_error(to, binding, ErrorCode::MalformedFrame, dst),
     };
-    let Ok(written) = written else {
+    site_answer(to, binding, (answer, &body), written, dst)
+}
+
+/// A reading-plane page as the site wrote it into `body`, sealed as
+/// `answer`. A held site is a retry. A failure is error 7 too, because
+/// KM43 has no live code for a controller fault a client should not retry
+/// (P-079 and P-254 answer theirs the same way), but the note names it so
+/// the probe tells it apart from contention.
+fn site_answer(
+    to: Addressed,
+    binding: &mut Binding,
+    page: (MessageType, &[u8]),
+    written: Result<Result<usize, ReadFailure>, SiteBusy>,
+    dst: &mut [u8],
+) -> Reply {
+    let (answer, body) = page;
+    match written {
         // Held by another task, which one executor never shows: retry.
-        return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
-    };
-    let Some(len) = written else {
-        // The site could not write a page it should always be able to: a
-        // defect in a cap or a sample, surfaced as busy rather than hidden.
-        return sealed_error(to, binding, ErrorCode::BusyRetry, dst).with(SessionNote::TooLarge);
-    };
-    let sealed = body
-        .get(..len)
-        .and_then(|body| binding.channel.tx.seal(to.header(answer), body, dst).ok());
-    answered(sealed)
+        Err(SiteBusy) => sealed_error(to, binding, ErrorCode::BusyRetry, dst),
+        Ok(Err(failure)) => sealed_error(to, binding, ErrorCode::BusyRetry, dst)
+            .with(SessionNote::ReadFailed(failure)),
+        Ok(Ok(len)) => {
+            let sealed = body
+                .get(..len)
+                .and_then(|body| binding.channel.tx.seal(to.header(answer), body, dst).ok());
+            answered(sealed)
+        }
+    }
 }
 
 /// The log's span as a `ReadLog` may page it and as a `Subscribe` may be
@@ -3073,6 +3116,11 @@ fn extent(log: LogSpan) -> Option<km43::LogExtent> {
     }
     km43::LogExtent::holding(log.oldest, log.newest).ok()
 }
+
+/// Room for a `SubscribeAck 0x83` body. The widest, three `u64::MAX`
+/// positions and `gap` true, is 33 bytes; km43 exports no maximum to check
+/// this against, so a test encodes that ack into this buffer.
+const SUBSCRIBE_ACK_BYTES: usize = 48;
 
 /// `Subscribe 0x03`: the session's cursor set to P-104's
 /// `accepted_from_seq`, replacing any subscription it held, and answered
@@ -3101,7 +3149,7 @@ fn subscribed(
     else {
         return sealed_error(to, binding, ErrorCode::BusyRetry, dst);
     };
-    let mut body = [0u8; 48];
+    let mut body = [0u8; SUBSCRIBE_ACK_BYTES];
     let Some(sealed) = ack.encode(&mut body).ok().and_then(|len| {
         let body = body.get(..len)?;
         binding
@@ -3293,6 +3341,52 @@ mod tests {
             Ok(with(&mut site, Tick::ZERO))
         }
     }
+
+    /// The site a rig's frames read.
+    #[derive(Debug, Clone, Copy)]
+    enum RigSite {
+        /// An empty site.
+        Empty,
+        /// Held by another task when asked.
+        Held,
+        /// Signal 1 written at one second and read at tick zero, which the
+        /// store refuses rather than measure backwards.
+        Behind,
+    }
+
+    impl SiteCell for RigSite {
+        fn with<R>(
+            &self,
+            with: impl FnOnce(&mut crate::Site, Tick) -> R,
+        ) -> Result<R, crate::SiteBusy> {
+            match self {
+                Self::Empty => NoSite.with(with),
+                Self::Held => Err(crate::SiteBusy),
+                Self::Behind => {
+                    use crate::topology::tests::{bus, device, signal};
+                    let mut site = crate::Site::new();
+                    site.apply(
+                        km43::TopologyChangeReason::Boot,
+                        &[
+                            bus(1, km43::Transport::Rs485),
+                            device(1, 1, Some(1), None),
+                            signal(1, 1),
+                        ],
+                    )
+                    .expect("a valid site");
+                    let seen =
+                        crate::Observation::value(1, km43::Provenance::Measured).expect("a value");
+                    site.write(
+                        km43::Id::new(1).expect("non-zero"),
+                        Tick::from_millis(1_000),
+                        seen,
+                    )
+                    .expect("registered");
+                    Ok(with(&mut site, Tick::ZERO))
+                }
+            }
+        }
+    }
     use crate::body::Kept;
     use crate::clients::Occupant;
     use crate::drbg::DrbgState;
@@ -3428,6 +3522,8 @@ mod tests {
         topology: Option<km43::Topology>,
         /// What is known of the log's span.
         log_known: LogKnown,
+        /// The site the frames read.
+        site: RigSite,
     }
 
     impl Rig {
@@ -3493,6 +3589,7 @@ mod tests {
                 },
                 topology: Some(crate::reported(0, [0; 8])),
                 log_known: LogKnown::Held,
+                site: RigSite::Empty,
             }
         }
 
@@ -3525,7 +3622,7 @@ mod tests {
             let reply = block_on(self.sessions.frame(
                 frame,
                 self.now,
-                (&facts, &mut self.wifi, &NoSite),
+                (&facts, &mut self.wifi, &self.site),
                 &mut self.part,
                 &mut dst,
             ));
@@ -4561,6 +4658,30 @@ mod tests {
         (rig, phone)
     }
 
+    /// A read of the whole of `kind`'s plane from the beginning.
+    fn read_frame(phone: &mut Phone, kind: MessageType) -> Frame {
+        let mut body = [0u8; 16];
+        let len = match kind {
+            MessageType::Inventory => km43::ReadInventory {
+                rev: 0,
+                what: 1,
+                from: 0,
+                dev: None,
+            }
+            .encode(&mut body)
+            .expect("fits"),
+            MessageType::Readings => km43::ReadSignals::everything(0, 0)
+                .encode(&mut body)
+                .expect("fits"),
+            MessageType::Concerns => {
+                body[..5].copy_from_slice(&[0xa2, 1, 0, 2, 0]);
+                5
+            }
+            other => panic!("{other:?} reads no plane"),
+        };
+        phone.sealed(kind, &body[..len])
+    }
+
     fn subscribe(rig: &mut Rig, phone: &mut Phone, from_seq: u64) -> km43::SubscribeAck {
         let replay = match from_seq {
             0 => km43::Replay::LiveOnly,
@@ -5246,6 +5367,28 @@ mod tests {
     }
 
     #[test]
+    fn p_104_the_widest_subscribe_ack_fits_its_buffer() {
+        let top = LogSeq(u64::MAX);
+        let log = km43::LogExtent::holding(top, top).expect("an extent");
+        let request = km43::Subscribe {
+            replay: km43::Replay::From(LogSeq(1)),
+        };
+        let ack = km43::SubscribeAck::answer(request, log).expect("an ack");
+        assert_eq!(
+            (
+                ack.accepted_from_seq(),
+                ack.oldest_seq(),
+                ack.current_seq(),
+                ack.gap()
+            ),
+            (top, top, top, true),
+            "every key at its widest"
+        );
+        let mut body = [0u8; SUBSCRIBE_ACK_BYTES];
+        assert_eq!(ack.encode(&mut body), Ok(33));
+    }
+
+    #[test]
     fn p_098_a_session_owed_more_live_events_than_its_queue_is_shed_and_replay_is_not_counted() {
         let (mut rig, mut phone) = subscribed_rig(1, 20);
         let _ = subscribe(&mut rig, &mut phone, 0);
@@ -5366,6 +5509,147 @@ mod tests {
             (header.outcome, header.total),
             (km43::ConcernsOutcome::Ok, 0)
         );
+    }
+
+    #[test]
+    fn a_readings_page_the_site_cannot_write_is_answered_busy_naming_the_store_failure() {
+        let (mut rig, mut phone) = subscribed_rig(1, 1);
+        rig.site = RigSite::Behind;
+        let frame = read_frame(&mut phone, MessageType::Readings);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(sealed_code(&mut phone, &answer), ErrorCode::BusyRetry as u8);
+        assert_eq!(
+            reply.note,
+            Some(SessionNote::ReadFailed(ReadFailure::Readings(
+                ReadingsFailed::Store(crate::SignalError::TickBehind(
+                    km43::Id::new(1).expect("non-zero")
+                ))
+            )))
+        );
+    }
+
+    /// The bound session's binding and the address of the phone's last
+    /// frame, as `sealed` hands them to an answer.
+    fn bound<'a>(rig: &'a mut Rig, phone: &Phone) -> (Addressed, &'a mut Binding) {
+        let to = Addressed {
+            conn: conn(phone.handle),
+            req_id: ReqId(phone.req),
+        };
+        let binding = rig
+            .sessions
+            .rows
+            .iter_mut()
+            .flatten()
+            .find_map(|row| {
+                let Bound::Session(binding) = &mut row.bound else {
+                    return None;
+                };
+                Some(binding)
+            })
+            .expect("a session");
+        (to, binding)
+    }
+
+    /// `failure` as `site_answer` answers it for `answer`.
+    fn site_failed(answer: MessageType, failure: ReadFailure) -> (Reply, u8) {
+        let (mut rig, mut phone) = subscribed_rig(1, 1);
+        let (to, binding) = bound(&mut rig, &phone);
+        let mut dst = [0u8; MAX_FRAME];
+        let reply = site_answer(to, binding, (answer, &[]), Ok(Err(failure)), &mut dst);
+        let code = sealed_code(&mut phone, &dst[..reply.answer.expect("answered")]);
+        (reply, code)
+    }
+
+    #[test]
+    fn an_inventory_page_the_site_cannot_write_is_answered_busy_naming_the_failure() {
+        let failure = ReadFailure::Inventory(InventoryError::EmptyCmds);
+        let (reply, code) = site_failed(MessageType::InventoryResponse, failure);
+        assert_eq!(code, ErrorCode::BusyRetry as u8);
+        assert_eq!(reply.note, Some(SessionNote::ReadFailed(failure)));
+        assert_eq!(reply.close, None, "the session stays up");
+    }
+
+    #[test]
+    fn a_readings_page_km43_refuses_is_answered_busy_naming_the_failure() {
+        let failure = ReadFailure::Readings(ReadingsFailed::Encode(
+            km43::ReadingsError::RowTooLong(km43::INNER_BODY_BYTES),
+        ));
+        let (reply, code) = site_failed(MessageType::ReadingsResponse, failure);
+        assert_eq!(code, ErrorCode::BusyRetry as u8);
+        assert_eq!(reply.note, Some(SessionNote::ReadFailed(failure)));
+    }
+
+    #[test]
+    fn a_concerns_page_that_did_not_fit_is_named_a_concerns_failure_not_too_large() {
+        let failure =
+            ReadFailure::Concerns(ConcernsError::Cbor(km43::CborError::DestinationTooSmall));
+        let (reply, code) = site_failed(MessageType::ConcernsResponse, failure);
+        assert_eq!(code, ErrorCode::BusyRetry as u8);
+        assert_eq!(reply.note, Some(SessionNote::ReadFailed(failure)));
+    }
+
+    #[test]
+    fn a_page_longer_than_its_buffer_sends_nothing_and_is_noted_too_large() {
+        let (mut rig, mut phone) = subscribed_rig(1, 1);
+        let (to, binding) = bound(&mut rig, &phone);
+        let body = [0xa0u8; 4];
+        let mut dst = [0u8; MAX_FRAME];
+        let reply = site_answer(
+            to,
+            binding,
+            (MessageType::ConcernsResponse, &body),
+            Ok(Ok(body.len() + 1)),
+            &mut dst,
+        );
+        assert_eq!(
+            (reply.answer, reply.note),
+            (None, Some(SessionNote::TooLarge))
+        );
+        // The page the site did write is sealed and sent.
+        let (to, binding) = bound(&mut rig, &phone);
+        let reply = site_answer(
+            to,
+            binding,
+            (MessageType::ConcernsResponse, &body),
+            Ok(Ok(1)),
+            &mut dst,
+        );
+        assert_eq!(reply.note, None);
+        let (kind, inner) = phone.open(&dst[..reply.answer.expect("answered")]);
+        assert_eq!(
+            (kind, &inner[..]),
+            (MessageType::ConcernsResponse, &body[..1])
+        );
+    }
+
+    #[test]
+    fn a_read_while_the_site_is_held_is_answered_busy_with_no_failure_noted() {
+        let (mut rig, mut phone) = subscribed_rig(1, 1);
+        rig.site = RigSite::Held;
+        for kind in [
+            MessageType::Inventory,
+            MessageType::Readings,
+            MessageType::Concerns,
+        ] {
+            let frame = read_frame(&mut phone, kind);
+            let (reply, answer) = rig.send(&frame);
+            assert_eq!(
+                sealed_code(&mut phone, &answer),
+                ErrorCode::BusyRetry as u8,
+                "{kind:?}"
+            );
+            assert_eq!(
+                reply.note,
+                Some(SessionNote::Refused(ErrorCode::BusyRetry as u16)),
+                "{kind:?}"
+            );
+        }
+        // The same requests are answered once the site is free.
+        rig.site = RigSite::Empty;
+        let frame = read_frame(&mut phone, MessageType::Readings);
+        let (reply, answer) = rig.send(&frame);
+        assert_eq!(reply.note, None);
+        assert_eq!(phone.open(&answer).0, MessageType::ReadingsResponse);
     }
 
     #[test]
