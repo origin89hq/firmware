@@ -141,7 +141,8 @@ fn describe(seq: u64, class: Class, payload: &[u8]) -> String {
             Err(ControllerRecordError::UnknownKind(_)) => {
                 let _ = write!(line, "body {}", hex::encode(event.body()));
             }
-            Err(_) if event.body() == EMPTY_MAP => {
+            // `comms held down` came after 0.4.1: its empty body is malformed.
+            Err(_) if event.body() == EMPTY_MAP && event.kind != EventKind::COMMS_HELD_DOWN => {
                 line.push_str("empty body: written before km43 0.4.1 gave the record its fields");
             }
             Err(why) => {
@@ -394,6 +395,15 @@ mod tests {
                 "{line}"
             );
         }
+        let empty = describe(
+            16,
+            Class::A,
+            &event(16, EventKind::COMMS_HELD_DOWN, EMPTY_MAP),
+        );
+        assert!(
+            empty.ends_with("body refused (controller record missing key 1): a0"),
+            "{empty}"
+        );
     }
 
     #[test]
