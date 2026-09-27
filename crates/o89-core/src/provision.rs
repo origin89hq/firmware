@@ -186,7 +186,7 @@ pub enum ProvisionFailed<E> {
     Unborn,
     /// A reseed onto a generator record that reads back an intact state,
     /// from either slot. A live generator is never replaced (P-237).
-    NotDamaged,
+    Intact,
 }
 
 impl<E> From<E> for ProvisionFailed<E> {
@@ -227,7 +227,7 @@ fn ready_for_a_transaction<E>(
 /// under way, because a birth writes the key and the generator before it is
 /// applied; and a fresh state from the station repeats nothing the unit
 /// drew. Refused while an intact state reads back from either slot
-/// ([`ProvisionFailed::NotDamaged`]), while the part holds no controller key
+/// ([`ProvisionFailed::Intact`]), while the part holds no controller key
 /// it can read ([`ProvisionFailed::Unborn`]), and while another transaction
 /// is unfinished. Boot applies it with [`finish`], which checks the same
 /// again. Only the bench mailbox calls this, over SWD; no message, reset,
@@ -244,7 +244,7 @@ pub async fn stage_reseed<F: Fram>(
         return Err(ProvisionFailed::Unborn);
     }
     match drbg {
-        Held::Present(_) => return Err(ProvisionFailed::NotDamaged),
+        Held::Present(_) => return Err(ProvisionFailed::Intact),
         Held::Corrupt | Held::Absent | Held::Malformed(_) => {}
     }
     change

@@ -1484,7 +1484,7 @@ mod tests {
         let before = part.clone();
         assert_eq!(
             block_on(stage_reseed(&mut part, reseeded())),
-            Err(ProvisionFailed::NotDamaged)
+            Err(ProvisionFailed::Intact)
         );
         assert_eq!(part.bytes, before.bytes, "nothing was staged");
         // Both slots written by draws, one of them damaged: the other holds.
@@ -1503,7 +1503,7 @@ mod tests {
             let before = damaged.clone();
             assert_eq!(
                 block_on(stage_reseed(&mut damaged, reseeded())),
-                Err(ProvisionFailed::NotDamaged)
+                Err(ProvisionFailed::Intact)
             );
             assert_eq!(damaged.bytes, before.bytes, "nothing was staged");
         }

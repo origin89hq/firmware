@@ -345,7 +345,7 @@ async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32)
             | ProvisionFailed::AlreadyProvisioned
             | ProvisionFailed::AlreadyBorn
             | ProvisionFailed::Unborn
-            | ProvisionFailed::NotDamaged,
+            | ProvisionFailed::Intact,
         ) => Status::OutOfRange,
     };
     (status, 0)
