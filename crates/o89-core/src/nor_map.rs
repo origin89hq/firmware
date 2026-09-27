@@ -81,7 +81,9 @@ pub enum BusRefused {
 /// Whether an SPI whose kernel clock the HAL recorded as `kernel` can be
 /// built for [`SCK`]: the same test the HAL's baud-rate divider makes, and
 /// that it `unwrap`s, taken first so a bus it would refuse is a refusal
-/// here rather than a panic there (F-095).
+/// here rather than a panic there (F-095). From `SCK` up to twice it, the
+/// HAL divides by two and the part is driven slower than asked, which it
+/// takes; only below `SCK` does no divider exist.
 ///
 /// # Errors
 ///

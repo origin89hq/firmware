@@ -21,7 +21,7 @@ use core::future::Future;
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Blocking;
-use embassy_stm32::peripherals::{PA4, PA5, PA6, PA7, RCC, SPI1};
+use embassy_stm32::peripherals::RCC;
 use embassy_stm32::spi::mode::Master;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
@@ -30,6 +30,8 @@ use embedded_storage_async::nor_flash::{
     ErrorType, MultiwriteNorFlash, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
 use o89_core::nor_map::{self, BusRefused};
+
+use crate::board::{NorCs, NorMiso, NorMosi, NorSck, NorSpi};
 
 /// Bytes in one erase sector.
 pub const SECTOR: usize = 4096;
@@ -83,7 +85,9 @@ pub struct Nor {
 }
 
 /// The part without its bus: why the bus was refused, and the chip select
-/// held high for as long as this lives, so the part stays deselected.
+/// held high for as long as this lives, so the part stays deselected. The
+/// SPI and its other three pins are dropped with the refusal; nothing
+/// retries the bus within a boot.
 pub struct Unbuilt {
     /// Why.
     pub refused: BusRefused,
@@ -94,7 +98,7 @@ impl Nor {
     /// Take the part's pins and build its bus at [`nor_map::SCK`], or say
     /// why not (F-095).
     ///
-    /// The chip select is driven high first, whatever follows: `PA4` sits
+    /// The chip select is driven high first, whatever follows: the pin sits
     /// in its reset state, analog, until here, and a refused bus leaves it
     /// high rather than floating. The bus is built only once the clock the
     /// HAL recorded for it can carry the SCK, because the HAL's own check
@@ -104,11 +108,11 @@ impl Nor {
     /// `unwrap`.
     pub fn build(
         rcc: &Peri<'static, RCC>,
-        spi1: Peri<'static, SPI1>,
-        sck: Peri<'static, PA5>,
-        mosi: Peri<'static, PA7>,
-        miso: Peri<'static, PA6>,
-        cs: Peri<'static, PA4>,
+        spi1: Peri<'static, NorSpi>,
+        sck: Peri<'static, NorSck>,
+        mosi: Peri<'static, NorMosi>,
+        miso: Peri<'static, NorMiso>,
+        cs: Peri<'static, NorCs>,
     ) -> Result<Self, Unbuilt> {
         let cs = Output::new(cs, Level::High, Speed::VeryHigh);
         let kernel = embassy_stm32::rcc::clocks(rcc)
