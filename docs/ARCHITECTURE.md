@@ -456,8 +456,8 @@ production and the bench map both include, gives the stack its own region at the
 `.data`, `.bss` and `.uninit` above it and the mailbox above them, and sets
 `_stack_start` to the region's top and `_stack_end` to the RAM origin. An
 overflow now runs off the bottom of RAM: the first push below `0x20000000`
-addresses the part's system area, not a static, and is expected to fault
-there; the hard fault cannot stack its own frame either, and the core
+addresses whatever the part maps under RAM, not a static, and is expected
+to fault there (what sits at `0x1FFF_FFFC` was not confirmed from RM0444); the hard fault cannot stack its own frame either, and the core
 locks up without running the handler. Lockup is the Armv6-M architecture's
 answer to a fault in the hard fault's own entry. Neither is proven on the
 part yet: the bench run for #233 reads `DHCSR.S_LOCKUP` before the reset,
