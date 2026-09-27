@@ -108,11 +108,14 @@ struct InExport {
     of_key: Option<Record>,
 }
 
-/// The export file and its journal. One process writes them at a time: a
-/// second writer is not locked out, and its rename can drop the first's line.
+/// The export file and its journal, held under an exclusive lock on
+/// `<export>.lock` for the ledger's life: a second station process on the
+/// same file is refused, so no rename can drop another's line.
 pub struct Ledger {
     export: PathBuf,
     journal: PathBuf,
+    /// Released when the ledger drops.
+    _lock: File,
 }
 
 impl Ledger {
@@ -127,9 +130,28 @@ impl Ledger {
         {
             bail!("the export file {} names no file", export.display());
         }
+        let locked = suffixed(export, ".lock");
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&locked)
+            .with_context(|| format!("opening {}", locked.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "another station process holds {}; one writes {} at a time",
+                locked.display(),
+                export.display()
+            ),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("locking {}", locked.display()));
+            }
+        }
         Ok(Self {
             export: export.to_owned(),
             journal: suffixed(export, ".drawn"),
+            _lock: lock,
         })
     }
 
@@ -760,6 +782,23 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn p_249_a_second_ledger_on_the_same_file_is_refused_while_the_first_lives() {
+        let scratch = Scratch::new();
+        let first = scratch.ledger();
+        let error = Ledger::new(&scratch.0.join("units.jsonl"))
+            .err()
+            .expect("refused");
+        assert!(
+            error.to_string().contains("another station process"),
+            "{error}"
+        );
+        // Another file is its own ledger.
+        drop(Ledger::new(&scratch.0.join("other.jsonl")).unwrap());
+        drop(first);
+        drop(scratch.ledger());
+    }
+
+    #[test]
     fn a_path_naming_no_file_or_a_directory_is_refused() {
         let scratch = Scratch::new();
         assert!(Ledger::new(Path::new("/")).is_err());
@@ -769,5 +808,6 @@ pub(super) mod tests {
         assert!(Ledger::new(Path::new(&slash)).is_err());
         let ledger = Ledger::new(&scratch.0.join("out")).unwrap();
         assert_eq!(ledger.journal, scratch.0.join("out.drawn"));
+        assert!(scratch.0.join("out.lock").exists());
     }
 }

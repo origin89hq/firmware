@@ -91,5 +91,5 @@ including a device id recorded twice, before a key is staged.
   until its key is drawn again (`o89-dev store blank --yes`, then
   `write-secret`).
 
-One station process writes a file at a time; two processes writing the same
-file are not coordinated.
+One station process writes a file at a time: it holds an exclusive lock on
+`<file>.lock` while it runs, and a second process on the same file is refused.
