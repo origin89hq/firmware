@@ -56,6 +56,13 @@ impl DrbgState {
     }
 }
 
+#[cfg(any(test, feature = "zeroize"))]
+impl zeroize::Zeroize for DrbgState {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl fmt::Debug for DrbgState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("DrbgState(..)")

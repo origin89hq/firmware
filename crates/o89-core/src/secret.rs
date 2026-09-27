@@ -114,6 +114,13 @@ impl ControllerKey {
     }
 }
 
+#[cfg(any(test, feature = "zeroize"))]
+impl zeroize::Zeroize for ControllerKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl core::fmt::Debug for ControllerKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("ControllerKey(..)")
@@ -127,6 +134,16 @@ impl Body<CONTROLLER_KEY_BYTES> for ControllerKey {
 
     fn decode(bytes: &[u8; CONTROLLER_KEY_BYTES]) -> Result<Self, Malformed> {
         Self::new(*bytes).map_err(|NoEntropy| Malformed { at: 0 })
+    }
+}
+
+/// Clears the device id with the printed secret, so the whole body reads
+/// zero; a `SecretChange` holding one clears it through this.
+#[cfg(any(test, feature = "zeroize"))]
+impl zeroize::Zeroize for Secret {
+    fn zeroize(&mut self) {
+        self.device_id.zeroize();
+        self.printed.zeroize();
     }
 }
 

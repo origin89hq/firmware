@@ -68,6 +68,46 @@ pub enum SecretChange {
     Reseed(DrbgState),
 }
 
+#[cfg(any(test, feature = "zeroize"))]
+impl zeroize::Zeroize for Birth {
+    fn zeroize(&mut self) {
+        self.controller.zeroize();
+        self.drbg.zeroize();
+    }
+}
+
+#[cfg(any(test, feature = "zeroize"))]
+impl SecretChange {
+    /// Clear every secret the variant holds, where it is, and leave the
+    /// variant: the step before [`zeroize`](zeroize::Zeroize::zeroize)
+    /// makes it `Complete`, which writes the tag and nothing else. The
+    /// fingerprint `Applied` holds is public and stays.
+    fn clear_in_place(&mut self) {
+        use zeroize::Zeroize as _;
+        match self {
+            Self::Complete => {}
+            Self::Pending(secret, birth) => {
+                secret.zeroize();
+                if let Some(birth) = birth {
+                    birth.zeroize();
+                }
+            }
+            Self::Applied(secret, _fingerprint) => secret.zeroize(),
+            Self::Reseed(state) => state.zeroize(),
+        }
+    }
+}
+
+/// Clears what the variant holds, then becomes `Complete`, which encodes
+/// to zeros: nothing a caller reads afterwards is a transaction to finish.
+#[cfg(any(test, feature = "zeroize"))]
+impl zeroize::Zeroize for SecretChange {
+    fn zeroize(&mut self) {
+        self.clear_in_place();
+        *self = Self::Complete;
+    }
+}
+
 impl Body<SECRET_CHANGE_BYTES> for SecretChange {
     fn encode(&self) -> [u8; SECRET_CHANGE_BYTES] {
         let mut out = [0; SECRET_CHANGE_BYTES];
@@ -429,4 +469,199 @@ async fn discard_residue<F: Fram>(
     }
     change.erase(fram).await.map_err(ProvisionFailed::Write)?;
     Ok(SecretRecovery::Discarded)
+}
+
+/// The station's clears (#242): every value that holds the controller key or
+/// the generator's state, and every container it holds one in, reads as
+/// zeros once cleared. The impls build for the tests without the feature.
+#[cfg(test)]
+mod zeroize_tests {
+    use core::future::Future;
+
+    use embassy_futures::block_on;
+    use zeroize::Zeroize as _;
+
+    use super::*;
+    use crate::fram::{Address, Record};
+
+    const KEY: [u8; CONTROLLER_KEY_BYTES] = [0xA5; CONTROLLER_KEY_BYTES];
+    const STATE: [u8; DRBG_BYTES] = [0x5A; DRBG_BYTES];
+    const KEY_RECORD: Record<CONTROLLER_KEY_BYTES> = Record::at(0x5954_4B43, Address(0));
+
+    fn key() -> ControllerKey {
+        ControllerKey::new(KEY).expect("entropy")
+    }
+
+    fn state() -> DrbgState {
+        DrbgState::new(STATE).expect("entropy")
+    }
+
+    fn secret() -> Secret {
+        Secret::new([0x11; 16], [0x22; 32]).expect("entropy")
+    }
+
+    fn birth() -> Birth {
+        Birth {
+            controller: key(),
+            drbg: state(),
+        }
+    }
+
+    /// A part in an array that reads and writes what it is given.
+    struct Part([u8; 512]);
+
+    impl Fram for Part {
+        type Error = ();
+
+        fn read(
+            &mut self,
+            at: crate::Address,
+            into: &mut [u8],
+        ) -> impl Future<Output = Result<(), ()>> {
+            let start = usize::from(at.0);
+            into.copy_from_slice(&self.0[start..][..into.len()]);
+            core::future::ready(Ok(()))
+        }
+
+        fn write(
+            &mut self,
+            at: crate::Address,
+            bytes: &[u8],
+        ) -> impl Future<Output = Result<(), Refused<()>>> {
+            let start = usize::from(at.0);
+            self.0[start..][..bytes.len()].copy_from_slice(bytes);
+            core::future::ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn a_cleared_controller_key_and_generator_state_encode_to_zeros() {
+        let mut key = key();
+        let mut state = state();
+        assert_eq!(key.encode(), KEY);
+        assert_eq!(state.encode(), STATE);
+        key.zeroize();
+        state.zeroize();
+        assert_eq!(key.encode(), [0; CONTROLLER_KEY_BYTES]);
+        assert_eq!(state.encode(), [0; DRBG_BYTES]);
+    }
+
+    #[test]
+    fn a_cleared_birth_clears_both_its_key_and_its_state() {
+        let mut birth = birth();
+        birth.zeroize();
+        assert_eq!(birth.controller.encode(), [0; CONTROLLER_KEY_BYTES]);
+        assert_eq!(birth.drbg.encode(), [0; DRBG_BYTES]);
+    }
+
+    #[test]
+    fn a_cleared_pending_birth_clears_its_secret_key_and_state_in_place() {
+        let mut change = SecretChange::Pending(secret(), Some(birth()));
+        change.clear_in_place();
+        let SecretChange::Pending(secret, Some(birth)) = change else {
+            panic!("clearing in place keeps the variant");
+        };
+        assert_eq!(secret.encode(), [0; SECRET_BYTES]);
+        assert_eq!(birth.controller.encode(), [0; CONTROLLER_KEY_BYTES]);
+        assert_eq!(birth.drbg.encode(), [0; DRBG_BYTES]);
+    }
+
+    #[test]
+    fn a_cleared_pending_birth_encodes_to_zeros() {
+        let mut change = SecretChange::Pending(secret(), Some(birth()));
+        assert_ne!(change.encode(), [0; SECRET_CHANGE_BYTES]);
+        change.zeroize();
+        assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
+        assert!(matches!(change, SecretChange::Complete));
+    }
+
+    #[test]
+    fn a_cleared_reseed_clears_its_state_in_place_then_encodes_to_zeros() {
+        let mut change = SecretChange::Reseed(state());
+        change.clear_in_place();
+        let SecretChange::Reseed(cleared) = change else {
+            panic!("clearing in place keeps the variant");
+        };
+        assert_eq!(cleared.encode(), [0; DRBG_BYTES]);
+        change.zeroize();
+        assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
+    }
+
+    #[test]
+    fn a_cleared_applied_transaction_clears_its_secret_and_keeps_the_public_fingerprint() {
+        let fingerprint = key().fingerprint();
+        let mut change = SecretChange::Applied(secret(), fingerprint);
+        change.clear_in_place();
+        let SecretChange::Applied(secret, kept) = change else {
+            panic!("clearing in place keeps the variant");
+        };
+        assert_eq!(secret.encode(), [0; SECRET_BYTES]);
+        assert_eq!(kept, fingerprint);
+        change.zeroize();
+        assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
+    }
+
+    #[test]
+    fn a_pending_transaction_without_a_birth_and_a_complete_one_clear_to_zeros() {
+        let mut change = SecretChange::Pending(secret(), None);
+        change.zeroize();
+        assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
+        let mut complete = SecretChange::Complete;
+        complete.zeroize();
+        assert_eq!(complete.encode(), [0; SECRET_CHANGE_BYTES]);
+    }
+
+    #[test]
+    fn a_cleared_held_key_reads_zero_and_an_absent_one_stays_absent() {
+        let mut held = Held::Present(key());
+        held.zeroize();
+        assert_eq!(
+            held.present().map(Body::encode),
+            Some([0; CONTROLLER_KEY_BYTES])
+        );
+        let mut absent = Held::<ControllerKey>::Absent;
+        absent.zeroize();
+        assert!(matches!(absent, Held::Absent));
+        let mut malformed = Held::<DrbgState>::Malformed(Malformed { at: 3 });
+        malformed.zeroize();
+        assert!(matches!(malformed, Held::Malformed(Malformed { at: 3 })));
+    }
+
+    #[test]
+    fn a_cleared_kept_key_read_off_a_part_reads_zero_and_keeps_its_record() {
+        let mut part = Part([0; 512]);
+        let mut kept = block_on(Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(
+            KEY_RECORD, &mut part,
+        ))
+        .expect("reads");
+        block_on(kept.write(&mut part, key())).expect("written");
+        let mut kept = block_on(Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(
+            KEY_RECORD, &mut part,
+        ))
+        .expect("reads");
+        assert_eq!(kept.present().map(Body::encode), Some(KEY));
+        kept.zeroize();
+        assert_eq!(
+            kept.present().map(Body::encode),
+            Some([0; CONTROLLER_KEY_BYTES])
+        );
+        assert_eq!(kept.record(), KEY_RECORD);
+    }
+
+    #[test]
+    fn a_cleared_kept_transaction_holding_a_birth_reads_complete() {
+        const CHANGE: Record<SECRET_CHANGE_BYTES> = Record::at(0x4843_5343, Address(0));
+        let mut part = Part([0; 512]);
+        let mut kept = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+            CHANGE, &mut part,
+        ))
+        .expect("reads");
+        block_on(kept.write(&mut part, SecretChange::Pending(secret(), Some(birth()))))
+            .expect("written");
+        kept.zeroize();
+        assert_eq!(
+            kept.present().map(Body::encode),
+            Some([0; SECRET_CHANGE_BYTES])
+        );
+    }
 }

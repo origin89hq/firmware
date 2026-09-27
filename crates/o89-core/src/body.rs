@@ -65,6 +65,18 @@ impl<T> Held<T> {
     }
 }
 
+/// Clears the value in place and leaves the variant: what is cleared is the
+/// secret, and which of the four a read found is not one.
+#[cfg(any(test, feature = "zeroize"))]
+impl<T: zeroize::Zeroize> zeroize::Zeroize for Held<T> {
+    fn zeroize(&mut self) {
+        match self {
+            Self::Present(value) => value.zeroize(),
+            Self::Absent | Self::Corrupt | Self::Malformed(_) => {}
+        }
+    }
+}
+
 /// Why an update did not land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -103,6 +115,14 @@ pub struct Kept<T, const N: usize> {
     record: Record<N>,
     position: Position,
     held: Held<T>,
+}
+
+/// Clears the value; the record and its position are the map's, not secret.
+#[cfg(any(test, feature = "zeroize"))]
+impl<T: zeroize::Zeroize, const N: usize> zeroize::Zeroize for Kept<T, N> {
+    fn zeroize(&mut self) {
+        self.held.zeroize();
+    }
 }
 
 impl<T: Body<N>, const N: usize> Kept<T, N> {

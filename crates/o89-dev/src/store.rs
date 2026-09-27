@@ -13,6 +13,12 @@
 //! prints is the fingerprint the controller wrote into the applied
 //! transaction, so a resumed label never needs the private key (P-236).
 //!
+//! Every binding here that holds the controller key or the generator's
+//! state, drawn or read back, is `Zeroizing` and cleared on every return
+//! (#242). That reaches the station's own bindings; not a compiler's
+//! temporary copy of a `Copy` value, the probe's transport buffers, or the
+//! operating system's paging.
+//!
 //! The station also keeps the public half of what it made (P-249): before a
 //! transaction is staged it journals it, for a birth the device id with the
 //! fingerprint of the key it drew, and once the part confirms that key it
@@ -31,7 +37,7 @@ use o89_core::{
     RUN_REASON_BYTES, Refused, RunReason, SECRET_BYTES, Secret, SecretChange, WRITE_VOLUME_BYTES,
     WriteVolume, map,
 };
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::link::Link;
 
@@ -59,7 +65,8 @@ fn show_into(
         Held::Corrupt => writeln!(out, "secret      Corrupt")?,
         Held::Malformed(at) => writeln!(out, "secret      Malformed({at:?})")?,
     }
-    let controller = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let controller =
+        read_zeroizing::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
     match controller.held() {
         Held::Present(key) => writeln!(
             out,
@@ -70,7 +77,7 @@ fn show_into(
         Held::Corrupt => writeln!(out, "controller  Corrupt")?,
         Held::Malformed(at) => writeln!(out, "controller  Malformed({at:?})")?,
     }
-    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    let drbg = read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
     writeln!(
         out,
         "drbg        {}",
@@ -134,6 +141,15 @@ fn read<T: Body<N>, const N: usize>(
     record: o89_core::Record<N>,
 ) -> Result<Kept<T, N>> {
     block_on(Kept::<T, N>::read(record, link))
+}
+
+/// [`read`] for a record that can hold the controller key or the
+/// generator's state: the value is cleared when the handle drops.
+fn read_zeroizing<T: Body<N> + Zeroize, const N: usize>(
+    link: &mut impl o89_core::Fram<Error = anyhow::Error>,
+    record: o89_core::Record<N>,
+) -> Result<Zeroizing<Kept<T, N>>> {
+    read(link, record).map(Zeroizing::new)
 }
 
 fn line<T: Body<N> + core::fmt::Debug, const N: usize>(
@@ -200,7 +216,9 @@ fn run_blank(
     }
     let end = usize::from(map::END.0);
     let zeros = [0u8; DATA_BYTES];
-    let mut back = [0u8; DATA_BYTES];
+    // A run that did not read back blank holds what was there: the key or
+    // the generator's state among it.
+    let mut back = Zeroizing::new([0u8; DATA_BYTES]);
     // At most END / DATA_BYTES + 1 transactions, each read back before the next.
     for start in (0..end).step_by(DATA_BYTES) {
         let len = DATA_BYTES.min(end.saturating_sub(start));
@@ -272,11 +290,12 @@ fn run_secret(
     ensure_no_transaction(link).with_context(|| resume_hint(ledger))?;
     let secret = generate_secret(link, device_id, replace)?;
     let device_id = DeviceId::new(secret.device_id_bytes());
-    let birth = if born(link)? {
+    let mut birth = Zeroizing::new(None);
+    if born(link)? {
         // Checked before anything is staged: once applied, the new label
         // has replaced the old one, and one that pairs with nothing is not
         // printed (P-237).
-        if read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
+        if read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
             .present()
             .is_none()
         {
@@ -288,7 +307,8 @@ fn run_secret(
         // The key stays, so an exported record for this device id must
         // already name it. Journaled as a replace, so a resume can tell this
         // transaction from one the ledger never saw; never exported from here.
-        let held = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+        let held =
+            read_zeroizing::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
         let Some(key) = held.present() else {
             bail!(
                 "the controller key does not read back, so this unit cannot be labelled or \
@@ -299,23 +319,22 @@ fn run_secret(
             device_id,
             fingerprint: key.fingerprint(),
         })?;
-        None
     } else {
-        let birth = generate_birth()?;
+        let drawn = generate_birth(&mut birth)?;
         // Durable before the key can reach the part, so a resume in another
         // process confirms against the station's own fingerprint.
         ledger.note_drawn(Record {
             device_id,
-            fingerprint: birth.controller.fingerprint(),
+            fingerprint: drawn.controller.fingerprint(),
         })?;
-        Some(birth)
-    };
-    // `Birth` is `Copy` and has no way to clear itself; the encoded body is
-    // the copy that crosses to the controller, and it is cleared below.
-    let mut body = Zeroizing::new(SecretChange::Pending(secret, birth).encode());
+    }
+    let mut change = Zeroizing::new(SecretChange::Pending(secret, *birth));
+    let mut body = Zeroizing::new(change.encode());
     link.stage_and_reboot(&body[..], replace)
         .with_context(|| resume_hint(ledger))?;
     body.zeroize();
+    change.zeroize();
+    birth.zeroize();
     show_applied(link, ledger, secret, output).with_context(|| resume_hint(ledger))
 }
 
@@ -340,11 +359,8 @@ fn shell_word(text: &str) -> String {
     }
 }
 
-type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
-
 fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<()> {
-    match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
-    {
+    match read_zeroizing::<SecretChange, _>(link, map::SECRET_CHANGE)?.held() {
         Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => {
             bail!("a secret transaction is unfinished")
         }
@@ -362,23 +378,30 @@ fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) 
 /// either would be: the firmware refuses birth material for any of these
 /// (P-235, P-237), and so does the host before drawing any.
 fn born(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<bool> {
-    let controller = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
-    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    let controller =
+        read_zeroizing::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let drbg = read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
     Ok(!matches!(controller.held(), Held::Absent) || !matches!(drbg.held(), Held::Absent))
 }
 
 /// The controller key and the generator's first state, drawn here and
-/// recorded nowhere. The raw draws are cleared as they are consumed.
-fn generate_birth() -> Result<Birth> {
+/// recorded nowhere, into the caller's `birth`, which it holds as
+/// `Zeroizing`. The raw draws and the typed values built from them are
+/// cleared on every return.
+fn generate_birth(birth: &mut Option<Birth>) -> Result<&Birth> {
     let mut key = Zeroizing::new([0u8; CONTROLLER_KEY_BYTES]);
     fill(&mut *key)?;
     let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
     fill(&mut *seed)?;
-    Ok(Birth {
-        controller: ControllerKey::new(*key)
-            .map_err(|_| anyhow!("the generator returned zeros"))?,
-        drbg: DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?,
-    })
+    let controller = Zeroizing::new(
+        ControllerKey::new(*key).map_err(|_| anyhow!("the generator returned zeros"))?,
+    );
+    let drbg =
+        Zeroizing::new(DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?);
+    Ok(birth.insert(Birth {
+        controller: *controller,
+        drbg: *drbg,
+    }))
 }
 
 trait SecretLink: o89_core::Fram<Error = anyhow::Error> {
@@ -407,7 +430,7 @@ fn resume_secret(
     ledger: &Ledger,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
-    let transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
+    let transaction = read_zeroizing::<SecretChange, _>(link, map::SECRET_CHANGE)?;
     let secret = match *transaction.held() {
         Held::Present(SecretChange::Pending(secret, _)) => {
             link.reboot()?;
@@ -463,8 +486,8 @@ fn show_applied(
     output: &mut impl std::io::Write,
 ) -> Result<()> {
     let applied = read::<Secret, SECRET_BYTES>(link, map::DEVICE_SECRET)?;
-    let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
-    let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
+    let mut transaction = read_zeroizing::<SecretChange, _>(link, map::SECRET_CHANGE)?;
+    let drbg = read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
     let fingerprint = match transaction.present() {
         Some(SecretChange::Applied(held, fingerprint)) if *held == secret => *fingerprint,
         Some(
@@ -481,7 +504,7 @@ fn show_applied(
     // The label vouches for the key the unit pairs with now, not the one
     // the transaction recorded: a key that no longer reads or no longer
     // matches would print a label nothing can pair against (P-236).
-    let key = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let key = read_zeroizing::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
     if key.present().map(ControllerKey::fingerprint) != Some(fingerprint) {
         bail!("the controller key does not read back as the one applied; no label printed");
     }
@@ -554,14 +577,14 @@ pub fn reseed(link: &mut Link) -> Result<()> {
 
 fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> Result<()> {
     ensure_no_transaction(link)?;
-    let key = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let key = read_zeroizing::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
     let Some(fingerprint) = key.present().map(ControllerKey::fingerprint) else {
         bail!(
             "the controller key does not read back, so there is no unit to keep: it is \
              provisioned again with `store blank` and `store write-secret`; nothing staged"
         );
     };
-    match read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?.held() {
+    match read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?.held() {
         // Beside a key that reads, with no transaction unfinished, none is a
         // birth under way: a birth writes both before it is applied.
         Held::Corrupt | Held::Absent | Held::Malformed(_) => {}
@@ -570,13 +593,13 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
         ),
     }
     let before = kept_by_a_reseed(link)?;
-    let mut body = Zeroizing::new(reseed_body()?);
+    let mut body = Zeroizing::new([0u8; o89_core::SECRET_CHANGE_BYTES]);
+    reseed_body(&mut body)?;
     link.stage_and_reboot(&body[..], false)?;
     // Nothing is compared with the state after the reboot, because a
     // session may already have drawn from it.
     body.zeroize();
-    match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
-    {
+    match read_zeroizing::<SecretChange, _>(link, map::SECRET_CHANGE)?.held() {
         Held::Absent | Held::Present(SecretChange::Complete) => {}
         Held::Present(
             SecretChange::Reseed(_) | SecretChange::Pending(..) | SecretChange::Applied(..),
@@ -584,7 +607,7 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
         | Held::Corrupt
         | Held::Malformed(_) => bail!("the controller did not finish the reseed"),
     }
-    if read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
+    if read_zeroizing::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
         .present()
         .is_none()
     {
@@ -615,31 +638,35 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
     Ok(())
 }
 
-/// A fresh state from the operating system's generator, encoded as the
-/// intent that carries it. `DrbgState` is `Copy` and cannot clear itself,
-/// so its copies are kept to this function's temporaries; the raw draw is
-/// cleared here and the encoded body by the caller.
-fn reseed_body() -> Result<[u8; o89_core::SECRET_CHANGE_BYTES]> {
+/// A fresh state from the operating system's generator, encoded into
+/// `body` as the intent that carries it. The raw draw, the state and the
+/// intent are cleared here on every return; `body` by the caller, which
+/// holds it as `Zeroizing`.
+fn reseed_body(body: &mut [u8; o89_core::SECRET_CHANGE_BYTES]) -> Result<()> {
     let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
     fill(&mut *seed)?;
-    let state = DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?;
-    Ok(SecretChange::Reseed(state).encode())
+    let state =
+        Zeroizing::new(DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?);
+    let change = Zeroizing::new(SecretChange::Reseed(*state));
+    *body = change.encode();
+    Ok(())
 }
 
 /// The bytes a reseed must leave as they were (`map::RESEED_KEEPS`): the
-/// unit's identity, then its client slots.
+/// unit's identity, then its client slots. The identity holds the
+/// controller key's record, so both runs are cleared when they drop.
 #[derive(Debug, PartialEq, Eq)]
 struct Keeps {
-    identity: Vec<u8>,
-    slots: Vec<u8>,
+    identity: Zeroizing<Vec<u8>>,
+    slots: Zeroizing<Vec<u8>>,
 }
 
 fn kept_by_a_reseed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<Keeps> {
-    let [identity, slots] = map::RESEED_KEEPS.map(|(start, end)| -> Result<Vec<u8>> {
+    let [identity, slots] = map::RESEED_KEEPS.map(|(start, end)| -> Result<Zeroizing<Vec<u8>>> {
         let len = usize::from(end.0)
             .checked_sub(usize::from(start.0))
             .context("a run of the map")?;
-        let mut run = vec![0u8; len];
+        let mut run = Zeroizing::new(vec![0u8; len]);
         block_on(link.read(start, &mut run))?;
         Ok(run)
     });
@@ -654,7 +681,9 @@ fn kept_by_a_reseed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Re
 /// state, and a write the part acknowledged and did not keep leaves it.
 fn intent_scrubbed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<bool> {
     let slot = o89_core::slot_bytes(o89_core::SECRET_CHANGE_BYTES);
-    let mut both = vec![0u8; slot.checked_mul(2).context("the intent's reservation")?];
+    let len = slot.checked_mul(2).context("the intent's reservation")?;
+    // A copy the boot did not scrub is the generator's state.
+    let mut both = Zeroizing::new(vec![0u8; len]);
     block_on(link.read(map::SECRET_CHANGE.start(), &mut both))?;
     let (a, b) = both.split_at(slot);
     Ok(a.iter().all(|byte| *byte == 0) || b.iter().all(|byte| *byte == 0))
