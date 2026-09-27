@@ -29,7 +29,7 @@ use embassy_stm32::peripherals::IWDG;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_time::{Duration, Instant, Ticker};
-use o89_core::{Blame, Clock, Feed, LastWords, Millis, Pattern, Rollcall, Task, Tick};
+use o89_core::{Blame, Clock, Feed, Millis, Pattern, Rollcall, Task, Tick, WordsUpdate};
 
 use crate::last_words;
 
@@ -128,7 +128,22 @@ pub async fn run(
     loop {
         ticker.next().await;
         let now = Uptime.now();
-        match verdict(now) {
+        let feed = verdict(now);
+        match feed.words(withheld) {
+            WordsUpdate::Keep => {}
+            WordsUpdate::Write(words) => {
+                last_words::write(words);
+                defmt::error!("feed withheld: {}; reset follows", words);
+            }
+            WordsUpdate::Withdraw(task) => {
+                // The task recovered: its blame would name it at a later
+                // reset it had no part in (F-096).
+                if last_words::withdraw(task) {
+                    defmt::warn!("feed earned again; {}'s blame withdrawn", task);
+                }
+            }
+        }
+        match feed {
             Feed::Earned => {
                 wdg.pet();
                 withheld = None;
@@ -139,14 +154,6 @@ pub async fn run(
                 defmt::debug!("supervisor: nobody on the roll yet");
             }
             Feed::Withheld(blame) => {
-                if withheld.map(|b| b.task) != Some(blame.task) {
-                    last_words::write(LastWords::Starved(blame));
-                    defmt::error!(
-                        "feed withheld: {} is {} ms past its window; reset follows",
-                        blame.task,
-                        blame.overdue.as_millis()
-                    );
-                }
                 // The episode starts at the first withheld feed and runs
                 // until the reset: a change of the task named in the middle
                 // updates the last words, not the clock.

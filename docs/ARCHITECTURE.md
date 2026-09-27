@@ -445,10 +445,60 @@ its own, so the temporaries of building it are not in the frame every poll
 of the task reserves. The gate reads the release ELF's frames and direct calls and refuses an
 image whose deepest stack, `main` with the supervisor and the hardware's
 handlers on it, or a thread task with a control task, the supervisor and
-the handlers on it, comes within 2 KB of the room between the statics and
-the mailbox. Calls through a pointer are what it cannot see, and what the
-2 KB is for: the deepest function reached only through one measured 1 056
-bytes when this was written.
+the handlers on it, comes within 2 KB of the stack's region. Calls through
+a pointer are what it cannot see, and what the 2 KB is for: the deepest
+function reached only through one measured 1 056 bytes when this was
+written.
+
+**The stack is linked below the statics** (F-096). A measurement lowers the
+odds of an overflow; it does not make one visible. So `ram.x`, which the
+production and the bench map both include, gives the stack its own region at the bottom of RAM, 63 KB from `0x20000000`, with
+`.data`, `.bss` and `.uninit` above it and the mailbox above them, and sets
+`_stack_start` to the region's top and `_stack_end` to the RAM origin. An
+overflow now runs off the bottom of RAM: the first push below `0x20000000`
+addresses whatever the part maps under RAM, not a static, and is expected
+to fault there (what sits at `0x1FFF_FFFC` was not confirmed from RM0444); the hard fault cannot stack its own frame either, and the core
+locks up without running the handler. Lockup is the Armv6-M architecture's
+answer to a fault in the hard fault's own entry. Neither is proven on the
+part yet: the bench run for #233 reads `DHCSR.S_LOCKUP` before the reset,
+and whatever the part does below RAM, it writes over no static, because
+none is under the stack. The G0B1's datasheet
+(DS13560, the interconnect table) routes the core's lockup to the break
+inputs of TIM1, TIM15, TIM16 and TIM17, which nothing here uses, and the
+reset flags in `RCC_CSR` have none for it, so this design counts on no
+lockup reset: the IWDG, on the LSI and fed by nobody, resets the part. Its
+period is 8 s at the 32 kHz the driver assumes, and up to 8.7 s at the
+29.5 kHz DS13560's table 46 allows. RM0444's list of system reset sources is
+where to confirm that; it was not read when this was written. While the core
+is locked up every output stays as it was last written, the hang case:
+`KICK` stops, so board B's monostable opens the contact within its
+3.0–6.5 s, and the reset vector drives `RUN` and `KICK` low after the reset.
+Nothing writes last words on the way, so the boot after reads an IWDG reset
+with nobody named, `BootCause::Watchdog(None)`, or the boot's own
+provisional blame if the overflow cut the boot short before its store was
+read, or a task the supervisor had already named as overdue. A blame the supervisor wrote for a late task is withdrawn when that
+task checks in again, unless a panic site has replaced it since, so it
+cannot name a task that recovered long before the lockup. The statics, the last words among them, are never under the
+stack.
+
+That bound holds only once the IWDG is armed, in step 4. An overflow before
+it, in the frame `main`'s task reserves on its first poll or anywhere in the
+clock setup, locks the core up with nothing to reset it: `RUN` and `KICK`
+stay low where the bootloader or step 1 left them, and the unit stays dead
+until its power is cycled. The gate's measurement is what keeps that
+window's stack in its region; arming the watchdog before it is #168.
+
+The stack's 63 KB is a budget like any other capacity: a static that no
+longer fits fails the link on `RAM`, and the fix is to take what it needs
+from `STACK` in `ram.x` and let F-094 say whether the stack still fits.
+`flip-link`, which relinks to give the stack whatever RAM is left, was not
+used: cargo names a linker per target rather than per package, so it would
+relink `o89-boot` too, and it is one more host binary that CI, the
+reproducible build's container and every bench laptop would have to pin.
+The gate reads the release ELF and refuses an image whose stack's floor is
+not the RAM origin, which puts a nonempty section in RAM under the stack's
+top, whose first vector is not that top, or whose mailbox is not where
+`o89-core` names it.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
 fed from a timer interrupt is a watchdog that does not work.

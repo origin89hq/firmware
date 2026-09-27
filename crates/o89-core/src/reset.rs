@@ -438,6 +438,47 @@ mod tests {
     }
 
     #[test]
+    fn f_096_a_stack_overflow_the_watchdog_ends_is_a_watchdog_with_nobody_named() {
+        // An overflow faults on the first push below RAM, and the hard
+        // fault cannot stack its own frame, so the core locks up with the
+        // handler never run: no last words, no software reset, and the
+        // IWDG resets the part. That flag raises the pin flag with it.
+        let flags = ResetFlags::NONE.watchdog(true).pin(true);
+        assert_eq!(ResetCause::from_flags(flags), ResetCause::Watchdog);
+        // The boot before took its predecessor's words and cleared its own
+        // provisional blame, so the words it leaves are cleared ones.
+        let none_written = LastWords::decode(&crate::CLEARED);
+        assert_eq!(none_written, None);
+        assert_eq!(
+            record(ResetCause::Watchdog, none_written).body().cause,
+            BootCause::Watchdog(None)
+        );
+        // RAM holding no record, as after a power-up, reads the same.
+        let noise = LastWords::decode(&[0x4C41_5354, 0, 1, 2, 3]);
+        assert_eq!(noise, None);
+        assert_eq!(
+            record(ResetCause::Watchdog, noise).body().cause,
+            BootCause::Watchdog(None)
+        );
+        // An overflow before the store is read ends under the boot's own
+        // provisional blame, which names the phase it cut short.
+        let provisional = LastWords::decode(
+            &LastWords::Starved(Blame {
+                task: Task::Boot,
+                overdue: Millis::ZERO,
+            })
+            .encode(),
+        );
+        assert_eq!(
+            record(ResetCause::Watchdog, provisional).body().cause,
+            BootCause::Watchdog(Some(Starved {
+                task: Task::Boot.byte(),
+                overdue_ms: 0,
+            }))
+        );
+    }
+
+    #[test]
     fn f_008_a_software_reset_with_a_panic_site_is_a_panic_and_without_one_is_not() {
         assert_eq!(
             record(ResetCause::Software, Some(panicked())).body().cause,

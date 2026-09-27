@@ -526,9 +526,9 @@ Source: owner decision 2026-09-24, temporary until
 
 **F-094** — The controller's deepest stack, measured on every commit from
 its release image as the frames of its direct calls under each task and
-handler that can be live at once, stays 2 KB under the room between its
-statics and its mailbox; no task of the control executor starts on the frame
-of `main`, which holds that executor until it has returned. Source:
+handler that can be live at once, stays 2 KB under the stack's region; no
+task of the control executor starts on the frame of `main`, which holds that
+executor until it has returned. Source:
 [#217](https://github.com/origin89hq/firmware/issues/217). M0.
 
 **F-095** — The NOR's bus is built only when the clock the HAL recorded for
@@ -537,6 +537,18 @@ select is held high, and the recorder runs without a ring, as it does for a
 part that does not answer; the controller keeps its store, its tasks and its
 rollcall, and nothing panics. Source:
 [#217](https://github.com/origin89hq/firmware/issues/217). M2.
+
+**F-096** — The controller's stack is linked at the bottom of RAM, its floor
+at the RAM origin and every static and the mailbox above its top, so an
+overflow faults on its first push below RAM instead of writing over a
+static. The gate refuses an image linked otherwise, or whose mailbox is not
+where `o89-core` names it. The core is expected to lock up in that fault
+(bench pending, #233) and, once the IWDG is armed, the IWDG resets it; the
+boot after reports a watchdog reset with nobody named unless a blame still
+stands: a task overdue when the lockup came, or the boot's provisional
+blame. The supervisor withdraws a task's blame when that task checks in
+again.
+Source: [#233](https://github.com/origin89hq/firmware/issues/233). M0.
 
 **F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller
 core. The adapter submits each due KM43 `0x0806` to the existing bounded

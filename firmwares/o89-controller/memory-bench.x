@@ -8,12 +8,10 @@
 MEMORY
 {
   FLASH : ORIGIN = 0x08000000, LENGTH = 480K
-  RAM   : ORIGIN = 0x20000000, LENGTH = 136K
-  /* The bench tool's mailbox and the bridge's rings: the last 8 KiB, out
-   * of the stack's way and never loaded or zeroed by the runtime, at the
-   * address o89-core names. */
-  MAILBOX : ORIGIN = 0x20022000, LENGTH = 8K
 }
+
+/* The stack, the statics and the mailbox. */
+INCLUDE ram.x
 
 _stext = ORIGIN(FLASH) + 0x100;
 
@@ -25,11 +23,3 @@ SECTIONS
   } > FLASH
 }
 INSERT AFTER .vector_table;
-
-SECTIONS
-{
-  .o89_mailbox (NOLOAD) :
-  {
-    KEEP(*(.o89_mailbox))
-  } > MAILBOX
-}

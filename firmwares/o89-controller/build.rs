@@ -68,6 +68,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     fs::write(out.join("memory.x"), map)?;
+    // Both maps include the one RAM layout, so a bench image's is the
+    // production image's (F-096).
+    fs::write(out.join("ram.x"), include_bytes!("ram.x"))?;
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rustc-link-arg=-Tlink.x");
     println!("cargo:rustc-link-arg=-Tdefmt.x");
@@ -83,6 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=DEFMT_LOG");
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=memory-bench.x");
+    println!("cargo:rerun-if-changed=ram.x");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../link_version.rs");
     Ok(())
