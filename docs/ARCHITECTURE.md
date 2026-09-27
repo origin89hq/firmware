@@ -527,7 +527,10 @@ its last write, no lock is held across an await, and no interrupt is masked
 while a page is encoded or a digest computed. A holder always finishes
 before another task runs, so the lock is free when asked; a caller that
 ever finds it held answers a retry, and a `Hello` is refused with error 7
-rather than told a topology that may not be current.
+rather than told a topology that may not be current. A page the site cannot
+write is a defect, answered error 7 as well: KM43 has no live code for a
+controller fault a client should not retry, so the probe's note names the
+failure that the wire cannot.
 
 **The descriptors change as a whole.** A batch is checked against the
 tables as they would stand and taken under a new revision, or refused and
