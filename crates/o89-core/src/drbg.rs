@@ -144,6 +144,8 @@ impl Generator {
 
     /// A network origin token: one draw, its first eight bytes (L-138).
     pub async fn origin<F: Fram>(&mut self, fram: &mut F) -> Result<km43::NetOrigin, Unavailable> {
+        // A token wider than the draw would end in zeros nobody drew.
+        const _: () = assert!(CHALLENGE_BYTES >= km43::NET_ORIGIN_BYTES);
         let challenge = self.challenge(fram).await?;
         let mut token = [0; km43::NET_ORIGIN_BYTES];
         for (to, from) in token.iter_mut().zip(challenge) {
