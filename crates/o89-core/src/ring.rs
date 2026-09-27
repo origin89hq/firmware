@@ -1397,8 +1397,7 @@ mod tests {
         // A torn record at the head closes its block: the search moves the
         // head on, and the block ahead of it is the kept one.
         let head = ring.head();
-        let at = head.block as usize * ERASE + head.at as usize;
-        ring.flash.bytes[at..at + 4].copy_from_slice(&[0x00, 0x12, 0x34, 0x56]);
+        tear(&mut ring);
         let mut scratch = [0u8; SCRATCH];
         block_on(ring.reconcile(&mut scratch)).expect("found again");
         assert_ne!(ring.head().block, head.block, "moved past the closed block");
@@ -1406,6 +1405,86 @@ mod tests {
         assert_eq!(read(&mut ring, first).0[0], first);
         ring.keep(None);
         assert_eq!(append_until_refused_or(&mut ring, first), None);
+    }
+
+    /// Close the head's block with a torn record at the head: bytes where
+    /// a record would start that no scan can read.
+    fn tear(ring: &mut Ring<Part<ERASE>>) {
+        let head = ring.head();
+        let at = (head.block as usize)
+            .saturating_mul(ERASE)
+            .saturating_add(head.at as usize);
+        ring.flash.bytes[at..at.saturating_add(4)].copy_from_slice(&[0x00, 0x12, 0x34, 0x56]);
+    }
+
+    /// The kept position in the block past the head, its erase ahead
+    /// waiting: a page turn refused to erase it, and a torn write then
+    /// moved the head on into the block before it. Answers the ring and
+    /// the kept sequence, still kept.
+    fn kept_past_a_torn_write() -> (Ring<Part<ERASE>>, u64) {
+        let mut part: Part<ERASE> = fresh();
+        let mut ring = open(&mut part);
+        let first = append(&mut ring, None);
+        ring.keep(Some(first));
+        assert_eq!(append_until_refused(&mut ring), RingError::Kept(first));
+        let torn = ring.head();
+        tear(&mut ring);
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.reconcile(&mut scratch)).expect("found again");
+        let head = ring.head();
+        assert_eq!(torn.block, 6, "the turn into block 7 would erase block 0");
+        assert_eq!(head.block, 7, "moved on, the kept block 0 next");
+        assert_eq!(head.at, 0);
+        assert_eq!(head.oldest, Some(first), "the erase ahead waited");
+        (ring, first)
+    }
+
+    #[test]
+    fn p_180_a_page_turn_into_the_block_holding_the_kept_position_is_refused() {
+        let (mut ring, first) = kept_past_a_torn_write();
+        let found = ring.head();
+        // The block after the kept one holds newer records, so only the
+        // turn's destination stands between the append and the erase.
+        let mut appended = Ok(0);
+        for _ in 0..64 {
+            appended = try_append(&mut ring);
+            if appended.is_err() || ring.head().block != found.block {
+                break;
+            }
+        }
+        assert_eq!(appended, Err(RingError::Kept(first)));
+        let head = ring.head();
+        assert_eq!(head.block, found.block, "the page did not turn");
+        assert_eq!(head.oldest, Some(first), "nothing erased");
+        assert!(ring.is_proven(), "refused before anything was erased");
+        assert_eq!(try_append(&mut ring), Err(RingError::Kept(first)), "still");
+        assert_eq!(ring.head(), head);
+        assert_eq!(read(&mut ring, first).0[0], first);
+    }
+
+    #[test]
+    fn p_180_a_torn_write_before_the_kept_block_leaves_the_head_at_the_end_of_the_closed_block() {
+        let (mut ring, first) = kept_past_a_torn_write();
+        let _ = append(&mut ring, None);
+        let closed = ring.head().block;
+        tear(&mut ring);
+        let mut scratch = [0u8; SCRATCH];
+        block_on(ring.reconcile(&mut scratch)).expect("found again");
+        let head = ring.head();
+        assert_eq!(head.block, closed, "the head stayed in the closed block");
+        assert_eq!(
+            head.at,
+            u32::try_from(ERASE).expect("fits"),
+            "at its end, so the next turns"
+        );
+        assert_eq!(head.oldest, Some(first), "the kept block was not erased");
+        assert_eq!(read(&mut ring, first).0[0], first);
+        assert_eq!(try_append(&mut ring), Err(RingError::Kept(first)));
+        assert_eq!(ring.head(), head);
+        ring.keep(None);
+        assert_eq!(try_append(&mut ring), Ok(head.next_seq), "turned");
+        assert_eq!(ring.head().block, 0);
+        assert!(ring.head().oldest.is_some_and(|oldest| oldest > first));
     }
 
     /// Append until the oldest has moved past `seq`, or the ring refuses.
