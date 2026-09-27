@@ -5,10 +5,15 @@
 //!
 //! Two files, both public. The export file, named by the operator, holds
 //! only records the part confirmed; it is what the cloud imports. Beside it,
-//! `<export>.drawn` holds the pairs the station drew before it staged them,
-//! so a `--resume` in a later process still has the station's own
-//! fingerprint to confirm against. A drawn pair whose key never reached the
-//! part stays there and is never exported.
+//! `<export>.drawn` journals every transaction before it is staged: the pair
+//! the station drew for a birth, or the intent of a `--replace`. A
+//! `--resume` in a later process confirms against that entry, and refuses a
+//! ledger that has none, which is the wrong file. A drawn pair whose key
+//! never reached the part stays in the journal and is never exported.
+//!
+//! Both files change only by a whole new copy renamed over the old one, so a
+//! host cut off mid-write leaves the file as it was or as it will be, never
+//! a torn line.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -19,27 +24,38 @@ use km43::{DeviceId, FINGERPRINT_BYTES, Fingerprint};
 use o89_core::DEVICE_ID_BYTES;
 use serde::{Deserialize, Serialize};
 
-/// The export file's format name and version.
-const EXPORTED: Format = Format {
-    name: "o89-controller-record",
-    version: 1,
-};
+/// Every line's version; a change to any field's meaning is a new one.
+const VERSION: u32 = 1;
 
-/// The drawn journal's: distinct, so an import handed the journal refuses it.
-const DRAWN: Format = Format {
-    name: "o89-controller-drawn",
-    version: 1,
-};
-
-/// Every line either file holds is 144 bytes with its newline; anything past this is
-/// not a line the station wrote, and reading stops there.
+/// Every line either file holds is at most 145 bytes with its newline;
+/// anything past this is not a line the station wrote, and reading stops.
 const LINE_BYTES: u64 = 512;
 
-#[derive(Clone, Copy)]
-struct Format {
-    name: &'static str,
-    version: u32,
+/// What a line says, by its format name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// The export file's record, confirmed by the part.
+    Exported,
+    /// A key the station drew for a birth, journaled before it was staged.
+    Drawn,
+    /// A `--replace` journaled before it was staged, with the fingerprint
+    /// the part held then: a lookup key for the export file, never a source.
+    Replaced,
 }
+
+impl Kind {
+    const fn format(self) -> &'static str {
+        match self {
+            Self::Exported => "o89-controller-record",
+            // Distinct, so an import handed the journal refuses it.
+            Self::Drawn => "o89-controller-drawn",
+            Self::Replaced => "o89-controller-replace",
+        }
+    }
+}
+
+const EXPORT_KINDS: &[Kind] = &[Kind::Exported];
+const JOURNAL_KINDS: &[Kind] = &[Kind::Drawn, Kind::Replaced];
 
 /// One unit's public record: its device id and its controller key's
 /// fingerprint (P-236).
@@ -78,28 +94,40 @@ pub enum Exported {
     Appended(Record),
     /// The file already held this exact record; nothing was written.
     AlreadyHeld(Record),
-    /// The station holds no record of the key the part carries, so nothing
+    /// A `--replace` onto a key the station holds no record of, so nothing
     /// was exported: its fingerprint is never taken from the part.
     NoStationRecord,
 }
 
-/// The export file and its drawn journal.
+/// What the export file says about one device id and one fingerprint.
+struct InExport {
+    /// The record for the device id.
+    held: Option<Record>,
+    /// A record, under any device id, of the fingerprint.
+    of_key: Option<Record>,
+}
+
+/// The export file and its journal.
 pub struct Ledger {
     export: PathBuf,
-    drawn: PathBuf,
+    journal: PathBuf,
 }
 
 impl Ledger {
-    /// The ledger for the operator's export file; neither file need exist.
+    /// The ledger for the operator's export file; neither file need exist,
+    /// but the name must be a file's.
     pub fn new(export: &Path) -> Result<Self> {
-        let mut drawn = export.as_os_str().to_owned();
-        drawn.push(".drawn");
-        if export.file_name().is_none() {
+        let text = export.as_os_str().to_string_lossy();
+        if export.file_name().is_none()
+            || text.ends_with(std::path::MAIN_SEPARATOR)
+            || text.ends_with('/')
+            || export.is_dir()
+        {
             bail!("the export file {} names no file", export.display());
         }
         Ok(Self {
             export: export.to_owned(),
-            drawn: PathBuf::from(drawn),
+            journal: suffixed(export, ".drawn"),
         })
     }
 
@@ -108,77 +136,94 @@ impl Ledger {
         &self.export
     }
 
-    /// Before a birth is staged: refuse a device id the export file already
-    /// gives another fingerprint, then journal the pair durably. Nothing is
-    /// staged unless this returns `Ok`.
+    /// Before a birth is staged: admit the pair, then journal it. Nothing
+    /// is staged unless this returns `Ok`.
     pub fn note_drawn(&self, record: Record) -> Result<()> {
-        self.refuse_conflict(record)?;
-        append(&self.drawn, DRAWN, record)
+        self.admit(record)?;
+        commit(&self.journal, Kind::Drawn, record)
     }
 
-    /// Before a `--replace` is staged: refuse a device id the export file
-    /// already gives a fingerprint other than the one the part holds now,
-    /// or one the station drew another key for, which `confirm` would
-    /// refuse only once the part had applied it. The part's fingerprint is
-    /// compared here, never recorded.
-    pub fn check_replace(&self, record: Record) -> Result<()> {
-        self.refuse_conflict(record)?;
-        let mut drawn_other = false;
-        scan(&self.drawn, DRAWN, |line| {
-            drawn_other |=
-                line.device_id == record.device_id && line.fingerprint != record.fingerprint;
-        })?;
-        if drawn_other {
-            bail!(
-                "{} records a key drawn for device id {} other than the one this unit holds; \
-                 choose another device id. Nothing was staged",
-                self.drawn.display(),
-                hex::encode(record.device_id.as_bytes())
-            );
-        }
-        Ok(())
+    /// Before a `--replace` is staged, with the fingerprint the part holds:
+    /// admit the pair, then journal the intent. The fingerprint is compared
+    /// and kept as a lookup key, never exported from here.
+    pub fn note_replace(&self, record: Record) -> Result<()> {
+        self.admit(record)?;
+        commit(&self.journal, Kind::Replaced, record)
     }
 
-    fn refuse_conflict(&self, record: Record) -> Result<()> {
-        let mut held = None;
-        scan(&self.export, EXPORTED, |line| {
-            if line.device_id == record.device_id {
-                held = Some(*line);
+    /// Refuse a device id the export file gives another fingerprint, or,
+    /// unless the export already settles it as this exact pair, one the
+    /// journal holds another key for: that key may be on a part awaiting
+    /// `--resume`, and `confirm` would refuse only once a second part had
+    /// applied this one. Both files are read whole, so a damaged one is
+    /// refused before anything is staged.
+    fn admit(&self, record: Record) -> Result<()> {
+        match self.in_export(record)?.held {
+            Some(held) if held == record => {
+                // Settled: abandoned draws for the id do not veto it.
+                scan(&self.journal, JOURNAL_KINDS, |_, _| Ok(()))?;
+                return Ok(());
             }
-        })?;
-        match held {
-            Some(held) if held.fingerprint != record.fingerprint => bail!(
+            Some(held) => bail!(
                 "{} already records device id {} with fingerprint {}; a second fingerprint for it \
                  is refused and nothing was staged",
                 self.export.display(),
                 hex::encode(record.device_id.as_bytes()),
                 hex::encode(held.fingerprint.as_bytes())
             ),
-            Some(_) | None => Ok(()),
+            None => {}
         }
+        let mut other = false;
+        scan(&self.journal, JOURNAL_KINDS, |_, line| {
+            other |= line.device_id == record.device_id && line.fingerprint != record.fingerprint;
+            Ok(())
+        })?;
+        if other {
+            bail!(
+                "{} holds another controller key for device id {}, which may be on a part \
+                 awaiting --resume; choose another device id. Nothing was staged",
+                self.journal.display(),
+                hex::encode(record.device_id.as_bytes())
+            );
+        }
+        Ok(())
+    }
+
+    fn in_export(&self, record: Record) -> Result<InExport> {
+        let mut found = InExport {
+            held: None,
+            of_key: None,
+        };
+        scan(&self.export, EXPORT_KINDS, |_, line| {
+            if line.device_id == record.device_id {
+                if found.held.is_some() {
+                    bail!(
+                        "device id {} is recorded twice",
+                        hex::encode(line.device_id.as_bytes())
+                    );
+                }
+                found.held = Some(*line);
+            }
+            if line.fingerprint == record.fingerprint {
+                found.of_key = Some(*line);
+            }
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// After the part confirmed it applied the key whose fingerprint is
     /// `applied`: export the station's own record for it. The fingerprint is
-    /// only a key to look up here. The record's source is the drawn journal
-    /// for this device id, or, for a `--replace` that kept the key, the
-    /// export file's earlier record of that key.
+    /// only a key to look up here. The record's source is the journal's
+    /// drawn pair for this device id, or, for a `--replace` that kept the
+    /// key, the export file's earlier record of that key.
     pub fn confirm(&self, device_id: DeviceId, applied: Fingerprint) -> Result<Exported> {
         let wanted = Record {
             device_id,
             fingerprint: applied,
         };
-        let mut held = None;
-        let mut earlier_key = None;
-        scan(&self.export, EXPORTED, |line| {
-            if line.device_id == device_id {
-                held = Some(*line);
-            }
-            if line.fingerprint == applied {
-                earlier_key = Some(*line);
-            }
-        })?;
-        match held {
+        let found = self.in_export(wanted)?;
+        match found.held {
             Some(held) if held == wanted => return Ok(Exported::AlreadyHeld(held)),
             Some(held) => bail!(
                 "{} records device id {} with fingerprint {}, but the part applied {}; nothing \
@@ -192,16 +237,19 @@ impl Ledger {
         }
         let mut drawn = None;
         let mut drawn_other = false;
-        scan(&self.drawn, DRAWN, |line| {
+        let mut replaced = false;
+        scan(&self.journal, JOURNAL_KINDS, |kind, line| {
             if line.device_id == device_id {
-                if line.fingerprint == applied {
-                    drawn = Some(*line);
-                } else {
-                    drawn_other = true;
+                match kind {
+                    Kind::Drawn if line.fingerprint == applied => drawn = Some(*line),
+                    Kind::Drawn => drawn_other = true,
+                    Kind::Replaced => replaced = true,
+                    Kind::Exported => {}
                 }
             }
+            Ok(())
         })?;
-        let source = match (drawn, earlier_key) {
+        let source = match (drawn, found.of_key) {
             (Some(record), _) => record,
             (None, Some(earlier)) => Record {
                 device_id,
@@ -214,38 +262,85 @@ impl Ledger {
                 hex::encode(applied.as_bytes()),
                 hex::encode(device_id.as_bytes())
             ),
-            (None, None) => return Ok(Exported::NoStationRecord),
+            (None, None) if replaced => return Ok(Exported::NoStationRecord),
+            (None, None) => bail!(
+                "{} has no entry for device id {}'s transaction; resume with the --export file \
+                 the write used. Nothing exported",
+                self.journal.display(),
+                hex::encode(device_id.as_bytes())
+            ),
         };
-        append(&self.export, EXPORTED, source)?;
+        commit(&self.export, Kind::Exported, source)?;
         Ok(Exported::Appended(source))
     }
 }
 
-/// Append one line and make it durable before returning.
-fn append(path: &Path, format: Format, record: Record) -> Result<()> {
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut text = path.as_os_str().to_owned();
+    text.push(suffix);
+    PathBuf::from(text)
+}
+
+/// Add one line to `path` as a new copy renamed over it, synced before and
+/// after the rename. The caller has already read the file whole, so the
+/// copy carries only lines the station accepts.
+fn commit(path: &Path, kind: Kind, record: Record) -> Result<()> {
     let device_id = hex::encode(record.device_id.as_bytes());
     let controller_fp = hex::encode(record.fingerprint.as_bytes());
     let mut text = serde_json::to_string(&Line {
-        format: format.name,
-        version: format.version,
+        format: kind.format(),
+        version: VERSION,
         device_id: &device_id,
         controller_fp: &controller_fp,
     })
     .context("encoding a record")?;
     text.push('\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("appending to {}", path.display()))
+    let staging = suffixed(path, ".new");
+    let written = (|| -> std::io::Result<()> {
+        // A copy a cut-off write left behind is replaced whole.
+        let mut copy = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staging)?;
+        match File::open(path) {
+            Ok(mut old) => {
+                std::io::copy(&mut old, &mut copy)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        copy.write_all(text.as_bytes())?;
+        copy.sync_all()?;
+        std::fs::rename(&staging, path)?;
+        sync_directory(path)
+    })();
+    written.with_context(|| format!("writing {} through {}", path.display(), staging.display()))
+}
+
+/// Make the rename durable: the directory's entry, not only the file's bytes.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        Some(_) | None => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
+}
+
+/// Windows offers no directory handle to sync; the rename is what there is.
+#[cfg(not(unix))]
+fn sync_directory(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Every record in `path`, one at a time, refusing the file whole if any
-/// line is not one of `format`'s. A file that does not exist holds none.
-fn scan(path: &Path, format: Format, mut each: impl FnMut(&Record)) -> Result<()> {
+/// line is not one of `kinds`. A file that does not exist holds none.
+fn scan(
+    path: &Path,
+    kinds: &[Kind],
+    mut each: impl FnMut(Kind, &Record) -> Result<()>,
+) -> Result<()> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -256,7 +351,9 @@ fn scan(path: &Path, format: Format, mut each: impl FnMut(&Record)) -> Result<()
     let mut reader = BufReader::new(file);
     let mut text = String::new();
     // Bounded by the file: each pass consumes at least one byte or ends.
-    for number in 1u64.. {
+    let mut number = 0u64;
+    loop {
+        number = number.saturating_add(1);
         text.clear();
         let read = (&mut reader)
             .take(LINE_BYTES)
@@ -272,31 +369,32 @@ fn scan(path: &Path, format: Format, mut each: impl FnMut(&Record)) -> Result<()
                 path.display()
             );
         };
-        let record =
-            parse(body, format).with_context(|| format!("line {number} of {}", path.display()))?;
-        each(&record);
+        let (kind, record) =
+            parse(body, kinds).with_context(|| format!("line {number} of {}", path.display()))?;
+        each(kind, &record).with_context(|| format!("line {number} of {}", path.display()))?;
     }
-    Ok(())
 }
 
-fn parse(body: &str, format: Format) -> Result<Record> {
+fn parse(body: &str, kinds: &[Kind]) -> Result<(Kind, Record)> {
     let line: Line<'_> = serde_json::from_str(body).context("not a record")?;
-    if line.format != format.name || line.version != format.version {
-        bail!(
-            "format {} version {}, where {} version {} is expected",
-            line.format,
-            line.version,
-            format.name,
-            format.version
-        );
+    let Some(kind) = kinds
+        .iter()
+        .copied()
+        .find(|kind| kind.format() == line.format)
+    else {
+        bail!("format {} is not one this file holds", line.format);
+    };
+    if line.version != VERSION {
+        bail!("version {}, where {VERSION} is expected", line.version);
     }
-    Ok(Record {
+    let record = Record {
         device_id: DeviceId::new(lower_hex::<DEVICE_ID_BYTES>(line.device_id, "device_id")?),
         fingerprint: Fingerprint::from_label(lower_hex::<FINGERPRINT_BYTES>(
             line.controller_fp,
             "controller_fp",
         )?),
-    })
+    };
+    Ok((kind, record))
 }
 
 fn lower_hex<const N: usize>(text: &str, field: &str) -> Result<[u8; N]> {
@@ -351,11 +449,24 @@ pub(super) mod tests {
 
     /// The export file's lines, in order.
     pub fn exported(ledger: &Ledger) -> Vec<String> {
-        match std::fs::read_to_string(&ledger.export) {
+        lines(&ledger.export)
+    }
+
+    /// The journal's lines, in order.
+    pub fn journaled(ledger: &Ledger) -> Vec<String> {
+        lines(&ledger.journal)
+    }
+
+    fn lines(path: &Path) -> Vec<String> {
+        match std::fs::read_to_string(path) {
             Ok(text) => text.lines().map(str::to_owned).collect(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => panic!("reading the export: {error}"),
+            Err(error) => panic!("reading {}: {error}", path.display()),
         }
+    }
+
+    fn confirm(ledger: &Ledger, record: Record) -> Result<Exported> {
+        ledger.confirm(record.device_id, record.fingerprint)
     }
 
     #[test]
@@ -369,9 +480,13 @@ pub(super) mod tests {
         ledger.note_drawn(record).unwrap();
         assert!(exported(&ledger).is_empty(), "a draw alone is not exported");
         assert_eq!(
-            ledger
-                .confirm(record.device_id, record.fingerprint)
-                .unwrap(),
+            journaled(&ledger),
+            [
+                r#"{"format":"o89-controller-drawn","version":1,"device_id":"abababababababababababababababab","controller_fp":"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"}"#
+            ]
+        );
+        assert_eq!(
+            confirm(&ledger, record).unwrap(),
             Exported::Appended(record)
         );
         assert_eq!(
@@ -380,22 +495,18 @@ pub(super) mod tests {
                 r#"{"format":"o89-controller-record","version":1,"device_id":"abababababababababababababababab","controller_fp":"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"}"#
             ]
         );
+        assert!(!scratch.0.join("units.jsonl.new").exists());
     }
 
     #[test]
     fn p_249_confirming_the_same_record_twice_writes_it_once() {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
-        let record = record(1, 2);
-        ledger.note_drawn(record).unwrap();
-        let _ = ledger
-            .confirm(record.device_id, record.fingerprint)
-            .unwrap();
+        ledger.note_drawn(record(1, 2)).unwrap();
+        let _ = confirm(&ledger, record(1, 2)).unwrap();
         assert_eq!(
-            ledger
-                .confirm(record.device_id, record.fingerprint)
-                .unwrap(),
-            Exported::AlreadyHeld(record)
+            confirm(&ledger, record(1, 2)).unwrap(),
+            Exported::AlreadyHeld(record(1, 2))
         );
         assert_eq!(exported(&ledger).len(), 1);
     }
@@ -405,17 +516,31 @@ pub(super) mod tests {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
         ledger.note_drawn(record(1, 2)).unwrap();
-        let _ = ledger.confirm(record(1, 2).device_id, record(1, 2).fingerprint);
+        let _ = confirm(&ledger, record(1, 2)).unwrap();
         let before = exported(&ledger);
-        let drawn_before = std::fs::read(&ledger.drawn).unwrap();
+        let journal_before = journaled(&ledger);
         let error = ledger.note_drawn(record(1, 3)).unwrap_err();
         assert!(error.to_string().contains("second fingerprint"), "{error}");
-        assert_eq!(std::fs::read(&ledger.drawn).unwrap(), drawn_before);
-        let error = ledger
-            .confirm(record(1, 3).device_id, record(1, 3).fingerprint)
-            .unwrap_err();
+        assert_eq!(journaled(&ledger), journal_before);
+        let error = confirm(&ledger, record(1, 3)).unwrap_err();
         assert!(error.to_string().contains("nothing exported"), "{error}");
         assert_eq!(exported(&ledger), before);
+    }
+
+    #[test]
+    fn p_249_a_birth_on_a_device_id_the_journal_holds_another_key_for_is_refused() {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        // Drawn, not yet confirmed: the key may be on a part awaiting resume.
+        ledger.note_drawn(record(1, 2)).unwrap();
+        let before = journaled(&ledger);
+        let error = ledger.note_drawn(record(1, 3)).unwrap_err();
+        assert!(
+            error.to_string().contains("choose another device id"),
+            "{error}"
+        );
+        assert_eq!(journaled(&ledger), before);
+        ledger.note_drawn(record(4, 3)).unwrap();
     }
 
     #[test]
@@ -423,25 +548,37 @@ pub(super) mod tests {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
         ledger.note_drawn(record(1, 2)).unwrap();
-        let error = ledger
-            .confirm(record(1, 9).device_id, record(1, 9).fingerprint)
-            .unwrap_err();
+        let error = confirm(&ledger, record(1, 9)).unwrap_err();
         assert!(error.to_string().contains("did not draw"), "{error}");
         assert!(exported(&ledger).is_empty());
     }
 
     #[test]
-    fn p_249_a_key_with_no_station_record_exports_nothing() {
+    fn p_249_a_replace_onto_a_key_with_no_station_record_exports_nothing() {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
+        ledger.note_replace(record(1, 2)).unwrap();
         assert_eq!(
-            ledger
-                .confirm(record(1, 2).device_id, record(1, 2).fingerprint)
-                .unwrap(),
+            confirm(&ledger, record(1, 2)).unwrap(),
             Exported::NoStationRecord
         );
         assert!(exported(&ledger).is_empty());
-        assert!(!ledger.drawn.exists());
+    }
+
+    #[test]
+    fn p_249_a_transaction_the_journal_does_not_hold_is_refused_as_the_wrong_file() {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        let error = confirm(&ledger, record(1, 2)).unwrap_err();
+        assert!(
+            error.to_string().contains("resume with the --export"),
+            "{error}"
+        );
+        assert!(exported(&ledger).is_empty());
+        // Another unit's entries do not stand in for this one's.
+        ledger.note_replace(record(3, 4)).unwrap();
+        assert!(confirm(&ledger, record(1, 2)).is_err());
+        assert!(exported(&ledger).is_empty());
     }
 
     #[test]
@@ -449,31 +586,57 @@ pub(super) mod tests {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
         ledger.note_drawn(record(1, 2)).unwrap();
-        let _ = ledger.confirm(record(1, 2).device_id, record(1, 2).fingerprint);
-        ledger.check_replace(record(7, 2)).unwrap();
+        let _ = confirm(&ledger, record(1, 2)).unwrap();
+        ledger.note_replace(record(7, 2)).unwrap();
         assert_eq!(
-            ledger
-                .confirm(record(7, 2).device_id, record(7, 2).fingerprint)
-                .unwrap(),
+            confirm(&ledger, record(7, 2)).unwrap(),
             Exported::Appended(record(7, 2))
         );
         assert_eq!(exported(&ledger).len(), 2);
         // The same device id replaced with the key it has: nothing new.
-        ledger.check_replace(record(1, 2)).unwrap();
-        assert!(ledger.check_replace(record(1, 5)).is_err());
+        ledger.note_replace(record(1, 2)).unwrap();
+        assert_eq!(
+            confirm(&ledger, record(1, 2)).unwrap(),
+            Exported::AlreadyHeld(record(1, 2))
+        );
+        assert!(ledger.note_replace(record(1, 5)).is_err());
     }
 
     #[test]
     fn p_249_a_replace_onto_a_device_id_drawn_for_another_key_is_refused_before_staging() {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
-        // Drawn, never confirmed: the key never reached a part.
+        // Drawn, never confirmed: the key may be on another part.
         ledger.note_drawn(record(1, 2)).unwrap();
-        let error = ledger.check_replace(record(1, 3)).unwrap_err();
+        let before = journaled(&ledger);
+        let error = ledger.note_replace(record(1, 3)).unwrap_err();
         assert!(error.to_string().contains("Nothing was staged"), "{error}");
-        ledger.check_replace(record(1, 2)).unwrap();
-        ledger.check_replace(record(4, 3)).unwrap();
+        assert_eq!(journaled(&ledger), before);
+        ledger.note_replace(record(4, 3)).unwrap();
         assert!(exported(&ledger).is_empty());
+    }
+
+    #[test]
+    fn p_249_abandoned_draws_do_not_veto_a_replace_the_export_settles() {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        // A draw cut off before its stage, then a second that the part took.
+        ledger.note_drawn(record(1, 2)).unwrap();
+        std::fs::write(
+            &ledger.journal,
+            journaled(&ledger).join("\n")
+                + "\n"
+                + r#"{"format":"o89-controller-drawn","version":1,"device_id":"01010101010101010101010101010101","controller_fp":"03030303030303030303030303030303"}"#
+                + "\n",
+        )
+        .unwrap();
+        let _ = confirm(&ledger, record(1, 3)).unwrap();
+        ledger.note_replace(record(1, 3)).unwrap();
+        assert_eq!(
+            confirm(&ledger, record(1, 3)).unwrap(),
+            Exported::AlreadyHeld(record(1, 3))
+        );
+        assert_eq!(exported(&ledger).len(), 1);
     }
 
     #[test]
@@ -487,37 +650,85 @@ pub(super) mod tests {
             good.replace("\"01010101", "\"0A010101"),
             good.replace("0101\",", "01\","),
             good.replace('}', ",\"secret\":\"00\"}"),
+            good.replace("02020202\"", "02020203\""),
             good.to_owned() + &" ".repeat(600),
         ] {
             let scratch = Scratch::new();
             let ledger = scratch.ledger();
             std::fs::write(&ledger.export, format!("{good}\n{bad}\n")).unwrap();
             let before = std::fs::read(&ledger.export).unwrap();
-            assert!(
-                ledger
-                    .confirm(record(1, 2).device_id, record(1, 2).fingerprint)
-                    .is_err(),
-                "{bad}"
-            );
-            assert!(ledger.note_drawn(record(3, 4)).is_err(), "{bad}");
+            // Both would succeed on the good line alone.
+            assert!(confirm(&ledger, record(1, 2)).is_err(), "{bad}");
+            assert!(ledger.note_drawn(record(1, 2)).is_err(), "{bad}");
             assert_eq!(std::fs::read(&ledger.export).unwrap(), before);
+            assert!(journaled(&ledger).is_empty(), "{bad}");
         }
     }
 
     #[test]
-    fn p_249_a_torn_last_line_is_refused_and_not_appended_after() {
+    fn p_249_a_torn_journal_is_refused_before_anything_is_journaled() {
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
-        std::fs::write(&ledger.export, r#"{"format":"o89-controller-rec"#).unwrap();
-        let error = ledger
-            .confirm(record(1, 2).device_id, record(1, 2).fingerprint)
-            .unwrap_err();
+        std::fs::write(&ledger.journal, r#"{"format":"#).unwrap();
+        let error = ledger.note_drawn(record(1, 2)).unwrap_err();
         assert!(format!("{error:#}").contains("cut short"), "{error:#}");
+        assert!(ledger.note_replace(record(1, 2)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&ledger.journal).unwrap(),
+            r#"{"format":"#
+        );
+        // A torn export is refused the same way, and nothing follows it.
+        std::fs::write(&ledger.journal, "").unwrap();
+        std::fs::write(&ledger.export, r#"{"format":"o89-controller-rec"#).unwrap();
+        let error = confirm(&ledger, record(1, 2)).unwrap_err();
+        assert!(format!("{error:#}").contains("cut short"), "{error:#}");
+        assert!(ledger.note_drawn(record(1, 2)).is_err());
     }
 
     #[test]
-    fn a_path_naming_no_file_is_refused() {
+    fn p_249_a_copy_left_by_a_cut_off_write_is_replaced_and_never_read() {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        ledger.note_drawn(record(1, 2)).unwrap();
+        // A cut between the copy and the rename leaves a partial copy.
+        std::fs::write(scratch.0.join("units.jsonl.new"), "{\"torn").unwrap();
+        assert!(exported(&ledger).is_empty());
+        assert_eq!(
+            confirm(&ledger, record(1, 2)).unwrap(),
+            Exported::Appended(record(1, 2))
+        );
+        assert_eq!(exported(&ledger).len(), 1);
+        assert!(!scratch.0.join("units.jsonl.new").exists());
+    }
+
+    #[test]
+    fn p_249_a_copy_that_cannot_be_written_leaves_the_export_as_it_was() {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        ledger.note_drawn(record(1, 2)).unwrap();
+        let _ = confirm(&ledger, record(1, 2)).unwrap();
+        ledger.note_drawn(record(3, 4)).unwrap();
+        let before = std::fs::read(&ledger.export).unwrap();
+        std::fs::create_dir(scratch.0.join("units.jsonl.new")).unwrap();
+        assert!(confirm(&ledger, record(3, 4)).is_err());
+        assert_eq!(std::fs::read(&ledger.export).unwrap(), before);
+        std::fs::remove_dir(scratch.0.join("units.jsonl.new")).unwrap();
+        assert_eq!(
+            confirm(&ledger, record(3, 4)).unwrap(),
+            Exported::Appended(record(3, 4))
+        );
+        assert_eq!(exported(&ledger).len(), 2);
+    }
+
+    #[test]
+    fn a_path_naming_no_file_or_a_directory_is_refused() {
+        let scratch = Scratch::new();
         assert!(Ledger::new(Path::new("/")).is_err());
         assert!(Ledger::new(Path::new("..")).is_err());
+        assert!(Ledger::new(&scratch.0).is_err());
+        let slash = format!("{}/", scratch.0.join("out").display());
+        assert!(Ledger::new(Path::new(&slash)).is_err());
+        let ledger = Ledger::new(&scratch.0.join("out")).unwrap();
+        assert_eq!(ledger.journal, scratch.0.join("out.drawn"));
     }
 }

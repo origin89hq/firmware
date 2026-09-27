@@ -1,5 +1,5 @@
 use super::ledger::Record;
-use super::ledger::tests::{Scratch, exported};
+use super::ledger::tests::{Scratch, exported, journaled};
 use super::*;
 use o89_core::{Address, Fram, SecretChange, Store};
 
@@ -153,6 +153,16 @@ fn staged(link: &mut FakeLink, secret: Secret, birth: Option<o89_core::Birth>) {
         .unwrap();
 }
 
+/// Journal `birth()` for `secret()` as the station does before staging it.
+fn drawn_by_station(ledger: &Ledger) {
+    ledger
+        .note_drawn(Record {
+            device_id: DeviceId::new(secret().device_id_bytes()),
+            fingerprint: birth().controller.fingerprint(),
+        })
+        .unwrap();
+}
+
 /// The fingerprint of the controller key the part holds.
 fn held_fingerprint(link: &mut FakeLink) -> Fingerprint {
     read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)
@@ -294,6 +304,7 @@ fn resume_refuses_mismatched_applied_secret_or_unreadable_generator() {
         let mut link = FakeLink::new();
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
+        drawn_by_station(&ledger);
         staged(&mut link, secret(), Some(birth()));
         if damage_generator {
             let at = usize::from(map::EPOCH.end().0);
@@ -315,6 +326,7 @@ fn p_236_resume_refuses_a_label_whose_controller_key_does_not_read_or_match() {
         let mut link = FakeLink::new();
         let scratch = Scratch::new();
         let ledger = scratch.ledger();
+        drawn_by_station(&ledger);
         staged(&mut link, secret(), Some(birth()));
         if replace_key {
             let mut held =
@@ -346,6 +358,7 @@ fn failed_output_keeps_the_same_label_resumable() {
     let mut link = FakeLink::new();
     let scratch = Scratch::new();
     let ledger = scratch.ledger();
+    drawn_by_station(&ledger);
     staged(&mut link, secret(), Some(birth()));
     assert!(resume_secret(&mut link, &ledger, &mut BrokenOutput).is_err());
     assert!(matches!(link.transaction(), SecretChange::Applied(..)));
@@ -415,6 +428,7 @@ fn failed_flush_does_not_acknowledge_the_label() {
     let mut link = FakeLink::new();
     let scratch = Scratch::new();
     let ledger = scratch.ledger();
+    drawn_by_station(&ledger);
     staged(&mut link, secret(), Some(birth()));
     let mut output = FailedFlush(Vec::new());
     assert!(resume_secret(&mut link, &ledger, &mut output).is_err());
@@ -942,11 +956,12 @@ fn p_249_replace_on_a_unit_the_station_has_no_record_of_exports_nothing_and_says
     let mut link = FakeLink::new();
     let scratch = Scratch::new();
     let ledger = scratch.ledger();
-    // Born elsewhere: its key reached the part without this station's journal.
+    // Born elsewhere: its key reached the part and its label was printed
+    // without this station's ledger.
     staged(&mut link, secret(), Some(birth()));
+    let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, &mut link)).unwrap();
+    block_on(transaction.write(&mut link, SecretChange::Complete)).unwrap();
     let mut output = Vec::new();
-    resume_secret(&mut link, &ledger, &mut output).unwrap();
-    output.clear();
     run_secret(&mut link, &ledger, None, true, false, &mut output).unwrap();
     let label = std::str::from_utf8(&output).unwrap();
     assert!(label.contains("record         none exported"), "{label}");
@@ -954,6 +969,7 @@ fn p_249_replace_on_a_unit_the_station_has_no_record_of_exports_nothing_and_says
     assert_label(&output, active(&mut link), birth().controller.fingerprint());
     assert!(exported(&ledger).is_empty());
     assert!(!scratch.0.join("units.jsonl").exists());
+    assert!(matches!(link.transaction(), SecretChange::Complete));
 }
 
 #[test]
@@ -1012,5 +1028,90 @@ fn p_249_an_export_that_cannot_be_written_prints_no_label_and_stays_resumable() 
     assert_eq!(
         exported(&ledger),
         [record_line(active(&mut link), held_fingerprint(&mut link))]
+    );
+}
+
+#[test]
+fn p_249_a_resume_against_another_export_file_prints_no_label_and_stays_resumable() {
+    let mut link = FakeLink::new();
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    link.reboot = Reboot::Fails;
+    assert!(run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).is_err());
+    link.reboot = Reboot::Boots;
+    // A typo, or the same relative name from another directory.
+    let elsewhere = Scratch::new();
+    let wrong = elsewhere.ledger();
+    let mut output = Vec::new();
+    let error = resume_secret(&mut link, &wrong, &mut output).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("resume with the --export file"),
+        "{error:#}"
+    );
+    assert!(output.is_empty(), "no label");
+    assert!(exported(&wrong).is_empty());
+    assert!(matches!(link.transaction(), SecretChange::Applied(..)));
+    // The right file still completes it, once.
+    resume_secret(&mut link, &ledger, &mut output).unwrap();
+    assert_eq!(
+        exported(&ledger),
+        [record_line(active(&mut link), held_fingerprint(&mut link))]
+    );
+}
+
+#[test]
+fn p_249_a_journal_that_cannot_be_read_or_written_stages_nothing() {
+    for torn in [true, false] {
+        let mut link = FakeLink::new();
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        let journal = scratch.0.join("units.jsonl.drawn");
+        if torn {
+            std::fs::write(&journal, r#"{"format":"o89-contr"#).unwrap();
+        } else {
+            std::fs::create_dir(&journal).unwrap();
+        }
+        let mut output = Vec::new();
+        assert!(run_secret(&mut link, &ledger, None, false, false, &mut output).is_err());
+        assert_eq!(link.stages, 0, "nothing staged");
+        assert!(!born(&mut link).unwrap());
+        assert!(output.is_empty());
+        assert!(exported(&ledger).is_empty());
+        if torn {
+            assert_eq!(
+                std::fs::read_to_string(&journal).unwrap(),
+                r#"{"format":"o89-contr"#
+            );
+        }
+    }
+}
+
+#[test]
+fn p_249_a_device_id_awaiting_resume_on_one_unit_is_refused_to_another_before_staging() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let id = "0123456789abcdef0123456789abcdef";
+    let mut first = FakeLink::new();
+    first.reboot = Reboot::Fails;
+    assert!(run_secret(&mut first, &ledger, Some(id), false, false, &mut Vec::new()).is_err());
+    first.reboot = Reboot::Boots;
+    let mut second = FakeLink::new();
+    let mut output = Vec::new();
+    let error = run_secret(&mut second, &ledger, Some(id), false, false, &mut output).unwrap_err();
+    assert!(
+        error.to_string().contains("choose another device id"),
+        "{error}"
+    );
+    assert_eq!(second.stages, 0);
+    assert!(output.is_empty());
+    assert_eq!(journaled(&ledger).len(), 1);
+    // The first unit's record is still the one exported.
+    resume_secret(&mut first, &ledger, &mut output).unwrap();
+    assert_eq!(
+        exported(&ledger),
+        [record_line(
+            active(&mut first),
+            held_fingerprint(&mut first)
+        )]
     );
 }

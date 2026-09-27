@@ -11,10 +11,10 @@
 //! transaction, so a resumed label never needs the private key (P-236).
 //!
 //! The station also keeps the public half of what it made (P-249): before a
-//! birth is staged it journals the device id with the fingerprint of the key
-//! it drew, and once the part confirms that key it appends the pair to the
-//! operator's export file (`ledger`). The part's fingerprint only confirms
-//! a record; it is never one's source.
+//! transaction is staged it journals it, for a birth the device id with the
+//! fingerprint of the key it drew, and once the part confirms that key it
+//! appends the pair to the operator's export file (`ledger`). The part's
+//! fingerprint only confirms a record; it is never one's source.
 
 use anyhow::{Context, Result, anyhow, bail};
 use embassy_futures::block_on;
@@ -282,11 +282,12 @@ fn run_secret(
             );
         }
         // The key stays, so an exported record for this device id must
-        // already name it. Compared here, never recorded from the part.
+        // already name it. Journaled as a replace, so a resume can tell this
+        // transaction from one the ledger never saw; never exported from here.
         if let Some(key) =
             read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?.present()
         {
-            ledger.check_replace(Record {
+            ledger.note_replace(Record {
                 device_id,
                 fingerprint: key.fingerprint(),
             })?;
@@ -491,9 +492,9 @@ fn show_applied(
             tracing::warn!(%export, "no controller record exported");
             writeln!(
                 output,
-                "record         none exported: neither {export} nor its journal records this \
-                 unit's controller key, so the station cannot vouch for it and does not take \
-                 the part's word; the cloud's vouch check (P-247) has no record for this unit"
+                "record         none exported: {export} holds no record of this unit's \
+                 controller key, so the station cannot vouch for it and does not take the \
+                 part's word; the cloud's vouch check (P-247) has no record for this unit"
             )?;
         }
     }

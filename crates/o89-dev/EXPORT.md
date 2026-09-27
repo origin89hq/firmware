@@ -47,27 +47,48 @@ already holds for a device id; P-249 says it refuses and tells a person.
 
 ## The journal beside it
 
-`<file>.drawn` is the station's journal: the same fields with
-`"format":"o89-controller-drawn"`, written and synced before a new key is
-staged, so that `--resume` in a later process can confirm the part against
-the station's own fingerprint. A key that never reached the part stays in
-the journal and is never exported. The journal is not for import; its format
-name makes an importer refuse it. Keep it beside the export file until every
-unit in it has been confirmed.
+`<file>.drawn` is the station's journal, written and synced before anything
+is staged, so that `--resume` in a later process can confirm the part against
+the station's own entry. It holds the same fields under two format names:
 
-## When nothing is exported
+- `o89-controller-drawn`: a key the station drew for a birth, with its
+  fingerprint. This is the only source of a new record's fingerprint.
+- `o89-controller-replace`: a `--replace`, with the fingerprint the part held
+  when it was staged. It is a lookup key for the export file, never exported.
 
-`write-secret` prints the label and says `record none exported` when neither
-file records the key the unit carries: a unit born before records were kept,
-or on another station, then given `--replace`. The part's fingerprint is not
-taken as a record's source, so such a unit has no record until its key is
-drawn again (`o89-dev store blank --yes`, then `write-secret`).
+A key that never reached the part stays in the journal and is never exported.
+The journal is not for import; its format names make an importer refuse it.
+Keep it beside the export file: a `--resume` whose journal has no entry for
+the unit's transaction is refused as the wrong file, prints no label, and can
+be run again with the right `--export`.
 
-A part that applied a key the station did not draw for that device id is
-refused loudly: no label, nothing exported, and every `--resume` refuses the
-same way. Such a unit needs a key the station draws: `o89-dev store blank
---yes`, then `write-secret`. A `--replace` naming a device id the journal
-holds another key for is refused before anything is staged.
+## Writes
 
-One station process writes a file at a time; two processes appending to the
-same file are not coordinated.
+Each file changes only by writing a new copy, `<name>.new`, syncing it,
+renaming it over the old one and syncing the directory. A host cut off
+mid-write leaves the file as it was or with its new line, never a torn line;
+a `<name>.new` left behind is replaced by the next write. Before a write the
+station reads both files whole and refuses anything but its own lines,
+including a device id recorded twice, before a key is staged.
+
+## Refusals and when nothing is exported
+
+- A device id the export file records with another fingerprint is refused
+  before anything is staged.
+- A device id the journal holds another key for is refused before anything is
+  staged, unless the export file already records that device id with this
+  unit's key: the other key may be on a part awaiting `--resume`. Choose
+  another device id.
+- A part that applied a key the station did not draw for that device id is
+  refused loudly: no label, nothing exported, and every `--resume` refuses the
+  same way. Such a unit needs a key the station draws: `o89-dev store blank
+  --yes`, then `write-secret`.
+- `write-secret --replace` prints the label and says `record none exported`
+  when the export file holds no record of the key the unit carries: a unit
+  born before records were kept, or on another station. The part's
+  fingerprint is not taken as a record's source, so such a unit has no record
+  until its key is drawn again (`o89-dev store blank --yes`, then
+  `write-secret`).
+
+One station process writes a file at a time; two processes writing the same
+file are not coordinated.

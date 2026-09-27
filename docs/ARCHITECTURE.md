@@ -278,11 +278,12 @@ Pending or unacknowledged transactions refuse new writes, and output and FRAM
 acknowledgement cannot be atomic: a crash after output but before
 acknowledgement can repeat the same label on resume. The intent keeps the
 secret and the fingerprint, never the key or the seed, once applied.
-The station keeps the public half (P-249): before a birth is staged it
-journals the device id with the fingerprint of the key it drew, and once the
-part confirms that key it appends the pair to the operator's `--export`
-file, before the label and before the acknowledgement, so a resume exports
-the same record and never a second. The part's fingerprint only confirms a
+The station keeps the public half (P-249): before a transaction is staged it
+journals it, for a birth the device id with the fingerprint of the key it
+drew, and once the part confirms that key it appends the pair to the
+operator's `--export` file, before the label and before the acknowledgement,
+so a resume exports the same record and never a second, and a resume against
+a file that never saw the transaction prints nothing. The part's fingerprint only confirms a
 record; it is never one's source. The format is in `crates/o89-dev/EXPORT.md`.
 `o89-dev store blank --yes` is the erase a bench repairs a part with: it zeroes
 the map, reads it back and reboots onto an unborn unit, which `write-secret`
