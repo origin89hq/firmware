@@ -130,6 +130,10 @@ impl Ledger {
         {
             bail!("the export file {} names no file", export.display());
         }
+        // One resolved path for the lock, the journal and every write, so a
+        // second name for the same directory meets the same lock.
+        let export = resolved(export)?;
+        let export = export.as_path();
         let locked = suffixed(export, ".lock");
         let lock = OpenOptions::new()
             .write(true)
@@ -315,6 +319,31 @@ impl Ledger {
     }
 }
 
+/// `export` with its directory resolved, refusing a file that is a symbolic
+/// link: its rename would replace the link, not the file it names.
+fn resolved(export: &Path) -> Result<PathBuf> {
+    let (Some(parent), Some(name)) = (export.parent(), export.file_name()) else {
+        bail!("the export file {} names no file", export.display());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let directory = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving the directory of {}", export.display()))?;
+    let path = directory.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "the export file {} is a symbolic link; name the file it points to",
+            export.display()
+        ),
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(error).with_context(|| format!("reading {}", export.display())),
+    }
+}
+
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut text = path.as_os_str().to_owned();
     text.push(suffix);
@@ -466,7 +495,9 @@ pub(super) mod tests {
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("a scratch directory");
-            Self(path)
+            // The name the ledger resolves it to, where the system's
+            // temporary directory is itself behind a link.
+            Self(std::fs::canonicalize(&path).expect("a resolvable scratch directory"))
         }
 
         pub fn ledger(&self) -> Ledger {
@@ -809,5 +840,34 @@ pub(super) mod tests {
         let ledger = Ledger::new(&scratch.0.join("out")).unwrap();
         assert_eq!(ledger.journal, scratch.0.join("out.drawn"));
         assert!(scratch.0.join("out.lock").exists());
+    }
+
+    #[test]
+    fn p_249_a_second_name_for_the_export_meets_the_same_lock_or_is_refused() {
+        let scratch = Scratch::new();
+        let first = scratch.ledger();
+        std::fs::write(scratch.0.join("units.jsonl"), "").unwrap();
+        #[cfg(unix)]
+        {
+            let via = scratch.0.join("via");
+            std::os::unix::fs::symlink(&scratch.0, &via).unwrap();
+            let error = Ledger::new(&via.join("units.jsonl"))
+                .err()
+                .expect("refused");
+            assert!(
+                error.to_string().contains("another station process"),
+                "{error}"
+            );
+            let link = scratch.0.join("link.jsonl");
+            std::os::unix::fs::symlink(scratch.0.join("units.jsonl"), &link).unwrap();
+            let error = Ledger::new(&link).err().expect("refused");
+            assert!(error.to_string().contains("symbolic link"), "{error}");
+        }
+        let dotted = scratch.0.join(".").join("units.jsonl");
+        assert!(
+            Ledger::new(&dotted).is_err(),
+            "the same file by another spelling"
+        );
+        drop(first);
     }
 }

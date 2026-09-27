@@ -92,4 +92,7 @@ including a device id recorded twice, before a key is staged.
   `write-secret`).
 
 One station process writes a file at a time: it holds an exclusive lock on
-`<file>.lock` while it runs, and a second process on the same file is refused.
+`<file>.lock` while it runs, and a second process on the same file is refused. The
+station resolves the file's directory first, so another name for the same
+directory meets the same lock, and it refuses an export file that is a
+symbolic link.
