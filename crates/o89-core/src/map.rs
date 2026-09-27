@@ -104,6 +104,15 @@ const GENERATION_MARK_6: Record<MARK_BYTES> = Record::at(magic(*b"GEN6"), GENERA
 const GENERATION_MARK_7: Record<MARK_BYTES> = Record::at(magic(*b"GEN7"), GENERATION_MARK_6.end());
 const GENERATION_MARK_8: Record<MARK_BYTES> = Record::at(magic(*b"GEN8"), GENERATION_MARK_7.end());
 
+/// What the station's reseed of the generator leaves byte for byte
+/// (P-237): the printed secret with the controller key, then every slot's
+/// key record and generation mark, each a contiguous run of the map from
+/// its first address to the one past it.
+pub const RESEED_KEEPS: [(Address, Address); 2] = [
+    (DEVICE_SECRET.start(), CONTROLLER_KEY.end()),
+    (CLIENT_KEY_1.start(), GENERATION_MARK_8.end()),
+];
+
 /// The dedup table, under the epoch its entries were made in (P-080,
 /// P-121).
 pub const COMMANDS: Record<COMMANDS_BYTES> = Record::at(magic(*b"CMDS"), GENERATION_MARK_8.end());

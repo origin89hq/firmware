@@ -11,7 +11,10 @@
 //! **Never re-initialised.** Nothing here makes a state: a factory reset
 //! does not touch the record, a boot that finds it damaged keeps it
 //! damaged, and only the manufacturing transaction writes a first one, onto
-//! a part that holds none. A generator that cannot be read back is
+//! a part that holds none. P-237's one exception is the station's reseed
+//! over SWD (`stage_reseed`), a fresh state from the station's CSPRNG onto
+//! a record damaged in both slots; it is refused while any state reads
+//! back. A generator that cannot be read back is
 //! [`Unavailable`]: every `Pair` and `Hello` is refused, `Discover` answers
 //! error 18, and the caller raises condition 22 `entropy unavailable`.
 //!

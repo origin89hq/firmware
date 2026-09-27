@@ -152,7 +152,9 @@ fn p_235_an_unappliable_intent_is_discarded_and_every_cut_boot_goes_on() {
             let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
             match report.secret_recovery {
                 SecretRecovery::Discarded => Ok(()),
-                SecretRecovery::Unchanged | SecretRecovery::Applied => Err(()),
+                SecretRecovery::Unchanged | SecretRecovery::Applied | SecretRecovery::Reseeded => {
+                    Err(())
+                }
             }
         },
         |part, step| {
@@ -234,9 +236,57 @@ fn p_236_label_acknowledgement_cut_at_every_byte_keeps_the_fingerprint_and_never
                 }
                 SecretChange::Complete => {}
                 SecretChange::Pending(..) => panic!("cut {step} reverted application"),
+                SecretChange::Reseed(_) => panic!("cut {step} staged a reseed"),
             }
         },
     )
     .expect("acknowledgement");
+    assert!(crashes.steps > 100);
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_cut_at_every_step_keeps_the_unit_and_never_draws_old_damage() {
+    use o89_core::{Generator, stage_reseed};
+    let mut start = drawn();
+    let (before, _) = block_on(Store::boot(&mut start, None)).expect("boot");
+    let fingerprint = before.controller.present().map(ControllerKey::fingerprint);
+    let at = map::DRBG.start();
+    let len = usize::from(map::DRBG.end().0)
+        .checked_sub(usize::from(at.0))
+        .expect("the record's length");
+    block_on(start.write(at, &vec![0x55; len])).expect("damage both copies");
+    let fresh = DrbgState::new([0x61; 32]).expect("the station's entropy");
+    let crashes = crash_at_every_step(
+        &start,
+        |part| {
+            block_on(stage_reseed(part, fresh)).map_err(|_| ())?;
+            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+            report.boot_recorded.map_err(|_| ())
+        },
+        |part, step| {
+            let (store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
+            assert!(store.secret.present() == Some(&secret()), "cut {step}");
+            assert!(
+                store.controller.present().map(ControllerKey::fingerprint) == fingerprint,
+                "cut {step}: the controller key changed"
+            );
+            let reseeded = match store.drbg.held() {
+                Held::Corrupt => false,
+                Held::Present(state) => {
+                    assert!(*state == fresh, "cut {step}: not the fresh state");
+                    true
+                }
+                other => panic!("cut {step}: {other:?}"),
+            };
+            // Damage still draws nothing; the fresh state, read back, draws.
+            let mut generator = Generator::new(store.drbg);
+            assert_eq!(
+                block_on(generator.challenge(part)).is_ok(),
+                reseeded,
+                "cut {step}"
+            );
+        },
+    )
+    .expect("uncut reseed");
     assert!(crashes.steps > 100);
 }

@@ -1,6 +1,9 @@
 //! The store from the host's side: every record read with the `Kept` the
 //! firmware reads with. Epoch writes use the same record seam; secret writes
 //! stage a firmware transaction, reboot, and verify it before printing the label.
+//! A reseed stages a fresh generator state through the same transaction onto
+//! a unit whose generator record is damaged in both slots, and verifies that
+//! the key, the label and the client slots came back byte for byte (P-237).
 //!
 //! On a unit's first transaction the host also draws the controller key and
 //! the generator's first state from the operating system's generator (P-235,
@@ -278,7 +281,8 @@ fn run_secret(
             .is_none()
         {
             bail!(
-                "the generator does not read back, so this unit cannot pair; nothing staged, the label it has stays"
+                "the generator does not read back, so this unit cannot pair; nothing staged, the \
+                 label it has stays; `o89-dev store reseed` gives a damaged generator a fresh state"
             );
         }
         // The key stays, so an exported record for this device id must
@@ -344,6 +348,9 @@ fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) 
         Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => {
             bail!("a secret transaction is unfinished")
         }
+        Held::Present(SecretChange::Reseed(_)) => {
+            bail!("a reseed is staged and not applied; reboot the controller to apply it")
+        }
         Held::Absent | Held::Present(SecretChange::Complete) => Ok(()),
         Held::Corrupt | Held::Malformed(_) => {
             bail!("unreadable secret transaction; reboot before provisioning")
@@ -406,7 +413,7 @@ fn resume_secret(
             secret
         }
         Held::Present(SecretChange::Applied(secret, _)) => secret,
-        Held::Absent | Held::Present(SecretChange::Complete) => {
+        Held::Absent | Held::Present(SecretChange::Complete | SecretChange::Reseed(_)) => {
             bail!("no secret label to resume")
         }
         Held::Corrupt | Held::Malformed(_) => {
@@ -459,7 +466,12 @@ fn show_applied(
     let drbg = read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?;
     let fingerprint = match transaction.present() {
         Some(SecretChange::Applied(held, fingerprint)) if *held == secret => *fingerprint,
-        Some(SecretChange::Applied(..) | SecretChange::Pending(..) | SecretChange::Complete)
+        Some(
+            SecretChange::Applied(..)
+            | SecretChange::Pending(..)
+            | SecretChange::Complete
+            | SecretChange::Reseed(_),
+        )
         | None => bail!("the controller did not finish applying the secret; no label printed"),
     };
     if applied.present() != Some(&secret) || drbg.present().is_none() {
@@ -529,6 +541,88 @@ fn show_applied(
     // can repeat the same label, but never substitutes an unseen secret.
     block_on(transaction.write(link, SecretChange::Complete)).map_err(refused)?;
     Ok(())
+}
+
+/// Give a unit whose generator record is damaged in both slots a fresh
+/// state from the operating system's generator, keeping its controller key,
+/// its label and its enrolled clients (P-237's station reseed).
+pub fn reseed(link: &mut Link) -> Result<()> {
+    run_reseed(link, &mut std::io::stdout().lock())
+}
+
+fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> Result<()> {
+    ensure_no_transaction(link)?;
+    let key = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+    let Some(fingerprint) = key.present().map(ControllerKey::fingerprint) else {
+        bail!(
+            "the controller key does not read back, so there is no unit to keep: it is \
+             provisioned again with `store blank` and `store write-secret`; nothing staged"
+        );
+    };
+    match read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?.held() {
+        Held::Corrupt => {}
+        Held::Present(_) => bail!(
+            "the generator reads back, and a live generator is never replaced (P-237); nothing staged"
+        ),
+        Held::Absent => bail!(
+            "the generator record is not damaged in both slots: one reads as never written; \
+             nothing staged"
+        ),
+        Held::Malformed(at) => bail!(
+            "the generator record holds and does not decode ({at:?}), which is not damage in \
+             both slots; nothing staged"
+        ),
+    }
+    let before = kept_by_a_reseed(link)?;
+    let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
+    fill(&mut *seed)?;
+    let state = DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?;
+    seed.zeroize();
+    // `DrbgState` is `Copy` and has no way to clear itself; the encoded body
+    // is the copy that crosses to the controller, and it is cleared below.
+    // The station keeps no copy past this: none is compared after the
+    // reboot, because a session may already have drawn from it.
+    let mut body = Zeroizing::new(SecretChange::Reseed(state).encode());
+    link.stage_and_reboot(&body[..], false)?;
+    body.zeroize();
+    match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
+    {
+        Held::Absent | Held::Present(SecretChange::Complete) => {}
+        Held::Present(
+            SecretChange::Reseed(_) | SecretChange::Pending(..) | SecretChange::Applied(..),
+        )
+        | Held::Corrupt
+        | Held::Malformed(_) => bail!("the controller did not finish the reseed"),
+    }
+    if read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?
+        .present()
+        .is_none()
+    {
+        bail!("the generator still does not read back: the part did not keep the fresh state");
+    }
+    if kept_by_a_reseed(link)? != before {
+        bail!("the controller key, the printed secret or a client slot changed across the reseed");
+    }
+    writeln!(
+        output,
+        "generator   reseeded; controller key {} (unchanged), label and client slots unchanged",
+        hex::encode(fingerprint.as_bytes())
+    )?;
+    Ok(())
+}
+
+/// The bytes a reseed must leave as they were (`map::RESEED_KEEPS`).
+fn kept_by_a_reseed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    for (start, end) in map::RESEED_KEEPS {
+        let len = usize::from(end.0)
+            .checked_sub(usize::from(start.0))
+            .context("a run of the map")?;
+        let mut run = vec![0u8; len];
+        block_on(link.read(start, &mut run))?;
+        kept.extend_from_slice(&run);
+    }
+    Ok(kept)
 }
 
 /// P-038, P-044, P-049, P-236: the label's ASCII payload, version 2, with no

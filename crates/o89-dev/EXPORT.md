@@ -84,6 +84,9 @@ including a device id recorded twice, before a key is staged.
   refused loudly: no label, nothing exported, and every `--resume` refuses the
   same way. Such a unit needs a key the station draws: `o89-dev store blank
   --yes`, then `write-secret`.
+- `store reseed` writes nothing to the file: it gives a damaged generator a
+  fresh state and keeps the device id and the controller key, so the unit's
+  line stays true.
 - `write-secret --replace` prints the label and says `record none exported`
   when the export file holds no record of the key the unit carries: a unit
   born before records were kept, or on another station. The part's

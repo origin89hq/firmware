@@ -252,6 +252,9 @@ pub(crate) struct Bench {
     /// The selector's override at the instant the recorder processes the request.
     floor_override: clock::FloorOverride,
     clock_notes: Vec<clock::ClockNote>,
+    /// Every note the sessions left for the probe, in order: what the
+    /// controller's adapter logs, and condition 22 among them (P-237).
+    pub(crate) session_notes: Vec<SessionNote>,
     pub(crate) calendar: Option<(o89_core::UnixMillis, Tick)>,
     pub(crate) clock_records: Vec<km43::ControllerRecord>,
     pub(crate) now: Tick,
@@ -367,6 +370,7 @@ impl Bench {
             clock: o89_core::WallClock::new(),
             floor_override: clock::FloorOverride::Unarmed,
             clock_notes: Vec::new(),
+            session_notes: Vec::new(),
             calendar: None,
             clock_records: Vec::new(),
             now,
@@ -583,6 +587,9 @@ impl Bench {
     /// recorder, the window closed on an enrolment, the answer framed for
     /// the pump. The link's actions come back to perform after it.
     fn stepped(&mut self, mut step: Step, dst: &mut [u8]) -> Actions {
+        if let Some(note) = step.reply.and_then(|reply| reply.note) {
+            self.session_notes.push(note);
+        }
         if let Some(o89_core::Reply {
             note: Some(SessionNote::TimeAsked(asked)),
             ..

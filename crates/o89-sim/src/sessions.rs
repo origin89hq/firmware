@@ -1194,6 +1194,116 @@ fn p_237_a_unit_whose_generator_is_damaged_gives_no_challenge_and_a_new_label_do
     );
 }
 
+/// The bytes a station reseed must leave as they were (`map::RESEED_KEEPS`).
+fn kept_by_a_reseed(part: &mut SimFram) -> Vec<u8> {
+    use o89_core::Fram as _;
+    let mut kept = Vec::new();
+    for (start, end) in o89_core::map::RESEED_KEEPS {
+        let len = usize::from(end.0)
+            .checked_sub(usize::from(start.0))
+            .expect("a run of the map");
+        let mut run = vec![0u8; len];
+        block_on(part.read(start, &mut run)).expect("reads");
+        kept.extend_from_slice(&run);
+    }
+    kept
+}
+
+/// The controller boots again on what the part holds, as `main` wires it;
+/// whether the generator it booted with can draw.
+fn rebooted(bench: &mut Bench) -> bool {
+    use o89_core::{DRBG_BYTES, DrbgState, Kept, map};
+    bench.boot_clients(o89_core::Revision::A);
+    bench.run_for(Millis::from_millis(2_000));
+    block_on(Kept::<DrbgState, DRBG_BYTES>::read(
+        map::DRBG,
+        &mut bench.fram,
+    ))
+    .expect("reads")
+    .present()
+    .is_some()
+}
+
+/// A `Discover` whose answer is error 18, noted as condition 22.
+fn refused_for_entropy(bench: &mut Bench, handle: u16) {
+    announce(bench, handle);
+    let mut client = Client::on(handle);
+    let frame = client.empty(MessageType::Discover);
+    let noted = bench.session_notes.len();
+    let answers = client.send(bench, &frame);
+    assert_eq!(
+        code(answers.last().expect("answered")),
+        Some(km43::ErrorCode::ChallengeUnavailable as u16)
+    );
+    assert!(
+        bench.session_notes[noted..].contains(&o89_core::SessionNote::EntropyUnavailable),
+        "condition 22 is raised"
+    );
+}
+
+#[test]
+fn f_041_p_237_a_reseed_serves_pair_and_hello_again_and_a_hello_recorded_before_the_damage_stays_refused()
+ {
+    // Capabilities: replay, stamp (a Hello recorded before the damage, put
+    // on another connection). The damage and the reseed are behind the
+    // storage seam, where the SWD mailbox writes.
+    use o89_core::{DrbgState, Fram as _, map, stage_reseed};
+    let mut damaged = linked();
+    announce(&mut damaged, 1);
+    let mut phone = Client::on(1);
+    let mut recorded = phone.open(&mut damaged);
+    // Both copies damaged, as board A's generator was on 2026-09-24.
+    let len = usize::from(map::DRBG.end().0)
+        .checked_sub(usize::from(map::DRBG.start().0))
+        .expect("the record's length");
+    block_on(damaged.fram.write(map::DRBG.start(), &vec![0x55; len])).expect("damage both copies");
+    // Every boot until the reseed refuses: the enrolled phone's Hello and a
+    // new install's Pair both begin at a Discover that answers 18.
+    assert!(!rebooted(&mut damaged));
+    refused_for_entropy(&mut damaged, 2);
+    assert!(!rebooted(&mut damaged));
+    refused_for_entropy(&mut damaged, 3);
+    let kept = kept_by_a_reseed(&mut damaged.fram);
+    block_on(stage_reseed(
+        &mut damaged.fram,
+        DrbgState::new([0x61; 32]).expect("the station's entropy"),
+    ))
+    .expect("staged over SWD");
+
+    // The controller boots on the part and the link comes up afresh.
+    let mut bench = linked();
+    bench.fram = damaged.fram.clone();
+    assert!(rebooted(&mut bench), "the boot applied the reseed");
+    assert_eq!(kept_by_a_reseed(&mut bench.fram), kept);
+    // The phone enrolled before the damage says Hello with the key and the
+    // label it already had.
+    announce(&mut bench, 4);
+    let mut again = Client::on(4);
+    let _ = again.open(&mut bench);
+    // The Hello recorded before the damage names a challenge this unit
+    // will never draw again: no slot's key vouches for it.
+    announce(&mut bench, 5);
+    let mut replayer = Client::on(5);
+    let _ = replayer.discover(&mut bench);
+    assert_eq!(recorded[2], 1, "fixture has a one-byte handle");
+    recorded[2] = 5;
+    let answers = replayer.exchange(&mut bench, &recorded);
+    assert_eq!(code(answers.last().expect("answered")), Some(12));
+    assert!(!bench.computing());
+    assert!(!bench.endpoint.sessions.is_bound(Conn::new(5).unwrap()));
+    // And a new install pairs from the same printed label.
+    bench.open_pairing();
+    announce(&mut bench, 6);
+    let mut laptop = Client::install(6, 2);
+    assert!(laptop.pair(&mut bench, "laptop").is_ok());
+    assert!(
+        !bench
+            .session_notes
+            .contains(&o89_core::SessionNote::EntropyUnavailable),
+        "condition 22 ends with the reseed"
+    );
+}
+
 mod adversarial;
 mod agreement;
 mod configuration;
