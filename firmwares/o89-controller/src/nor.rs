@@ -18,14 +18,20 @@
 
 use core::future::Future;
 
-use embassy_stm32::gpio::Output;
+use embassy_stm32::Peri;
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Blocking;
-use embassy_stm32::spi::Spi;
+use embassy_stm32::peripherals::RCC;
 use embassy_stm32::spi::mode::Master;
+use embassy_stm32::spi::{self, Spi};
+use embassy_stm32::time::Hertz;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_storage_async::nor_flash::{
     ErrorType, MultiwriteNorFlash, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
+use o89_core::nor_map::{self, BusRefused};
+
+use crate::board::{NorCs, NorMiso, NorMosi, NorSck, NorSpi};
 
 /// Bytes in one erase sector.
 pub const SECTOR: usize = 4096;
@@ -78,10 +84,48 @@ pub struct Nor {
     cs: Output<'static>,
 }
 
+/// The part without its bus: why the bus was refused, and the chip select
+/// held high for as long as this lives, so the part stays deselected. The
+/// SPI and its other three pins are dropped with the refusal; nothing
+/// retries the bus within a boot.
+pub struct Unbuilt {
+    /// Why.
+    pub refused: BusRefused,
+    _cs: Output<'static>,
+}
+
 impl Nor {
-    /// Take the bus. The chip select must already be high.
-    pub const fn new(spi: Spi<'static, Blocking, Master>, cs: Output<'static>) -> Self {
-        Self { spi, cs }
+    /// Take the part's pins and build its bus at [`nor_map::SCK`], or say
+    /// why not (F-095).
+    ///
+    /// The chip select is driven high first, whatever follows: the pin sits
+    /// in its reset state, analog, until here, and a refused bus leaves it
+    /// high rather than floating. The bus is built only once the clock the
+    /// HAL recorded for it can carry the SCK, because the HAL's own check
+    /// is an `unwrap` and a panic here is a panic on every boot (#217).
+    /// SPI1's kernel clock on this part is PCLK1, the HAL's table for the
+    /// STM32G0B1 says so, and `clocks` reads it without that table's own
+    /// `unwrap`.
+    pub fn build(
+        rcc: &Peri<'static, RCC>,
+        spi1: Peri<'static, NorSpi>,
+        sck: Peri<'static, NorSck>,
+        mosi: Peri<'static, NorMosi>,
+        miso: Peri<'static, NorMiso>,
+        cs: Peri<'static, NorCs>,
+    ) -> Result<Self, Unbuilt> {
+        let cs = Output::new(cs, Level::High, Speed::VeryHigh);
+        let kernel = embassy_stm32::rcc::clocks(rcc)
+            .pclk1
+            .to_hertz()
+            .map(|kernel| nor_map::Hertz(kernel.0));
+        if let Err(refused) = nor_map::bus(kernel) {
+            return Err(Unbuilt { refused, _cs: cs });
+        }
+        let mut config = spi::Config::default();
+        config.frequency = Hertz(nor_map::SCK.0);
+        let spi = Spi::new_blocking(spi1, sck, mosi, miso, config);
+        Ok(Self { spi, cs })
     }
 
     /// One command with the select held: the command bytes out, then

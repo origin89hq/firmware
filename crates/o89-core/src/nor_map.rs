@@ -51,6 +51,51 @@ pub fn in_an_image_region(block: u32) -> bool {
     })
 }
 
+/// The serial clock the controller drives the part at. The W25Q128JV takes
+/// 133 MHz for a fast read and 50 MHz for the plain `0x03` read the driver
+/// uses; 8 MHz is what board A was proven at, and a record of under three
+/// hundred bytes is a fraction of a millisecond at it.
+pub const SCK: Hertz = Hertz(8_000_000);
+
+/// A frequency, in hertz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Hertz(pub u32);
+
+/// Why the NOR's bus was not built, so the recorder runs without a ring
+/// instead of the HAL panicking on every boot (#217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BusRefused {
+    /// The HAL recorded no clock for the bus: the clock tree it was given
+    /// does not run the bus's kernel clock.
+    NoKernelClock,
+    /// The kernel clock is slower than the serial clock asked of it: an SPI
+    /// divides its kernel clock by two at least, so no divider reaches it.
+    KernelBelowSck {
+        /// The kernel clock the HAL recorded.
+        kernel: Hertz,
+    },
+}
+
+/// Whether an SPI whose kernel clock the HAL recorded as `kernel` can be
+/// built for [`SCK`]: the same test the HAL's baud-rate divider makes, and
+/// that it `unwrap`s, taken first so a bus it would refuse is a refusal
+/// here rather than a panic there (F-095). From `SCK` up to twice it, the
+/// HAL divides by two and the part is driven slower than asked, which it
+/// takes; only below `SCK` does no divider exist.
+///
+/// # Errors
+///
+/// [`BusRefused`] names the clock that cannot carry the part.
+pub fn bus(kernel: Option<Hertz>) -> Result<(), BusRefused> {
+    match kernel {
+        None | Some(Hertz(0)) => Err(BusRefused::NoKernelClock),
+        Some(kernel) if kernel < SCK => Err(BusRefused::KernelBelowSck { kernel }),
+        Some(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +135,37 @@ mod tests {
     fn the_regions_sit_just_past_the_ring_and_end_inside_the_part() {
         assert_eq!(IMAGE_REGIONS, [0x00E8_0000, 0x00F0_0000]);
         assert_eq!(IMAGE_REGIONS[1] + IMAGE_REGION_BYTES, 0x00F8_0000);
+    }
+
+    #[test]
+    fn f_095_the_bus_is_built_on_the_clock_tree_board_a_runs() {
+        // PCLK1 at 64 MHz, as `clock.rs` sets it: a divide by eight.
+        assert_eq!(bus(Some(Hertz(64_000_000))), Ok(()));
+    }
+
+    #[test]
+    fn f_095_a_kernel_clock_equal_to_the_sck_is_the_slowest_one_accepted() {
+        assert_eq!(bus(Some(SCK)), Ok(()));
+        assert_eq!(
+            bus(Some(Hertz(SCK.0 - 1))),
+            Err(BusRefused::KernelBelowSck {
+                kernel: Hertz(SCK.0 - 1)
+            })
+        );
+    }
+
+    #[test]
+    fn f_095_a_clobbered_kernel_clock_is_refused_not_unwrapped() {
+        // #217: a word the stack left where the HAL keeps PCLK1.
+        assert_eq!(
+            bus(Some(Hertz(1))),
+            Err(BusRefused::KernelBelowSck { kernel: Hertz(1) })
+        );
+    }
+
+    #[test]
+    fn f_095_no_kernel_clock_is_refused() {
+        assert_eq!(bus(None), Err(BusRefused::NoKernelClock));
+        assert_eq!(bus(Some(Hertz(0))), Err(BusRefused::NoKernelClock));
     }
 }

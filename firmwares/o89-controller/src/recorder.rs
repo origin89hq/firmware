@@ -7,8 +7,9 @@
 //! takes the epoch, the generator and the client table, each
 //! through its own lease on the part. It identifies the NOR, opens the
 //! ring, writes the boot record, publishes the span of the log a `Hello`
-//! reports, and from then on holds the ring for whoever asks. A board whose NOR does not answer
-//! still has its store; the ring is simply absent and says so. The rail
+//! reports, and from then on holds the ring for whoever asks. A board whose NOR does not answer,
+//! or whose bus was refused before it was built (F-095), still has its
+//! store; the ring is simply absent and says so. The rail
 //! task hands it the recovery ladder's cuts to keep before the rail goes
 //! off, and polls for the answer without waiting on it (F-017).
 //!
@@ -35,7 +36,7 @@ use o89_core::{
 
 use crate::fram::Lease;
 use crate::mailbox;
-use crate::nor::{CAPACITY, JEDEC, Nor, SECTOR};
+use crate::nor::{CAPACITY, JEDEC, Nor, SECTOR, Unbuilt};
 use crate::rtc::CalendarClock;
 use crate::selector;
 use crate::supervisor::check_in;
@@ -337,7 +338,7 @@ pub fn post_wifi(event: km43::WifiStatusChanged) -> bool {
 pub async fn run(
     mut cuts: Cuts,
     mut fram: Lease,
-    nor: Nor,
+    nor: Result<Nor, Unbuilt>,
     boot: Boot,
     mut calendar: CalendarClock,
     site: crate::site::Shared,
@@ -346,8 +347,8 @@ pub async fn run(
         let _ = CLOCK.lock(|clock| clock.borrow_mut().recover_audit(change));
     }
     let mut scratch = [0u8; SCRATCH];
-    let ring = open_ring(nor, &mut scratch).await;
-    let mut ring = ring;
+    // A refused bus's chip select stays held high for the task's life.
+    let (mut ring, _unbuilt) = open_ring(nor, &mut scratch).await;
     // The head the open found, before the boot's records can move it; each
     // of those publishes its own outcome.
     match ring.as_mut() {
@@ -854,7 +855,23 @@ async fn recover_floor(
     }
 }
 
-async fn open_ring(mut nor: Nor, scratch: &mut [u8]) -> Option<Ring<Nor>> {
+/// The ring on the part, or none; and a refused bus, which the caller
+/// holds for its chip select. A refused bus is a board without a ring, as
+/// one whose NOR does not answer is (F-095).
+async fn open_ring(
+    nor: Result<Nor, Unbuilt>,
+    scratch: &mut [u8],
+) -> (Option<Ring<Nor>>, Option<Unbuilt>) {
+    match nor {
+        Ok(nor) => (identify_and_open(nor, scratch).await, None),
+        Err(unbuilt) => {
+            defmt::error!("nor: the bus was refused: {}; no ring", unbuilt.refused);
+            (None, Some(unbuilt))
+        }
+    }
+}
+
+async fn identify_and_open(mut nor: Nor, scratch: &mut [u8]) -> Option<Ring<Nor>> {
     defmt::info!("recorder: identifying the NOR");
     let jedec = nor.jedec().await;
     defmt::info!("recorder: identification answered {}", jedec);

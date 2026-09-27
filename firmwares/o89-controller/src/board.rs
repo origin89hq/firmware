@@ -86,6 +86,17 @@ pub type EspRts = p::PB3;
 /// `ESP_CTS`, PB4.
 pub type EspCts = p::PB4;
 
+/// SPI1, the NOR's bus.
+pub type NorSpi = p::SPI1;
+/// NOR chip select, PA4.
+pub type NorCs = p::PA4;
+/// NOR clock, PA5.
+pub type NorSck = p::PA5;
+/// NOR MISO, PA6.
+pub type NorMiso = p::PA6;
+/// NOR MOSI, PA7.
+pub type NorMosi = p::PA7;
+
 /// The link to the module, and the lines into it that are inputs until the
 /// rail is up (F-003).
 pub struct Module {
@@ -110,6 +121,9 @@ pub struct Module {
 
 /// The board, split into what each task owns.
 pub struct Board {
+    /// The clock tree, held so the clocks the HAL recorded can be read
+    /// without its panicking accessors (`nor::Nor::build`).
+    pub rcc: Peri<'static, p::RCC>,
     /// The independent watchdog.
     pub iwdg: Peri<'static, p::IWDG>,
     /// The five retained backup words for calendar validity and pending audit.
@@ -162,15 +176,15 @@ pub struct Board {
     pub fram_sda: Peri<'static, p::PB14>,
 
     /// The NOR's SPI. Blocking, no DMA: see `nor.rs`.
-    pub spi1: Peri<'static, p::SPI1>,
+    pub spi1: Peri<'static, NorSpi>,
     /// NOR chip select.
-    pub nor_cs: Peri<'static, p::PA4>,
+    pub nor_cs: Peri<'static, NorCs>,
     /// NOR clock.
-    pub nor_sck: Peri<'static, p::PA5>,
+    pub nor_sck: Peri<'static, NorSck>,
     /// NOR MISO.
-    pub nor_miso: Peri<'static, p::PA6>,
+    pub nor_miso: Peri<'static, NorMiso>,
     /// NOR MOSI.
-    pub nor_mosi: Peri<'static, p::PA7>,
+    pub nor_mosi: Peri<'static, NorMosi>,
 
     /// `OW_DATA_F`: the 1-Wire bus, bit-banged.
     #[expect(dead_code, reason = "taken in M5, the site")]
@@ -203,6 +217,7 @@ impl Board {
     #[must_use]
     pub fn split(p: Peripherals) -> Self {
         Self {
+            rcc: p.RCC,
             iwdg: p.IWDG,
             rtc: p.RTC,
             tamp: p.TAMP,

@@ -245,13 +245,14 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease, 
         tx: TX_RING.init([0; MAX_FRAME]),
     };
     let mut rings = rings;
-    let mut machine = Machine {
-        endpoint: Endpoint {
-            link: Link::new(identity, Uptime.now()),
-            sessions: Sessions::new(keys),
-        },
-        fram,
-        site,
+    let Some(machine) = machine(identity, keys, fram, site) else {
+        // The task is spawned once, so this is a second run that cannot
+        // happen; ending it takes the link off the roll and the watchdog
+        // resets the part.
+        defmt::error!(
+            "link: the state machine was already built; the watchdog will reset the part"
+        );
+        return;
     };
     let mut reader = FrameReader::new();
     let mut writer = FrameWriter::new();
@@ -296,7 +297,7 @@ pub async fn run(mut pins: Pins, linked: Option<(Identity, Keys)>, fram: Lease, 
             // Bounded: an episode ends on a cut or a refusal, and a refusal
             // is tried again after the next word.
             let ended = episode(
-                &mut machine,
+                machine,
                 &mut pins,
                 &mut rings,
                 &mut reader,
@@ -392,6 +393,31 @@ struct Machine {
     endpoint: Endpoint,
     fram: Lease,
     site: Shared,
+}
+
+/// Where the state machine lives for the life of the part.
+static MACHINE: StaticCell<Machine> = StaticCell::new();
+
+/// The state machine, built once into [`MACHINE`], or `None` if it already
+/// was. Built here and not in the task, so the temporaries of building it
+/// are in this frame for one call and not in the task's poll, whose frame
+/// every poll reserves: built in the task they made that frame 31 KB, the
+/// deepest thing on the stack (#217, F-094).
+#[inline(never)]
+fn machine(
+    identity: Identity,
+    keys: Keys,
+    fram: Lease,
+    site: Shared,
+) -> Option<&'static mut Machine> {
+    MACHINE.try_init(Machine {
+        endpoint: Endpoint {
+            link: Link::new(identity, Uptime.now()),
+            sessions: Sessions::new(keys),
+        },
+        fram,
+        site,
+    })
 }
 
 /// The driver's rings, owned for the life of the part and lent to each

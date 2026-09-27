@@ -384,7 +384,11 @@ role; `BOARD-A.md` maps them to pins.
    the last words as a provisional blame until the store is read, so a
    boot the watchdog cuts short here is named by the boot after.
    **NOR scan**: the log ring's head and the time floor, the newest
-   timestamped record (L-140).
+   timestamped record (L-140). The NOR's bus is built only once the clock
+   the HAL recorded for it can carry the part's 8 MHz, because the HAL's
+   own check is an `unwrap`: a bus refused, like a part that does not
+   answer, is a unit with its store and without a ring, whose log span
+   says `NoLog`, and never a panic on every boot (F-095, #217).
 7. **Outputs to their declared fail state**, per output, from configuration,
    and shadow unless authority was granted.
 8. **Buses up**: three RS-485 USARTs, FDCAN, two LPUARTs, 1-Wire, ADC.
@@ -424,6 +428,27 @@ names levels for four, so only `P0`, `P4`, `P8` and `P12` are real here; any
 other truncates to the highest, where nothing preempts anything, and a
 compile-time assertion refuses them. The worker is on the roll with a ten-second window, and
 checks in between jobs and every idle second.
+
+**The control executor starts held, and the stack is measured** (F-094).
+`main` builds every task from inside its own poll, whose frame is 32 KB,
+and a task spawned onto an interrupt executor preempts the spawner at once:
+on #206's image the link task's first poll, 31 KB of its own, ran on top of
+that frame, and the stack, grown down from the mailbox, went 1.2 KB into
+the statics below it. Nothing on a Cortex-M0+ stops it there. It left a
+small number where the HAL keeps SPI1's kernel clock, and the NOR's bus
+refused its 8 MHz on every boot (#217). So `control::start` masks its
+interrupt again as soon as the executor is started, spawns only pend it,
+and `control::release`, a thread-mode task `main` spawns last, unmasks it
+once `main` has returned: no control task ever starts on `main`'s frame.
+The link task's state machine is built once into a static by a function of
+its own, so the temporaries of building it are not in the frame every poll
+of the task reserves. The gate reads the release ELF's frames and direct calls and refuses an
+image whose deepest stack, `main` with the supervisor and the hardware's
+handlers on it, or a thread task with a control task, the supervisor and
+the handlers on it, comes within 2 KB of the room between the statics and
+the mailbox. Calls through a pointer are what it cannot see, and what the
+2 KB is for: the deepest function reached only through one measured 1 056
+bytes when this was written.
 
 **The IWDG is fed only when every state machine reports sane.** A watchdog
 fed from a timer interrupt is a watchdog that does not work.
