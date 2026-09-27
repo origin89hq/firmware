@@ -1061,6 +1061,7 @@ mod tests {
                 }
             );
             assert_eq!(journal.pending(), None);
+            assert_eq!(part.calendar, None);
             assert!(!clock.audit_pending());
             assert!(!clock.client_rate_limited(Tick::ZERO));
             part.fault = Fault::None;
