@@ -27,8 +27,9 @@
 # F-096: f_096_* in xtask test the layout check on #233's map and #232's,
 # and the gate runs it over the release ELF; f_096_* in o89-core reads the
 # lockup's IWDG reset as a watchdog with nobody named, and withdraws a
-# recovered task's blame. That the G0B1 locks
-# up there and the IWDG resets it is a bench step for #233, not yet run.
+# recovered task's blame unless a panic site replaced it. That the G0B1
+# locks up there and the IWDG resets it is a bench step for #233, not yet
+# run.
 # F-093's deadline decisions are host tested; the adapter queues their record.
 # No bench evidence is claimed: join failures, DHCP withheld, AP loss, scan
 # during BLE, and unwritten-network scans remain the issue's bench exit.

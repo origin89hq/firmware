@@ -8,7 +8,7 @@
 
 use core::sync::atomic::Ordering;
 
-use o89_core::{CLEARED, LastWords, WORDS, Words};
+use o89_core::{CLEARED, LastWords, Task, WORDS, Words};
 use portable_atomic::AtomicU32;
 
 #[expect(
@@ -31,6 +31,23 @@ pub fn clear() {
     for slot in &LAST_WORDS {
         slot.store(0, Ordering::Relaxed);
     }
+}
+
+/// Clear the words if they still blame `task`, and say whether they did.
+///
+/// A panic site written since stays. The panic handler resets without
+/// returning, so one that runs between the read and the clear, from a
+/// handler above the supervisor, never lets the clear happen.
+pub fn withdraw(task: Task) -> bool {
+    let mut words = CLEARED;
+    for (word, slot) in words.iter_mut().zip(&LAST_WORDS) {
+        *word = slot.load(Ordering::Relaxed);
+    }
+    let ours = LastWords::blames(&words, task);
+    if ours {
+        clear();
+    }
+    ours
 }
 
 /// Read and clear whatever the previous run left.

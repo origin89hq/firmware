@@ -135,11 +135,12 @@ pub async fn run(
                 last_words::write(words);
                 defmt::error!("feed withheld: {}; reset follows", words);
             }
-            WordsUpdate::Clear => {
+            WordsUpdate::Withdraw(task) => {
                 // The task recovered: its blame would name it at a later
                 // reset it had no part in (F-096).
-                last_words::clear();
-                defmt::warn!("feed earned again; blame withdrawn");
+                if last_words::withdraw(task) {
+                    defmt::warn!("feed earned again; {}'s blame withdrawn", task);
+                }
             }
         }
         match feed {

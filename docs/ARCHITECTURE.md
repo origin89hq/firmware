@@ -476,9 +476,9 @@ is locked up every output stays as it was last written, the hang case:
 Nothing writes last words on the way, so the boot after reads an IWDG reset
 with nobody named, `BootCause::Watchdog(None)`, or the boot's own
 provisional blame if the overflow cut the boot short before its store was
-read. A blame the supervisor wrote for a late task is cleared when that
-task checks in again, so it cannot name a task that recovered long before
-the lockup. The statics, the last words among them, are never under the
+read. A blame the supervisor wrote for a late task is withdrawn when that
+task checks in again, unless a panic site has replaced it since, so it
+cannot name a task that recovered long before the lockup. The statics, the last words among them, are never under the
 stack.
 
 That bound holds only once the IWDG is armed, in step 4. An overflow before

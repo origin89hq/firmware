@@ -76,6 +76,14 @@ impl LastWords {
         [MAGIC, !MAGIC, kind, a, b]
     }
 
+    /// Whether `words` still hold `task`'s blame, so withdrawing it takes
+    /// nothing else with it: a panic site written since is the next boot's
+    /// to read.
+    #[must_use]
+    pub fn blames(words: &Words, task: Task) -> bool {
+        matches!(Self::decode(words), Some(Self::Starved(blame)) if blame.task == task)
+    }
+
     /// Read the words back, or nothing when they are not a record.
     #[must_use]
     pub fn decode(words: &Words) -> Option<Self> {
@@ -99,6 +107,21 @@ impl LastWords {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f_096_only_the_recovered_task_s_own_blame_is_withdrawn() {
+        let blame = Blame {
+            task: Task::OneWire,
+            overdue: Millis::from_millis(1_000),
+        };
+        let starved = LastWords::Starved(blame).encode();
+        assert!(LastWords::blames(&starved, Task::OneWire));
+        // Another task's blame, a panic site, or no record: not ours.
+        assert!(!LastWords::blames(&starved, Task::Rail));
+        let panicked = LastWords::Panicked(PanicSite { file: 7, line: 9 }).encode();
+        assert!(!LastWords::blames(&panicked, Task::OneWire));
+        assert!(!LastWords::blames(&CLEARED, Task::OneWire));
+    }
 
     #[test]
     fn f_008_a_blame_survives_the_reset_and_names_the_task() {

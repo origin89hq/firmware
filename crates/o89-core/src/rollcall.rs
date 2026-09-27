@@ -184,10 +184,12 @@ pub enum WordsUpdate {
     Keep,
     /// Write this blame: a task newly named for a withheld feed.
     Write(LastWords),
-    /// Clear them: the task named earlier checked in again and the feed
-    /// is earned, so a later reset in this run, a hang or the lockup of a
+    /// Withdraw this task's blame: it checked in again and the feed is
+    /// earned, so a later reset in this run, a hang or the lockup of a
     /// stack overflow, is nobody's fault that the words can name (F-096).
-    Clear,
+    /// Only while the words still hold that blame
+    /// ([`LastWords::blames`]): a panic site written since stays.
+    Withdraw(crate::Task),
 }
 
 impl Feed {
@@ -195,8 +197,10 @@ impl Feed {
     /// earlier in this run's withheld episode, if any.
     pub fn words(self, written: Option<Blame>) -> WordsUpdate {
         match self {
-            Self::Earned if written.is_some() => WordsUpdate::Clear,
-            Self::Earned | Self::NobodyOnTheRoll => WordsUpdate::Keep,
+            Self::Earned => {
+                written.map_or(WordsUpdate::Keep, |blame| WordsUpdate::Withdraw(blame.task))
+            }
+            Self::NobodyOnTheRoll => WordsUpdate::Keep,
             Self::Withheld(blame) if written.map(|b| b.task) == Some(blame.task) => {
                 WordsUpdate::Keep
             }
@@ -322,7 +326,10 @@ mod tests {
         );
         // It checks in again before the reset: the words are cleared, so a
         // lockup later in the run boots as a watchdog with nobody named.
-        assert_eq!(Feed::Earned.words(Some(late)), WordsUpdate::Clear);
+        assert_eq!(
+            Feed::Earned.words(Some(later)),
+            WordsUpdate::Withdraw(Task::OneWire)
+        );
         assert_eq!(LastWords::decode(&crate::CLEARED), None);
         // Nothing withheld: nothing to write or clear.
         assert_eq!(Feed::Earned.words(None), WordsUpdate::Keep);
