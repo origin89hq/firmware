@@ -730,10 +730,12 @@ fn enforce_layout(layout: &Layout) -> Result<()> {
             ));
         }
     }
-    if layout.initial != layout.top & !7 || !RAM.contains(&layout.initial) {
+    // cortex-m-rt writes `_stack_start` masked to 8 bytes into the table.
+    let top = layout.top & !7;
+    if layout.initial != top || !RAM.contains(&layout.initial) {
         refusals.push(format!(
-            "the vector table's stack pointer {:#x} is not `_stack_start` {:#x} inside the RAM `o89-boot` accepts",
-            layout.initial, layout.top
+            "the vector table's stack pointer {:#x} is not `_stack_start` {top:#x} inside the RAM `o89-boot` accepts",
+            layout.initial
         ));
     }
     let address = u64::from(o89_core::mailbox::MAILBOX_ADDRESS);
