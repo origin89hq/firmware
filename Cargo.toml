@@ -47,7 +47,7 @@ md-5 = { version = "0.11", default-features = false }
 sha1 = { version = "0.11", default-features = false }
 # The NOR flash trait the ring is written against; the same release
 # embassy's flash drivers implement.
-embedded-storage-async = "=0.4.1"
+embedded-storage-async = "=0.4.2"
 
 anyhow = "1"
 cargo_metadata = "0.23"

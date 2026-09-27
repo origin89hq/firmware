@@ -36,7 +36,7 @@ embassy-sync = { version = "=0.8.0", default-features = false }
 embassy-futures = { version = "=0.1.2", default-features = false }
 # The NOR flash trait the ring is written against; the same release
 # embassy's flash drivers implement.
-embedded-storage-async = "=0.4.1"
+embedded-storage-async = "=0.4.2"
 # The traits the buffered UART reads and writes through; the release the
 # pinned embassy-stm32 implements.
 embedded-io-async = "=0.7.0"
