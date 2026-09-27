@@ -12,7 +12,9 @@
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
-use km43::{Boot, BootCause, ControllerRecord, ControllerRecordError, Event, EventKind};
+use km43::{
+    Boot, BootCause, ControllerRecord, ControllerRecordError, Event, EventKind, HeldDownReason,
+};
 use o89_core::mailbox::{RingEntry, RingPage};
 use o89_core::{Class, Task};
 
@@ -174,6 +176,13 @@ fn record_line(record: ControllerRecord) -> String {
         ControllerRecord::CommsBootNoise { count } => {
             format!("comms boot noise: {count} bytes that were not frames")
         }
+        ControllerRecord::CommsHeldDown { reason } => format!(
+            "comms held down: {}",
+            match reason {
+                HeldDownReason::NoDeviceId => "no device_id at boot",
+                HeldDownReason::RevisionsSpent => "the pairing window's revisions ran out",
+            }
+        ),
     }
 }
 
@@ -363,6 +372,28 @@ mod tests {
             &record_event(13, ControllerRecord::CommsLinkLost),
         );
         assert!(lost.ends_with("comms link lost"), "{lost}");
+    }
+
+    #[test]
+    fn a_held_down_record_names_which_of_its_two_reasons_held() {
+        for (seq, reason, words) in [
+            (14, HeldDownReason::NoDeviceId, "no device_id at boot"),
+            (
+                15,
+                HeldDownReason::RevisionsSpent,
+                "the pairing window's revisions ran out",
+            ),
+        ] {
+            let line = describe(
+                seq,
+                Class::A,
+                &record_event(seq, ControllerRecord::CommsHeldDown { reason }),
+            );
+            assert!(
+                line.ends_with(&format!("comms held down: {words}")),
+                "{line}"
+            );
+        }
     }
 
     #[test]
