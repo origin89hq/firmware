@@ -216,12 +216,15 @@ impl Program {
                     function.calls.insert(target);
                 }
             } else if target == from
-                && linked
                 && let Some(function) = program.functions.get_mut(&from)
             {
-                // A call to its own start is recursion; a plain branch there
-                // is a loop whose head is the entry.
-                function.calls.insert(target);
+                // A call to its own start is recursion. A plain branch there
+                // is a loop only if the function reserves nothing, so its
+                // entry is the loop's head; one that reserved a frame would
+                // take another each time round, which is recursion too.
+                if linked || function.frame > 0 {
+                    function.calls.insert(target);
+                }
             }
         }
         Ok(program)
@@ -778,15 +781,27 @@ mod tests {
     }
 
     #[test]
-    fn f_094_a_branch_to_its_own_start_is_a_loop_not_recursion() {
-        let text = "\
+    fn f_094_a_branch_to_its_own_start_is_a_loop_only_without_a_frame() {
+        let idle = "\
 08000100 <o89_controller::idle>:
- 8000100:      \tsub\tsp, #0x10
+ 8000100:      \tnop
  8000102:      \tb\t0x8000100 <o89_controller::idle> @ imm = #-0x6
 ";
-        let program = Program::parse(text).expect("parses");
+        let program = Program::parse(idle).expect("parses");
         let depths = program.depths().expect("a loop is not recursion");
-        assert_eq!(depths[&0x0800_0100], 0x10);
+        assert_eq!(depths[&0x0800_0100], 0);
+
+        let growing = "\
+08000100 <o89_controller::grow>:
+ 8000100:      \tsub\tsp, #0x10
+ 8000102:      \tb\t0x8000100 <o89_controller::grow> @ imm = #-0x6
+";
+        let program = Program::parse(growing).expect("parses");
+        let error = program.depths().expect_err("a frame each time round");
+        assert!(
+            error.to_string().contains("o89_controller::grow"),
+            "{error}"
+        );
     }
 
     #[test]
