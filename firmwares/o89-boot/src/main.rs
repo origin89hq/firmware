@@ -68,8 +68,9 @@ const fn plausible(stack: u32, reset: u32) -> bool {
 const _: () = {
     // The real application: the stack at the top of its region at the
     // bottom of RAM, the reset handler just past the vector table and the
-    // build-id note. A stack at the top of RAM, as the runtime's default.
+    // build-id note.
     assert!(plausible(0x2000_FC00, 0x0800_8101));
+    // A stack at the top of RAM, the runtime's default layout.
     assert!(plausible(0x2002_4000, 0x0800_8101));
     assert!(plausible(0x2001_0000, 0x0800_8100));
     // A reset vector in the second bank, where a large image's code goes.
