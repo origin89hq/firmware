@@ -1,0 +1,59 @@
+# Copy to the Cargo workspace root; see engineering's docs/dependencies.md.
+# Add a license or exception only after reading the crate's terms, and record why.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0110", reason = "bare-metal is deprecated with no fix; reached through cortex-m under the pinned embassy revision. https://github.com/origin89hq/firmware/issues/222" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained proc-macro with no fix; used by esp-hal and riscv at build time. https://github.com/origin89hq/firmware/issues/223" },
+]
+
+[licenses]
+# The shared list covers several repositories; unused entries are expected.
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[[licenses.exceptions]]
+# 0BSD (license file read): use, copy, modify and distribute with no conditions.
+crate = "managed"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+# 0BSD (license file read): use, copy, modify and distribute with no conditions.
+crate = "smoltcp"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+# 0BSD, read in the git source; the crates.io copy declares 0BSD without the file.
+crate = "xarxa-driver"
+allow = ["0BSD"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # Our protocol crate, pinned to a commit in Cargo.lock.
+    "https://github.com/origin89hq/km43",
+    # Embassy HALs and executor, pinned to one reviewed revision; Cargo.lock records the commit.
+    "https://github.com/embassy-rs/embassy",
+    # stm32-metapac for that embassy revision; Cargo.lock records the commit behind the tag.
+    "https://github.com/embassy-rs/stm32-data-generated",
+    # Required by that embassy revision; Cargo.lock records the commit.
+    "https://github.com/embassy-rs/unitrait",
+    # Required by that embassy revision; Cargo.lock records the commit.
+    "https://github.com/embassy-rs/xarxa",
+]

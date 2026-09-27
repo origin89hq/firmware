@@ -1,0 +1,45 @@
+# From origin89hq/engineering templates/dependabot.yml; see its docs/dependencies.md.
+# People review and merge every update. Embassy, HAL and toolchain moves need
+# the board revalidation AGENTS.md describes before merging.
+# xtask/reproducible/Dockerfile pins its base by digest alone, which Dependabot
+# could only move to the digest of `latest`; that pin is moved by hand.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: ci
+
+  # The host tools workspace and the firmware workspace have separate lockfiles.
+  - package-ecosystem: cargo
+    directories: [/, /firmwares]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
