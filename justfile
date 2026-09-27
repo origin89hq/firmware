@@ -292,6 +292,8 @@ dev-write-epoch epoch *args:
 # operating system's generator, shown once. Effect: the unit can enrol
 # clients. Refused when one is held; `--replace` orphans every client
 # enrolled under the old one. Recovery: none; a replaced secret is gone.
+# `--export <file>` is required: the unit's public record is appended there
+# for the cloud import (crates/o89-dev/EXPORT.md).
 #
 # WRITE the device secret on the FRAM, shown once; refused when one is held.
 dev-write-secret *args:

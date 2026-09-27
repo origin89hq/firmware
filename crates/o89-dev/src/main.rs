@@ -226,6 +226,11 @@ enum StoreCommand {
         /// Recover the label from an interrupted secret write.
         #[arg(long, conflicts_with_all = ["device_id", "replace"])]
         resume: bool,
+        /// The file the unit's public record is appended to, one JSON
+        /// object per line (`crates/o89-dev/EXPORT.md`); the same file on
+        /// `--resume`. Its journal `<export>.drawn` is kept beside it.
+        #[arg(long, value_name = "FILE")]
+        export: std::path::PathBuf,
     },
 }
 
@@ -326,7 +331,8 @@ fn main() -> Result<()> {
                 device_id,
                 replace,
                 resume,
-            }) => store::write_secret(&mut link, device_id.as_deref(), replace, resume),
+                export,
+            }) => store::write_secret(&mut link, &export, device_id.as_deref(), replace, resume),
         },
         Command::Rail { revision } => {
             let readout = rail::read(&mut link, revision.into())?;
@@ -471,6 +477,40 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn p_249_the_printed_resume_command_parses_even_for_a_path_starting_with_a_dash() {
+        let parsed = Cli::try_parse_from([
+            "o89-dev",
+            "store",
+            "write-secret",
+            "--resume",
+            "--export=-units.jsonl",
+        ])
+        .expect("parses");
+        let Command::Store {
+            what: Some(StoreCommand::WriteSecret { export, resume, .. }),
+        } = parsed.command
+        else {
+            panic!("a write-secret")
+        };
+        assert!(resume);
+        assert_eq!(export, std::path::Path::new("-units.jsonl"));
+        // Without `=` the same path reads as a flag, and without the file
+        // there is no ledger to resume against.
+        assert!(
+            Cli::try_parse_from([
+                "o89-dev",
+                "store",
+                "write-secret",
+                "--resume",
+                "--export",
+                "-units.jsonl"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["o89-dev", "store", "write-secret", "--resume"]).is_err());
+    }
 
     #[test]
     fn a_flash_takes_the_knock_or_the_strap_and_refuses_a_plain_reset() {

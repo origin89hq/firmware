@@ -9,10 +9,16 @@
 //! held them are cleared once the transaction is staged. What the label
 //! prints is the fingerprint the controller wrote into the applied
 //! transaction, so a resumed label never needs the private key (P-236).
+//!
+//! The station also keeps the public half of what it made (P-249): before a
+//! transaction is staged it journals it, for a birth the device id with the
+//! fingerprint of the key it drew, and once the part confirms that key it
+//! appends the pair to the operator's export file (`ledger`). The part's
+//! fingerprint only confirms a record; it is never one's source.
 
 use anyhow::{Context, Result, anyhow, bail};
 use embassy_futures::block_on;
-use km43::{ClientId, Epoch, Fingerprint};
+use km43::{ClientId, DeviceId, Epoch, Fingerprint};
 use o89_core::Address;
 use o89_core::mailbox::DATA_BYTES;
 use o89_core::{
@@ -25,6 +31,9 @@ use o89_core::{
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::link::Link;
+
+mod ledger;
+use ledger::{Exported, Ledger, Record};
 
 /// Every record, decoded, one line each. Never a key, a seed or an admission
 /// key: only whether each is there.
@@ -227,15 +236,18 @@ fn run_blank(
 }
 
 /// Write the secret, and on a unit's first transaction its controller key
-/// and generator; the label is shown once.
+/// and generator; the label is shown once and the unit's public record goes
+/// to `export`.
 pub fn write_secret(
     link: &mut Link,
+    export: &std::path::Path,
     device_id: Option<&str>,
     replace: bool,
     resume: bool,
 ) -> Result<()> {
     run_secret(
         link,
+        &Ledger::new(export)?,
         device_id,
         replace,
         resume,
@@ -245,16 +257,18 @@ pub fn write_secret(
 
 fn run_secret(
     link: &mut impl SecretLink,
+    ledger: &Ledger,
     device_id: Option<&str>,
     replace: bool,
     resume: bool,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
     if resume {
-        return resume_secret(link, output).context(RESUME);
+        return resume_secret(link, ledger, output).with_context(|| resume_hint(ledger));
     }
-    ensure_no_transaction(link)?;
+    ensure_no_transaction(link).with_context(|| resume_hint(ledger))?;
     let secret = generate_secret(link, device_id, replace)?;
+    let device_id = DeviceId::new(secret.device_id_bytes());
     let birth = if born(link)? {
         // Checked before anything is staged: once applied, the new label
         // has replaced the old one, and one that pairs with nothing is not
@@ -267,26 +281,69 @@ fn run_secret(
                 "the generator does not read back, so this unit cannot pair; nothing staged, the label it has stays"
             );
         }
+        // The key stays, so an exported record for this device id must
+        // already name it. Journaled as a replace, so a resume can tell this
+        // transaction from one the ledger never saw; never exported from here.
+        let held = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+        let Some(key) = held.present() else {
+            bail!(
+                "the controller key does not read back, so this unit cannot be labelled or \
+                 recorded; nothing staged, the label it has stays"
+            );
+        };
+        ledger.note_replace(Record {
+            device_id,
+            fingerprint: key.fingerprint(),
+        })?;
         None
     } else {
-        Some(generate_birth()?)
+        let birth = generate_birth()?;
+        // Durable before the key can reach the part, so a resume in another
+        // process confirms against the station's own fingerprint.
+        ledger.note_drawn(Record {
+            device_id,
+            fingerprint: birth.controller.fingerprint(),
+        })?;
+        Some(birth)
     };
     // `Birth` is `Copy` and has no way to clear itself; the encoded body is
     // the copy that crosses to the controller, and it is cleared below.
     let mut body = Zeroizing::new(SecretChange::Pending(secret, birth).encode());
-    link.stage_and_reboot(&body[..], replace).context(RESUME)?;
+    link.stage_and_reboot(&body[..], replace)
+        .with_context(|| resume_hint(ledger))?;
     body.zeroize();
-    show_applied(link, secret, output).context(RESUME)
+    show_applied(link, ledger, secret, output).with_context(|| resume_hint(ledger))
 }
 
-const RESUME: &str = "secret write interrupted; run: o89-dev store write-secret --resume";
+/// The command that recovers an interrupted write: the same export file,
+/// quoted for a POSIX shell and joined by `=` so a path starting with `-`
+/// is still the flag's value.
+fn resume_hint(ledger: &Ledger) -> String {
+    format!(
+        "secret write interrupted; run: o89-dev store write-secret --resume --export={}",
+        shell_word(&ledger.export().to_string_lossy())
+    )
+}
+
+/// `text` as one POSIX shell word: bare when every character is safe,
+/// otherwise single-quoted with each `'` closed, escaped and reopened.
+fn shell_word(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
 
 type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
 
 fn ensure_no_transaction(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<()> {
     match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
     {
-        Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => bail!(RESUME),
+        Held::Present(SecretChange::Pending(..) | SecretChange::Applied(..)) => {
+            bail!("a secret transaction is unfinished")
+        }
         Held::Absent | Held::Present(SecretChange::Complete) => Ok(()),
         Held::Corrupt | Held::Malformed(_) => {
             bail!("unreadable secret transaction; reboot before provisioning")
@@ -337,7 +394,11 @@ impl SecretLink for Link {
     }
 }
 
-fn resume_secret(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> Result<()> {
+fn resume_secret(
+    link: &mut impl SecretLink,
+    ledger: &Ledger,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
     let transaction = block_on(Transaction::read(map::SECRET_CHANGE, link))?;
     let secret = match *transaction.held() {
         Held::Present(SecretChange::Pending(secret, _)) => {
@@ -352,7 +413,7 @@ fn resume_secret(link: &mut impl SecretLink, output: &mut impl std::io::Write) -
             bail!("unreadable secret transaction; no label printed")
         }
     };
-    show_applied(link, secret, output)
+    show_applied(link, ledger, secret, output)
 }
 
 fn generate_secret(
@@ -389,6 +450,7 @@ fn generate_secret(
 
 fn show_applied(
     link: &mut impl o89_core::Fram<Error = anyhow::Error>,
+    ledger: &Ledger,
     secret: Secret,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
@@ -410,6 +472,13 @@ fn show_applied(
     if key.present().map(ControllerKey::fingerprint) != Some(fingerprint) {
         bail!("the controller key does not read back as the one applied; no label printed");
     }
+    // Before the label, so a record that cannot be written leaves the
+    // transaction resumable and a key the station did not draw prints no
+    // label. A replace onto a key it holds no record of is still labelled,
+    // with the warning below that nothing was exported.
+    let exported = ledger
+        .confirm(DeviceId::new(secret.device_id_bytes()), fingerprint)
+        .context("no label printed")?;
     let encoded = secret.encode();
     let id = secret.device_id_bytes();
     let printed: Zeroizing<[u8; PRINTED_SECRET_BYTES]> = Zeroizing::new(
@@ -435,6 +504,26 @@ fn show_applied(
         output,
         "shown once: it goes on the unit's label and nowhere else"
     )?;
+    let export = ledger.export().display();
+    match exported {
+        Exported::Appended(record) => {
+            tracing::info!(?record, %export, "controller record exported");
+            writeln!(output, "record         exported to {export}")?;
+        }
+        Exported::AlreadyHeld(record) => {
+            tracing::info!(?record, %export, "controller record already exported");
+            writeln!(output, "record         already in {export}")?;
+        }
+        Exported::NoStationRecord => {
+            tracing::warn!(%export, "no controller record exported");
+            writeln!(
+                output,
+                "record         none exported: {export} holds no record of this unit's \
+                 controller key, so the station cannot vouch for it and does not take the \
+                 part's word; the cloud's vouch check (P-247) has no record for this unit"
+            )?;
+        }
+    }
     output.flush()?;
     // A failed output remains resumable. A crash between output and acknowledgement
     // can repeat the same label, but never substitutes an unseen secret.
@@ -537,6 +626,14 @@ mod tests {
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].decode().expect("a scannable QR").1, PAYLOAD);
         assert!(rows[0].iter().all(|pixel| *pixel == ' '));
+    }
+
+    #[test]
+    fn a_resume_path_is_one_shell_word_as_printed() {
+        assert_eq!(shell_word("/tmp/units.jsonl"), "/tmp/units.jsonl");
+        assert_eq!(shell_word("unit records.jsonl"), "'unit records.jsonl'");
+        assert_eq!(shell_word("it's;rm"), r"'it'\''s;rm'");
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]

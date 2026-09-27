@@ -1366,6 +1366,8 @@ dependencies = [
  "probe-rs",
  "qrcode",
  "rqrr",
+ "serde",
+ "serde_json",
  "sha2",
  "tracing",
  "tracing-subscriber",
