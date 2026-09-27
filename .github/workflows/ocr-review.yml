@@ -3,7 +3,7 @@ name: Open Code Review
 
 # pull_request_target keeps this secret-bearing file on the base branch;
 # a PR cannot edit the workflow that receives the key.
-on:
+on: # zizmor: ignore[dangerous-triggers] reviewed: the called workflow never runs PR code
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
