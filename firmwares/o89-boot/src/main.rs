@@ -39,8 +39,11 @@ use stm32_metapac::{GPIOD, RCC};
 const APPLICATION: usize = 0x0800_8000;
 
 /// The part's RAM, which is where an initial stack pointer has to point.
-/// The top is included: the runtime puts the first stack at the very end
-/// of RAM, and the first push moves below it.
+/// The top is included: a stack starts at the end of its region and the
+/// first push moves below it. The controller links its stack at the bottom
+/// of RAM, so its first stack pointer is the top of that region (F-096);
+/// this image is never updated, so it accepts any stack inside RAM rather
+/// than the one layout this checkout links.
 const RAM: RangeInclusive<u32> = 0x2000_0000..=0x2002_4000;
 
 /// The application region, which is where a reset vector has to point: past
@@ -63,8 +66,10 @@ const fn plausible(stack: u32, reset: u32) -> bool {
 }
 
 const _: () = {
-    // The real application: the stack at the top of RAM, the reset handler
-    // just past the vector table and the build-id note.
+    // The real application: the stack at the top of its region at the
+    // bottom of RAM, the reset handler just past the vector table and the
+    // build-id note. A stack at the top of RAM, as the runtime's default.
+    assert!(plausible(0x2000_FC00, 0x0800_8101));
     assert!(plausible(0x2002_4000, 0x0800_8101));
     assert!(plausible(0x2001_0000, 0x0800_8100));
     // A reset vector in the second bank, where a large image's code goes.

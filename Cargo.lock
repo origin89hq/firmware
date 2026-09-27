@@ -2343,6 +2343,7 @@ dependencies = [
  "clap",
  "hex",
  "km43",
+ "o89-core",
  "serde",
  "sha1",
  "sha2",

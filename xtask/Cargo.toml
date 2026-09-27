@@ -18,6 +18,8 @@ sha2.workspace = true
 # Git's blob ids, which a staged tree's files are hashed against (#74).
 sha1.workspace = true
 km43.workspace = true
+# Where the mailbox sits, which the stack check holds the linked image to.
+o89-core = { path = "../crates/o89-core" }
 serde.workspace = true
 syn.workspace = true
 toml.workspace = true

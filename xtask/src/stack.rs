@@ -1,13 +1,20 @@
-//! The controller's stack, measured from the image the gate built (F-094).
+//! The controller's stack, read from the image the gate built: where it is
+//! linked (F-096) and how deep it can go (F-094).
 //!
-//! The stack grows down from the mailbox toward the statics, and nothing on
-//! a Cortex-M0+ stops it at their edge: #217 was the stack running 1.2 KB
-//! into `.bss` and leaving a small number where the HAL keeps SPI1's clock,
-//! so the NOR's bus refused its frequency on every boot. Host tests cannot
-//! see a frame, so this reads them off the release ELF: every function's
-//! frame from its prologue, the deepest chain of direct calls under each
-//! task and interrupt, and the sum of what can be on the stack at once,
-//! held under the room the linker left with a margin.
+//! Nothing on a Cortex-M0+ stops a stack at the edge of the statics: #217
+//! was the stack running 1.2 KB into `.bss` and leaving a small number
+//! where the HAL keeps SPI1's clock, so the NOR's bus refused its frequency
+//! on every boot. So the stack is linked at the bottom of RAM with every
+//! static above it, and an overflow runs off the bottom of RAM, faults and
+//! resets instead (#233). The check refuses an image whose stack's floor is
+//! not the RAM origin, or that puts anything in RAM under the stack's top,
+//! or whose mailbox is not where `o89-core` says it is.
+//!
+//! A fault is still a reset, so the depth is measured too. Host tests
+//! cannot see a frame, so this reads them off the release ELF: every
+//! function's frame from its prologue, the deepest chain of direct calls
+//! under each task and interrupt, and the sum of what can be on the stack
+//! at once, held under the stack's region with a margin.
 //!
 //! What can be on the stack at once follows from who preempts whom: one
 //! thread-mode task, one task of the control executor above it, one of the
@@ -34,6 +41,11 @@ use crate::repo::llvm_tool;
 /// What the check insists on under the room the linker left, for the calls
 /// through a pointer the call graph counts as calling nothing.
 const MARGIN: u64 = 2 * 1024;
+
+/// The part's RAM, all 144 KB of it: the range the bootloader accepts an
+/// initial stack pointer in (`o89-boot`'s `RAM`, top included). Its origin
+/// is the stack's floor, with no RAM under it for an overflow to land on.
+const RAM: std::ops::RangeInclusive<u64> = 0x2000_0000..=0x2002_4000;
 
 /// What an exception pushes: eight words, and one more when the stack it
 /// lands on is not 8-byte aligned.
@@ -592,7 +604,7 @@ fn enforce(measured: &Measured) -> Result<()> {
     let limit = measured.room.saturating_sub(MARGIN);
     ensure!(
         measured.worst() <= limit,
-        "the controller's stack can reach {} bytes (boot {}, running {}), over the {limit}-byte line ({} of room less a {MARGIN} margin): the stack would run into the statics below it (#217)",
+        "the controller's stack can reach {} bytes (boot {}, running {}), over the {limit}-byte line ({} of room less a {MARGIN} margin): the stack would run off the bottom of RAM and reset the part (#217)",
         measured.worst(),
         measured.boot,
         measured.running,
@@ -617,30 +629,135 @@ fn tool(name: &str, args: &[&str], elf: &Path) -> Result<String> {
     String::from_utf8(output.stdout).with_context(|| format!("{name} wrote something not UTF-8"))
 }
 
-/// `_stack_start - _stack_end` from `llvm-nm`: the room cortex-m-rt left.
+/// The address `llvm-nm` gives the symbol `name`.
+fn symbol(symbols: &str, name: &str) -> Result<u64> {
+    symbols
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = fields.next()?;
+            let _kind = fields.next()?;
+            (fields.next()? == name).then(|| u64::from_str_radix(address, 16).ok())?
+        })
+        .with_context(|| format!("the image has no `{name}`"))
+}
+
+/// `_stack_start - _stack_end` from `llvm-nm`: the stack's region.
 fn room(symbols: &str) -> Result<u64> {
-    let find = |name: &str| -> Result<u64> {
-        symbols
-            .lines()
-            .find_map(|line| {
-                let mut fields = line.split_whitespace();
-                let address = fields.next()?;
-                let _kind = fields.next()?;
-                (fields.next()? == name).then(|| u64::from_str_radix(address, 16).ok())?
-            })
-            .with_context(|| format!("the image has no `{name}`"))
-    };
-    let start = find("_stack_start")?;
-    let end = find("_stack_end")?;
+    let start = symbol(symbols, "_stack_start")?;
+    let end = symbol(symbols, "_stack_end")?;
     start
         .checked_sub(end)
         .with_context(|| format!("the stack's top {start:#x} is under its floor {end:#x}"))
 }
 
-/// The handlers the vector table names, past the initial stack pointer and
-/// the reset vector first, from `llvm-objdump -s -j .vector_table`, with
-/// the Thumb bit cleared.
-fn vectors(dump: &str) -> Result<Vec<u64>> {
+/// An output section of the image.
+#[derive(Debug)]
+struct Section {
+    name: String,
+    address: u64,
+    size: u64,
+}
+
+/// The sections `llvm-objdump -h` lists,
+/// `  8 .bss            00011b58 2000fdf8 2000fdf8 BSS`, without the
+/// unnamed null section, whose line is one field short.
+fn sections(headers: &str) -> Vec<Section> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next()?.parse::<u32>().ok()?;
+            let name = fields.next()?;
+            let size = u64::from_str_radix(fields.next()?, 16).ok()?;
+            let address = u64::from_str_radix(fields.next()?, 16).ok()?;
+            u64::from_str_radix(fields.next()?, 16).ok()?;
+            Some(Section {
+                name: name.to_owned(),
+                address,
+                size,
+            })
+        })
+        .collect()
+}
+
+/// Where the linker put the stack, and what it put beside it.
+#[derive(Debug)]
+struct Layout {
+    /// `_stack_end`: the stack's floor, its lowest address.
+    floor: u64,
+    /// `_stack_start`: the stack's top, where the first frame is pushed.
+    top: u64,
+    /// The vector table's first word: the stack pointer the core loads at
+    /// reset, and the one `o89-boot` judges before it jumps.
+    initial: u64,
+    sections: Vec<Section>,
+}
+
+impl Layout {
+    fn read(symbols: &str, dump: &str, headers: &str) -> Result<Self> {
+        Ok(Self {
+            floor: symbol(symbols, "_stack_end")?,
+            top: symbol(symbols, "_stack_start")?,
+            initial: table(dump)?
+                .first()
+                .copied()
+                .context("the vector table has no stack pointer")?,
+            sections: sections(headers),
+        })
+    }
+}
+
+/// Refuse an image whose stack can overflow into anything but a fault
+/// (F-096), naming every reason at once.
+fn enforce_layout(layout: &Layout) -> Result<()> {
+    let mut refusals = Vec::new();
+    if layout.floor != *RAM.start() {
+        refusals.push(format!(
+            "the stack's floor `_stack_end` is {:#x}, not the RAM origin {:#x}: an overflow lands on what is under it instead of faulting",
+            layout.floor,
+            RAM.start()
+        ));
+    }
+    for section in &layout.sections {
+        if section.size > 0 && RAM.contains(&section.address) && section.address < layout.top {
+            refusals.push(format!(
+                "`{}` at {:#x} is under the stack's top {:#x}: an overflow writes over it before anything faults",
+                section.name, section.address, layout.top
+            ));
+        }
+    }
+    if layout.initial != layout.top & !7 || !RAM.contains(&layout.initial) {
+        refusals.push(format!(
+            "the vector table's stack pointer {:#x} is not `_stack_start` {:#x} inside the RAM `o89-boot` accepts",
+            layout.initial, layout.top
+        ));
+    }
+    let address = u64::from(o89_core::mailbox::MAILBOX_ADDRESS);
+    let bytes = u64::try_from(o89_core::mailbox::MAILBOX_BYTES)?;
+    match layout
+        .sections
+        .iter()
+        .find(|section| section.name == ".o89_mailbox")
+    {
+        Some(mailbox) if mailbox.address == address && mailbox.size <= bytes => {}
+        Some(mailbox) => refusals.push(format!(
+            "the mailbox is {} bytes at {:#x}, not within the {bytes} at {address:#x} `o89-core` names",
+            mailbox.size, mailbox.address
+        )),
+        None => refusals.push("the image has no `.o89_mailbox`".to_owned()),
+    }
+    ensure!(
+        refusals.is_empty(),
+        "the controller's RAM is not laid out for a stack overflow to fault (#233):\n  {}",
+        refusals.join("\n  ")
+    );
+    Ok(())
+}
+
+/// The vector table's words, from `llvm-objdump -s -j .vector_table`: the
+/// initial stack pointer first, then the reset vector and the handlers.
+fn table(dump: &str) -> Result<Vec<u64>> {
     let mut words = Vec::new();
     for line in dump.lines() {
         let mut fields = line.split_whitespace();
@@ -659,7 +776,13 @@ fn vectors(dump: &str) -> Result<Vec<u64>> {
         }
     }
     ensure!(words.len() > 2, "the vector table is empty");
-    Ok(words
+    Ok(words)
+}
+
+/// The handlers the vector table names, past the initial stack pointer and
+/// the reset vector first, with the Thumb bit cleared.
+fn vectors(dump: &str) -> Result<Vec<u64>> {
+    Ok(table(dump)?
         .into_iter()
         .skip(1)
         .filter(|&word| word != 0)
@@ -667,16 +790,24 @@ fn vectors(dump: &str) -> Result<Vec<u64>> {
         .collect())
 }
 
-/// Measure the controller's release ELF and refuse a stack that does not
+/// Refuse the controller's release ELF if an overflow of its stack would
+/// not fault (F-096), then measure the stack and refuse one that does not
 /// fit (F-094).
 pub fn check(elf: &Path) -> Result<()> {
+    let dump = tool("llvm-objdump", &["-s", "-j", ".vector_table"], elf)?;
+    let symbols = tool("llvm-nm", &[], elf)?;
+    let headers = tool("llvm-objdump", &["-h"], elf)?;
+    let layout = Layout::read(&symbols, &dump, &headers)?;
+    println!(
+        "o89-controller RAM: stack {:#x}..{:#x}",
+        layout.floor, layout.top
+    );
+    enforce_layout(&layout)?;
     let disassembly = tool(
         "llvm-objdump",
         &["-d", "--no-show-raw-insn", "--demangle"],
         elf,
     )?;
-    let dump = tool("llvm-objdump", &["-s", "-j", ".vector_table"], elf)?;
-    let symbols = tool("llvm-nm", &[], elf)?;
     let program = Program::parse(&disassembly)?;
     let measured = measure(&program, &vectors(&dump)?, room(&symbols)?)?;
     let mut report = String::new();
@@ -882,8 +1013,8 @@ mod tests {
 
     #[test]
     fn f_094_room_is_read_from_the_runtime_symbols() {
-        let symbols = "20012154 B _stack_end\n20022000 A _stack_start\n20000000 D __sdata\n";
-        assert_eq!(room(symbols).expect("both"), 0x2_2000 - 0x1_2154);
+        let symbols = "20000000 A _stack_end\n2000fc00 A _stack_start\n2000fc00 D __sdata\n";
+        assert_eq!(room(symbols).expect("both"), 0xfc00);
         assert!(room("20022000 A _stack_start\n").is_err(), "no floor");
         assert!(
             room("20000000 B _stack_end\n1fff0000 A _stack_start\n").is_err(),
@@ -903,5 +1034,150 @@ Contents of section .vector_table:
             vec![0x0800_8100, 0x0804_cd98]
         );
         assert!(vectors("Contents of section .vector_table:\n").is_err());
+    }
+
+    /// `llvm-objdump -h` of the release image as #233 links it: the stack
+    /// under 0x2000fc00, the statics and the mailbox above.
+    const HEADERS: &str = "\
+o89-controller:\tfile format elf32-littlearm
+
+Sections:
+Idx Name            Size     VMA      LMA      Type
+  0                 00000000 00000000 00000000 
+  1 .o89_mailbox    00001838 20022000 20022000 BSS
+  2 .vector_table   000000bc 08008000 08008000 DATA
+  4 .text           00044db0 08008100 08008100 TEXT
+  6 .data           000001f8 2000fc00 08052650 DATA
+  7 .gnu.sgstubs    00000000 08052860 08052860 DATA
+  8 .bss            00011b58 2000fdf8 2000fdf8 BSS
+  9 .uninit         00000414 20021950 20021950 BSS
+ 10 .defmt          0000013f 00000000 00000000 
+";
+
+    /// The same image as #232 linked it: the stack down from the mailbox,
+    /// its floor at the end of `.uninit`.
+    const HEADERS_232: &str = "\
+Idx Name            Size     VMA      LMA      Type
+  1 .o89_mailbox    00001838 20022000 20022000 BSS
+  6 .data           000001f8 20000000 08052650 DATA
+  8 .bss            00011b58 200001f8 200001f8 BSS
+  9 .uninit         00000414 20011d50 20011d50 BSS
+";
+
+    fn table_with(stack_pointer: &str) -> String {
+        format!(
+            "Contents of section .vector_table:\n 8008000 {stack_pointer} 01810008 718c0308 95ce0408  ....\n"
+        )
+    }
+
+    fn layout(floor: u64, top: u64, headers: &str) -> Layout {
+        let initial = top.to_le_bytes();
+        let word = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            initial[0], initial[1], initial[2], initial[3]
+        );
+        let symbols = format!("{floor:08x} A _stack_end\n{top:08x} A _stack_start\n");
+        Layout::read(&symbols, &table_with(&word), headers).expect("reads")
+    }
+
+    #[test]
+    fn f_096_the_stack_under_every_static_at_the_ram_origin_passes() {
+        let linked = layout(0x2000_0000, 0x2000_fc00, HEADERS);
+        assert_eq!(linked.initial, 0x2000_fc00);
+        // `.data` starts at exactly the stack's top, which is above it.
+        assert!(enforce_layout(&linked).is_ok());
+    }
+
+    #[test]
+    fn f_096_the_layout_232_linked_is_refused_for_its_floor_and_every_static_under_its_top() {
+        let old = layout(0x2001_2164, 0x2002_2000, HEADERS_232);
+        let error = enforce_layout(&old).expect_err("the stack above the statics");
+        let text = error.to_string();
+        assert!(text.contains("floor `_stack_end` is 0x20012164"), "{text}");
+        for name in ["`.data`", "`.bss`", "`.uninit`"] {
+            assert!(text.contains(name), "{name} in {text}");
+        }
+        // The mailbox is above the top here too, and is not named.
+        assert!(!text.contains("mailbox"), "{text}");
+    }
+
+    #[test]
+    fn f_096_a_static_one_word_under_the_top_is_refused_with_the_floor_at_the_origin() {
+        let under = HEADERS.replace("2000fdf8 2000fdf8 BSS", "2000fbfc 2000fbfc BSS");
+        let error = enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &under))
+            .expect_err("`.bss` four bytes into the stack");
+        let text = error.to_string();
+        assert!(text.contains("`.bss` at 0x2000fbfc"), "{text}");
+        assert!(!text.contains("floor"), "{text}");
+        // An empty section there holds nothing to overwrite.
+        let empty = HEADERS.replace(
+            "00011b58 2000fdf8 2000fdf8 BSS",
+            "00000000 2000fbfc 2000fbfc BSS",
+        );
+        assert!(enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &empty)).is_ok());
+    }
+
+    #[test]
+    fn f_096_a_floor_above_the_ram_origin_is_refused() {
+        // Nothing sits under the stack, but the words under its floor are
+        // RAM, so the first push past it lands there and nothing faults.
+        let error = enforce_layout(&layout(0x2000_0100, 0x2000_fc00, HEADERS))
+            .expect_err("a floor inside RAM");
+        let text = error.to_string();
+        assert!(text.contains("floor `_stack_end` is 0x20000100"), "{text}");
+        assert!(!text.contains("`.bss`"), "{text}");
+    }
+
+    #[test]
+    fn f_096_the_mailbox_is_held_where_o89_core_names_it() {
+        let moved = HEADERS.replace("00001838 20022000 20022000", "00001838 20022100 20022100");
+        let error = enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &moved)).expect_err("moved");
+        assert!(error.to_string().contains("mailbox"), "{error}");
+        let grown = HEADERS.replace("00001838 20022000", "00002004 20022000");
+        let error =
+            enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &grown)).expect_err("past its 8 KiB");
+        assert!(error.to_string().contains("mailbox"), "{error}");
+        let gone = HEADERS.replace(".o89_mailbox", ".o89_elsewhere");
+        let error = enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &gone)).expect_err("missing");
+        assert!(error.to_string().contains("no `.o89_mailbox`"), "{error}");
+    }
+
+    #[test]
+    fn f_096_the_initial_stack_pointer_is_the_stack_top_inside_the_ram_the_bootloader_accepts() {
+        let symbols = "20000000 A _stack_end\n2000fc00 A _stack_start\n";
+        // The core would start on the old top, over the statics.
+        let stale = Layout::read(symbols, &table_with("00200220"), HEADERS).expect("reads");
+        assert_eq!(stale.initial, 0x2002_2000);
+        let error = enforce_layout(&stale).expect_err("not the top");
+        assert!(
+            error.to_string().contains("stack pointer 0x20022000"),
+            "{error}"
+        );
+        // A top past the part's RAM is one `o89-boot` refuses to jump to.
+        let past = layout(0x2000_0000, 0x2002_4008, HEADERS);
+        let error = enforce_layout(&past).expect_err("past RAM");
+        assert!(error.to_string().contains("o89-boot"), "{error}");
+        assert!(Layout::read(symbols, "Contents of section .vector_table:\n", HEADERS).is_err());
+    }
+
+    #[test]
+    fn f_096_sections_are_read_from_the_headers_without_the_null_one() {
+        let read = sections(HEADERS);
+        let names: Vec<&str> = read.iter().map(|section| section.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                ".o89_mailbox",
+                ".vector_table",
+                ".text",
+                ".data",
+                ".gnu.sgstubs",
+                ".bss",
+                ".uninit",
+                ".defmt"
+            ]
+        );
+        assert_eq!((read[5].address, read[5].size), (0x2000_fdf8, 0x1_1b58));
+        assert!(sections("").is_empty());
     }
 }
