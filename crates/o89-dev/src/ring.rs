@@ -12,7 +12,9 @@
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
-use km43::{Boot, BootCause, ControllerRecord, ControllerRecordError, Event, EventKind};
+use km43::{
+    Boot, BootCause, ControllerRecord, ControllerRecordError, Event, EventKind, HeldDownReason,
+};
 use o89_core::mailbox::{RingEntry, RingPage};
 use o89_core::{Class, Task};
 
@@ -139,7 +141,8 @@ fn describe(seq: u64, class: Class, payload: &[u8]) -> String {
             Err(ControllerRecordError::UnknownKind(_)) => {
                 let _ = write!(line, "body {}", hex::encode(event.body()));
             }
-            Err(_) if event.body() == EMPTY_MAP => {
+            // `comms held down` came after 0.4.1: its empty body is malformed.
+            Err(_) if event.body() == EMPTY_MAP && event.kind != EventKind::COMMS_HELD_DOWN => {
                 line.push_str("empty body: written before km43 0.4.1 gave the record its fields");
             }
             Err(why) => {
@@ -174,6 +177,13 @@ fn record_line(record: ControllerRecord) -> String {
         ControllerRecord::CommsBootNoise { count } => {
             format!("comms boot noise: {count} bytes that were not frames")
         }
+        ControllerRecord::CommsHeldDown { reason } => format!(
+            "comms held down: {}",
+            match reason {
+                HeldDownReason::NoDeviceId => "no device_id at boot",
+                HeldDownReason::RevisionsSpent => "the pairing window's revisions ran out",
+            }
+        ),
     }
 }
 
@@ -363,6 +373,37 @@ mod tests {
             &record_event(13, ControllerRecord::CommsLinkLost),
         );
         assert!(lost.ends_with("comms link lost"), "{lost}");
+    }
+
+    #[test]
+    fn a_held_down_record_names_which_of_its_two_reasons_held() {
+        for (seq, reason, words) in [
+            (14, HeldDownReason::NoDeviceId, "no device_id at boot"),
+            (
+                15,
+                HeldDownReason::RevisionsSpent,
+                "the pairing window's revisions ran out",
+            ),
+        ] {
+            let line = describe(
+                seq,
+                Class::A,
+                &record_event(seq, ControllerRecord::CommsHeldDown { reason }),
+            );
+            assert!(
+                line.ends_with(&format!("comms held down: {words}")),
+                "{line}"
+            );
+        }
+        let empty = describe(
+            16,
+            Class::A,
+            &event(16, EventKind::COMMS_HELD_DOWN, EMPTY_MAP),
+        );
+        assert!(
+            empty.ends_with("body refused (controller record missing key 1): a0"),
+            "{empty}"
+        );
     }
 
     #[test]
