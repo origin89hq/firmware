@@ -7,7 +7,7 @@
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
-use crate::{Calendar, Millis, Tick, UnixMillis};
+use crate::{Calendar, Millis, Tick, TimeAnswer, UnixMillis};
 
 /// Ten Julian years, in milliseconds, shared by both clock-setting paths.
 pub const PLAUSIBILITY_SPAN: u64 = 315_576_000_000;
@@ -97,6 +97,31 @@ pub enum ClientSet {
     Rejected,
     /// Outcome 4: below the floor with no override armed (P-114).
     NeedsButton,
+}
+
+/// A client's accepted `Time` once the adapter has tried to write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a write nobody answers is a client left to time out"]
+pub enum ClientWritten<E> {
+    /// The calendar holds the change and its audit is owed: `accepted` is
+    /// answered once the `time set` record lands (P-111).
+    Applied {
+        /// The change lifted the floor on the armed override, which is
+        /// spent now and not before (P-116, P-117).
+        spend_override: bool,
+        /// False when another change was already owed to the log, which
+        /// the recorder rules out before it decides.
+        retained: bool,
+    },
+    /// The RTC or the retained words refused the write. Nothing is
+    /// retained, no P-118 window starts and the override is not spent.
+    Failed {
+        /// Why the write failed.
+        error: E,
+        /// Error 7, never outcome 2: the same time may land on the next
+        /// try, where one the clock cannot hold never will (P-266).
+        answer: TimeAnswer,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -448,6 +473,28 @@ impl WallClock {
             retry_at: Some(now),
         });
         true
+    }
+
+    /// Take the result of writing a [`ClientSet::Set`]'s change to the
+    /// calendar: retain it and start P-118's window when it landed; when it
+    /// failed, change nothing and answer busy.
+    pub fn client_written<E>(
+        &mut self,
+        change: ClockChange,
+        overridden: bool,
+        written: Result<(), E>,
+        now: Tick,
+    ) -> ClientWritten<E> {
+        match written {
+            Ok(()) => ClientWritten::Applied {
+                spend_override: overridden,
+                retained: self.client_applied(change, now),
+            },
+            Err(error) => ClientWritten::Failed {
+                error,
+                answer: TimeAnswer::Busy,
+            },
+        }
     }
 
     /// Refuse and count an offer at intake without waiting for storage. This
@@ -845,7 +892,7 @@ mod tests {
     /// clock moves, rather than failing at the write and answered busy for
     /// a retry that can never land.
     #[test]
-    fn p_266_an_armed_override_below_the_clock_century_is_rejected() {
+    fn p_116_p_266_an_armed_override_below_the_clock_century_is_rejected() {
         for current in [None, Some(time(FLOOR))] {
             for at in [0, CENTURY_START - 1] {
                 assert_eq!(
@@ -940,6 +987,112 @@ mod tests {
         assert!(!clock.client_rate_limited(limit));
         // An offer's limit is its own: a client set does not start it.
         assert!(!clock.refuse_rate_limited(Tick::from_millis(1_001)));
+    }
+
+    /// How the part fails the journal's write of a client's time.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        /// The RTC refuses a time it can hold.
+        Calendar,
+        /// A retained word does not read back: the time is not stored.
+        Storage,
+    }
+
+    struct Part {
+        words: [u32; crate::CLOCK_BACKUP_WORDS],
+        fault: Fault,
+        calendar: Option<UnixMillis>,
+    }
+
+    impl crate::CalendarStore for Part {
+        type Error = ();
+        fn read_word(&self, index: usize) -> Option<u32> {
+            self.words.get(index).copied()
+        }
+        fn write_word(&mut self, index: usize, value: u32) {
+            if let (Some(word), Fault::None | Fault::Calendar) =
+                (self.words.get_mut(index), self.fault)
+            {
+                *word = value;
+            }
+        }
+        fn set_calendar(&mut self, at: UnixMillis) -> Result<(), ()> {
+            match self.fault {
+                Fault::Calendar => Err(()),
+                Fault::None | Fault::Storage => {
+                    self.calendar = Some(at);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// A write that fails, on the RTC or in the retained words, is not the
+    /// range refusal: error 7, the clock and P-118's window untouched, the
+    /// override kept, and the same time lands once the part takes it.
+    #[test]
+    fn p_266_a_failed_calendar_or_storage_write_is_busy_and_spends_nothing() {
+        let at = CENTURY_START;
+        let ClientSet::Set {
+            change, overridden, ..
+        } = WallClock::client(at, None, time(FLOOR), true)
+        else {
+            panic!("accepted on the override");
+        };
+        assert!(overridden);
+        for (fault, error) in [
+            (Fault::Calendar, crate::JournalError::Calendar(())),
+            (Fault::Storage, crate::JournalError::Verify),
+        ] {
+            let mut clock = WallClock::new();
+            let mut part = Part {
+                words: [0; crate::CLOCK_BACKUP_WORDS],
+                fault,
+                calendar: None,
+            };
+            let mut journal = crate::ClockJournal::UNKNOWN;
+            let written = journal.apply(&mut part, change);
+            assert_eq!(
+                clock.client_written(change, overridden, written, Tick::ZERO),
+                ClientWritten::Failed {
+                    error,
+                    answer: TimeAnswer::Busy
+                }
+            );
+            assert_eq!(journal.pending(), None);
+            assert!(!clock.audit_pending());
+            assert!(!clock.client_rate_limited(Tick::ZERO));
+            part.fault = Fault::None;
+            let written = journal.apply(&mut part, change);
+            assert_eq!(
+                clock.client_written(change, overridden, written, Tick::ZERO),
+                ClientWritten::Applied {
+                    spend_override: true,
+                    retained: true
+                }
+            );
+            assert_eq!(part.calendar, Some(time(at)));
+            assert_eq!(clock.audit_due(Tick::ZERO), Some(change));
+            assert!(clock.client_rate_limited(Tick::ZERO));
+        }
+    }
+
+    #[test]
+    fn a_landed_write_above_the_floor_spends_no_override() {
+        let ClientSet::Set {
+            change, overridden, ..
+        } = WallClock::client(FLOOR, None, time(FLOOR), true)
+        else {
+            panic!("accepted");
+        };
+        assert_eq!(
+            WallClock::new().client_written::<()>(change, overridden, Ok(()), Tick::ZERO),
+            ClientWritten::Applied {
+                spend_override: false,
+                retained: true
+            }
+        );
     }
 
     #[test]

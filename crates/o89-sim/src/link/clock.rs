@@ -1,4 +1,4 @@
-//! Successful recorder seam for signed clock requests in the host bench.
+//! The recorder seam for signed clock requests in the host bench.
 use super::*;
 
 /// Recorder diagnostics only; the M5 concern records are not implemented yet.
@@ -44,23 +44,31 @@ impl Bench {
                     o89_core::UnixMillis::new(1_700_000_000_000).unwrap(),
                     matches!(self.floor_override, FloorOverride::Armed),
                 ) {
-                    o89_core::ClientSet::Set { .. }
-                        if matches!(self.calendar_write, CalendarWrite::Refused) =>
-                    {
-                        // A failed write is not the range refusal: error 7,
-                        // and the same time may land on the next try (P-266).
-                        return o89_core::TimeAnswer::Busy;
-                    }
                     o89_core::ClientSet::Set {
                         change,
                         stepped,
                         overridden,
                     } => {
-                        self.calendar = Some((change.new_value(), self.now));
-                        assert!(self.clock.client_applied(change, self.now));
-                        if overridden {
-                            self.floor_override = FloorOverride::Unarmed;
-                            self.clock_notes.push(ClockNote::FloorOverridden);
+                        let written = match self.calendar_write {
+                            CalendarWrite::Lands => Ok(()),
+                            CalendarWrite::Refused => Err(()),
+                        };
+                        match self
+                            .clock
+                            .client_written(change, overridden, written, self.now)
+                        {
+                            o89_core::ClientWritten::Failed { answer, .. } => return answer,
+                            o89_core::ClientWritten::Applied {
+                                spend_override,
+                                retained,
+                            } => {
+                                assert!(retained);
+                                self.calendar = Some((change.new_value(), self.now));
+                                if spend_override {
+                                    self.floor_override = FloorOverride::Unarmed;
+                                    self.clock_notes.push(ClockNote::FloorOverridden);
+                                }
+                            }
                         }
                         if stepped {
                             self.clock_notes.push(ClockNote::Stepped);

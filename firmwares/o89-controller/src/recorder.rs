@@ -28,10 +28,10 @@ use km43::{
     MAX_EVENT_QUEUE, ReqId, Time, TimeAck, TimeOffer,
 };
 use o89_core::{
-    Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, CutsRecord, Keep, KeepAnswer, Kept,
-    LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime, Outgoing,
-    RecentCuts, Ring, RingError, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis, WallClock,
-    nor_map, time_expired,
+    Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, ClientWritten, CutsRecord, Keep,
+    KeepAnswer, Kept, LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime,
+    Outgoing, RecentCuts, Ring, RingError, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis,
+    WallClock, nor_map, time_expired,
 };
 
 use crate::fram::Lease;
@@ -776,16 +776,29 @@ async fn serve_client(
                 return answer_client(asked.ticket, refused(Time::NeedsButton, current));
             }
         };
-    if let Err(error) = calendar.set(change) {
-        defmt::error!("clock: calendar write refused: {}", error);
-        return answer_client(asked.ticket, TimeAnswer::Busy);
-    }
+    let written = calendar.set(change);
     let now = Tick::from_millis(Instant::now().as_millis());
-    if !CLOCK.lock(|clock| clock.borrow_mut().client_applied(change, now)) {
-        // Only the recorder applies a change and it checked none was owed.
-        defmt::error!("clock: a client set applied beside another owed to the log");
-    }
-    if overridden {
+    let spend_override = match CLOCK.lock(|clock| {
+        clock
+            .borrow_mut()
+            .client_written(change, overridden, written, now)
+    }) {
+        ClientWritten::Applied {
+            spend_override,
+            retained,
+        } => {
+            if !retained {
+                // Only the recorder applies a change and it checked none was owed.
+                defmt::error!("clock: a client set applied beside another owed to the log");
+            }
+            spend_override
+        }
+        ClientWritten::Failed { error, answer } => {
+            defmt::error!("clock: calendar write refused: {}", error);
+            return answer_client(asked.ticket, answer);
+        }
+    };
+    if spend_override {
         selector::floor_used();
         // P-116's `floor overridden` concern waits on the concern table.
         defmt::error!("clock: the floor was overridden at the panel");
