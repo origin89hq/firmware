@@ -720,7 +720,10 @@ fn enforce_layout(layout: &Layout) -> Result<()> {
         ));
     }
     for section in &layout.sections {
-        if section.size > 0 && RAM.contains(&section.address) && section.address < layout.top {
+        // Any byte of it in RAM under the top: a section starting under
+        // RAM and running into it counts as much as one starting inside.
+        let end = section.address.saturating_add(section.size);
+        if section.size > 0 && section.address < layout.top && end > *RAM.start() {
             refusals.push(format!(
                 "`{}` at {:#x} is under the stack's top {:#x}: an overflow writes over it before anything faults",
                 section.name, section.address, layout.top
@@ -1109,6 +1112,23 @@ Idx Name            Size     VMA      LMA      Type
         let text = error.to_string();
         assert!(text.contains("`.bss` at 0x2000fbfc"), "{text}");
         assert!(!text.contains("floor"), "{text}");
+        // One that starts under RAM and runs into the stack is refused too.
+        let across = HEADERS.replace(
+            "00011b58 2000fdf8 2000fdf8 BSS",
+            "00000010 1ffffff8 1ffffff8 BSS",
+        );
+        let error = enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &across))
+            .expect_err("eight bytes of `.bss` in the stack");
+        assert!(
+            error.to_string().contains("`.bss` at 0x1ffffff8"),
+            "{error}"
+        );
+        // Ending exactly at the RAM origin, it is not in RAM at all.
+        let under = HEADERS.replace(
+            "00011b58 2000fdf8 2000fdf8 BSS",
+            "00000008 1ffffff8 1ffffff8 BSS",
+        );
+        assert!(enforce_layout(&layout(0x2000_0000, 0x2000_fc00, &under)).is_ok());
         // An empty section there holds nothing to overwrite.
         let empty = HEADERS.replace(
             "00011b58 2000fdf8 2000fdf8 BSS",

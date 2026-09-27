@@ -451,8 +451,8 @@ function reached only through one measured 1 056 bytes when this was
 written.
 
 **The stack is linked below the statics** (F-096). A measurement lowers the
-odds of an overflow; it does not make one visible. So `memory.x` gives the
-stack its own region at the bottom of RAM, 63 KB from `0x20000000`, with
+odds of an overflow; it does not make one visible. So `ram.x`, which the
+production and the bench map both include, gives the stack its own region at the bottom of RAM, 63 KB from `0x20000000`, with
 `.data`, `.bss` and `.uninit` above it and the mailbox above them, and sets
 `_stack_start` to the region's top and `_stack_end` to the RAM origin. An
 overflow now runs off the bottom of RAM: the first push below `0x20000000`
@@ -476,7 +476,10 @@ is locked up every output stays as it was last written, the hang case:
 Nothing writes last words on the way, so the boot after reads an IWDG reset
 with nobody named, `BootCause::Watchdog(None)`, or the boot's own
 provisional blame if the overflow cut the boot short before its store was
-read. The statics, the last words among them, are never under the stack.
+read. A blame the supervisor wrote for a late task is cleared when that
+task checks in again, so it cannot name a task that recovered long before
+the lockup. The statics, the last words among them, are never under the
+stack.
 
 That bound holds only once the IWDG is armed, in step 4. An overflow before
 it, in the frame `main`'s task reserves on its first poll or anywhere in the
@@ -487,7 +490,7 @@ window's stack in its region; arming the watchdog before it is #168.
 
 The stack's 63 KB is a budget like any other capacity: a static that no
 longer fits fails the link on `RAM`, and the fix is to take what it needs
-from `STACK` in `memory.x` and let F-094 say whether the stack still fits.
+from `STACK` in `ram.x` and let F-094 say whether the stack still fits.
 `flip-link`, which relinks to give the stack whatever RAM is left, was not
 used: cargo names a linker per target rather than per package, so it would
 relink `o89-boot` too, and it is one more host binary that CI, the

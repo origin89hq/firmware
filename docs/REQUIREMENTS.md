@@ -542,9 +542,10 @@ rollcall, and nothing panics. Source:
 at the RAM origin and every static and the mailbox above its top, so an
 overflow faults on its first push below RAM instead of writing over a
 static. The gate refuses an image linked otherwise, or whose mailbox is not
-where `o89-core` names it. The core locks up in that fault and, once the
-IWDG is armed, the IWDG resets it; the boot after reports a watchdog reset
-with nobody named.
+where `o89-core` names it. The core is expected to lock up in that fault
+(bench pending, #233) and, once the IWDG is armed, the IWDG resets it; the
+boot after reports a watchdog reset with nobody named, because the
+supervisor clears a task's blame when that task checks in again.
 Source: [#233](https://github.com/origin89hq/firmware/issues/233). M0.
 
 **F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller

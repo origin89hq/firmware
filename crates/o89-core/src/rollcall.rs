@@ -13,7 +13,7 @@
 //!
 //! cites: F-007
 
-use crate::{Blame, Millis, Tick};
+use crate::{Blame, LastWords, Millis, Tick};
 
 /// Every task the controller runs, each owning a peripheral and declaring
 /// how long it may go without checking in.
@@ -175,6 +175,36 @@ pub enum Feed {
     NobodyOnTheRoll,
 }
 
+/// What the supervisor does to the last words on a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a blame left behind names a task that recovered at the next reset"]
+pub enum WordsUpdate {
+    /// Leave them as they are.
+    Keep,
+    /// Write this blame: a task newly named for a withheld feed.
+    Write(LastWords),
+    /// Clear them: the task named earlier checked in again and the feed
+    /// is earned, so a later reset in this run, a hang or the lockup of a
+    /// stack overflow, is nobody's fault that the words can name (F-096).
+    Clear,
+}
+
+impl Feed {
+    /// What this verdict does to the last words, given the blame written
+    /// earlier in this run's withheld episode, if any.
+    pub fn words(self, written: Option<Blame>) -> WordsUpdate {
+        match self {
+            Self::Earned if written.is_some() => WordsUpdate::Clear,
+            Self::Earned | Self::NobodyOnTheRoll => WordsUpdate::Keep,
+            Self::Withheld(blame) if written.map(|b| b.task) == Some(blame.task) => {
+                WordsUpdate::Keep
+            }
+            Self::Withheld(blame) => WordsUpdate::Write(LastWords::Starved(blame)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Answer {
@@ -262,6 +292,42 @@ mod tests {
 
     fn at(millis: u64) -> Tick {
         Tick::from_millis(millis)
+    }
+
+    #[test]
+    fn f_096_a_task_that_recovers_takes_back_its_blame() {
+        let late = Blame {
+            task: Task::OneWire,
+            overdue: Millis::from_millis(1_000),
+        };
+        // First withheld: the blame is written.
+        assert_eq!(
+            Feed::Withheld(late).words(None),
+            WordsUpdate::Write(LastWords::Starved(late))
+        );
+        // The same task, later in the episode: already written.
+        let later = Blame {
+            overdue: Millis::from_millis(2_000),
+            ..late
+        };
+        assert_eq!(Feed::Withheld(later).words(Some(late)), WordsUpdate::Keep);
+        // Another task in the middle: its name replaces the first.
+        let other = Blame {
+            task: Task::Rail,
+            ..late
+        };
+        assert_eq!(
+            Feed::Withheld(other).words(Some(late)),
+            WordsUpdate::Write(LastWords::Starved(other))
+        );
+        // It checks in again before the reset: the words are cleared, so a
+        // lockup later in the run boots as a watchdog with nobody named.
+        assert_eq!(Feed::Earned.words(Some(late)), WordsUpdate::Clear);
+        assert_eq!(LastWords::decode(&crate::CLEARED), None);
+        // Nothing withheld: nothing to write or clear.
+        assert_eq!(Feed::Earned.words(None), WordsUpdate::Keep);
+        assert_eq!(Feed::NobodyOnTheRoll.words(None), WordsUpdate::Keep);
+        assert_eq!(Feed::NobodyOnTheRoll.words(Some(late)), WordsUpdate::Keep);
     }
 
     #[test]
