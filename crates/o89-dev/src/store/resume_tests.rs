@@ -206,7 +206,7 @@ fn resume_after_failed_reboot_prints_the_staged_secret_once() {
     // A command the operator can run as printed: the export is required.
     assert!(
         error.to_string().ends_with(&format!(
-            "o89-dev store write-secret --resume --export {}",
+            "o89-dev store write-secret --resume --export={}",
             scratch.0.join("units.jsonl").display()
         )),
         "{error}"

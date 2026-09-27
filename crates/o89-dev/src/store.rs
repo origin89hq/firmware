@@ -316,10 +316,11 @@ fn run_secret(
 }
 
 /// The command that recovers an interrupted write: the same export file,
-/// quoted for a POSIX shell so it runs as printed.
+/// quoted for a POSIX shell and joined by `=` so a path starting with `-`
+/// is still the flag's value.
 fn resume_hint(ledger: &Ledger) -> String {
     format!(
-        "secret write interrupted; run: o89-dev store write-secret --resume --export {}",
+        "secret write interrupted; run: o89-dev store write-secret --resume --export={}",
         shell_word(&ledger.export().to_string_lossy())
     )
 }

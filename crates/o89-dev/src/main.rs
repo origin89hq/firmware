@@ -479,6 +479,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p_249_the_printed_resume_command_parses_even_for_a_path_starting_with_a_dash() {
+        let parsed = Cli::try_parse_from([
+            "o89-dev",
+            "store",
+            "write-secret",
+            "--resume",
+            "--export=-units.jsonl",
+        ])
+        .expect("parses");
+        let Command::Store {
+            what: Some(StoreCommand::WriteSecret { export, resume, .. }),
+        } = parsed.command
+        else {
+            panic!("a write-secret")
+        };
+        assert!(resume);
+        assert_eq!(export, std::path::Path::new("-units.jsonl"));
+        // Without `=` the same path reads as a flag, and without the file
+        // there is no ledger to resume against.
+        assert!(
+            Cli::try_parse_from([
+                "o89-dev",
+                "store",
+                "write-secret",
+                "--resume",
+                "--export",
+                "-units.jsonl"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["o89-dev", "store", "write-secret", "--resume"]).is_err());
+    }
+
+    #[test]
     fn a_flash_takes_the_knock_or_the_strap_and_refuses_a_plain_reset() {
         let knock = Cli::try_parse_from(["o89-dev", "flash-comms", "o89-comms"]).expect("parses");
         assert!(matches!(
