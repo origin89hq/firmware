@@ -544,8 +544,10 @@ overflow faults on its first push below RAM instead of writing over a
 static. The gate refuses an image linked otherwise, or whose mailbox is not
 where `o89-core` names it. The core is expected to lock up in that fault
 (bench pending, #233) and, once the IWDG is armed, the IWDG resets it; the
-boot after reports a watchdog reset with nobody named, because the
-supervisor clears a task's blame when that task checks in again.
+boot after reports a watchdog reset with nobody named unless a blame still
+stands: a task overdue when the lockup came, or the boot's provisional
+blame. The supervisor withdraws a task's blame when that task checks in
+again.
 Source: [#233](https://github.com/origin89hq/firmware/issues/233). M0.
 
 **F-093** — Wi-Fi diagnostic decisions belong to the host-testable controller
