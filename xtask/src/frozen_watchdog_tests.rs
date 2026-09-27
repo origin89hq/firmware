@@ -48,14 +48,13 @@ impl Bench {
         // Fails when its arguments end in $FAKE_FAIL; runs until stopped,
         // as `probe-rs run` does, when they end in $FAKE_SLEEP, and logs
         // `stopped` when a signal ends it, stopping and reaping its own
-        // sleep. Logs
-        // every call first. A run sleeps $FAKE_STALL seconds between its log
-        // line and its trap, and creates $FAKE_READY once the trap is in
-        // place.
+        // sleep, or ignores TERM when $FAKE_DEAF is set. Logs every call
+        // first. A run sleeps $FAKE_STALL seconds between its log line and
+        // its trap, and creates $FAKE_READY once the trap is in place.
         let fake = "#!/bin/sh\n\
             echo \"$*\" >> \"$FAKE_LOG\"\n\
             case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && [ -n \"$FAKE_STALL\" ] && sleep \"$FAKE_STALL\";; esac\n\
-            trap 'kill $! 2>/dev/null; wait $!; echo stopped >> \"$FAKE_LOG\"; exit 143' TERM\n\
+            if [ -n \"$FAKE_DEAF\" ]; then trap '' TERM; else trap 'kill $! 2>/dev/null; wait $!; echo stopped >> \"$FAKE_LOG\"; exit 143' TERM; fi\n\
             case \"$*\" in *\"$FAKE_SLEEP\") [ -n \"$FAKE_SLEEP\" ] && { : > \"$FAKE_READY\"; sleep 60 & wait $!; };; esac\n\
             case \"$*\" in *\"$FAKE_FAIL\") [ -n \"$FAKE_FAIL\" ] && exit 3;; esac\n\
             exit 0\n";
@@ -81,6 +80,7 @@ impl Bench {
             .env("FAKE_FAIL", fail)
             .env("FAKE_SLEEP", sleep)
             .env("FAKE_STALL", "")
+            .env("FAKE_DEAF", "")
             .env("FAKE_READY", self.ready_path());
         command
     }
@@ -92,12 +92,14 @@ impl Bench {
     }
 
     /// Starts `probe-rs run image` through the script, in a process group
-    /// of its own so that everything it starts can be killed at once.
-    fn launch(&self, fail: &str, stall: &str) -> Launched<'_> {
+    /// of its own so that everything it starts can be killed at once. A
+    /// `deaf` command ignores the TERM that should stop it.
+    fn launch(&self, fail: &str, stall: &str, deaf: bool) -> Launched<'_> {
         let stderr = File::create(self.dir.join("stderr")).expect("the script's stderr");
         let child = self
             .command(fail, "image", &["probe-rs", "run", "image"])
             .env("FAKE_STALL", stall)
+            .env("FAKE_DEAF", if deaf { "1" } else { "" })
             .stderr(stderr)
             .process_group(0)
             .spawn()
@@ -123,6 +125,10 @@ impl Bench {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    fn stderr(&self) -> String {
+        fs::read_to_string(self.dir.join("stderr")).unwrap_or_default()
     }
 }
 
@@ -199,6 +205,25 @@ impl fmt::Display for StartupFailure {
     }
 }
 
+/// A script still running when its shutdown bound ran out, with what it
+/// did.
+#[derive(Debug)]
+struct ShutdownFailure {
+    after: Duration,
+    calls: Vec<String>,
+    stderr: String,
+}
+
+impl fmt::Display for ShutdownFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the script had not ended {:?} after its signal; calls {:?}; stderr {:?}",
+            self.after, self.calls, self.stderr
+        )
+    }
+}
+
 /// The script, spawned. Dropping it terminates it, before the bench it
 /// borrows removes their directory.
 struct Launched<'a> {
@@ -229,8 +254,42 @@ impl Launched<'_> {
                 cause,
                 after,
                 calls: self.bench.calls(),
-                stderr: fs::read_to_string(self.bench.dir.join("stderr")).unwrap_or_default(),
+                stderr: self.bench.stderr(),
             }),
+        }
+    }
+
+    /// Sends `signal` to the script and waits at most `bound` for it to
+    /// end, returning its status and how long it took from the signal.
+    /// Past the bound, kills the script's group and says what it had done.
+    /// The loop ends at most one `POLL` after the bound, so an end seen then
+    /// can take longer than `bound`.
+    fn stop(
+        &mut self,
+        signal: &str,
+        bound: Duration,
+    ) -> Result<(ExitStatus, Duration), ShutdownFailure> {
+        let signalled = Instant::now();
+        let kill = Command::new("kill")
+            .args([signal, &self.child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(kill.success());
+        loop {
+            if let Some(status) = self.child.try_wait().expect("the script's status") {
+                return Ok((status, signalled.elapsed()));
+            }
+            let after = signalled.elapsed();
+            if after >= bound {
+                let failure = ShutdownFailure {
+                    after,
+                    calls: self.bench.calls(),
+                    stderr: self.bench.stderr(),
+                };
+                self.terminate();
+                return Err(failure);
+            }
+            std::thread::sleep(POLL);
         }
     }
 
@@ -356,18 +415,14 @@ fn interrupt(name: &str, signal: &str, stall: Duration) -> (Option<i32>, Duratio
     } else {
         stall.as_secs().to_string()
     };
-    let mut launched = bench.launch("", &stall_secs);
+    let mut launched = bench.launch("", &stall_secs, false);
     if let Err(failure) = launched.ready(STARTUP_BUDGET.saturating_add(stall)) {
         panic!("{failure}");
     }
-    let signalled = Instant::now();
-    let kill = Command::new("kill")
-        .args([signal, &launched.child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(kill.success());
-    let status = launched.child.wait().expect("the script ends");
-    let took = signalled.elapsed();
+    let (status, took) = match launched.stop(signal, SHUTDOWN_BOUND) {
+        Ok(stopped) => stopped,
+        Err(failure) => panic!("{failure}"),
+    };
     assert!(
         !group_survives(launched.pgid()),
         "the command outlived the script"
@@ -413,7 +468,7 @@ fn a_command_slow_to_trap_is_signalled_only_once_it_has() {
 #[test]
 fn a_script_that_ends_before_its_command_fails_at_once_and_says_how() {
     let bench = Bench::new("early-exit");
-    let mut launched = bench.launch("0x1000", "");
+    let mut launched = bench.launch("0x1000", "", false);
     let failure = launched
         .ready(STARTUP_BUDGET)
         .expect_err("the freeze failed, so nothing ran");
@@ -433,7 +488,7 @@ fn a_script_that_ends_before_its_command_fails_at_once_and_says_how() {
 #[test]
 fn a_command_never_ready_fails_at_its_budget_and_leaves_nothing_running() {
     let bench = Bench::new("never-ready");
-    let mut launched = bench.launch("", "60");
+    let mut launched = bench.launch("", "60", false);
     // The budget runs out half a second after the command logs its call,
     // however long the script took to get there.
     while !bench.calls().iter().any(|call| call == "run image") {
@@ -461,6 +516,27 @@ fn a_command_never_ready_fails_at_its_budget_and_leaves_nothing_running() {
     assert_eq!(failure.calls, [DISARM, FREEZE, "run image"]);
     assert!(failure.to_string().contains("not ready"), "{failure}");
     launched.terminate();
+    assert!(!group_survives(launched.pgid()));
+}
+
+#[test]
+fn a_command_deaf_to_its_signal_fails_at_the_shutdown_bound_and_leaves_nothing_running() {
+    let bench = Bench::new("deaf");
+    let mut launched = bench.launch("", "", true);
+    if let Err(failure) = launched.ready(STARTUP_BUDGET) {
+        panic!("{failure}");
+    }
+    let failure = launched
+        .stop("-TERM", SHUTDOWN_BOUND)
+        .expect_err("the command ignores the TERM the script passes on");
+    // A look and a pause past the bound, with room for a loaded host.
+    let prompt = SHUTDOWN_BOUND.saturating_add(Duration::from_secs(2));
+    assert!(
+        failure.after >= SHUTDOWN_BOUND && failure.after < prompt,
+        "{failure}"
+    );
+    assert_eq!(failure.calls, [DISARM, FREEZE, "run image"]);
+    assert!(failure.to_string().contains("had not ended"), "{failure}");
     assert!(!group_survives(launched.pgid()));
 }
 
