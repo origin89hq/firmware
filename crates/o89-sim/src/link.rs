@@ -251,6 +251,8 @@ pub(crate) struct Bench {
     clock: o89_core::WallClock,
     /// The selector's override at the instant the recorder processes the request.
     floor_override: clock::FloorOverride,
+    /// Whether the RTC takes the next client time the recorder writes.
+    calendar_write: clock::CalendarWrite,
     clock_notes: Vec<clock::ClockNote>,
     /// Every note the sessions left for the probe, in order: what the
     /// controller's adapter logs, and condition 22 among them (P-237).
@@ -369,6 +371,7 @@ impl Bench {
         let mut bench = Self {
             clock: o89_core::WallClock::new(),
             floor_override: clock::FloorOverride::Unarmed,
+            calendar_write: clock::CalendarWrite::Lands,
             clock_notes: Vec::new(),
             session_notes: Vec::new(),
             calendar: None,

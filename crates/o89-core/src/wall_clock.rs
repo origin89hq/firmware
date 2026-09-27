@@ -3,7 +3,7 @@
 //! The recorder supplies the newest timestamp from `Ring::floor`. A failed
 //! scan is not an empty ring and must never become the build-time fallback.
 //!
-//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-160, L-162, P-111, P-215
+//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-160, L-162, P-111, P-215, P-266
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
@@ -92,7 +92,8 @@ pub enum ClientSet {
         /// overridden`, and the override is spent (P-116, P-117).
         overridden: bool,
     },
-    /// Outcome 2: past the window's upper edge, which nothing lifts (P-113).
+    /// Outcome 2: past the window's upper edge, which nothing lifts
+    /// (P-113), or outside the century the RTC holds (P-266).
     Rejected,
     /// Outcome 4: below the floor with no override armed (P-114).
     NeedsButton,
@@ -835,27 +836,69 @@ mod tests {
         ));
     }
 
+    /// The first and the last millisecond of the RTC's century.
+    const CENTURY_START: u64 = 946_684_800_000;
+    const CENTURY_END: u64 = 4_102_444_799_999;
+
     /// The override lifts the floor with no lower bound, and the RTC holds
     /// only its century: a value it cannot hold is refused here, before the
     /// clock moves, rather than failing at the write and answered busy for
     /// a retry that can never land.
     #[test]
-    fn p_116_an_armed_override_below_the_calendar_century_is_rejected() {
-        assert_eq!(
-            WallClock::client(0, Some(time(FLOOR)), time(FLOOR), true),
-            ClientSet::Rejected
-        );
-        assert_eq!(
-            WallClock::client(946_684_799_999, None, time(FLOOR), true),
-            ClientSet::Rejected
-        );
-        assert!(matches!(
-            WallClock::client(946_684_800_000, None, time(FLOOR), true),
-            ClientSet::Set {
-                overridden: true,
-                ..
+    fn p_266_an_armed_override_below_the_clock_century_is_rejected() {
+        for current in [None, Some(time(FLOOR))] {
+            for at in [0, CENTURY_START - 1] {
+                assert_eq!(
+                    WallClock::client(at, current, time(FLOOR), true),
+                    ClientSet::Rejected
+                );
             }
-        ));
+            assert!(matches!(
+                WallClock::client(CENTURY_START, current, time(FLOOR), true),
+                ClientSet::Set {
+                    overridden: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// P-114 comes first: unarmed, below the floor is the button however
+    /// far below, the century's edge included.
+    #[test]
+    fn p_266_p_114_unarmed_below_the_floor_and_the_century_needs_the_button() {
+        for current in [None, Some(time(FLOOR))] {
+            for at in [0, CENTURY_START - 1, CENTURY_START] {
+                assert_eq!(
+                    WallClock::client(at, current, time(FLOOR), false),
+                    ClientSet::NeedsButton
+                );
+            }
+        }
+    }
+
+    /// A floor in 2095 opens a window to 2105: past the end of 2099 is
+    /// inside P-113's window and outside the RTC, refused in either
+    /// override state.
+    #[test]
+    fn p_266_past_the_clock_century_inside_the_window_is_rejected_armed_or_not() {
+        let floor = time(3_944_678_400_000);
+        assert!(CENTURY_END + 1 - floor.as_millis() < PLAUSIBILITY_SPAN);
+        for armed in [false, true] {
+            for current in [None, Some(floor)] {
+                assert_eq!(
+                    WallClock::client(CENTURY_END + 1, current, floor, armed),
+                    ClientSet::Rejected
+                );
+                assert!(matches!(
+                    WallClock::client(CENTURY_END, current, floor, armed),
+                    ClientSet::Set {
+                        overridden: false,
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]
