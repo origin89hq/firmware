@@ -226,6 +226,11 @@ enum StoreCommand {
         /// Recover the label from an interrupted secret write.
         #[arg(long, conflicts_with_all = ["device_id", "replace"])]
         resume: bool,
+        /// The file the unit's public record is appended to, one JSON
+        /// object per line (`crates/o89-dev/EXPORT.md`); the same file on
+        /// `--resume`. Its journal `<export>.drawn` is kept beside it.
+        #[arg(long, value_name = "FILE")]
+        export: std::path::PathBuf,
     },
 }
 
@@ -326,7 +331,8 @@ fn main() -> Result<()> {
                 device_id,
                 replace,
                 resume,
-            }) => store::write_secret(&mut link, device_id.as_deref(), replace, resume),
+                export,
+            }) => store::write_secret(&mut link, &export, device_id.as_deref(), replace, resume),
         },
         Command::Rail { revision } => {
             let readout = rail::read(&mut link, revision.into())?;
