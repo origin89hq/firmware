@@ -379,6 +379,43 @@ mod tests {
     }
 
     #[test]
+    fn l_138_a_record_stored_before_the_token_does_not_load() {
+        // A written set as the firmware before the token stored it: keys 1
+        // to 6, no key 7.
+        let mut payload = [0u8; 192];
+        let mut cbor = o89_link::link_header(km43::LinkMessageType::NetConfig, km43::ReqId(1))
+            .write(6, &mut payload)
+            .unwrap();
+        cbor.key(1).unwrap();
+        cbor.u64(u64::from(km43::NetConfigOp::Set as u8)).unwrap();
+        cbor.key(2).unwrap();
+        cbor.u64(7).unwrap();
+        cbor.key(3).unwrap();
+        cbor.text("site").unwrap();
+        cbor.key(4).unwrap();
+        cbor.text("password").unwrap();
+        cbor.key(5).unwrap();
+        cbor.text("CA").unwrap();
+        cbor.key(6).unwrap();
+        cbor.text("origin89").unwrap();
+        let len = cbor.finish().unwrap();
+        let mut flash = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        let mut record = [0u8; STORED_CREDENTIAL_BYTES];
+        record[4..8].copy_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+        record[8..8 + len].copy_from_slice(&payload[..len]);
+        let checksum = crc(&record[4..200]);
+        record[200..204].copy_from_slice(&checksum.to_le_bytes());
+        flash.write(4, &record[4..]).unwrap();
+        flash.write(0, &COMMIT).unwrap();
+        // A committed, intact record the decoder refuses: the firmware boots
+        // with no cache, reports version 0 and waits for the controller.
+        assert_eq!(load_credential(&mut flash), Err(CredentialStorageError));
+    }
+
+    #[test]
     fn corrupt_payload_or_length_and_failed_reads_are_refused() {
         let mut flash = Flash {
             bytes: [255; 4096],

@@ -2815,6 +2815,63 @@ fn l_138_a_module_unplugged_across_a_repair_is_pushed_at_the_version_the_repair_
     }
 }
 
+#[test]
+fn p_108_l_138_a_record_in_the_layout_before_the_token_reads_unreadable_and_no_clear_is_pushed() {
+    // Capabilities: a module that still reports the unit's own version 3.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 3,
+        ..Capabilities::default()
+    });
+    let mut network = o89_core::Network::NONE;
+    for _ in 0..3 {
+        network
+            .set(
+                o89_core::Credentials {
+                    ssid: o89_core::Text::new("cabin").expect("ssid"),
+                    psk: o89_core::Psk::new("correct horse").expect("psk"),
+                    country: o89_core::Country::new(*b"CA").expect("country"),
+                    hostname: o89_core::Text::new("origin89").expect("host"),
+                },
+                ORIGIN,
+            )
+            .expect("network");
+    }
+    // The earlier layout: the same record with no token after the version.
+    let current = o89_core::Body::encode(&network);
+    let mut earlier = [0u8; o89_core::NETWORK_BYTES];
+    earlier[..4].copy_from_slice(&current[..4]);
+    let rest = &current[4 + km43::NET_ORIGIN_BYTES..];
+    earlier[4..4 + rest.len()].copy_from_slice(rest);
+    let _ = block_on(o89_core::map::NETWORK.write(
+        &mut bench.fram,
+        o89_core::Position::Start,
+        &earlier,
+    ))
+    .expect("an earlier build's record");
+    let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
+    assert!(
+        matches!(store.network.held(), o89_core::Held::Malformed(_)),
+        "{:?}",
+        store.network.held()
+    );
+    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
+    bench.run_for(Millis::from_millis(2000));
+    assert!(
+        !bench
+            .comms
+            .heard
+            .iter()
+            .any(|heard| matches!(heard, Heard::NetConfig { .. })),
+        "no unwritten clear for a master it cannot read"
+    );
+    assert!(
+        bench
+            .asked
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Note(Note::NetworkWithoutMaster)))
+    );
+}
+
 mod clock;
 
 fn wifi_started(bench: &mut Bench, at: Tick, outcome: km43::WifiScan) -> u32 {
