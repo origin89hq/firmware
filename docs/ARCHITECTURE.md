@@ -271,12 +271,16 @@ yields has been exposed and a recorded `Pair` or `Hello` stays unusable.
 `o89-dev store reseed` draws thirty-two bytes and stages them through the
 manufacturing transaction below, as its own kind of intent; the only caller of
 `stage_reseed` is the bench mailbox, which the host reaches over SWD. Staging
-refuses unless the controller key reads and the generator record is damaged in
-both A/B slots: an intact state, one slot that still holds, a record that reads
-as never written or holds a body of zeros, a part with no controller key and an
-unfinished or unreadable transaction are each refused, and a part with no key
-is provisioned again, not reseeded. Whether the two middle readings should be
-reseeded as well is #240. The boot checks the same again before it writes, writes the state
+refuses unless the controller key reads and no intact generator state can be
+read back: the record may be damaged in both A/B slots, read as never written
+(slot A damaged before a draw wrote slot B) or hold a checked body of zeros,
+which the firmware never writes. Beside a key that reads, none of these is a
+birth still under way once the manufacturing transaction is applied, because a
+birth writes the key and then the generator while its intent is pending and
+replays both until it is applied. An intact state in either slot, a part with no
+controller key and a pending, unacknowledged or unreadable transaction are each
+refused, and a part with no key is provisioned again, not reseeded. The boot
+checks the same again before it writes, writes the state
 and reads it back off the part, keeps what it read rather than what it meant
 to write, and scrubs the intent so no copy of the state outlives the boot. A
 write the part does not keep is scrubbed as well, and the generator stays

@@ -1190,6 +1190,43 @@ fn p_249_a_replace_onto_a_key_that_does_not_read_back_stages_nothing() {
 /// A unit born through the station with a client at slot 1, whose generator
 /// then read as damaged in both slots.
 fn damaged_unit(ledger: &Ledger) -> FakeLink {
+    let mut link = labelled_unit(ledger);
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
+    link
+}
+
+/// The same unit, never drawn from, whose generator then read as never
+/// written: slot A damaged, slot B never written.
+fn absent_generator(ledger: &Ledger) -> FakeLink {
+    let mut link = labelled_unit(ledger);
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start.checked_add(8).unwrap()] ^= 1;
+    assert_eq!(
+        read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+            .unwrap()
+            .held(),
+        &Held::Absent
+    );
+    link
+}
+
+/// The same unit, whose generator then held a checked body of zeros.
+fn malformed_generator(ledger: &Ledger) -> FakeLink {
+    let mut link = labelled_unit(ledger);
+    let _ =
+        block_on(map::DRBG.write(&mut link, o89_core::Position::Start, &[0; DRBG_BYTES])).unwrap();
+    assert!(matches!(
+        read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+            .unwrap()
+            .held(),
+        Held::Malformed(_)
+    ));
+    link
+}
+
+/// A unit born through the station with a client at slot 1.
+fn labelled_unit(ledger: &Ledger) -> FakeLink {
     let mut link = FakeLink::new();
     run_secret(&mut link, ledger, None, false, false, &mut Vec::new()).unwrap();
     let (mut store, report) = block_on(Store::boot(&mut link, None)).unwrap();
@@ -1207,8 +1244,6 @@ fn damaged_unit(ledger: &Ledger) -> FakeLink {
         &mut link,
     ))
     .unwrap();
-    let start = usize::from(map::DRBG.start().0);
-    link.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
     link
 }
 
@@ -1242,7 +1277,44 @@ fn f_041_p_237_a_station_reseed_keeps_the_key_the_label_and_the_slots() {
 }
 
 #[test]
-fn f_041_p_237_a_station_reseed_is_refused_while_the_generator_reads_back() {
+fn f_041_p_237_a_station_reseed_of_a_generator_never_written_or_malformed_keeps_the_key_the_label_and_the_slots()
+ {
+    for (reads, made) in [
+        ("never written", absent_generator as fn(&Ledger) -> FakeLink),
+        ("malformed", malformed_generator),
+    ] {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        let mut link = made(&ledger);
+        let fingerprint = held_fingerprint(&mut link);
+        let label = active(&mut link);
+        let kept = kept_by_a_reseed(&mut link).unwrap();
+        let stages = link.stages;
+        let mut output = Vec::new();
+        run_reseed(&mut link, &mut output).unwrap();
+        assert_eq!(link.stages, stages + 1, "{reads}");
+        assert!(
+            read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+                .unwrap()
+                .present()
+                .is_some(),
+            "{reads}"
+        );
+        assert_eq!(kept_by_a_reseed(&mut link).unwrap(), kept, "{reads}");
+        assert_eq!(held_fingerprint(&mut link), fingerprint, "{reads}");
+        assert!(active(&mut link) == label, "{reads}");
+        assert_eq!(link.transaction(), SecretChange::Complete, "{reads}");
+        let said = std::str::from_utf8(&output).unwrap();
+        assert!(said.contains("reseeded"), "{reads}");
+        assert!(
+            said.contains(&hex::encode(fingerprint.as_bytes())),
+            "{reads}"
+        );
+    }
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_is_refused_while_either_slot_holds_a_state() {
     let scratch = Scratch::new();
     let ledger = scratch.ledger();
     let mut link = FakeLink::new();
@@ -1253,40 +1325,26 @@ fn f_041_p_237_a_station_reseed_is_refused_while_the_generator_reads_back() {
     assert!(error.to_string().contains("never replaced"), "{error}");
     assert_eq!(link.stages, stages, "nothing was staged");
     assert_eq!(link.bytes, before);
-}
-
-#[test]
-fn f_041_p_237_a_station_reseed_is_refused_when_one_slot_holds_or_none_was_written() {
-    let scratch = Scratch::new();
-    let ledger = scratch.ledger();
-    // Drawn from, so both slots hold a state, then one of them damaged.
-    let mut link = FakeLink::new();
-    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
+    // Drawn from, so both slots hold a state, then either one damaged.
     let (store, _) = block_on(Store::boot(&mut link, None)).unwrap();
     let mut generator = o89_core::Generator::new(store.drbg);
     for _ in 0..2 {
         block_on(generator.challenge(&mut link)).unwrap();
     }
-    let start = usize::from(map::DRBG.start().0);
-    link.bytes[start.checked_add(8).unwrap()] ^= 1;
-    let stages = link.stages;
-    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
-    assert!(error.to_string().contains("never replaced"), "{error}");
-    assert_eq!(link.stages, stages, "nothing was staged");
-    let scratch = Scratch::new();
-    let ledger = scratch.ledger();
-    let mut link = FakeLink::new();
-    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
-    // Born and never drawn from: slot A damaged, slot B never written.
-    let start = usize::from(map::DRBG.start().0);
-    link.bytes[start.checked_add(8).unwrap()] ^= 1;
-    let stages = link.stages;
-    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
-    assert!(
-        error.to_string().contains("not damaged in both slots"),
-        "{error}"
-    );
-    assert_eq!(link.stages, stages, "nothing was staged");
+    let slot = o89_core::slot_bytes(DRBG_BYTES);
+    for offset in [0, slot] {
+        let mut damaged = FakeLink::new();
+        damaged.bytes.clone_from(&link.bytes);
+        let start = usize::from(map::DRBG.start().0)
+            .checked_add(offset)
+            .unwrap();
+        damaged.bytes[start.checked_add(8).unwrap()] ^= 1;
+        let before = damaged.bytes.clone();
+        let error = run_reseed(&mut damaged, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("never replaced"), "{error}");
+        assert_eq!(damaged.stages, 0, "nothing was staged");
+        assert_eq!(damaged.bytes, before);
+    }
 }
 
 #[test]
@@ -1297,6 +1355,24 @@ fn f_041_p_237_a_station_reseed_is_refused_on_a_part_with_no_controller_key() {
     let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
     assert!(error.to_string().contains("write-secret"), "{error}");
     assert_eq!(link.stages, 0, "nothing was staged");
+    // Born, and the key damaged beside a generator that reads as never
+    // written or malformed.
+    for made in [
+        absent_generator as fn(&Ledger) -> FakeLink,
+        malformed_generator,
+    ] {
+        let scratch = Scratch::new();
+        let ledger = scratch.ledger();
+        let mut link = made(&ledger);
+        let start = usize::from(map::DEVICE_SECRET.end().0);
+        link.bytes[start..usize::from(map::CONTROLLER_KEY.end().0)].fill(0x55);
+        let before = link.bytes.clone();
+        let stages = link.stages;
+        let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("write-secret"), "{error}");
+        assert_eq!(link.stages, stages, "nothing was staged");
+        assert_eq!(link.bytes, before);
+    }
 }
 
 #[test]
@@ -1324,6 +1400,16 @@ fn f_041_p_237_a_station_reseed_is_refused_behind_an_unfinished_transaction() {
     );
     // Nor does a label go behind it.
     assert!(run_secret(&mut link, &ledger, None, true, false, &mut Vec::new()).is_err());
+    // A label printed and not acknowledged, beside a generator that reads
+    // as never written: the transaction finishes first.
+    let mut link = absent_generator(&ledger);
+    let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, &mut link)).unwrap();
+    let fingerprint = held_fingerprint(&mut link);
+    block_on(transaction.write(&mut link, SecretChange::Applied(secret(), fingerprint))).unwrap();
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("unfinished"), "{error}");
+    assert_eq!(link.stages, stages, "nothing was staged");
 }
 
 #[test]

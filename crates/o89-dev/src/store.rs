@@ -2,7 +2,7 @@
 //! firmware reads with. Epoch writes use the same record seam; secret writes
 //! stage a firmware transaction, reboot, and verify it before printing the label.
 //! A reseed stages a fresh generator state through the same transaction onto
-//! a unit whose generator record is damaged in both slots, and verifies that
+//! a unit whose generator record holds no intact state, and verifies that
 //! the key, the label and the client slots came back byte for byte (P-237).
 //!
 //! On a unit's first transaction the host also draws the controller key and
@@ -544,9 +544,10 @@ fn show_applied(
     Ok(())
 }
 
-/// Give a unit whose generator record is damaged in both slots a fresh
-/// state from the operating system's generator, keeping its controller key,
-/// its label and its enrolled clients (P-237's station reseed).
+/// Give a unit whose generator record holds no intact state (damaged in
+/// both slots, never written, or a body of zeros) a fresh state from the
+/// operating system's generator, keeping its controller key, its label and
+/// its enrolled clients (P-237's station reseed).
 pub fn reseed(link: &mut Link) -> Result<()> {
     run_reseed(link, &mut std::io::stdout().lock())
 }
@@ -561,17 +562,11 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
         );
     };
     match read::<DrbgState, DRBG_BYTES>(link, map::DRBG)?.held() {
-        Held::Corrupt => {}
+        // Beside a key that reads, with no transaction unfinished, none is a
+        // birth under way: a birth writes both before it is applied.
+        Held::Corrupt | Held::Absent | Held::Malformed(_) => {}
         Held::Present(_) => bail!(
             "the generator reads back, and a live generator is never replaced (P-237); nothing staged"
-        ),
-        Held::Absent => bail!(
-            "the generator record is not damaged in both slots: one reads as never written; \
-             nothing staged"
-        ),
-        Held::Malformed(at) => bail!(
-            "the generator record holds and does not decode ({at:?}), which is not damage in \
-             both slots; nothing staged"
         ),
     }
     let before = kept_by_a_reseed(link)?;
