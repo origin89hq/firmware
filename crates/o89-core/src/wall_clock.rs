@@ -411,9 +411,10 @@ impl WallClock {
     /// door. The override lifts the floor and nothing else; the ten-year
     /// edge above it binds whatever the panel says (P-116, P-117).
     ///
-    /// This does not move the clock or spend the override: the adapter sets
-    /// the calendar, then calls [`client_applied`](Self::client_applied),
-    /// then spends the override if this was `overridden`.
+    /// This does not move the clock or spend the override: the adapter
+    /// writes the calendar, hands the result to
+    /// [`client_written`](Self::client_written), and spends the override
+    /// only when that says to.
     pub fn client(
         at: u64,
         current: Option<UnixMillis>,
@@ -462,7 +463,7 @@ impl WallClock {
     /// start P-118's window. Refused, like an offer's, while another audit
     /// is owed.
     #[must_use]
-    pub fn client_applied(&mut self, change: ClockChange, now: Tick) -> bool {
+    fn client_applied(&mut self, change: ClockChange, now: Tick) -> bool {
         if self.audit.is_some() {
             return false;
         }
@@ -1080,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn a_landed_write_above_the_floor_spends_no_override() {
+    fn a_landed_write_at_the_floor_spends_no_override() {
         let ClientSet::Set {
             change, overridden, ..
         } = WallClock::client(FLOOR, None, time(FLOOR), true)
