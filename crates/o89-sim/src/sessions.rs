@@ -1252,6 +1252,12 @@ fn f_041_p_237_a_reseed_serves_pair_and_hello_again_and_a_hello_recorded_before_
     announce(&mut damaged, 1);
     let mut phone = Client::on(1);
     let mut recorded = phone.open(&mut damaged);
+    // Every challenge the unit handed out before the damage.
+    let mut seen: Vec<[u8; 16]> = phone.challenge.into_iter().collect();
+    for handle in 7..=8 {
+        announce(&mut damaged, handle);
+        seen.push(Client::on(handle).discover(&mut damaged));
+    }
     // Both copies damaged, as board A's generator was on 2026-09-24.
     let len = usize::from(map::DRBG.end().0)
         .checked_sub(usize::from(map::DRBG.start().0))
@@ -1291,6 +1297,17 @@ fn f_041_p_237_a_reseed_serves_pair_and_hello_again_and_a_hello_recorded_before_
     assert_eq!(code(answers.last().expect("answered")), Some(12));
     assert!(!bench.computing());
     assert!(!bench.endpoint.sessions.is_bound(Conn::new(5).unwrap()));
+    // The fresh state walks a sequence the unit never held: no challenge
+    // from before the damage comes round again, as it would if the reseed
+    // had put back a state the unit started from.
+    for handle in 9..=11 {
+        announce(&mut bench, handle);
+        let challenge = Client::on(handle).discover(&mut bench);
+        assert!(
+            !seen.contains(&challenge),
+            "a challenge from before the damage repeated"
+        );
+    }
     // And a new install pairs from the same printed label.
     bench.open_pairing();
     announce(&mut bench, 6);

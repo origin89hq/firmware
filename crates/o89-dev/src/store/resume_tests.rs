@@ -23,6 +23,8 @@ enum Tamper {
     MovesASlot,
     /// The generator's record is damaged again in both slots.
     LosesTheGenerator,
+    /// The intent's zeroed copy did not keep its zeros.
+    KeepsTheIntent,
 }
 
 struct FakeLink {
@@ -126,6 +128,17 @@ impl SecretLink for FakeLink {
             Tamper::LosesTheGenerator => {
                 let start = usize::from(map::DRBG.start().0);
                 self.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
+            }
+            Tamper::KeepsTheIntent => {
+                let slot = o89_core::slot_bytes(o89_core::SECRET_CHANGE_BYTES);
+                let a = usize::from(map::SECRET_CHANGE.start().0);
+                let b = a.checked_add(slot).unwrap();
+                let zeroed = if self.bytes[a..b].iter().all(|byte| *byte == 0) {
+                    a
+                } else {
+                    b
+                };
+                self.bytes[zeroed.checked_add(8).unwrap()] = 0x61;
             }
         }
         Ok(())
@@ -1246,6 +1259,22 @@ fn f_041_p_237_a_station_reseed_is_refused_while_the_generator_reads_back() {
 fn f_041_p_237_a_station_reseed_is_refused_when_one_slot_holds_or_none_was_written() {
     let scratch = Scratch::new();
     let ledger = scratch.ledger();
+    // Drawn from, so both slots hold a state, then one of them damaged.
+    let mut link = FakeLink::new();
+    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
+    let (store, _) = block_on(Store::boot(&mut link, None)).unwrap();
+    let mut generator = o89_core::Generator::new(store.drbg);
+    for _ in 0..2 {
+        block_on(generator.challenge(&mut link)).unwrap();
+    }
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start.checked_add(8).unwrap()] ^= 1;
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("never replaced"), "{error}");
+    assert_eq!(link.stages, stages, "nothing was staged");
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
     let mut link = FakeLink::new();
     run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
     // Born and never drawn from: slot A damaged, slot B never written.
@@ -1331,7 +1360,7 @@ fn f_041_p_237_a_reseed_that_moved_the_key_the_label_or_a_slot_fails_loudly() {
     let mut output = Vec::new();
     let error = run_reseed(&mut link, &mut output).unwrap_err();
     assert!(
-        error.to_string().contains("changed across the reseed"),
+        error.to_string().contains("a client slot changed"),
         "{error}"
     );
     assert!(output.is_empty(), "no success reported");
@@ -1347,6 +1376,21 @@ fn f_041_p_237_a_reseed_the_part_did_not_keep_fails_loudly() {
     let error = run_reseed(&mut link, &mut output).unwrap_err();
     assert!(
         error.to_string().contains("still does not read back"),
+        "{error}"
+    );
+    assert!(output.is_empty(), "no success reported");
+}
+
+#[test]
+fn f_041_p_237_a_reseed_whose_intent_was_not_scrubbed_fails_loudly() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    link.tamper = Tamper::KeepsTheIntent;
+    let mut output = Vec::new();
+    let error = run_reseed(&mut link, &mut output).unwrap_err();
+    assert!(
+        error.to_string().contains("did not scrub its intent"),
         "{error}"
     );
     assert!(output.is_empty(), "no success reported");

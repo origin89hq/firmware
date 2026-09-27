@@ -95,7 +95,7 @@ impl fmt::Debug for Generator {
 impl Generator {
     /// The generator over what the boot read. A record that holds no state
     /// is a generator that draws nothing until the manufacturing
-    /// transaction writes one.
+    /// transaction writes one, or the station's reseed a fresh one.
     #[must_use]
     pub fn new(kept: Kept<DrbgState, DRBG_BYTES>) -> Self {
         let drbg = kept.present().map(|state| Drbg::from_stored(state.0));

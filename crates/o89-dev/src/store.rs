@@ -385,7 +385,8 @@ trait SecretLink: o89_core::Fram<Error = anyhow::Error> {
     fn reboot(&mut self) -> Result<()>;
     /// Reboot after a blank, which starts the boot count over.
     fn reboot_blank(&mut self) -> Result<()>;
-    /// Stage the encoded `SecretChange::Pending` body and reboot to apply it.
+    /// Stage the encoded `SecretChange::Pending` or `SecretChange::Reseed`
+    /// body and reboot to apply it.
     fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()>;
 }
 
@@ -574,16 +575,10 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
         ),
     }
     let before = kept_by_a_reseed(link)?;
-    let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
-    fill(&mut *seed)?;
-    let state = DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?;
-    seed.zeroize();
-    // `DrbgState` is `Copy` and has no way to clear itself; the encoded body
-    // is the copy that crosses to the controller, and it is cleared below.
-    // The station keeps no copy past this: none is compared after the
-    // reboot, because a session may already have drawn from it.
-    let mut body = Zeroizing::new(SecretChange::Reseed(state).encode());
+    let mut body = Zeroizing::new(reseed_body()?);
     link.stage_and_reboot(&body[..], false)?;
+    // Nothing is compared with the state after the reboot, because a
+    // session may already have drawn from it.
     body.zeroize();
     match read::<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>(link, map::SECRET_CHANGE)?.held()
     {
@@ -600,8 +595,22 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
     {
         bail!("the generator still does not read back: the part did not keep the fresh state");
     }
-    if kept_by_a_reseed(link)? != before {
-        bail!("the controller key, the printed secret or a client slot changed across the reseed");
+    let after = kept_by_a_reseed(link)?;
+    if after.identity != before.identity {
+        bail!("the controller key or the printed secret changed across the reseed");
+    }
+    if after.slots != before.slots {
+        bail!(
+            "a client slot changed across the reseed's reboot; a pairing or a removal over the \
+             link in that time changes one too, so check `o89-dev store` before trusting either"
+        );
+    }
+    if !intent_scrubbed(link)? {
+        bail!(
+            "the controller applied the reseed and did not scrub its intent, so a copy of the \
+             state is still on the part; every boot scrubs it again, so reboot the controller \
+             and check `o89-dev fram` over the intent before the unit leaves the bench"
+        );
     }
     writeln!(
         output,
@@ -611,18 +620,49 @@ fn run_reseed(link: &mut impl SecretLink, output: &mut impl std::io::Write) -> R
     Ok(())
 }
 
-/// The bytes a reseed must leave as they were (`map::RESEED_KEEPS`).
-fn kept_by_a_reseed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<Vec<u8>> {
-    let mut kept = Vec::new();
-    for (start, end) in map::RESEED_KEEPS {
+/// A fresh state from the operating system's generator, encoded as the
+/// intent that carries it. `DrbgState` is `Copy` and cannot clear itself,
+/// so its copies are kept to this function's temporaries; the raw draw is
+/// cleared here and the encoded body by the caller.
+fn reseed_body() -> Result<[u8; o89_core::SECRET_CHANGE_BYTES]> {
+    let mut seed = Zeroizing::new([0u8; DRBG_BYTES]);
+    fill(&mut *seed)?;
+    let state = DrbgState::new(*seed).map_err(|_| anyhow!("the generator returned zeros"))?;
+    Ok(SecretChange::Reseed(state).encode())
+}
+
+/// The bytes a reseed must leave as they were (`map::RESEED_KEEPS`): the
+/// unit's identity, then its client slots.
+#[derive(Debug, PartialEq, Eq)]
+struct Keeps {
+    identity: Vec<u8>,
+    slots: Vec<u8>,
+}
+
+fn kept_by_a_reseed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<Keeps> {
+    let [identity, slots] = map::RESEED_KEEPS.map(|(start, end)| -> Result<Vec<u8>> {
         let len = usize::from(end.0)
             .checked_sub(usize::from(start.0))
             .context("a run of the map")?;
         let mut run = vec![0u8; len];
         block_on(link.read(start, &mut run))?;
-        kept.extend_from_slice(&run);
-    }
-    Ok(kept)
+        Ok(run)
+    });
+    Ok(Keeps {
+        identity: identity?,
+        slots: slots?,
+    })
+}
+
+/// Whether one of the intent's two copies is all zeros: the boot that
+/// applies a reseed writes the other and zeroes the one that carried the
+/// state, and a write the part acknowledged and did not keep leaves it.
+fn intent_scrubbed(link: &mut impl o89_core::Fram<Error = anyhow::Error>) -> Result<bool> {
+    let slot = o89_core::slot_bytes(o89_core::SECRET_CHANGE_BYTES);
+    let mut both = vec![0u8; slot.checked_mul(2).context("the intent's reservation")?];
+    block_on(link.read(map::SECRET_CHANGE.start(), &mut both))?;
+    let (a, b) = both.split_at(slot);
+    Ok(a.iter().all(|byte| *byte == 0) || b.iter().all(|byte| *byte == 0))
 }
 
 /// P-038, P-044, P-049, P-236: the label's ASCII payload, version 2, with no

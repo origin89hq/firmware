@@ -151,7 +151,9 @@ pub enum SecretRecovery {
     /// A valid intent supplied a fresh secret, and on a first transaction the
     /// controller key and the generator.
     Applied,
-    /// Unreadable intent or a torn staging write was erased; active records stayed.
+    /// Unreadable intent or a torn staging write was erased, or a reseed the
+    /// boot would not apply or the part did not keep was scrubbed; active
+    /// records stayed.
     Discarded,
     /// The station's reseed wrote the generator a fresh state, read it back
     /// off the part, and scrubbed the intent (P-237).

@@ -1700,6 +1700,82 @@ mod tests {
         assert!(!copied_outside_the_generator(&part, reseeded()));
     }
 
+    /// A born unit whose generator record reads as never written: slot A
+    /// damaged before any draw wrote slot B.
+    fn absent_generator() -> Part {
+        let (mut part, _) = manufactured();
+        acknowledge(&mut part);
+        let a = usize::from(map::DRBG.start().0);
+        part.bytes[a.saturating_add(8)] ^= 1;
+        let (store, _) = boot(&mut part, None);
+        assert_eq!(store.drbg.held(), &Held::Absent);
+        part
+    }
+
+    /// A born unit whose generator record holds a checked body of zeros,
+    /// which is no state.
+    fn malformed_generator() -> Part {
+        let (mut part, _) = manufactured();
+        acknowledge(&mut part);
+        let _ = block_on(map::DRBG.write(&mut part, Position::Start, &[0; DRBG_BYTES]))
+            .expect("a zero body");
+        let (store, _) = boot(&mut part, None);
+        assert!(matches!(store.drbg.held(), Held::Malformed(_)));
+        part
+    }
+
+    #[test]
+    fn f_041_p_237_a_generator_that_reads_as_never_written_or_malformed_is_not_reseeded() {
+        // Neither is damage in both slots: staging refuses both, and a boot
+        // handed the intent anyway writes nothing.
+        for made in [absent_generator as fn() -> Part, malformed_generator] {
+            let mut part = made();
+            let before = part.clone();
+            assert_eq!(
+                block_on(stage_reseed(&mut part, reseeded())),
+                Err(ProvisionFailed::NotDamaged)
+            );
+            assert_eq!(part.bytes, before.bytes);
+            let held = *boot(&mut part, None).0.drbg.held();
+            let mut change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
+                map::SECRET_CHANGE,
+                &mut part,
+            ))
+            .expect("reads");
+            block_on(change.write(&mut part, SecretChange::Reseed(reseeded()))).expect("lands");
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
+            assert_eq!(store.drbg.held(), &held);
+            assert!(!copied_outside_the_generator(&part, reseeded()));
+        }
+    }
+
+    #[test]
+    fn f_041_p_237_a_scrub_the_part_did_not_keep_is_done_again_at_the_next_boot() {
+        let mut part = damaged_unit();
+        block_on(stage_reseed(&mut part, reseeded())).expect("stage");
+        // The copy of the intent that carries the state.
+        let slot = slot_bytes(SECRET_CHANGE_BYTES);
+        let a = usize::from(map::SECRET_CHANGE.start().0);
+        let wanted = reseeded().encode();
+        let in_a = part.bytes[a..a.saturating_add(slot)]
+            .windows(wanted.len())
+            .any(|window| window == wanted);
+        let carrying = if in_a { a } else { a.saturating_add(slot) };
+        part.loses = Some(carrying..carrying.saturating_add(slot));
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Reseeded);
+        assert_eq!(store.drbg.present(), Some(&reseeded()));
+        assert!(
+            copied_outside_the_generator(&part, reseeded()),
+            "the fault left the copy"
+        );
+        part.loses = None;
+        let (_, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Unchanged);
+        assert!(!copied_outside_the_generator(&part, reseeded()));
+    }
+
     #[test]
     fn p_237_a_reseed_intent_round_trips_and_carries_no_zero_state() {
         let encoded = SecretChange::Reseed(reseeded()).encode();

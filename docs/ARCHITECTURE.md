@@ -273,9 +273,10 @@ manufacturing transaction below, as its own kind of intent; the only caller of
 `stage_reseed` is the bench mailbox, which the host reaches over SWD. Staging
 refuses unless the controller key reads and the generator record is damaged in
 both A/B slots: an intact state, one slot that still holds, a record that reads
-as never written, a part with no controller key and an unfinished or unreadable
-transaction are each refused, and a part with no key is provisioned again, not
-reseeded. The boot checks the same again before it writes, writes the state
+as never written or holds a body of zeros, a part with no controller key and an
+unfinished or unreadable transaction are each refused, and a part with no key
+is provisioned again, not reseeded. Whether the two middle readings should be
+reseeded as well is #240. The boot checks the same again before it writes, writes the state
 and reads it back off the part, keeps what it read rather than what it meant
 to write, and scrubs the intent so no copy of the state outlives the boot. A
 write the part does not keep is scrubbed as well, and the generator stays
@@ -283,7 +284,10 @@ damaged; a refused write leaves the boot without a store and is tried again at
 the next. It writes the state and nothing else: the printed secret, the
 controller key and every client slot come back byte for byte
 (`map::RESEED_KEEPS`), which the station checks after the reboot, so the label
-and every enrolled client keep working and condition 22 clears. Physical
+and every enrolled client keep working and condition 22 clears. The station also
+checks that one copy of the intent reads as zeros: a scrub the part acknowledged
+and did not keep is done again by every boot, and the station says so rather
+than send the unit out with a copy of its state beside the generator. Physical
 authorisation is the probe on the bench; the station keeps no copy of the
 state.
 
