@@ -284,14 +284,17 @@ fn run_secret(
         // The key stays, so an exported record for this device id must
         // already name it. Journaled as a replace, so a resume can tell this
         // transaction from one the ledger never saw; never exported from here.
-        if let Some(key) =
-            read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?.present()
-        {
-            ledger.note_replace(Record {
-                device_id,
-                fingerprint: key.fingerprint(),
-            })?;
-        }
+        let held = read::<ControllerKey, CONTROLLER_KEY_BYTES>(link, map::CONTROLLER_KEY)?;
+        let Some(key) = held.present() else {
+            bail!(
+                "the controller key does not read back, so this unit cannot be labelled or \
+                 recorded; nothing staged, the label it has stays"
+            );
+        };
+        ledger.note_replace(Record {
+            device_id,
+            fingerprint: key.fingerprint(),
+        })?;
         None
     } else {
         let birth = generate_birth()?;
@@ -312,12 +315,24 @@ fn run_secret(
     show_applied(link, ledger, secret, output).with_context(|| resume_hint(ledger))
 }
 
-/// The command that recovers an interrupted write: the same export file.
+/// The command that recovers an interrupted write: the same export file,
+/// quoted for a POSIX shell so it runs as printed.
 fn resume_hint(ledger: &Ledger) -> String {
     format!(
         "secret write interrupted; run: o89-dev store write-secret --resume --export {}",
-        ledger.export().display()
+        shell_word(&ledger.export().to_string_lossy())
     )
+}
+
+/// `text` as one POSIX shell word: bare when every character is safe,
+/// otherwise single-quoted with each `'` closed, escaped and reopened.
+fn shell_word(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
@@ -457,8 +472,9 @@ fn show_applied(
         bail!("the controller key does not read back as the one applied; no label printed");
     }
     // Before the label, so a record that cannot be written leaves the
-    // transaction resumable; the label is not printed for a unit whose key
-    // the station cannot account for.
+    // transaction resumable and a key the station did not draw prints no
+    // label. A replace onto a key it holds no record of is still labelled,
+    // with the warning below that nothing was exported.
     let exported = ledger
         .confirm(DeviceId::new(secret.device_id_bytes()), fingerprint)
         .context("no label printed")?;
@@ -609,6 +625,14 @@ mod tests {
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].decode().expect("a scannable QR").1, PAYLOAD);
         assert!(rows[0].iter().all(|pixel| *pixel == ' '));
+    }
+
+    #[test]
+    fn a_resume_path_is_one_shell_word_as_printed() {
+        assert_eq!(shell_word("/tmp/units.jsonl"), "/tmp/units.jsonl");
+        assert_eq!(shell_word("unit records.jsonl"), "'unit records.jsonl'");
+        assert_eq!(shell_word("it's;rm"), r"'it'\''s;rm'");
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]

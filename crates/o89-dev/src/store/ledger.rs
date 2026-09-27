@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 /// Every line's version; a change to any field's meaning is a new one.
 const VERSION: u32 = 1;
 
-/// Every line either file holds is at most 145 bytes with its newline;
-/// anything past this is not a line the station wrote, and reading stops.
+/// A bound well above any line the station writes (145 bytes with its
+/// newline, for the longest format name); a longer line is not the
+/// station's, and reading stops there.
 const LINE_BYTES: u64 = 512;
 
 /// What a line says, by its format name.
@@ -107,7 +108,8 @@ struct InExport {
     of_key: Option<Record>,
 }
 
-/// The export file and its journal.
+/// The export file and its journal. One process writes them at a time: a
+/// second writer is not locked out, and its rename can drop the first's line.
 pub struct Ledger {
     export: PathBuf,
     journal: PathBuf,
@@ -225,8 +227,34 @@ impl Ledger {
             fingerprint: applied,
         };
         let found = self.in_export(wanted)?;
+        let mut drawn = None;
+        let mut drawn_other = false;
+        let mut replaced = false;
+        scan(&self.journal, JOURNAL_KINDS, |kind, line| {
+            if line.device_id == device_id {
+                match kind {
+                    Kind::Drawn if line.fingerprint == applied => drawn = Some(*line),
+                    Kind::Drawn => drawn_other = true,
+                    Kind::Replaced if line.fingerprint == applied => replaced = true,
+                    // A replace journaled onto another key is not this one's;
+                    // the journal holds no exported lines, and `scan` refuses one.
+                    Kind::Replaced | Kind::Exported => {}
+                }
+            }
+            Ok(())
+        })?;
         match found.held {
-            Some(held) if held == wanted => return Ok(Exported::AlreadyHeld(held)),
+            // Held, and journaled here: a repeat of this ledger's own record.
+            Some(held) if held == wanted && (drawn.is_some() || replaced) => {
+                return Ok(Exported::AlreadyHeld(held));
+            }
+            Some(held) if held == wanted => bail!(
+                "{} has no entry for device id {}'s transaction, though {} holds its record; \
+                 resume with the --export file the write used. Nothing exported",
+                self.journal.display(),
+                hex::encode(device_id.as_bytes()),
+                self.export.display()
+            ),
             Some(held) => bail!(
                 "{} records device id {} with fingerprint {}, but the part applied {}; nothing \
                  exported",
@@ -237,21 +265,6 @@ impl Ledger {
             ),
             None => {}
         }
-        let mut drawn = None;
-        let mut drawn_other = false;
-        let mut replaced = false;
-        scan(&self.journal, JOURNAL_KINDS, |kind, line| {
-            if line.device_id == device_id {
-                match kind {
-                    Kind::Drawn if line.fingerprint == applied => drawn = Some(*line),
-                    Kind::Drawn => drawn_other = true,
-                    Kind::Replaced if line.fingerprint == applied => replaced = true,
-                    // A replace journaled onto another key is not this one's.
-                    Kind::Replaced | Kind::Exported => {}
-                }
-            }
-            Ok(())
-        })?;
         let source = match (drawn, found.of_key) {
             (Some(record), _) => record,
             // Only a replace this ledger journaled for this key reuses the
@@ -604,6 +617,12 @@ pub(super) mod tests {
         let other = elsewhere.ledger();
         std::fs::copy(&ledger.export, &other.export).unwrap();
         assert!(confirm(&other, record(8, 2)).is_err());
+        // Nor does an exact pair it holds without this journal's entry.
+        let error = confirm(&other, record(1, 2)).unwrap_err();
+        assert!(
+            error.to_string().contains("resume with the --export"),
+            "{error}"
+        );
         assert_eq!(exported(&other).len(), 2);
         // The same device id replaced with the key it has: nothing new.
         ledger.note_replace(record(1, 2)).unwrap();

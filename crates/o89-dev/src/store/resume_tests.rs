@@ -1122,3 +1122,24 @@ fn p_249_a_device_id_awaiting_resume_on_one_unit_is_refused_to_another_before_st
         )]
     );
 }
+
+#[test]
+fn p_249_a_replace_onto_a_key_that_does_not_read_back_stages_nothing() {
+    let mut link = FakeLink::new();
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut output = Vec::new();
+    run_secret(&mut link, &ledger, None, false, false, &mut output).unwrap();
+    let at = usize::from(map::DEVICE_SECRET.end().0);
+    link.bytes[at..usize::from(map::CONTROLLER_KEY.end().0)].fill(0x55);
+    let before = link.bytes.clone();
+    let journal = journaled(&ledger);
+    let stages = link.stages;
+    output.clear();
+    let error = run_secret(&mut link, &ledger, None, true, false, &mut output).unwrap_err();
+    assert!(error.to_string().contains("nothing staged"), "{error}");
+    assert_eq!(link.stages, stages);
+    assert_eq!(link.bytes, before);
+    assert_eq!(journaled(&ledger), journal);
+    assert!(output.is_empty());
+}
