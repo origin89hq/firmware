@@ -166,6 +166,7 @@ mod tests {
             psk: "password",
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap()
     }
@@ -181,8 +182,8 @@ mod tests {
         assert!(flash.bytes.iter().all(|byte| *byte == 255));
         assert_eq!(load_credential(&mut flash), Ok(None));
         assert_eq!(
-            crate::Network::new(load_credential(&mut flash).unwrap()).stored_version(),
-            0
+            crate::Network::new(load_credential(&mut flash).unwrap()).stored(),
+            km43::NetStamp::Unwritten
         );
     }
 
@@ -209,10 +210,20 @@ mod tests {
             );
             assert_eq!(verdict.version, 7, "cut {cut}");
             assert_eq!(
+                network.stored(),
+                record().stamp(),
+                "the foreign token stays visible until erasure succeeds, cut {cut}"
+            );
+            assert_eq!(
                 network.credential().unwrap().change(),
                 Ok(NetChange::ClearUnwritten)
             );
             flash.budget = usize::MAX;
+            let rebooted = crate::Network::new(load_credential(&mut flash).ok().flatten()).stored();
+            assert!(
+                rebooted == record().stamp() || rebooted == km43::NetStamp::Unwritten,
+                "cut {cut}: {rebooted:?}"
+            );
             let verdict = network.apply(NetChange::ClearUnwritten, |clear| {
                 store_credential(&mut flash, clear).is_ok()
             });
@@ -241,6 +252,7 @@ mod tests {
             version: 8,
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         store_credential(&mut flash, &clear).unwrap();
@@ -275,12 +287,14 @@ mod tests {
             psk: "different",
             country: "US",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         let clear = Credential::new(km43::NetChange::Clear {
             version: 8,
             country: "US",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         let mut initial = Flash {
@@ -307,6 +321,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn l_137_an_interrupted_write_at_an_equal_version_reports_only_the_persisted_token() {
+        // Another controller's network at the very version this one holds.
+        let theirs = Credential::new(NetChange::Set {
+            version: 7,
+            ssid: "theirs",
+            psk: "their password",
+            country: "US",
+            hostname: "elsewhere",
+            origin: km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]),
+        })
+        .unwrap();
+        let ours = record();
+        assert_eq!(theirs.version(), ours.version());
+        let mut initial = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        store_credential(&mut initial, &theirs).unwrap();
+        for budget in 0..=4301 {
+            let mut flash = Flash {
+                bytes: initial.bytes,
+                budget,
+            };
+            let mut network = crate::Network::new(Some(theirs));
+            let verdict = network.apply(ours.change().unwrap(), |next| {
+                store_credential(&mut flash, next).is_ok()
+            });
+            assert_eq!(network.credential(), Some(&ours), "RAM runs on ours");
+            if verdict.outcome == km43::NetConfig::Stored {
+                assert_eq!(network.stored(), ours.stamp(), "budget {budget}");
+            } else {
+                assert_eq!(
+                    network.stored(),
+                    theirs.stamp(),
+                    "LinkUp keeps the token flash held, budget {budget}"
+                );
+            }
+            // Reboot: what the next LinkUp reports is what the record loads.
+            flash.budget = usize::MAX;
+            let loaded = load_credential(&mut flash).ok().flatten();
+            let rebooted = crate::Network::new(loaded);
+            let stamp = rebooted.stored();
+            assert!(
+                stamp == theirs.stamp()
+                    || stamp == km43::NetStamp::Unwritten
+                    || (stamp == ours.stamp() && loaded == Some(ours)),
+                "budget {budget}: {stamp:?}"
+            );
+            if verdict.outcome == km43::NetConfig::Stored {
+                assert_eq!(stamp, ours.stamp(), "budget {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn l_138_a_record_stored_before_the_token_does_not_load() {
+        // A written set as the firmware before the token stored it: keys 1
+        // to 6, no key 7.
+        let mut payload = [0u8; 192];
+        let mut cbor = o89_link::link_header(km43::LinkMessageType::NetConfig, km43::ReqId(1))
+            .write(6, &mut payload)
+            .unwrap();
+        cbor.key(1).unwrap();
+        cbor.u64(u64::from(km43::NetConfigOp::Set as u8)).unwrap();
+        cbor.key(2).unwrap();
+        cbor.u64(7).unwrap();
+        cbor.key(3).unwrap();
+        cbor.text("site").unwrap();
+        cbor.key(4).unwrap();
+        cbor.text("password").unwrap();
+        cbor.key(5).unwrap();
+        cbor.text("CA").unwrap();
+        cbor.key(6).unwrap();
+        cbor.text("origin89").unwrap();
+        let len = cbor.finish().unwrap();
+        let mut flash = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        let mut record = [0u8; STORED_CREDENTIAL_BYTES];
+        record[4..8].copy_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+        record[8..8 + len].copy_from_slice(&payload[..len]);
+        let checksum = crc(&record[4..200]);
+        record[200..204].copy_from_slice(&checksum.to_le_bytes());
+        flash.write(4, &record[4..]).unwrap();
+        flash.write(0, &COMMIT).unwrap();
+        // A committed, intact record the decoder refuses: the firmware boots
+        // with no cache, reports version 0 and waits for the controller.
+        assert_eq!(load_credential(&mut flash), Err(CredentialStorageError));
     }
 
     #[test]

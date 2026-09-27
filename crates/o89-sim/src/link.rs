@@ -2225,12 +2225,25 @@ fn the_resynchroniser_recovers_inside_one_delimiter_after_a_thousand_cut_frames(
     assert!(bench.endpoint.link.is_up());
 }
 
+/// The token of the section the network fixtures write.
+const ORIGIN: km43::NetOrigin = km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]);
+/// Another controller's, or this one's from before a repair.
+const FOREIGN: km43::NetOrigin = km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]);
+
 #[test]
-fn l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions() {
-    // Capabilities: claim another cached version, as a replaced module can.
-    for cached in [0, 1, 7] {
+fn l_133_hostile_comms_gets_network_unless_it_holds_this_version_under_this_token() {
+    // Capabilities: claim another cached version or token, as a module moved
+    // between units can.
+    for (cached, origin, pushed) in [
+        (0, None, true),
+        (1, Some(ORIGIN), false),
+        (1, Some(FOREIGN), true),
+        (1, None, true),
+        (7, Some(ORIGIN), true),
+    ] {
         let mut bench = Bench::new(Capabilities {
             net_version: cached,
+            net_origin: origin,
             ..Capabilities::default()
         });
         let mut record = block_on(o89_core::Kept::read(
@@ -2240,12 +2253,15 @@ fn l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions() {
         .expect("read");
         let mut network = o89_core::Network::NONE;
         network
-            .set(o89_core::Credentials {
-                ssid: o89_core::Text::new("cabin").expect("ssid"),
-                psk: o89_core::Psk::new("correct horse").expect("psk"),
-                country: o89_core::Country::new(*b"CA").expect("country"),
-                hostname: o89_core::Text::new("origin89").expect("host"),
-            })
+            .set(
+                o89_core::Credentials {
+                    ssid: o89_core::Text::new("cabin").expect("ssid"),
+                    psk: o89_core::Psk::new("correct horse").expect("psk"),
+                    country: o89_core::Country::new(*b"CA").expect("country"),
+                    hostname: o89_core::Text::new("origin89").expect("host"),
+                },
+                ORIGIN,
+            )
             .expect("network");
         block_on(record.write(&mut bench.fram, network)).expect("persist");
         let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
@@ -2258,8 +2274,8 @@ fn l_133_hostile_comms_gets_network_for_both_lower_and_higher_versions() {
                 .heard
                 .iter()
                 .any(|heard| matches!(heard, Heard::NetConfig { version: 1, .. })),
-            cached != 1,
-            "cached {cached}"
+            pushed,
+            "cached {cached} under {origin:?}"
         );
     }
 }
@@ -2281,7 +2297,10 @@ fn network_bench() -> Bench {
             hostname: km43::Hostname::new("origin89").expect("host"),
         })
         .expect("network");
-    block_on(record.write(&mut bench.fram, network)).expect("persist");
+    let o89_core::NetworkChange::Create(created) = network else {
+        panic!("an unwritten section is created");
+    };
+    block_on(record.write(&mut bench.fram, created.originate(ORIGIN))).expect("persist");
     let (store, report) = block_on(o89_core::Store::boot(&mut bench.fram, None)).expect("boot");
     bench.endpoint.sessions =
         o89_core::Sessions::new(crate::link::keys(store, report.epoch.epoch()));
@@ -2312,7 +2331,8 @@ fn l_134_hostile_comms_observes_the_validated_country_in_net_config() {
             ssid: "cabin",
             psk: "correct horse",
             country: "CA",
-            hostname: "origin89"
+            hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
     );
 }
@@ -2338,7 +2358,8 @@ fn l_135_factory_reset_pushes_clear_and_keeps_its_version_after_reboot() {
         Some(km43::NetChange::Clear {
             version: 2,
             country: "CA",
-            hostname: "origin89"
+            hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
     );
     let kept = block_on(o89_core::Kept::<o89_core::Network, 160>::read(
@@ -2716,12 +2737,16 @@ fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_ver
             body: &body[..len],
         },
         &mut store.network,
+        &mut o89_core::Generator::new(
+            block_on(o89_core::Kept::read(o89_core::map::DRBG, &mut bench.fram)).expect("drbg"),
+        ),
         &mut bench.fram,
     ))
     .expect("replacement");
     assert_eq!(ack.outcome, km43::SetConfig::Accepted);
-    let epoch = store.epoch.present().copied();
-    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, epoch));
+    // The boot after the write, so the generator is the part's.
+    let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("store");
+    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
     bench.run_for(Millis::from_millis(2000));
     assert!(
         bench
@@ -2729,6 +2754,121 @@ fn l_133_replacing_damaged_network_pushes_even_when_the_peer_reports_the_new_ver
             .heard
             .iter()
             .any(|heard| matches!(heard, Heard::NetConfig { version: 1, .. }))
+    );
+}
+
+#[test]
+fn l_138_a_module_unplugged_across_a_repair_is_pushed_at_the_version_the_repair_reaches() {
+    // Capabilities: claim version 1 under the token the section had before
+    // it was damaged, and then under the token the repair drew.
+    let (mut part, _) = damaged_network_unit(false);
+    let (mut store, _) = block_on(Store::boot(&mut part, None)).expect("store");
+    assert!(store.network.present().is_none(), "unreadable (P-108)");
+    let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+    let len = km43::NetworkWrite {
+        join: Some(km43::JoinWrite {
+            ssid: km43::Ssid::new("cabin").expect("ssid"),
+            psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+        }),
+        country: km43::Country::new("CA").expect("country"),
+        hostname: km43::Hostname::new("origin89").expect("host"),
+    }
+    .encode(&mut body)
+    .expect("body");
+    let ack = block_on(store.configuration.set(
+        km43::SetConfigOperation {
+            section: km43::ConfigSection::Network,
+            expected_version: 0,
+            body: &body[..len],
+        },
+        &mut store.network,
+        &mut o89_core::Generator::new(store.drbg),
+        &mut part,
+    ))
+    .expect("repair");
+    assert_eq!((ack.version, ack.outcome), (1, km43::SetConfig::Accepted));
+    let repaired = store
+        .network
+        .present()
+        .and_then(o89_core::Network::origin)
+        .expect("a drawn token");
+    assert_ne!(repaired, FOREIGN);
+    for (held, pushed) in [(FOREIGN, true), (repaired, false)] {
+        let mut bench = Bench::new(Capabilities {
+            net_version: 1,
+            net_origin: Some(held),
+            ..Capabilities::default()
+        });
+        bench.fram = part.clone();
+        bench.fram.reboot();
+        let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
+        bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
+        bench.run_for(Millis::from_millis(2000));
+        let heard = bench.comms.heard.iter().find_map(|heard| match heard {
+            Heard::NetConfig {
+                version: 1,
+                network,
+            } => network.origin(),
+            _ => None,
+        });
+        assert_eq!(heard, pushed.then_some(repaired), "module under {held:?}");
+    }
+}
+
+#[test]
+fn p_108_l_138_a_record_in_the_layout_before_the_token_reads_unreadable_and_no_clear_is_pushed() {
+    // Capabilities: a module that still reports the unit's own version 3.
+    let mut bench = Bench::new(Capabilities {
+        net_version: 3,
+        ..Capabilities::default()
+    });
+    let mut network = o89_core::Network::NONE;
+    for _ in 0..3 {
+        network
+            .set(
+                o89_core::Credentials {
+                    ssid: o89_core::Text::new("cabin").expect("ssid"),
+                    psk: o89_core::Psk::new("correct horse").expect("psk"),
+                    country: o89_core::Country::new(*b"CA").expect("country"),
+                    hostname: o89_core::Text::new("origin89").expect("host"),
+                },
+                ORIGIN,
+            )
+            .expect("network");
+    }
+    // The earlier layout: the same record with no token after the version.
+    let current = o89_core::Body::encode(&network);
+    let mut earlier = [0u8; o89_core::NETWORK_BYTES];
+    earlier[..4].copy_from_slice(&current[..4]);
+    let rest = &current[4 + km43::NET_ORIGIN_BYTES..];
+    earlier[4..4 + rest.len()].copy_from_slice(rest);
+    let _ = block_on(o89_core::map::NETWORK.write(
+        &mut bench.fram,
+        o89_core::Position::Start,
+        &earlier,
+    ))
+    .expect("an earlier build's record");
+    let (store, report) = block_on(Store::boot(&mut bench.fram, None)).expect("boot");
+    assert!(
+        matches!(store.network.held(), o89_core::Held::Malformed(_)),
+        "{:?}",
+        store.network.held()
+    );
+    bench.endpoint.sessions = Sessions::new(crate::link::keys(store, report.epoch.epoch()));
+    bench.run_for(Millis::from_millis(2000));
+    assert!(
+        !bench
+            .comms
+            .heard
+            .iter()
+            .any(|heard| matches!(heard, Heard::NetConfig { .. })),
+        "no unwritten clear for a master it cannot read"
+    );
+    assert!(
+        bench
+            .asked
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Note(Note::NetworkWithoutMaster)))
     );
 }
 

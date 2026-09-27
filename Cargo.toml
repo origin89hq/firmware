@@ -33,7 +33,7 @@ publish = false
 # Includes the metadata-free unwritten clear and rejects written version zero.
 # 0.6.1 clears key material on drop and ships canonical vectors for host tests.
 # 0.6.3 retains Wi-Fi diagnostics (P-216–P-221, L-200–L-207) and adds client enrolment storage.
-km43 = "=0.7.0"
+km43 = "=0.8.1"
 # The dedup fingerprint is the leftmost eight bytes of SHA-256 over the
 # operation bytes (P-120); the same release km43 hashes with.
 sha2 = { version = "0.11", default-features = false }
@@ -99,8 +99,8 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 
 [patch.crates-io]
-# km43 at roles, invites and removal (origin89hq/km43#138), with key
-# agreement (#130), the retired write counter (#134), vouching (#137) and
-# the asynchronous DRBG store (#136) before it. The pin moves to `=0.8.0`
-# with the last of #178, when every type that release adds is answered.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "0f94f45e4554ab3889408bb76952cf6eb90dd484" }
+# km43 at the network origin token (origin89hq/km43#175, #234 here), past
+# the 0.8.1 release (#178), with the counters' `reset` validity and the
+# vendor-fault and dialect allocations between. The patch goes when a
+# release carries #175.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "50a7f3b6e521b72ffe435383bae1d765fd029a11" }

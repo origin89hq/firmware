@@ -109,6 +109,9 @@ pub enum Releases {
 pub struct Capabilities {
     /// Network version claimed at `LinkUp`; supports a module moved between units.
     pub net_version: u32,
+    /// Origin token claimed beside it (L-138): a module out of another unit,
+    /// or one unplugged across a repair, holds a token not the controller's.
+    pub net_origin: Option<km43::NetOrigin>,
     /// Drop only network acknowledgements, leaving the handshake and beats intact.
     pub withhold_network_ack: bool,
     /// Whether it answers at all.
@@ -136,6 +139,7 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             net_version: 0,
+            net_origin: None,
             withhold_network_ack: false,
             answers: Answers::Everything,
             statement: Statement::Given,
@@ -166,7 +170,8 @@ pub enum Heard {
     NetConfig {
         /// Version offered by the controller.
         version: u32,
-        /// Redacted decoded body (its synthetic version is one).
+        /// Redacted decoded body under the token it carried (its synthetic
+        /// version is one).
         network: o89_core::Network,
     },
     /// The controller stated itself.
@@ -803,7 +808,8 @@ impl HostileComms {
         }
         let honest = self.caps.version == OURS
             && self.caps.claims == Claims::Comms
-            && self.caps.net_version == 0;
+            && self.caps.net_version == 0
+            && self.caps.net_origin.is_none();
         if !honest {
             if let Frame::LinkUp { req_id } = frame {
                 return self.claimed_statement(LinkMessageType::LinkUp, req_id);
@@ -966,9 +972,9 @@ impl HostileComms {
         };
         // A statement claiming the controller carries the key only the
         // controller sends (L-035), or it could not be written at all.
-        let (net_version, device_id) = match self.caps.claims {
-            Claims::Comms => (Some(self.caps.net_version), None),
-            Claims::Controller => (None, Some([0x11; o89_core::DEVICE_ID_BYTES])),
+        let (net_version, net_origin, device_id) = match self.caps.claims {
+            Claims::Comms => (Some(self.caps.net_version), self.caps.net_origin, None),
+            Claims::Controller => (None, None, Some([0x11; o89_core::DEVICE_ID_BYTES])),
         };
         let len = LinkUp {
             version: self.caps.version,
@@ -978,6 +984,7 @@ impl HostileComms {
             hw: IDENTITY_HW,
             net_version,
             device_id,
+            net_origin,
         }
         .write(header(kind, req_id), &mut envelope)
         .map_err(|_| Broken::Body)?;
@@ -1165,7 +1172,7 @@ fn first_value(envelope: LinkEnvelope<'_>) -> Option<u8> {
 
 fn heard_network(envelope: LinkEnvelope<'_>) -> Option<Heard> {
     km43::NetChange::decode(envelope).ok().and_then(|change| {
-        let (version, join, country, hostname) = match change {
+        let (version, join, country, hostname, origin) = match change {
             km43::NetChange::ClearUnwritten => {
                 return Some(Heard::NetConfig {
                     version: 0,
@@ -1178,6 +1185,7 @@ fn heard_network(envelope: LinkEnvelope<'_>) -> Option<Heard> {
                 psk,
                 country,
                 hostname,
+                origin,
             } => (
                 version,
                 Some(km43::JoinWrite {
@@ -1186,20 +1194,26 @@ fn heard_network(envelope: LinkEnvelope<'_>) -> Option<Heard> {
                 }),
                 country,
                 hostname,
+                origin,
             ),
             km43::NetChange::Clear {
                 version,
                 country,
                 hostname,
-            } => (version, None, country, hostname),
+                origin,
+            } => (version, None, country, hostname, origin),
         };
-        let network = o89_core::Network::NONE
+        let network = match o89_core::Network::NONE
             .changed(km43::NetworkWrite {
                 join,
                 country: km43::Country::new(country).ok()?,
                 hostname: km43::Hostname::new(hostname).ok()?,
             })
-            .ok()?;
+            .ok()?
+        {
+            o89_core::NetworkChange::Create(created) => created.originate(origin),
+            o89_core::NetworkChange::Edit(_) => return None,
+        };
         Some(Heard::NetConfig { version, network })
     })
 }

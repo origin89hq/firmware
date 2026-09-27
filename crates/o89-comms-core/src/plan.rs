@@ -79,6 +79,7 @@ mod tests {
             psk: "correct horse",
             country,
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .expect("valid")
     }
@@ -88,6 +89,7 @@ mod tests {
             version: 4,
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .expect("valid")
     }

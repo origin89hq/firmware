@@ -1,6 +1,10 @@
 //! The single credential cache (L-136), independent of flash and the radio.
+//!
+//! The origin token rides inside the encoded `NetConfig` the record holds,
+//! so it is stored in the same write as the configuration and its version
+//! and cannot outlive them or arrive without them (L-132, L-138).
 
-use km43::{LinkEnvelope, LinkMessageType, NetChange, NetConfig, NetVerdict, ReqId};
+use km43::{LinkEnvelope, LinkMessageType, NetChange, NetConfig, NetStamp, NetVerdict, ReqId};
 use o89_link::link_header;
 
 /// Maximum encoded credential record. Overflow refuses the change.
@@ -11,13 +15,13 @@ pub const CREDENTIAL_BYTES: usize = 192;
 pub struct Credential {
     bytes: [u8; CREDENTIAL_BYTES],
     len: usize,
-    version: u32,
+    stamp: NetStamp,
 }
 
 impl core::fmt::Debug for Credential {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Credential")
-            .field("version", &self.version)
+            .field("stamp", &self.stamp)
             .finish_non_exhaustive()
     }
 }
@@ -27,16 +31,19 @@ impl core::fmt::Debug for Credential {
 pub struct InvalidCredential;
 
 impl Credential {
-    /// Validate and copy a configuration without allocating.
+    /// Validate and copy a configuration without allocating. A `set` or
+    /// `clear` at version 0 is refused: zero is the unwritten clear's, which
+    /// carries no token (L-133, L-138).
     pub fn new(change: NetChange<'_>) -> Result<Self, InvalidCredential> {
-        let (version, metadata) = match change {
-            NetChange::ClearUnwritten => (0, None),
+        let stamp = NetStamp::of(&change).map_err(|_| InvalidCredential)?;
+        let metadata = match change {
+            NetChange::ClearUnwritten => None,
             NetChange::Set {
-                version,
                 ssid,
                 psk,
                 country,
                 hostname,
+                ..
             } => {
                 if ssid.is_empty()
                     || ssid.len() > 32
@@ -45,13 +52,11 @@ impl Credential {
                 {
                     return Err(InvalidCredential);
                 }
-                (version, Some((country, hostname)))
+                Some((country, hostname))
             }
             NetChange::Clear {
-                version,
-                country,
-                hostname,
-            } => (version, Some((country, hostname))),
+                country, hostname, ..
+            } => Some((country, hostname)),
         };
         if let Some((country, hostname)) = metadata
             && (<[u8; 2]>::try_from(country.as_bytes())
@@ -75,11 +80,7 @@ impl Credential {
                 &mut bytes,
             )
             .map_err(|_| InvalidCredential)?;
-        Ok(Self {
-            bytes,
-            len,
-            version,
-        })
+        Ok(Self { bytes, len, stamp })
     }
 
     /// Decode a stored record through the same validation as a link update.
@@ -103,15 +104,21 @@ impl Credential {
     /// Controller configuration version, with no ordering implied.
     #[must_use]
     pub const fn version(&self) -> u32 {
-        self.version
+        self.stamp.net_version()
+    }
+
+    /// The version with the origin token it was sent under (L-138).
+    #[must_use]
+    pub const fn stamp(&self) -> NetStamp {
+        self.stamp
     }
 }
 
-/// One RAM credential and the version that actually reached NVS.
+/// One RAM credential and the version and token that actually reached NVS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Network {
     credential: Option<Credential>,
-    stored_version: u32,
+    stored: NetStamp,
     dirty: bool,
 }
 
@@ -119,19 +126,21 @@ impl Network {
     /// Restore the cache before association, without waiting for the controller.
     #[must_use]
     pub const fn new(credential: Option<Credential>) -> Self {
-        let stored_version = match credential {
-            Some(value) => value.version,
-            None => 0,
+        let stored = match credential {
+            Some(value) => value.stamp,
+            None => NetStamp::Unwritten,
         };
         Self {
             credential,
-            stored_version,
+            stored,
             dirty: false,
         }
     }
 
     /// Replace rather than append; a failed write still replaces RAM (L-136, L-137).
-    /// The adapter returns true only after durable storage succeeds.
+    /// The adapter returns true only after durable storage succeeds, and
+    /// until one does the version and token reported are flash's, as
+    /// `km43::NetStamp::settle` states the rule (L-132, L-137).
     pub fn apply(
         &mut self,
         change: NetChange<'_>,
@@ -140,18 +149,18 @@ impl Network {
         let Ok(credential) = Credential::new(change) else {
             return NetVerdict {
                 outcome: NetConfig::RejectedInvalid,
-                version: self.stored_version,
+                version: self.stored.net_version(),
             };
         };
         if !self.dirty && self.credential == Some(credential) {
             return NetVerdict {
                 outcome: NetConfig::Stored,
-                version: credential.version,
+                version: credential.version(),
             };
         }
         self.credential = Some(credential);
         let outcome = if store(&credential) {
-            self.stored_version = credential.version;
+            self.stored = credential.stamp;
             self.dirty = false;
             NetConfig::Stored
         } else {
@@ -160,7 +169,7 @@ impl Network {
         };
         NetVerdict {
             outcome,
-            version: self.stored_version,
+            version: self.stored.net_version(),
         }
     }
 
@@ -173,7 +182,14 @@ impl Network {
     /// Advertise durable state, so the next handshake repairs a failed write.
     #[must_use]
     pub const fn stored_version(&self) -> u32 {
-        self.stored_version
+        self.stored.net_version()
+    }
+
+    /// The version and token that reached NVS, which `LinkUp` reports
+    /// (L-132, L-137): never the RAM copy's after a failed write.
+    #[must_use]
+    pub const fn stored(&self) -> NetStamp {
+        self.stored
     }
 }
 
@@ -187,6 +203,7 @@ mod tests {
             psk: "password",
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         }
     }
     #[test]
@@ -255,6 +272,7 @@ mod tests {
             version: 2,
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         };
         assert_eq!(
             network.apply(clear, |_| false).outcome,
@@ -298,6 +316,7 @@ mod tests {
                 psk,
                 country,
                 hostname,
+                origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
             };
             let verdict = network.apply(change, |_| {
                 panic!("invalid configuration must not reach flash")
@@ -308,6 +327,77 @@ mod tests {
         }
     }
 
+    const FOREIGN: km43::NetOrigin = km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]);
+
+    #[test]
+    fn l_137_a_failed_write_keeps_reporting_the_persisted_token_at_an_equal_version() {
+        let theirs = NetChange::Set {
+            version: 3,
+            ssid: "theirs",
+            psk: "password",
+            country: "US",
+            hostname: "elsewhere",
+            origin: FOREIGN,
+        };
+        let mut network = Network::new(Some(Credential::new(theirs).unwrap()));
+        let before = network.stored();
+        assert_eq!(before.net_origin(), Some(FOREIGN));
+        let verdict = network.apply(set(3, "ours"), |_| false);
+        assert_eq!(
+            verdict,
+            NetVerdict {
+                outcome: NetConfig::NvsWriteFailed,
+                version: 3
+            }
+        );
+        assert_eq!(network.credential().unwrap().change(), Ok(set(3, "ours")));
+        assert_eq!(network.stored(), before, "flash's token, not RAM's");
+        assert_eq!(
+            network.apply(set(3, "ours"), |_| true).outcome,
+            NetConfig::Stored
+        );
+        assert_eq!(
+            network.stored().net_origin(),
+            Some(km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]))
+        );
+    }
+
+    #[test]
+    fn l_138_the_token_is_stored_in_the_record_with_its_version() {
+        let record = Credential::new(set(4, "site")).unwrap();
+        let decoded = Credential::decode(record.encoded()).unwrap();
+        assert_eq!(decoded.stamp(), record.stamp());
+        assert_eq!(
+            decoded.stamp().net_origin(),
+            Some(km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]))
+        );
+        let unwritten = Credential::new(NetChange::ClearUnwritten).unwrap();
+        assert_eq!(unwritten.stamp(), NetStamp::Unwritten);
+        assert_eq!(Network::new(None).stored(), NetStamp::Unwritten);
+    }
+
+    #[test]
+    fn l_133_a_written_change_at_version_zero_is_refused_whatever_it_carries() {
+        let mut network = Network::new(Some(Credential::new(set(2, "site")).unwrap()));
+        let clear = NetChange::Clear {
+            version: 0,
+            country: "CA",
+            hostname: "origin89",
+            origin: FOREIGN,
+        };
+        for change in [set(0, "site"), clear] {
+            assert_eq!(Credential::new(change), Err(InvalidCredential));
+            assert_eq!(
+                network.apply(change, |_| panic!("must not write")),
+                NetVerdict {
+                    outcome: NetConfig::RejectedInvalid,
+                    version: 2
+                }
+            );
+        }
+        assert_eq!(network.stored().net_version(), 2);
+    }
+
     #[test]
     fn maximum_fields_round_trip_and_truncated_records_are_refused() {
         let change = NetChange::Set {
@@ -316,6 +406,7 @@ mod tests {
             psk: "123456789012345678901234567890123456789012345678901234567890123",
             country: "CA",
             hostname: "12345678901234567890123456789012",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         };
         let record = Credential::new(change).unwrap();
         assert_eq!(Credential::decode(record.encoded()), Ok(record));
