@@ -122,7 +122,7 @@ impl Program {
         let mut functions = BTreeMap::new();
         let mut current: Option<(u64, Function, BTreeMap<String, u64>)> = None;
         // Branch targets are resolved once every function's start is known.
-        let mut branches: Vec<(u64, u64)> = Vec::new();
+        let mut branches: Vec<(u64, u64, bool)> = Vec::new();
         for line in disassembly.lines() {
             if let Some((start, name)) = function_header(line) {
                 if let Some((at, function, _)) = current.take() {
@@ -198,7 +198,7 @@ impl Program {
                 }
                 "bl" | "b" | "b.w" => {
                     if let Some(target) = branch_target(operands) {
-                        branches.push((*at, target));
+                        branches.push((*at, target, mnemonic == "bl"));
                     }
                 }
                 _ => {}
@@ -208,7 +208,7 @@ impl Program {
             functions.insert(at, function);
         }
         let mut program = Self { functions };
-        for (from, target) in branches {
+        for (from, target, linked) in branches {
             // A branch into the middle of a function, its own included, is
             // not a call: thumbv6m reaches a far label of its own with `bl`.
             if target != from && program.functions.contains_key(&target) {
@@ -216,9 +216,11 @@ impl Program {
                     function.calls.insert(target);
                 }
             } else if target == from
+                && linked
                 && let Some(function) = program.functions.get_mut(&from)
             {
-                // A call to its own start is recursion.
+                // A call to its own start is recursion; a plain branch there
+                // is a loop whose head is the entry.
                 function.calls.insert(target);
             }
         }
@@ -773,6 +775,18 @@ mod tests {
         let depths = program.depths().expect("no recursion");
         assert_eq!(depths[&program.named("outer").unwrap()], 0x140);
         assert_eq!(depths[&program.named("inner").unwrap()], 0x40);
+    }
+
+    #[test]
+    fn f_094_a_branch_to_its_own_start_is_a_loop_not_recursion() {
+        let text = "\
+08000100 <o89_controller::idle>:
+ 8000100:      \tsub\tsp, #0x10
+ 8000102:      \tb\t0x8000100 <o89_controller::idle> @ imm = #-0x6
+";
+        let program = Program::parse(text).expect("parses");
+        let depths = program.depths().expect("a loop is not recursion");
+        assert_eq!(depths[&0x0800_0100], 0x10);
     }
 
     #[test]
