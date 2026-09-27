@@ -2106,6 +2106,63 @@ fn l_140_l_162_first_offer_sets_clock_and_records_comms_provenance() {
     ));
 }
 
+/// The last seconds of 2099 are inside L-150's cap of a time the RTC
+/// cannot hold: the peer hears outcome 2, the calendar stays where it was
+/// and L-151's window does not start, so an in-range offer then lands.
+#[test]
+fn l_153_an_offer_past_the_clock_century_is_answered_implausible_over_the_link() {
+    // Capabilities: none.
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(1_000));
+    let known = (
+        o89_core::UnixMillis::new(4_102_444_798_000).expect("non-zero"),
+        bench.now,
+    );
+    bench.calendar = Some(known);
+    let bytes = bench
+        .comms
+        .offer_time(4_102_444_801_000, bench.now)
+        .expect("the peer builds it");
+    bench.feed(&bytes);
+    assert!(matches!(
+        bench.sent(is_time_verdict).last(),
+        Some((
+            _,
+            Outgoing::TimeVerdict {
+                outcome: km43::TimeOffer::RefusedImplausible,
+                ..
+            }
+        ))
+    ));
+    assert!(bench.comms.heard.iter().any(|h| matches!(
+        h,
+        Heard::Other {
+            opcode: 0xE6,
+            outcome: Some(2),
+            ..
+        }
+    )));
+    assert_eq!(bench.calendar, Some(known));
+    assert!(bench.clock_records.is_empty());
+    assert_eq!(bench.clock.rate_refusals(), 0);
+    let bytes = bench
+        .comms
+        .offer_time(4_102_444_799_999, bench.now)
+        .expect("the peer builds it");
+    bench.feed(&bytes);
+    assert!(matches!(
+        bench.sent(is_time_verdict).last(),
+        Some((
+            _,
+            Outgoing::TimeVerdict {
+                outcome: km43::TimeOffer::Accepted,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(bench.clock_records.len(), 1);
+}
+
 #[test]
 fn p_031_a_request_whose_body_does_not_decode_is_neither_heard_nor_answered() {
     // Capabilities: none.

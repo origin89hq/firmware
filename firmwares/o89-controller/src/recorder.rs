@@ -693,6 +693,8 @@ fn process_offer(
         Ok(change) => change,
         Err(outcome) => return OfferResult::Finished(Some(outcome)),
     };
+    // `offer` refused a time the calendar cannot hold (L-153), so this write
+    // failing is not that refusal and is never answered outcome 2.
     if let Err(error) = calendar.set(change) {
         defmt::error!("clock: calendar write refused: {}", error);
         return OfferResult::Finished(None);

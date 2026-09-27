@@ -109,13 +109,15 @@ arithmetic_side_effects = "deny"
 # (bench 2026-09-25). `supervisor.rs` asserts that at compile time; when this
 # pin moves, check whether upstream now selects the chip's own bit count.
 [patch.crates-io]
-# km43 at the refusal of a client time the clock cannot hold
-# (origin89hq/km43#181, P-266, #238 here), past the network origin token
-# (#175, #234 here) and the 0.8.1 release, with the counters' `reset`
-# validity, the vendor-fault and dialect allocations, the buses and devices
-# body, the held-down record and the reseed and lockout wording between.
-# The patch goes when a release carries #181.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "3ed611982fc90e0d1dc82aeabb8aa4732ae5f278" }
+# km43 at the refusal of a time offer the clock cannot hold
+# (origin89hq/km43#186, L-153, #245 here), past the client time's
+# (#181, P-266, #238 here), the network origin token (#175, #234 here) and
+# the 0.8.1 release, with the counters' `reset` validity, the vendor-fault
+# and dialect allocations, the buses and devices body and its received
+# topology, the held-down record and silence, the failed client write and
+# the reseed, lockout and comms no-downgrade wording between.
+# The patch goes when a release carries #186.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "14cc384b3b948174267c88e20794727794d173bb" }
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "77afe6cf4ac346c15b78d5991ae40fdbc3e300e8" }
