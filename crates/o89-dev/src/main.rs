@@ -232,12 +232,13 @@ enum StoreCommand {
         #[arg(long, value_name = "FILE")]
         export: std::path::PathBuf,
     },
-    /// Give a generator whose record is damaged in both slots a fresh
-    /// state from the operating system's generator, which never leaves
-    /// this process except to the controller (P-237). The controller key,
-    /// the label and every enrolled client stay. Refused while the
-    /// generator reads back, while one slot still holds, while the unit
-    /// has no controller key, and while a transaction is unfinished.
+    /// Give a generator whose record holds no intact state (damaged in
+    /// both slots, never written, or a body of zeros) a fresh state from
+    /// the operating system's generator, which never leaves this process
+    /// except to the controller (P-237). The controller key, the label and
+    /// every enrolled client stay. Refused while the generator reads back
+    /// from either slot, while the unit has no controller key, and while a
+    /// transaction is unfinished.
     /// Reboots the controller to apply it, then verifies.
     Reseed,
 }

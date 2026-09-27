@@ -17,12 +17,13 @@
 //!
 //! **The station's reseed** is the one other write of the generator, and
 //! P-237's one exception: a fresh state from the station's CSPRNG, staged
-//! over SWD through the same record, onto a unit whose generator record is
-//! damaged in both slots and whose controller key reads. Staging refuses it
-//! while an intact state reads back, while one slot still holds, while the
-//! part has no key, or while another transaction is unfinished; the boot
-//! checks the same again before it writes, reads the state back off the
-//! part, and scrubs the intent so no copy of the state outlives the boot.
+//! over SWD through the same record, onto a unit whose generator record
+//! holds no intact state (damaged in both slots, never written, or a body
+//! of zeros) and whose controller key reads. Staging refuses it while an
+//! intact state reads back from either slot, while the part has no key, or
+//! while another transaction is unfinished; the boot checks the same again
+//! before it writes, reads the state back off the part, and scrubs the
+//! intent so no copy of the state outlives the boot.
 //! It writes the state and nothing else: the controller key, the printed
 //! secret and every client slot stay byte for byte.
 //!
@@ -61,8 +62,8 @@ pub enum SecretChange {
     /// Applied at boot, retained until the host has printed the label: the
     /// secret, and the fingerprint of the controller key the part holds.
     Applied(Secret, Fingerprint),
-    /// The station's fresh state for a generator whose record is damaged
-    /// in both slots (P-237). Applied at boot and scrubbed there; it is
+    /// The station's fresh state for a generator whose record holds no
+    /// intact state (P-237). Applied at boot and scrubbed there; it is
     /// never retained past the boot that applies it.
     Reseed(DrbgState),
 }
@@ -183,10 +184,9 @@ pub enum ProvisionFailed<E> {
     /// carries none: it would print a label with nothing to pin. For a
     /// reseed, the unit is one to provision again, not to reseed.
     Unborn,
-    /// A reseed onto a generator record that is not damaged in both slots:
-    /// it holds a state, one slot still holds, or it was never written.
-    /// A live generator is never replaced (P-237).
-    NotDamaged,
+    /// A reseed onto a generator record that reads back an intact state,
+    /// from either slot. A live generator is never replaced (P-237).
+    Intact,
 }
 
 impl<E> From<E> for ProvisionFailed<E> {
@@ -220,13 +220,18 @@ fn ready_for_a_transaction<E>(
 }
 
 /// Stage the station's fresh generator state for a unit whose generator
-/// record is damaged in both slots, then reboot before any session can use
-/// it (P-237's station reseed). Refused while an intact state reads back or
-/// one slot still holds ([`ProvisionFailed::NotDamaged`]), while the part
-/// holds no controller key it can read ([`ProvisionFailed::Unborn`]), and
-/// while another transaction is unfinished. Boot applies it with
-/// [`finish`], which checks the same again. Only the bench mailbox calls
-/// this, over SWD; no message, reset, update or comms input reaches it.
+/// record holds no intact state, then reboot before any session can use it
+/// (P-237's station reseed). The record may read damaged in both slots,
+/// never written or malformed. Beside a controller key that reads, and with
+/// no transaction pending or unacknowledged, none of these is a birth still
+/// under way, because a birth writes the key and the generator before it is
+/// applied; and a fresh state from the station repeats nothing the unit
+/// drew. Refused while an intact state reads back from either slot
+/// ([`ProvisionFailed::Intact`]), while the part holds no controller key
+/// it can read ([`ProvisionFailed::Unborn`]), and while another transaction
+/// is unfinished. Boot applies it with [`finish`], which checks the same
+/// again. Only the bench mailbox calls this, over SWD; no message, reset,
+/// update or comms input reaches it.
 pub async fn stage_reseed<F: Fram>(
     fram: &mut F,
     state: DrbgState,
@@ -238,8 +243,9 @@ pub async fn stage_reseed<F: Fram>(
     if controller.present().is_none() {
         return Err(ProvisionFailed::Unborn);
     }
-    if !matches!(drbg, Held::Corrupt) {
-        return Err(ProvisionFailed::NotDamaged);
+    match drbg {
+        Held::Present(_) => return Err(ProvisionFailed::Intact),
+        Held::Corrupt | Held::Absent | Held::Malformed(_) => {}
     }
     change
         .write(fram, SecretChange::Reseed(state))
@@ -371,7 +377,7 @@ pub(crate) async fn finish<F: Fram>(
 }
 
 /// Apply a staged reseed: write the state only while the key reads and the
-/// generator record is still damaged in both slots, and keep what the part
+/// generator record still holds no intact state, and keep what the part
 /// reads back, never what was meant to land. A cut before the write lands
 /// replays it; a cut after finds the state and writes nothing. Either way
 /// the intent is scrubbed before any session exists, so the state it
@@ -383,7 +389,7 @@ async fn reseed<F: Fram>(
     drbg: &mut Kept<DrbgState, DRBG_BYTES>,
     state: DrbgState,
 ) -> Result<SecretRecovery, ProvisionFailed<F::Error>> {
-    if controller.present().is_some() && matches!(drbg.held(), Held::Corrupt) {
+    if controller.present().is_some() && drbg.present().is_none() {
         match drbg.write_verified(fram, state).await {
             // A disagreement leaves whatever the part read back, damage
             // included, and the intent is scrubbed below: retrying a write

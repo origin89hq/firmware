@@ -268,8 +268,9 @@ written and read back off the part; a draw whose successor does not land is
 withheld, and nothing ever writes the state but a draw, the unit's first
 manufacturing transaction, and the station's reseed over SWD. The reseed
 writes a fresh state from the station's CSPRNG only while the controller key
-reads and the generator record is damaged in both slots, is refused while any
-state reads back or another transaction is unfinished, is applied by the next
+reads and no intact generator state can be read back (damaged in both slots,
+never written, or a body of zeros), is refused while any state reads back or
+another transaction is unfinished, is applied by the next
 boot with the state read back off the part, and leaves the printed secret, the
 controller key and every client slot as they were. No wire message, factory
 reset, store recovery, update or comms-processor input reaches it. The part

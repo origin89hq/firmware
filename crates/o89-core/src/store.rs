@@ -1405,6 +1405,48 @@ mod tests {
         part
     }
 
+    /// A labelled unit with a client at slot 1 that has never drawn: its
+    /// generator's state is in slot A alone.
+    fn undrawn_unit() -> Part {
+        let (mut part, mut store) = manufactured();
+        acknowledge(&mut part);
+        let _ = enrolled(&mut store, &mut part, 1);
+        part
+    }
+
+    /// A labelled unit whose generator record reads as never written: slot
+    /// A damaged before any draw wrote slot B.
+    fn absent_generator() -> Part {
+        let mut part = undrawn_unit();
+        let a = usize::from(map::DRBG.start().0);
+        part.bytes[a.saturating_add(8)] ^= 1;
+        let (store, _) = boot(&mut part, None);
+        assert_eq!(store.drbg.held(), &Held::Absent);
+        part
+    }
+
+    /// A labelled unit whose generator record holds a checked body of
+    /// zeros, which is no state and which the firmware never writes.
+    fn malformed_generator() -> Part {
+        let mut part = undrawn_unit();
+        let _ = block_on(map::DRBG.write(&mut part, Position::Start, &[0; DRBG_BYTES]))
+            .expect("a zero body");
+        let (store, _) = boot(&mut part, None);
+        assert!(matches!(store.drbg.held(), Held::Malformed(_)));
+        part
+    }
+
+    /// A fixture named for what its generator record reads as.
+    type Reads = (&'static str, fn() -> Part);
+
+    /// Every generator record that holds no intact state, as a labelled unit
+    /// with a client can come to read.
+    const UNREADABLE: [Reads; 3] = [
+        ("damaged in both slots", damaged_unit),
+        ("never written", absent_generator),
+        ("malformed", malformed_generator),
+    ];
+
     /// Whether `after` holds the printed secret, the controller key and
     /// every client slot byte for byte as `before` did.
     fn kept_as(before: &Part, after: &Part) -> bool {
@@ -1435,19 +1477,16 @@ mod tests {
     }
 
     #[test]
-    fn f_041_p_237_a_reseed_is_refused_while_the_generator_reads_back() {
+    fn f_041_p_237_a_reseed_is_refused_while_either_slot_holds_a_state() {
+        // Born and never drawn: the state is in slot A.
         let (mut part, _) = manufactured();
         acknowledge(&mut part);
         let before = part.clone();
         assert_eq!(
             block_on(stage_reseed(&mut part, reseeded())),
-            Err(ProvisionFailed::NotDamaged)
+            Err(ProvisionFailed::Intact)
         );
         assert_eq!(part.bytes, before.bytes, "nothing was staged");
-    }
-
-    #[test]
-    fn f_041_p_237_a_reseed_is_refused_while_one_slot_still_holds() {
         // Both slots written by draws, one of them damaged: the other holds.
         let (mut part, store) = manufactured();
         acknowledge(&mut part);
@@ -1455,25 +1494,19 @@ mod tests {
         for _ in 0..2 {
             let _ = block_on(generator.challenge(&mut part)).expect("draws");
         }
-        let a = usize::from(map::DRBG.start().0);
-        part.bytes[a.saturating_add(8)] ^= 1;
-        let before = part.clone();
-        assert_eq!(
-            block_on(stage_reseed(&mut part, reseeded())),
-            Err(ProvisionFailed::NotDamaged)
-        );
-        assert_eq!(part.bytes, before.bytes);
-        // Born and never drawn from: slot A damaged, slot B never written.
-        // That reads as never written, not as damage in both slots.
-        let (mut part, _) = manufactured();
-        acknowledge(&mut part);
-        part.bytes[a.saturating_add(8)] ^= 1;
-        let (store, _) = boot(&mut part, None);
-        assert_eq!(store.drbg.held(), &Held::Absent);
-        assert_eq!(
-            block_on(stage_reseed(&mut part, reseeded())),
-            Err(ProvisionFailed::NotDamaged)
-        );
+        for slot in [0, slot_bytes(DRBG_BYTES)] {
+            let mut damaged = part.clone();
+            let at = usize::from(map::DRBG.start().0).saturating_add(slot);
+            damaged.bytes[at.saturating_add(8)] ^= 1;
+            let (store, _) = boot(&mut damaged, None);
+            assert!(store.drbg.present().is_some(), "slot at {slot} holds");
+            let before = damaged.clone();
+            assert_eq!(
+                block_on(stage_reseed(&mut damaged, reseeded())),
+                Err(ProvisionFailed::Intact)
+            );
+            assert_eq!(damaged.bytes, before.bytes, "nothing was staged");
+        }
     }
 
     #[test]
@@ -1488,15 +1521,19 @@ mod tests {
             block_on(stage_reseed(&mut part, reseeded())),
             Err(ProvisionFailed::Unborn)
         );
-        // Born, and the key damaged along with the generator.
-        let mut part = damaged_unit();
-        damage(&mut part, map::CONTROLLER_KEY);
-        let before = part.clone();
-        assert_eq!(
-            block_on(stage_reseed(&mut part, reseeded())),
-            Err(ProvisionFailed::Unborn)
-        );
-        assert_eq!(part.bytes, before.bytes);
+        // Born, and the key damaged along with the generator, whatever the
+        // generator reads as.
+        for (reads, made) in UNREADABLE {
+            let mut part = made();
+            damage(&mut part, map::CONTROLLER_KEY);
+            let before = part.clone();
+            assert_eq!(
+                block_on(stage_reseed(&mut part, reseeded())),
+                Err(ProvisionFailed::Unborn),
+                "{reads}"
+            );
+            assert_eq!(part.bytes, before.bytes, "{reads}");
+        }
     }
 
     #[test]
@@ -1538,6 +1575,46 @@ mod tests {
     }
 
     #[test]
+    fn f_041_p_237_a_birth_cut_between_the_key_and_the_generator_is_finished_not_reseeded() {
+        // The birth's key landed and its generator did not: the key reads
+        // beside a generator never written, and the intent is still
+        // pending. That is a birth to finish, not damage.
+        let mut part = Part::fresh();
+        block_on(stage_secret(&mut part, secret(2), Some(birth(7, 9)), false)).expect("stage");
+        let mut key = block_on(Kept::<ControllerKey, CONTROLLER_KEY_BYTES>::read(
+            map::CONTROLLER_KEY,
+            &mut part,
+        ))
+        .expect("reads");
+        block_on(key.write(&mut part, birth(7, 9).controller)).expect("the key lands");
+        let before = part.clone();
+        assert_eq!(
+            block_on(stage_reseed(&mut part, reseeded())),
+            Err(ProvisionFailed::Pending)
+        );
+        assert_eq!(part.bytes, before.bytes, "nothing was staged");
+        let (store, report) = boot(&mut part, None);
+        assert_eq!(report.secret_recovery, SecretRecovery::Applied);
+        assert_eq!(store.drbg.present(), Some(&birth(7, 9).drbg));
+        // Applied and not yet acknowledged, then damaged before a draw:
+        // the label is still to print, and nothing goes behind it.
+        let a = usize::from(map::DRBG.start().0);
+        part.bytes[a.saturating_add(8)] ^= 1;
+        let (store, _) = boot(&mut part, None);
+        assert_eq!(store.drbg.held(), &Held::Absent);
+        assert!(matches!(
+            intent(&mut part),
+            Held::Present(SecretChange::Applied(..))
+        ));
+        let before = part.clone();
+        assert_eq!(
+            block_on(stage_reseed(&mut part, reseeded())),
+            Err(ProvisionFailed::Pending)
+        );
+        assert_eq!(part.bytes, before.bytes, "nothing was staged");
+    }
+
+    #[test]
     fn f_041_p_237_a_reseed_of_a_generator_damaged_in_both_slots_keeps_the_key_the_label_and_every_slot()
      {
         let mut part = damaged_unit();
@@ -1574,56 +1651,63 @@ mod tests {
 
     #[test]
     fn f_041_p_237_a_reseed_cut_at_every_byte_draws_only_from_a_state_read_back() {
-        let start = damaged_unit();
-        let mut finished_at = None;
-        for at in 0..4096 {
-            let mut cut = start.cut_before(at);
-            let staged = block_on(stage_reseed(&mut cut, reseeded()));
-            let booted = staged.map(|()| block_on(Store::boot(&mut cut, None)));
-            if let Ok(Ok((_, report))) = &booted
-                && report.secret_recovery == SecretRecovery::Reseeded
-                && report.boot_recorded.is_ok()
-            {
-                finished_at = Some(at);
-                break;
-            }
-            // The recovery boot, on a steady supply.
-            let mut after = cut.rebooted();
-            let (store, _) = boot(&mut after, None);
-            match store.drbg.held() {
-                // Never the old damaged bytes treated as a state: still
-                // damage, and nothing drawn from it.
-                Held::Corrupt => {
-                    let mut generator = Generator::new(store.drbg);
-                    assert_eq!(
-                        block_on(generator.draw(&mut after)).err(),
-                        Some(Unavailable),
-                        "cut at {at}"
-                    );
+        for (reads, made) in UNREADABLE {
+            let start = made();
+            let unreadable = *boot(&mut start.clone(), None).0.drbg.held();
+            let mut finished_at = None;
+            for at in 0..4096 {
+                let mut cut = start.cut_before(at);
+                let staged = block_on(stage_reseed(&mut cut, reseeded()));
+                let booted = staged.map(|()| block_on(Store::boot(&mut cut, None)));
+                if let Ok(Ok((_, report))) = &booted
+                    && report.secret_recovery == SecretRecovery::Reseeded
+                    && report.boot_recorded.is_ok()
+                {
+                    finished_at = Some(at);
+                    break;
                 }
-                // The fresh state, and the one the part reads back.
-                Held::Present(state) => {
-                    assert_eq!(*state, reseeded(), "cut at {at}");
-                    let read = block_on(Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, &mut after))
-                        .expect("reads");
-                    assert_eq!(read.present(), Some(&reseeded()), "cut at {at}");
+                // The recovery boot, on a steady supply.
+                let mut after = cut.rebooted();
+                let (store, _) = boot(&mut after, None);
+                match store.drbg.held() {
+                    // Never the old bytes treated as a state: the record
+                    // reads as it did, and nothing is drawn from it.
+                    held @ (Held::Corrupt | Held::Absent | Held::Malformed(_)) => {
+                        assert_eq!(*held, unreadable, "{reads}: cut at {at}");
+                        let mut generator = Generator::new(store.drbg);
+                        assert_eq!(
+                            block_on(generator.draw(&mut after)).err(),
+                            Some(Unavailable),
+                            "{reads}: cut at {at}"
+                        );
+                    }
+                    // The fresh state, and the one the part reads back.
+                    Held::Present(state) => {
+                        assert_eq!(*state, reseeded(), "{reads}: cut at {at}");
+                        let read =
+                            block_on(Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, &mut after))
+                                .expect("reads");
+                        assert_eq!(read.present(), Some(&reseeded()), "{reads}: cut at {at}");
+                    }
                 }
-                Held::Absent | Held::Malformed(_) => panic!("cut at {at}: {:?}", store.drbg.held()),
+                assert!(
+                    kept_as(&start, &after),
+                    "{reads}: cut at {at}: the key, the label or a slot moved"
+                );
+                assert!(
+                    !copied_outside_the_generator(&after, reseeded()),
+                    "{reads}: cut at {at}: the intent outlived its boot"
+                );
+                assert!(
+                    !matches!(intent(&mut after), Held::Present(SecretChange::Reseed(_))),
+                    "{reads}: cut at {at}"
+                );
             }
             assert!(
-                kept_as(&start, &after),
-                "cut at {at}: the key, the label or a slot moved"
-            );
-            assert!(
-                !copied_outside_the_generator(&after, reseeded()),
-                "cut at {at}: the intent outlived its boot"
-            );
-            assert!(
-                !matches!(intent(&mut after), Held::Present(SecretChange::Reseed(_))),
-                "cut at {at}"
+                finished_at.is_some_and(|at| at > 100),
+                "{reads}: {finished_at:?}"
             );
         }
-        assert!(finished_at.is_some_and(|at| at > 100), "{finished_at:?}");
     }
 
     #[test]
@@ -1690,63 +1774,71 @@ mod tests {
             "a live generator was replaced"
         );
         assert!(!copied_outside_the_generator(&part, reseeded()));
-        // No key: the damage stays.
-        let mut part = damaged_unit();
-        damage(&mut part, map::CONTROLLER_KEY);
-        write_intent(&mut part);
-        let (store, report) = boot(&mut part, None);
-        assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
-        assert_eq!(store.drbg.held(), &Held::Corrupt);
-        assert!(!copied_outside_the_generator(&part, reseeded()));
-    }
-
-    /// A born unit whose generator record reads as never written: slot A
-    /// damaged before any draw wrote slot B.
-    fn absent_generator() -> Part {
-        let (mut part, _) = manufactured();
-        acknowledge(&mut part);
-        let a = usize::from(map::DRBG.start().0);
-        part.bytes[a.saturating_add(8)] ^= 1;
-        let (store, _) = boot(&mut part, None);
-        assert_eq!(store.drbg.held(), &Held::Absent);
-        part
-    }
-
-    /// A born unit whose generator record holds a checked body of zeros,
-    /// which is no state.
-    fn malformed_generator() -> Part {
-        let (mut part, _) = manufactured();
-        acknowledge(&mut part);
-        let _ = block_on(map::DRBG.write(&mut part, Position::Start, &[0; DRBG_BYTES]))
-            .expect("a zero body");
-        let (store, _) = boot(&mut part, None);
-        assert!(matches!(store.drbg.held(), Held::Malformed(_)));
-        part
+        // No key: the generator stays as it reads, whatever that is.
+        for (reads, made) in UNREADABLE {
+            let mut part = made();
+            let unreadable = *boot(&mut part.clone(), None).0.drbg.held();
+            damage(&mut part, map::CONTROLLER_KEY);
+            write_intent(&mut part);
+            let (store, report) = boot(&mut part, None);
+            assert_eq!(report.secret_recovery, SecretRecovery::Discarded, "{reads}");
+            assert_eq!(store.drbg.held(), &unreadable, "{reads}");
+            assert!(!copied_outside_the_generator(&part, reseeded()), "{reads}");
+        }
     }
 
     #[test]
-    fn f_041_p_237_a_generator_that_reads_as_never_written_or_malformed_is_not_reseeded() {
-        // Neither is damage in both slots: staging refuses both, and a boot
-        // handed the intent anyway writes nothing.
-        for made in [absent_generator as fn() -> Part, malformed_generator] {
+    fn f_041_p_237_a_generator_that_reads_as_never_written_or_malformed_is_reseeded_keeping_the_key_the_label_and_every_slot()
+     {
+        for (reads, made) in [
+            ("never written", absent_generator as fn() -> Part),
+            ("malformed", malformed_generator),
+        ] {
             let mut part = made();
             let before = part.clone();
+            let (store, _) = boot(&mut part, None);
+            assert!(!Generator::new(store.drbg).is_available(), "{reads}");
+            let fingerprint = store.controller.present().map(ControllerKey::fingerprint);
+            assert!(fingerprint.is_some(), "{reads}");
+            block_on(stage_reseed(&mut part, reseeded())).expect("stage");
             assert_eq!(
-                block_on(stage_reseed(&mut part, reseeded())),
-                Err(ProvisionFailed::NotDamaged)
+                intent(&mut part),
+                Held::Present(SecretChange::Reseed(reseeded())),
+                "{reads}"
             );
-            assert_eq!(part.bytes, before.bytes);
-            let held = *boot(&mut part, None).0.drbg.held();
-            let mut change = block_on(Kept::<SecretChange, SECRET_CHANGE_BYTES>::read(
-                map::SECRET_CHANGE,
-                &mut part,
-            ))
-            .expect("reads");
-            block_on(change.write(&mut part, SecretChange::Reseed(reseeded()))).expect("lands");
             let (store, report) = boot(&mut part, None);
-            assert_eq!(report.secret_recovery, SecretRecovery::Discarded);
-            assert_eq!(store.drbg.held(), &held);
-            assert!(!copied_outside_the_generator(&part, reseeded()));
+            assert_eq!(report.secret_recovery, SecretRecovery::Reseeded, "{reads}");
+            assert_eq!(store.drbg.present(), Some(&reseeded()), "{reads}");
+            let read =
+                block_on(Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, &mut part)).expect("reads");
+            assert_eq!(read.present(), Some(&reseeded()), "{reads}: read back");
+            assert!(store.secret.present() == Some(&secret(2)), "{reads}");
+            assert_eq!(
+                store.controller.present(),
+                Some(&birth(7, 9).controller),
+                "{reads}"
+            );
+            assert!(
+                store.controller.present().map(ControllerKey::fingerprint) == fingerprint,
+                "{reads}: the fingerprint moved"
+            );
+            assert_eq!(store.clients.enrolled(Epoch::FIRST), 1, "{reads}");
+            assert!(
+                kept_as(&before, &part),
+                "{reads}: the key, the label or a slot moved"
+            );
+            assert_eq!(
+                intent(&mut part),
+                Held::Present(SecretChange::Complete),
+                "{reads}"
+            );
+            assert!(!copied_outside_the_generator(&part, reseeded()), "{reads}");
+            let mut generator = Generator::new(store.drbg);
+            let first = block_on(generator.challenge(&mut part)).expect("draws again");
+            let second = block_on(generator.challenge(&mut part)).expect("draws again");
+            assert_ne!(first, second, "{reads}");
+            let (_, report) = boot(&mut part, None);
+            assert_eq!(report.secret_recovery, SecretRecovery::Unchanged, "{reads}");
         }
     }
 

@@ -244,49 +244,106 @@ fn p_236_label_acknowledgement_cut_at_every_byte_keeps_the_fingerprint_and_never
     assert!(crashes.steps > 100);
 }
 
-#[test]
-fn f_041_p_237_a_station_reseed_cut_at_every_step_keeps_the_unit_and_never_draws_old_damage() {
-    use o89_core::{Generator, stage_reseed};
-    let mut start = drawn();
-    let (before, _) = block_on(Store::boot(&mut start, None)).expect("boot");
-    let fingerprint = before.controller.present().map(ControllerKey::fingerprint);
+/// A drawn unit whose generator record then read as damaged in both slots.
+fn damaged_in_both_slots() -> SimFram {
+    let mut part = drawn();
     let at = map::DRBG.start();
     let len = usize::from(map::DRBG.end().0)
         .checked_sub(usize::from(at.0))
         .expect("the record's length");
-    block_on(start.write(at, &vec![0x55; len])).expect("damage both copies");
-    let fresh = DrbgState::new([0x61; 32]).expect("the station's entropy");
-    let crashes = crash_at_every_step(
-        &start,
-        |part| {
-            block_on(stage_reseed(part, fresh)).map_err(|_| ())?;
-            let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
-            report.boot_recorded.map_err(|_| ())
-        },
-        |part, step| {
-            let (store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
-            assert!(store.secret.present() == Some(&secret()), "cut {step}");
-            assert!(
-                store.controller.present().map(ControllerKey::fingerprint) == fingerprint,
-                "cut {step}: the controller key changed"
-            );
-            let reseeded = match store.drbg.held() {
-                Held::Corrupt => false,
-                Held::Present(state) => {
-                    assert!(*state == fresh, "cut {step}: not the fresh state");
-                    true
+    block_on(part.write(at, &vec![0x55; len])).expect("damage both copies");
+    let (store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
+    assert_eq!(store.drbg.held(), &Held::Corrupt);
+    part
+}
+
+/// A unit never drawn from whose generator record then read as never
+/// written: slot A damaged, slot B never written.
+fn never_written() -> SimFram {
+    let mut part = manufactured();
+    let at = map::DRBG.start().plus(8);
+    let byte = part.bytes()[usize::from(at.0)];
+    block_on(part.write(at, &[byte ^ 1])).expect("damage slot A");
+    let (store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
+    assert_eq!(store.drbg.held(), &Held::Absent);
+    part
+}
+
+/// A unit never drawn from whose generator record then held a checked
+/// body of zeros.
+fn malformed() -> SimFram {
+    let mut part = manufactured();
+    let _ = block_on(map::DRBG.write(
+        &mut part,
+        o89_core::Position::Start,
+        &[0; o89_core::DRBG_BYTES],
+    ))
+    .expect("a zero body");
+    let (store, _) = block_on(Store::boot(&mut part, None)).expect("boot");
+    assert!(matches!(store.drbg.held(), Held::Malformed(_)));
+    part
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_cut_at_every_step_keeps_the_unit_and_never_draws_old_damage() {
+    use o89_core::{Generator, stage_reseed};
+    for (reads, made) in [
+        (
+            "damaged in both slots",
+            damaged_in_both_slots as fn() -> SimFram,
+        ),
+        ("never written", never_written),
+        ("malformed", malformed),
+    ] {
+        let mut start = made();
+        let (before, _) = block_on(Store::boot(&mut start, None)).expect("boot");
+        let fingerprint = before.controller.present().map(ControllerKey::fingerprint);
+        let unreadable = *before.drbg.held();
+        assert!(before.drbg.present().is_none(), "{reads}");
+        let fresh = DrbgState::new([0x61; 32]).expect("the station's entropy");
+        let crashes = crash_at_every_step(
+            &start,
+            |part| {
+                block_on(stage_reseed(part, fresh)).map_err(|_| ())?;
+                let (_, report) = block_on(Store::boot(part, None)).map_err(|_| ())?;
+                // Uncut, the boot applies it: a boot that discards the
+                // reseed would pass every cut's invariant.
+                if report.secret_recovery != SecretRecovery::Reseeded {
+                    return Err(());
                 }
-                other => panic!("cut {step}: {other:?}"),
-            };
-            // Damage still draws nothing; the fresh state, read back, draws.
-            let mut generator = Generator::new(store.drbg);
-            assert_eq!(
-                block_on(generator.challenge(part)).is_ok(),
-                reseeded,
-                "cut {step}"
-            );
-        },
-    )
-    .expect("uncut reseed");
-    assert!(crashes.steps > 100);
+                report.boot_recorded.map_err(|_| ())
+            },
+            |part, step| {
+                let (store, _) = block_on(Store::boot(part, None)).expect("recovery boot");
+                assert!(
+                    store.secret.present() == Some(&secret()),
+                    "{reads}: cut {step}"
+                );
+                assert!(
+                    store.controller.present().map(ControllerKey::fingerprint) == fingerprint,
+                    "{reads}: cut {step}: the controller key changed"
+                );
+                let reseeded = match store.drbg.held() {
+                    held @ (Held::Corrupt | Held::Absent | Held::Malformed(_)) => {
+                        assert_eq!(*held, unreadable, "{reads}: cut {step}");
+                        false
+                    }
+                    Held::Present(state) => {
+                        assert!(*state == fresh, "{reads}: cut {step}: not the fresh state");
+                        true
+                    }
+                };
+                // The old bytes still draw nothing; the fresh state, read
+                // back, draws.
+                let mut generator = Generator::new(store.drbg);
+                assert_eq!(
+                    block_on(generator.challenge(part)).is_ok(),
+                    reseeded,
+                    "{reads}: cut {step}"
+                );
+            },
+        )
+        .expect("uncut reseed");
+        assert!(crashes.steps > 100, "{reads}");
+    }
 }

@@ -308,9 +308,9 @@ async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
 /// The data is an encoded `SecretChange::Pending`: the secret and, on a
 /// unit's first transaction, its controller key and generator (P-235,
 /// P-237); or a `SecretChange::Reseed`, with `replace` 0, the station's
-/// fresh state for a generator damaged in both slots. This handler, served
-/// only over SWD, is the one caller of `stage_reseed`. The buffer the data
-/// crossed in is cleared before this returns.
+/// fresh state for a generator whose record holds no intact state. This
+/// handler, served only over SWD, is the one caller of `stage_reseed`. The
+/// buffer the data crossed in is cleared before this returns.
 async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32) {
     use o89_core::{Body as _, ProvisionFailed, SECRET_CHANGE_BYTES, SecretChange};
     if replace > 1 || usize::try_from(len) != Ok(SECRET_CHANGE_BYTES) {
@@ -345,7 +345,7 @@ async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32)
             | ProvisionFailed::AlreadyProvisioned
             | ProvisionFailed::AlreadyBorn
             | ProvisionFailed::Unborn
-            | ProvisionFailed::NotDamaged,
+            | ProvisionFailed::Intact,
         ) => Status::OutOfRange,
     };
     (status, 0)
