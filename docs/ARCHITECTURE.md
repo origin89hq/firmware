@@ -466,16 +466,24 @@ none is under the stack. The G0B1's datasheet
 (DS13560, the interconnect table) routes the core's lockup to the break
 inputs of TIM1, TIM15, TIM16 and TIM17, which nothing here uses, and the
 reset flags in `RCC_CSR` have none for it, so this design counts on no
-lockup reset: the IWDG, on the LSI and fed by nobody, resets the part within
-its 8 s. RM0444's list of system reset sources is where to confirm that; it
-was not read when this was written. While the core is locked up every output
-stays as it was last written, the hang case: `KICK` stops, so board B's
-monostable opens the contact within its 3.0–6.5 s, and the reset vector
-drives `RUN` and `KICK` low after the reset. Nothing writes last words on the
-way, so the boot after reads an IWDG reset with nobody named,
-`BootCause::Watchdog(None)`, or the boot's own provisional blame if the
-overflow cut the boot short before its store was read. The statics, the last
-words among them, are never under the stack.
+lockup reset: the IWDG, on the LSI and fed by nobody, resets the part. Its
+period is 8 s at the 32 kHz the driver assumes, and up to 8.7 s at the
+29.5 kHz DS13560's table 46 allows. RM0444's list of system reset sources is
+where to confirm that; it was not read when this was written. While the core
+is locked up every output stays as it was last written, the hang case:
+`KICK` stops, so board B's monostable opens the contact within its
+3.0–6.5 s, and the reset vector drives `RUN` and `KICK` low after the reset.
+Nothing writes last words on the way, so the boot after reads an IWDG reset
+with nobody named, `BootCause::Watchdog(None)`, or the boot's own
+provisional blame if the overflow cut the boot short before its store was
+read. The statics, the last words among them, are never under the stack.
+
+That bound holds only once the IWDG is armed, in step 4. An overflow before
+it, in the frame `main`'s task reserves on its first poll or anywhere in the
+clock setup, locks the core up with nothing to reset it: `RUN` and `KICK`
+stay low where the bootloader or step 1 left them, and the unit stays dead
+until its power is cycled. The gate's measurement is what keeps that
+window's stack in its region; arming the watchdog before it is #168.
 
 The stack's 63 KB is a budget like any other capacity: a static that no
 longer fits fails the link on `RAM`, and the fix is to take what it needs
