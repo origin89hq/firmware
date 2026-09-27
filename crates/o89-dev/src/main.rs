@@ -232,6 +232,30 @@ enum StoreCommand {
         #[arg(long, value_name = "FILE")]
         export: std::path::PathBuf,
     },
+    /// Give a generator whose record is damaged in both slots a fresh
+    /// state from the operating system's generator, which never leaves
+    /// this process except to the controller (P-237). The controller key,
+    /// the label and every enrolled client stay. Refused while the
+    /// generator reads back, while one slot still holds, while the unit
+    /// has no controller key, and while a transaction is unfinished.
+    /// Reboots the controller to apply it, then verifies.
+    Reseed,
+}
+
+/// The store's commands, each against the part through the firmware.
+fn store(link: &mut Link, what: Option<StoreCommand>) -> Result<()> {
+    match what {
+        None => store::show(link),
+        Some(StoreCommand::WriteEpoch { epoch }) => store::write_epoch(link, epoch),
+        Some(StoreCommand::Blank { yes }) => store::blank(link, yes),
+        Some(StoreCommand::WriteSecret {
+            device_id,
+            replace,
+            resume,
+            export,
+        }) => store::write_secret(link, &export, device_id.as_deref(), replace, resume),
+        Some(StoreCommand::Reseed) => store::reseed(link),
+    }
 }
 
 impl Layout {
@@ -323,17 +347,7 @@ fn main() -> Result<()> {
             println!("boot {boot}");
             Ok(())
         }
-        Command::Store { what } => match what {
-            None => store::show(&mut link),
-            Some(StoreCommand::WriteEpoch { epoch }) => store::write_epoch(&mut link, epoch),
-            Some(StoreCommand::Blank { yes }) => store::blank(&mut link, yes),
-            Some(StoreCommand::WriteSecret {
-                device_id,
-                replace,
-                resume,
-                export,
-            }) => store::write_secret(&mut link, &export, device_id.as_deref(), replace, resume),
-        },
+        Command::Store { what } => store(&mut link, what),
         Command::Rail { revision } => {
             let readout = rail::read(&mut link, revision.into())?;
             println!("pin  {:?}", readout.pin);
@@ -510,6 +524,18 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["o89-dev", "store", "write-secret", "--resume"]).is_err());
+    }
+
+    #[test]
+    fn p_237_store_reseed_parses_and_takes_no_argument() {
+        let parsed = Cli::try_parse_from(["o89-dev", "store", "reseed"]).expect("parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Store {
+                what: Some(StoreCommand::Reseed)
+            }
+        ));
+        assert!(Cli::try_parse_from(["o89-dev", "store", "reseed", "--yes"]).is_err());
     }
 
     #[test]

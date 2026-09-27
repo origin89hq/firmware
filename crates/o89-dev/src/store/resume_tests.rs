@@ -15,9 +15,22 @@ enum Reboot {
     Ignored,
 }
 
+/// What the fake part does to itself once a reboot's boot has run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tamper {
+    Nothing,
+    /// A client slot's key record moves.
+    MovesASlot,
+    /// The generator's record is damaged again in both slots.
+    LosesTheGenerator,
+    /// The intent's zeroed copy did not keep its zeros.
+    KeepsTheIntent,
+}
+
 struct FakeLink {
     bytes: Vec<u8>,
     reboot: Reboot,
+    tamper: Tamper,
     fail_readback: bool,
     reads_fail: bool,
     reboots: usize,
@@ -33,6 +46,7 @@ impl FakeLink {
         Self {
             bytes: vec![0; map::END.0 as usize],
             reboot: Reboot::Boots,
+            tamper: Tamper::Nothing,
             fail_readback: false,
             reads_fail: false,
             reboots: 0,
@@ -103,6 +117,30 @@ impl SecretLink for FakeLink {
             .boot_recorded
             .map_err(|_| anyhow!("boot count failed"))?;
         self.reads_fail = self.fail_readback;
+        match self.tamper {
+            Tamper::Nothing => {}
+            Tamper::MovesASlot => {
+                let at = usize::from(map::CLIENT_KEYS[0].start().0)
+                    .checked_add(8)
+                    .unwrap();
+                self.bytes[at] ^= 1;
+            }
+            Tamper::LosesTheGenerator => {
+                let start = usize::from(map::DRBG.start().0);
+                self.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
+            }
+            Tamper::KeepsTheIntent => {
+                let slot = o89_core::slot_bytes(o89_core::SECRET_CHANGE_BYTES);
+                let a = usize::from(map::SECRET_CHANGE.start().0);
+                let b = a.checked_add(slot).unwrap();
+                let zeroed = if self.bytes[a..b].iter().all(|byte| *byte == 0) {
+                    a
+                } else {
+                    b
+                };
+                self.bytes[zeroed.checked_add(8).unwrap()] = 0x61;
+            }
+        }
         Ok(())
     }
 
@@ -122,10 +160,15 @@ impl SecretLink for FakeLink {
     fn stage_and_reboot(&mut self, body: &[u8], replace: bool) -> Result<()> {
         self.step()?;
         self.stages = self.stages.checked_add(1).unwrap();
-        let Ok(SecretChange::Pending(secret, birth)) =
-            SecretChange::decode(body.try_into().unwrap())
-        else {
-            bail!("not a pending transaction");
+        let (secret, birth) = match SecretChange::decode(body.try_into().unwrap()) {
+            Ok(SecretChange::Pending(secret, birth)) => (secret, birth),
+            Ok(SecretChange::Reseed(state)) if !replace => {
+                block_on(o89_core::stage_reseed(self, state))
+                    .map_err(|why| anyhow!("stage failed: {why:?}"))?;
+                return self.reboot();
+            }
+            Ok(SecretChange::Reseed(_) | SecretChange::Complete | SecretChange::Applied(..))
+            | Err(_) => bail!("not a pending transaction"),
         };
         if birth.is_some() {
             self.birth_stages = self.birth_stages.checked_add(1).unwrap();
@@ -1142,4 +1185,213 @@ fn p_249_a_replace_onto_a_key_that_does_not_read_back_stages_nothing() {
     assert_eq!(link.bytes, before);
     assert_eq!(journaled(&ledger), journal);
     assert!(output.is_empty());
+}
+
+/// A unit born through the station with a client at slot 1, whose generator
+/// then read as damaged in both slots.
+fn damaged_unit(ledger: &Ledger) -> FakeLink {
+    let mut link = FakeLink::new();
+    run_secret(&mut link, ledger, None, false, false, &mut Vec::new()).unwrap();
+    let (mut store, report) = block_on(Store::boot(&mut link, None)).unwrap();
+    block_on(store.clients.enrol(
+        km43::ClientId::new(1).unwrap(),
+        o89_core::Enrolment {
+            client: km43::PublicKey::from_bytes([9; 32]),
+            admit: [3; 32],
+            suite: km43::Suite::X25519ChachapolySha256,
+            role: km43::Role::Owner,
+            kind: km43::ClientKind::App,
+            label: o89_core::ClientLabel::new("phone").unwrap(),
+        },
+        report.epoch.epoch().unwrap(),
+        &mut link,
+    ))
+    .unwrap();
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
+    link
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_keeps_the_key_the_label_and_the_slots() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    let fingerprint = held_fingerprint(&mut link);
+    let label = active(&mut link);
+    let kept = kept_by_a_reseed(&mut link).unwrap();
+    let stages = link.stages;
+    let mut output = Vec::new();
+    run_reseed(&mut link, &mut output).unwrap();
+    assert_eq!(link.stages, stages + 1);
+    assert!(
+        read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+            .unwrap()
+            .present()
+            .is_some()
+    );
+    assert_eq!(kept_by_a_reseed(&mut link).unwrap(), kept);
+    assert_eq!(held_fingerprint(&mut link), fingerprint);
+    assert!(active(&mut link) == label);
+    assert_eq!(link.transaction(), SecretChange::Complete);
+    let said = std::str::from_utf8(&output).unwrap();
+    assert!(said.contains("reseeded"));
+    assert!(said.contains(&hex::encode(fingerprint.as_bytes())));
+    // No label is printed: the one on the unit stays.
+    assert!(!said.contains("printed secret"));
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_is_refused_while_the_generator_reads_back() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = FakeLink::new();
+    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
+    let before = link.bytes.clone();
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("never replaced"), "{error}");
+    assert_eq!(link.stages, stages, "nothing was staged");
+    assert_eq!(link.bytes, before);
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_is_refused_when_one_slot_holds_or_none_was_written() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    // Drawn from, so both slots hold a state, then one of them damaged.
+    let mut link = FakeLink::new();
+    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
+    let (store, _) = block_on(Store::boot(&mut link, None)).unwrap();
+    let mut generator = o89_core::Generator::new(store.drbg);
+    for _ in 0..2 {
+        block_on(generator.challenge(&mut link)).unwrap();
+    }
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start.checked_add(8).unwrap()] ^= 1;
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("never replaced"), "{error}");
+    assert_eq!(link.stages, stages, "nothing was staged");
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = FakeLink::new();
+    run_secret(&mut link, &ledger, None, false, false, &mut Vec::new()).unwrap();
+    // Born and never drawn from: slot A damaged, slot B never written.
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start.checked_add(8).unwrap()] ^= 1;
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(
+        error.to_string().contains("not damaged in both slots"),
+        "{error}"
+    );
+    assert_eq!(link.stages, stages, "nothing was staged");
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_is_refused_on_a_part_with_no_controller_key() {
+    let mut link = FakeLink::new();
+    let start = usize::from(map::DRBG.start().0);
+    link.bytes[start..usize::from(map::DRBG.end().0)].fill(0x55);
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("write-secret"), "{error}");
+    assert_eq!(link.stages, 0, "nothing was staged");
+}
+
+#[test]
+fn f_041_p_237_a_station_reseed_is_refused_behind_an_unfinished_transaction() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    let mut transaction = block_on(Transaction::read(map::SECRET_CHANGE, &mut link)).unwrap();
+    block_on(transaction.write(&mut link, SecretChange::Pending(secret(), None))).unwrap();
+    let stages = link.stages;
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("unfinished"), "{error}");
+    assert_eq!(link.stages, stages, "nothing was staged");
+    // A reseed staged and never applied: reboot, not a second one.
+    let mut link = damaged_unit(&ledger);
+    block_on(o89_core::stage_reseed(
+        &mut link,
+        DrbgState::new([0x61; 32]).unwrap(),
+    ))
+    .unwrap();
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(
+        error.to_string().contains("reboot the controller"),
+        "{error}"
+    );
+    // Nor does a label go behind it.
+    assert!(run_secret(&mut link, &ledger, None, true, false, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn f_041_p_237_a_reseed_the_part_did_not_apply_fails_loudly() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    // The request is lost with the reset: the part boots on what it held.
+    link.reboot = Reboot::Fails;
+    assert!(run_reseed(&mut link, &mut Vec::new()).is_err());
+    // A later run finds the reseed staged and says to reboot, not to stage
+    // another; the reboot applies it.
+    let error = run_reseed(&mut link, &mut Vec::new()).unwrap_err();
+    assert!(
+        error.to_string().contains("reboot the controller"),
+        "{error}"
+    );
+    link.reboot = Reboot::Boots;
+    link.reboot().unwrap();
+    assert!(
+        read::<DrbgState, DRBG_BYTES>(&mut link, map::DRBG)
+            .unwrap()
+            .present()
+            .is_some()
+    );
+}
+
+#[test]
+fn f_041_p_237_a_reseed_that_moved_the_key_the_label_or_a_slot_fails_loudly() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    link.tamper = Tamper::MovesASlot;
+    let mut output = Vec::new();
+    let error = run_reseed(&mut link, &mut output).unwrap_err();
+    assert!(
+        error.to_string().contains("a client slot changed"),
+        "{error}"
+    );
+    assert!(output.is_empty(), "no success reported");
+}
+
+#[test]
+fn f_041_p_237_a_reseed_the_part_did_not_keep_fails_loudly() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    link.tamper = Tamper::LosesTheGenerator;
+    let mut output = Vec::new();
+    let error = run_reseed(&mut link, &mut output).unwrap_err();
+    assert!(
+        error.to_string().contains("still does not read back"),
+        "{error}"
+    );
+    assert!(output.is_empty(), "no success reported");
+}
+
+#[test]
+fn f_041_p_237_a_reseed_whose_intent_was_not_scrubbed_fails_loudly() {
+    let scratch = Scratch::new();
+    let ledger = scratch.ledger();
+    let mut link = damaged_unit(&ledger);
+    link.tamper = Tamper::KeepsTheIntent;
+    let mut output = Vec::new();
+    let error = run_reseed(&mut link, &mut output).unwrap_err();
+    assert!(
+        error.to_string().contains("did not scrub its intent"),
+        "{error}"
+    );
+    assert!(output.is_empty(), "no success reported");
 }

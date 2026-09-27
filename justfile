@@ -299,6 +299,18 @@ dev-write-epoch epoch *args:
 dev-write-secret *args:
     cargo run -q -p o89-dev -- store write-secret {{args}}
 
+# WRITE a fresh generator state on the FRAM of a unit whose generator record
+# is damaged in both slots (P-237), then reboot the controller to apply it.
+# Effect: Pair and Hello are served again; the controller key, the label and
+# every enrolled client stay. Refused while the generator reads back, while
+# one slot holds, without a controller key, and with a transaction pending.
+# Recovery: none needed; a reseed that did not land leaves the generator
+# damaged, and it can be run again.
+#
+# WRITE a fresh generator state onto a damaged generator; key and label kept.
+dev-reseed *args:
+    cargo run -q -p o89-dev -- {{args}} store reseed
+
 # DROP the event ring's `count` oldest 4 KiB blocks, one request each, the
 # oldest first. Effect: the records in them are gone and the oldest sequence
 # moves up; the next sequence is untouched until the last block goes, when

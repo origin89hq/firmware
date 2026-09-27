@@ -152,7 +152,10 @@ pub enum Op {
     /// a unit's first transaction only, the controller key and the
     /// generator's first state. The firmware clears the data area once it has
     /// read it. The host then requests Reboot and reads back the applied
-    /// transaction, whose fingerprint the label prints.
+    /// transaction, whose fingerprint the label prints. With `ARG0` 0, the
+    /// data may instead be an encoded `SecretChange::Reseed`: the station's
+    /// fresh generator state for a unit whose generator record is damaged
+    /// in both slots (P-237), applied by the same reboot.
     WriteSecret,
 }
 

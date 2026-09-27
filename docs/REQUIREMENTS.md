@@ -265,10 +265,17 @@ P-117, `A-42`. M4.
 **F-041** — Every challenge and every controller ephemeral key is a draw from
 the generator the station manufactured, released only once its successor is
 written and read back off the part; a draw whose successor does not land is
-withheld, and nothing ever writes the state but a draw and the unit's first
-manufacturing transaction. The part has no RNG, and a draw that repeats is a
-recorded `Hello` accepted twice. Source: KM43 P-237,
-[`ARCHITECTURE.md`](ARCHITECTURE.md), where randomness comes from. M4.
+withheld, and nothing ever writes the state but a draw, the unit's first
+manufacturing transaction, and the station's reseed over SWD. The reseed
+writes a fresh state from the station's CSPRNG only while the controller key
+reads and the generator record is damaged in both slots, is refused while any
+state reads back or another transaction is unfinished, is applied by the next
+boot with the state read back off the part, and leaves the printed secret, the
+controller key and every client slot as they were. No wire message, factory
+reset, store recovery, update or comms-processor input reaches it. The part
+has no RNG, and a draw that repeats is a recorded `Hello` accepted twice.
+Source: KM43 P-237, [`ARCHITECTURE.md`](ARCHITECTURE.md), where randomness
+comes from and the station may reseed a lost state. M4.
 
 F-042, the comms processor's own access point, is retired: the comms
 processor raises none. Running it beside the station while the pairing

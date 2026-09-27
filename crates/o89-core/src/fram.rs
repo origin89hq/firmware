@@ -278,6 +278,12 @@ impl<const N: usize> Record<N> {
         }
     }
 
+    /// The first address of slot `A`: where the record starts.
+    #[must_use]
+    pub const fn start(self) -> Address {
+        self.a
+    }
+
     /// The first address past both slots: where the next record may start.
     #[must_use]
     pub const fn end(self) -> Address {

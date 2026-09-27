@@ -255,12 +255,41 @@ and the same ephemeral twice is a session key given away. A state read out
 with a probe yields the draws after it and none before, so a session recorded
 before a capture stays sealed.
 
-**It is never re-initialised.** A factory reset does not touch it, a boot that
-finds it damaged keeps it damaged, and a record that cannot be read back
-refuses every `Pair` and `Hello`, answers `Discover` with error 18 and raises
-condition 22 `entropy unavailable`; a bench repairs it by erasing the part, not
-by the firmware choosing a state. Bytes from elsewhere may be mixed in through
-the same one-way step, never in place of it.
+**It is never re-initialised by the unit.** A factory reset does not touch it,
+a boot that finds it damaged keeps it damaged, and a record that cannot be read
+back refuses every `Pair` and `Hello`, answers `Discover` with error 18 and
+raises condition 22 `entropy unavailable`. Bytes from elsewhere may be mixed in
+through the same one-way step, never in place of it. No wire message, factory
+reset, store recovery, update or comms-processor input writes a state.
+
+**The station may reseed a lost state.** P-237 names one exception: "The
+manufacturing station, with physical SWD access at the bench, MAY write a fresh
+state onto a controller whose state cannot be read back intact." The danger in
+re-initialising is repetition, a unit walking a sequence it has already sent; a
+fresh state from the station's CSPRNG is not one the unit held, so no draw it
+yields has been exposed and a recorded `Pair` or `Hello` stays unusable.
+`o89-dev store reseed` draws thirty-two bytes and stages them through the
+manufacturing transaction below, as its own kind of intent; the only caller of
+`stage_reseed` is the bench mailbox, which the host reaches over SWD. Staging
+refuses unless the controller key reads and the generator record is damaged in
+both A/B slots: an intact state, one slot that still holds, a record that reads
+as never written or holds a body of zeros, a part with no controller key and an
+unfinished or unreadable transaction are each refused, and a part with no key
+is provisioned again, not reseeded. Whether the two middle readings should be
+reseeded as well is #240. The boot checks the same again before it writes, writes the state
+and reads it back off the part, keeps what it read rather than what it meant
+to write, and scrubs the intent so no copy of the state outlives the boot. A
+write the part does not keep is scrubbed as well, and the generator stays
+damaged; a refused write leaves the boot without a store and is tried again at
+the next. It writes the state and nothing else: the printed secret, the
+controller key and every client slot come back byte for byte
+(`map::RESEED_KEEPS`), which the station checks after the reboot, so the label
+and every enrolled client keep working and condition 22 clears. The station also
+checks that one copy of the intent reads as zeros: a scrub the part acknowledged
+and did not keep is done again by every boot, and the station says so rather
+than send the unit out with a copy of its state beside the generator. Physical
+authorisation is the probe on the bench; the station keeps no copy of the
+state.
 
 **Manufacture is one transaction.** `o89-dev store write-secret` draws the
 printed secret and, on a unit that holds neither, the controller key and the
@@ -285,11 +314,15 @@ operator's `--export` file, before the label and before the acknowledgement,
 so a resume exports the same record and never a second, and a resume against
 a file that never saw the transaction prints nothing. The part's fingerprint only confirms a
 record; it is never one's source. The format is in `crates/o89-dev/EXPORT.md`.
-`o89-dev store blank --yes` is the erase a bench repairs a part with: it zeroes
-the map, reads it back and reboots onto an unborn unit, which `write-secret`
-then gives a new key, generator and label. It is also how a part written under
-an earlier map is brought onto this one, since its old bytes read as a damaged
-key or generator.
+A reseed goes through the same record as its own intent: it carries the
+state and no secret, is refused behind any unfinished transaction and refuses
+one behind it, and is scrubbed by the boot that applies it rather than kept
+for an acknowledgement, since there is no label to print.
+`o89-dev store blank --yes` is the erase a bench repairs a part with when the
+controller key is lost: it zeroes the map, reads it back and reboots onto an
+unborn unit, which `write-secret` then gives a new key, generator and label.
+It is also how a part written under an earlier map is brought onto this one,
+since its old bytes read as a damaged key or generator.
 
 ### Embassy, and why the choice is cheap
 

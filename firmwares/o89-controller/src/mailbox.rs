@@ -307,7 +307,10 @@ async fn read_fram(fram: &mut Lease, at: u32, len: u32) -> (Status, u32) {
 /// reboots us, and boot applies the transaction before any session exists.
 /// The data is an encoded `SecretChange::Pending`: the secret and, on a
 /// unit's first transaction, its controller key and generator (P-235,
-/// P-237). The buffer it crossed in is cleared before this returns.
+/// P-237); or a `SecretChange::Reseed`, with `replace` 0, the station's
+/// fresh state for a generator damaged in both slots. This handler, served
+/// only over SWD, is the one caller of `stage_reseed`. The buffer the data
+/// crossed in is cleared before this returns.
 async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32) {
     use o89_core::{Body as _, ProvisionFailed, SECRET_CHANGE_BYTES, SecretChange};
     if replace > 1 || usize::try_from(len) != Ok(SECRET_CHANGE_BYTES) {
@@ -319,10 +322,17 @@ async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32)
     let decoded = SecretChange::decode(&bytes);
     bytes.fill(0);
     clear_data();
-    let Ok(SecretChange::Pending(secret, birth)) = decoded else {
-        return (Status::OutOfRange, 0);
+    let staged = match decoded {
+        Ok(SecretChange::Pending(secret, birth)) => {
+            o89_core::stage_secret(fram, secret, birth, replace == 1).await
+        }
+        Ok(SecretChange::Reseed(state)) if replace == 0 => {
+            o89_core::stage_reseed(fram, state).await
+        }
+        Ok(SecretChange::Reseed(_) | SecretChange::Complete | SecretChange::Applied(..))
+        | Err(_) => return (Status::OutOfRange, 0),
     };
-    let status = match o89_core::stage_secret(fram, secret, birth, replace == 1).await {
+    let status = match staged {
         Ok(()) => Status::Ok,
         Err(ProvisionFailed::Write(Refused::SupplyFalling)) => Status::SupplyFalling,
         Err(
@@ -334,7 +344,8 @@ async fn write_secret(fram: &mut Lease, replace: u32, len: u32) -> (Status, u32)
             ProvisionFailed::SameSecret
             | ProvisionFailed::AlreadyProvisioned
             | ProvisionFailed::AlreadyBorn
-            | ProvisionFailed::Unborn,
+            | ProvisionFailed::Unborn
+            | ProvisionFailed::NotDamaged,
         ) => Status::OutOfRange,
     };
     (status, 0)
