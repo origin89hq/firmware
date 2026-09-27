@@ -1,5 +1,6 @@
-//! The generator every challenge and every controller ephemeral key is a
-//! draw from, because the part has no RNG (P-237).
+//! The generator every challenge, every controller ephemeral key and every
+//! network origin token is a draw from, because the part has no RNG (P-237,
+//! L-138).
 //!
 //! The state is thirty-two bytes the station wrote at manufacture and
 //! recorded nowhere. `km43`'s [`Drbg`] advances it one way on every draw,
@@ -23,7 +24,7 @@
 //! re-initialisation: if the successor landed it is the successor, and if
 //! it did not, the draw that would repeat was never released.
 //!
-//! cites: P-063, P-237
+//! cites: P-063, P-237, L-138
 
 use core::fmt;
 
@@ -139,6 +140,16 @@ impl Generator {
         fram: &mut F,
     ) -> Result<[u8; CHALLENGE_BYTES], Unavailable> {
         Ok(self.draw(fram).await?.into_challenge())
+    }
+
+    /// A network origin token: one draw, its first eight bytes (L-138).
+    pub async fn origin<F: Fram>(&mut self, fram: &mut F) -> Result<km43::NetOrigin, Unavailable> {
+        let challenge = self.challenge(fram).await?;
+        let mut token = [0; km43::NET_ORIGIN_BYTES];
+        for (to, from) in token.iter_mut().zip(challenge) {
+            *to = from;
+        }
+        Ok(km43::NetOrigin::new(token))
     }
 
     /// Start again from the part after a draw was withheld.

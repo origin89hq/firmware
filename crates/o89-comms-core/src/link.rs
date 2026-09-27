@@ -941,7 +941,8 @@ impl Link {
             fw: me.fw,
             boot_id: me.boot_id,
             hw: me.hw,
-            net_version: Some(self.network.stored_version()),
+            net_version: Some(self.network.stored().net_version()),
+            net_origin: self.network.stored().net_origin(),
             device_id: None,
         }
         .write(link_header(kind, req_id), dst)
@@ -1170,6 +1171,7 @@ mod tests {
             psk: "correct horse",
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         };
         let len = change
             .write(
@@ -1279,6 +1281,7 @@ mod tests {
                 version: 1,
                 country: "CA",
                 hostname: "origin89",
+                origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
             })
             .expect("metadata"),
         ));
@@ -1326,6 +1329,7 @@ mod tests {
                 version: 1,
                 country: "CA",
                 hostname: "origin89",
+                origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
             })
             .expect("metadata"),
         ));
@@ -1467,6 +1471,7 @@ mod tests {
             hw: "controller-a rev A",
             net_version: None,
             device_id: (role == Side::Controller).then_some(CONTROLLER_DEVICE),
+            net_origin: None,
         }
         .write(link_header(kind, req_id), buf);
         decoded(buf, len)
@@ -1511,6 +1516,7 @@ mod tests {
                     hw: "controller-a rev A",
                     net_version: None,
                     device_id: (role == Side::Controller).then_some(CONTROLLER_DEVICE),
+                    net_origin: None,
                 }
                 .write(link_header(kind, req_id), &mut buf);
                 let _ = link.received(decoded(&buf, len), at(1));
@@ -2034,6 +2040,7 @@ mod tests {
             hw: "controller-a rev A",
             net_version: None,
             device_id: Some(other),
+            net_origin: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(8)), &mut buf);
         let _ = link.received(decoded(&buf, len), at(2));
@@ -2175,6 +2182,7 @@ mod tests {
             psk: "password",
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         }
         .write(link_header(LinkMessageType::NetConfig, ReqId(55)), buf)
         .unwrap()
@@ -2244,6 +2252,98 @@ mod tests {
                 version: 7
             })
         );
+    }
+
+    /// The statement this side sends now, read back off the wire.
+    fn statement_net(link: &Link) -> (Option<u32>, Option<km43::NetOrigin>) {
+        let mut wire = [0u8; MAX_FRAME];
+        let len = link
+            .build(
+                Frame::LinkUp { req_id: ReqId(12) },
+                &ME,
+                at(5),
+                &mut FrameWriter::new(),
+                &mut wire,
+            )
+            .expect("builds");
+        let mut out = [0u8; 256];
+        let len = read_back(wire.get(..len).expect("fits"), &mut out);
+        let ours = LinkUp::decode(envelope_in(&out, len)).expect("a statement");
+        (ours.net_version, ours.net_origin)
+    }
+
+    #[test]
+    fn l_132_link_up_reports_the_token_flash_holds_and_none_beside_zero() {
+        let foreign = km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]);
+        let mut link = linked_at_boot();
+        assert_eq!(statement_net(&link), (Some(0), None), "an empty cache");
+        link.restore_network(Some(
+            crate::Credential::new(NetChange::Set {
+                version: 7,
+                ssid: "theirs",
+                psk: "password",
+                country: "US",
+                hostname: "elsewhere",
+                origin: foreign,
+            })
+            .unwrap(),
+        ));
+        assert_eq!(statement_net(&link), (Some(7), Some(foreign)));
+        // Ours at the very same version, and the write fails (L-137).
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "site");
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(10), |_| {
+                false
+            });
+        assert_eq!(
+            statement_net(&link),
+            (Some(7), Some(foreign)),
+            "the persisted token, never the RAM copy's"
+        );
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(11), |_| true);
+        assert_eq!(
+            statement_net(&link),
+            (
+                Some(7),
+                Some(km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]))
+            )
+        );
+    }
+
+    #[test]
+    fn l_133_an_unwritten_clear_carrying_a_token_is_refused_and_the_cache_kept() {
+        let mut link = linked_at_boot();
+        let mut buf = [0; 256];
+        let len = net_change(&mut buf, "site");
+        let _ =
+            link.received_with_store(LinkEnvelope::decode(&buf[..len]).unwrap(), at(10), |_| true);
+        let before = statement_net(&link);
+        let mut cbor = link_header(LinkMessageType::NetConfig, ReqId(57))
+            .write(3, &mut buf)
+            .unwrap();
+        cbor.key(1).unwrap();
+        cbor.u64(u64::from(km43::NetConfigOp::Clear as u8)).unwrap();
+        cbor.key(2).unwrap();
+        cbor.u64(0).unwrap();
+        cbor.key(7).unwrap();
+        cbor.bytes(&[0xC3; km43::NET_ORIGIN_BYTES]).unwrap();
+        let len = cbor.finish().unwrap();
+        assert_eq!(
+            link.received_with_store(
+                LinkEnvelope::decode(&buf[..len]).unwrap(),
+                at(11),
+                |_| panic!("an erase nothing asked for")
+            ),
+            Some(Frame::NetReport {
+                req_id: ReqId(57),
+                outcome: NetConfig::RejectedInvalid,
+                version: 7
+            })
+        );
+        assert_eq!(statement_net(&link), before);
+        assert_eq!(link.credential().unwrap().version(), 7);
     }
 
     #[test]
@@ -3250,6 +3350,7 @@ mod tests {
                 psk: "password",
                 country: "CA",
                 hostname: "origin89",
+                origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
             })
             .expect("valid"),
         ));
@@ -3287,6 +3388,7 @@ mod tests {
                         version: 4,
                         country: "CA",
                         hostname: "origin89",
+                        origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
                     })
                     .expect("valid"),
                 ));
@@ -3406,6 +3508,7 @@ mod tests {
                 version: 4,
                 country: "CA",
                 hostname: "origin89",
+                origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
             })
             .expect("valid"),
         ));

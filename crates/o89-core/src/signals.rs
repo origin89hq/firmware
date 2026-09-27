@@ -337,7 +337,10 @@ impl<const N: usize> Signals<N> {
         match validity {
             Validity::Ok => {}
             Validity::Stale => return Err(Ineligible::Stale(provenance)),
-            Validity::Initialising
+            // A counter's restart (P-259), which `Observation` cannot build:
+            // nothing here writes a counter yet.
+            Validity::Reset
+            | Validity::Initialising
             | Validity::Unsupported
             | Validity::SensorFault
             | Validity::OutOfRange
@@ -601,6 +604,12 @@ mod tests {
         assert_eq!(
             Observation::missing(Validity::Stale),
             Err(QualityError::ValueOmitted(Validity::Stale))
+        );
+        // A counter's restart carries its new reading (P-259), and nothing
+        // here writes one yet, so the store never holds a `reset`.
+        assert_eq!(
+            Observation::missing(Validity::Reset),
+            Err(QualityError::ValueOmitted(Validity::Reset))
         );
     }
 

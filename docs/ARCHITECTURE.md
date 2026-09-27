@@ -1078,8 +1078,19 @@ holds the link-local state: link-up and `boot_id` invalidation, the heartbeat
 and the recovery ladder with the board's revision policy (below), connection
 rows and challenges, network configuration push, time offers with the floor,
 cap and rate limit, and the comms release flow. After every accepted `LinkUp`, the controller
-compares the module's `net_version` with its persisted network section and
-pushes `NetConfig` whenever they differ in either direction (L-133). A local
+compares the module's `net_version` and `net_origin` with its persisted
+network section and pushes `NetConfig` whenever the versions differ in either
+direction, or, with a written section, whenever the token is absent or not the
+section's (L-133). The token is eight bytes drawn from the P-237 generator
+when a write creates the section from version 0, the first write or the
+repair of an unreadable one, and it is kept through every later write,
+the factory clear included (L-138). A version alone cannot tell this unit's
+network from a board out of another unit at the same version, or from this
+unit's own credentials held by a module that was unplugged while a repair
+counted the section back up from 1. A creating write whose draw fails writes
+nothing and answers `BusyRetry`, so a generator damaged in both slots refuses
+every first network write until the station reseeds it. An unwritten or
+unreadable section has no token and compares the version alone. A local
 network write also owes a push. One immutable snapshot is tracked in the
 bounded request table; retries retain its request id and bytes. A newer write
 supersedes that request. A refused or exhausted request raises a probe note;
@@ -1105,7 +1116,6 @@ the next link-up (L-137). Unanswered clears use the same bounded retry machinery
 as written network changes. A module already reporting zero needs no clear.
 A corrupt or malformed master still raises `NetworkWithoutMaster` until it is
 replaced or reset; damage is not evidence of an unwritten section.
-Equal-version collisions remain tracked in [KM43 #100](https://github.com/origin89hq/km43/issues/100).
 The phone-to-Wi-Fi bench exit, including unwritten-clear radio shutdown and
 reconfiguration, remains open and depends on #90's comms side.
 
@@ -1968,9 +1978,13 @@ a failed write is reported and the RAM copy keeps the site on the air
 (L-137). The comms cache uses a fixed, checksummed record in `creds`, not
 ESP-IDF's key/value NVS format. Replacement erases that partition, writes the
 record, commits its marker last, and verifies it before answering `stored`.
-An interrupted replacement may lose the cache; the controller restores it at
-link-up. A clear erases the previous passphrase and retains only the version,
-country and hostname. Duplicate successful requests do not erase again.
+The record is the encoded `NetConfig`, so the origin token is stored in the
+same write as the configuration and its version (L-138). `LinkUp` reports the
+version and token that record holds, never the RAM copy's after a failed
+write or erase (L-132, L-137). An interrupted replacement may lose the cache;
+the controller restores it at link-up. A clear erases the previous passphrase
+and retains only the version, token, country and hostname. Duplicate
+successful requests do not erase again.
 
 The Wi-Fi station starts after the recovery window and OTA confirmation,
 using that cache, once the controller has said whether its pairing window

@@ -166,6 +166,7 @@ mod tests {
             psk: "password",
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap()
     }
@@ -181,8 +182,8 @@ mod tests {
         assert!(flash.bytes.iter().all(|byte| *byte == 255));
         assert_eq!(load_credential(&mut flash), Ok(None));
         assert_eq!(
-            crate::Network::new(load_credential(&mut flash).unwrap()).stored_version(),
-            0
+            crate::Network::new(load_credential(&mut flash).unwrap()).stored(),
+            km43::NetStamp::Unwritten
         );
     }
 
@@ -209,10 +210,20 @@ mod tests {
             );
             assert_eq!(verdict.version, 7, "cut {cut}");
             assert_eq!(
+                network.stored(),
+                record().stamp(),
+                "the foreign token stays visible until erasure succeeds, cut {cut}"
+            );
+            assert_eq!(
                 network.credential().unwrap().change(),
                 Ok(NetChange::ClearUnwritten)
             );
             flash.budget = usize::MAX;
+            let rebooted = crate::Network::new(load_credential(&mut flash).ok().flatten()).stored();
+            assert!(
+                rebooted == record().stamp() || rebooted == km43::NetStamp::Unwritten,
+                "cut {cut}: {rebooted:?}"
+            );
             let verdict = network.apply(NetChange::ClearUnwritten, |clear| {
                 store_credential(&mut flash, clear).is_ok()
             });
@@ -241,6 +252,7 @@ mod tests {
             version: 8,
             country: "CA",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         store_credential(&mut flash, &clear).unwrap();
@@ -275,12 +287,14 @@ mod tests {
             psk: "different",
             country: "US",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         let clear = Credential::new(km43::NetChange::Clear {
             version: 8,
             country: "US",
             hostname: "origin89",
+            origin: km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
         })
         .unwrap();
         let mut initial = Flash {
@@ -305,6 +319,61 @@ mod tests {
                 if result.is_ok() {
                     assert_eq!(loaded, Ok(Some(next)));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn l_137_an_interrupted_write_at_an_equal_version_reports_only_the_persisted_token() {
+        // Another controller's network at the very version this one holds.
+        let theirs = Credential::new(NetChange::Set {
+            version: 7,
+            ssid: "theirs",
+            psk: "their password",
+            country: "US",
+            hostname: "elsewhere",
+            origin: km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]),
+        })
+        .unwrap();
+        let ours = record();
+        assert_eq!(theirs.version(), ours.version());
+        let mut initial = Flash {
+            bytes: [255; 4096],
+            budget: usize::MAX,
+        };
+        store_credential(&mut initial, &theirs).unwrap();
+        for budget in 0..=4301 {
+            let mut flash = Flash {
+                bytes: initial.bytes,
+                budget,
+            };
+            let mut network = crate::Network::new(Some(theirs));
+            let verdict = network.apply(ours.change().unwrap(), |next| {
+                store_credential(&mut flash, next).is_ok()
+            });
+            assert_eq!(network.credential(), Some(&ours), "RAM runs on ours");
+            if verdict.outcome == km43::NetConfig::Stored {
+                assert_eq!(network.stored(), ours.stamp(), "budget {budget}");
+            } else {
+                assert_eq!(
+                    network.stored(),
+                    theirs.stamp(),
+                    "LinkUp keeps the token flash held, budget {budget}"
+                );
+            }
+            // Reboot: what the next LinkUp reports is what the record loads.
+            flash.budget = usize::MAX;
+            let loaded = load_credential(&mut flash).ok().flatten();
+            let rebooted = crate::Network::new(loaded);
+            let stamp = rebooted.stored();
+            assert!(
+                stamp == theirs.stamp()
+                    || stamp == km43::NetStamp::Unwritten
+                    || (stamp == ours.stamp() && loaded == Some(ours)),
+                "budget {budget}: {stamp:?}"
+            );
+            if verdict.outcome == km43::NetConfig::Stored {
+                assert_eq!(stamp, ours.stamp(), "budget {budget}");
             }
         }
     }

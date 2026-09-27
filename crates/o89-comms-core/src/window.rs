@@ -273,6 +273,7 @@ mod tests {
             hw: "controller-a rev A",
             net_version: None,
             device_id: Some([7; 16]),
+            net_origin: None,
         }
         .write(header(LinkMessageType::LinkUp), &mut envelope)
         .expect("encodes");

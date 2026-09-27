@@ -1667,8 +1667,8 @@ dependencies = [
 
 [[package]]
 name = "km43"
-version = "0.7.0"
-source = "git+https://github.com/origin89hq/km43?rev=0f94f45e4554ab3889408bb76952cf6eb90dd484#0f94f45e4554ab3889408bb76952cf6eb90dd484"
+version = "0.8.1"
+source = "git+https://github.com/origin89hq/km43?rev=50a7f3b6e521b72ffe435383bae1d765fd029a11#50a7f3b6e521b72ffe435383bae1d765fd029a11"
 dependencies = [
  "chacha20poly1305",
  "defmt",

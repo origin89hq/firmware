@@ -1,7 +1,20 @@
 use crate::SimFram;
 use embassy_futures::block_on;
 use km43::{ConfigAnswer, ConfigSection, SetConfig, SetConfigOperation};
-use o89_core::{Configuration, Kept, Network, map};
+use o89_core::{Configuration, DRBG_BYTES, DrbgState, Generator, Kept, Network, map};
+
+/// Write the station's state onto `part` (P-237) and power it back up, so
+/// the step counter starts at zero.
+fn seed_generator(part: &mut SimFram) {
+    let mut kept = block_on(Kept::<DrbgState, DRBG_BYTES>::read(map::DRBG, part)).expect("read");
+    block_on(kept.write(part, DrbgState::new([0x61; 32]).expect("entropy"))).expect("seeded");
+    part.reboot();
+}
+
+/// The generator over whatever `part` holds, as a boot reads it.
+fn generator_of(part: &mut SimFram) -> Generator {
+    Generator::new(block_on(Kept::read(map::DRBG, part)).expect("read"))
+}
 
 #[test]
 fn p_100_version_mismatch_precedes_body_validation() {
@@ -15,6 +28,7 @@ fn p_100_version_mismatch_precedes_body_validation() {
             body: &[0xa0],
         },
         &mut network,
+        &mut generator_of(&mut part),
         &mut part,
     ))
     .expect("ack");
@@ -55,9 +69,14 @@ fn p_101_bad_values_and_bad_structure_have_distinct_refusals() {
         body: &[0xa1, 1, 0x60],
     };
     assert_eq!(
-        block_on(config.set(operation, &mut network, &mut part))
-            .expect("ack")
-            .outcome,
+        block_on(config.set(
+            operation,
+            &mut network,
+            &mut generator_of(&mut part),
+            &mut part
+        ))
+        .expect("ack")
+        .outcome,
         SetConfig::Invalid
     );
     assert_eq!(
@@ -67,7 +86,8 @@ fn p_101_bad_values_and_bad_structure_have_distinct_refusals() {
                 ..operation
             },
             &mut network,
-            &mut part
+            &mut generator_of(&mut part),
+            &mut part,
         )),
         Err(km43::ErrorCode::MalformedFrame)
     );
@@ -97,6 +117,7 @@ fn p_103_each_behaviour_preserves_its_explicit_shadow_flag() {
                     body: &body[..len],
                 },
                 &mut network,
+                &mut generator_of(&mut part),
                 &mut part,
             ))
             .expect("ack");
@@ -127,7 +148,7 @@ fn p_102_set_config_cut_at_every_storage_byte_keeps_old_or_new_section() {
         body: &[0xa1, 1, 0x61, b'a'],
     };
     assert_eq!(
-        block_on(config.set(first, &mut network, &mut part))
+        block_on(config.set(first, &mut network, &mut generator_of(&mut part), &mut part))
             .expect("ack")
             .outcome,
         SetConfig::Accepted
@@ -140,9 +161,14 @@ fn p_102_set_config_cut_at_every_storage_byte_keeps_old_or_new_section() {
         ..first
     };
     assert_eq!(
-        block_on(config.set(second, &mut network, &mut part))
-            .expect("ack")
-            .outcome,
+        block_on(config.set(
+            second,
+            &mut network,
+            &mut generator_of(&mut part),
+            &mut part
+        ))
+        .expect("ack")
+        .outcome,
         SetConfig::Accepted
     );
     let steps = part.bytes_written();
@@ -153,7 +179,12 @@ fn p_102_set_config_cut_at_every_storage_byte_keeps_old_or_new_section() {
         let mut network =
             block_on(Kept::<Network, 160>::read(map::NETWORK, &mut torn)).expect("read");
         torn.cut_after(cut);
-        let _ = block_on(config.set(second, &mut network, &mut torn));
+        let _ = block_on(config.set(
+            second,
+            &mut network,
+            &mut generator_of(&mut torn),
+            &mut torn,
+        ));
         torn.reboot();
         let config = block_on(Configuration::read(&mut torn)).expect("reboot");
         let mut bytes = [0; 100];
@@ -180,7 +211,12 @@ fn p_106_debug_of_owned_network_and_credentials_redacts_passphrase() {
         hostname: o89_core::Text::new("origin89").expect("hostname"),
     };
     let mut network = Network::NONE;
-    network.set(credentials).expect("set");
+    network
+        .set(
+            credentials,
+            km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]),
+        )
+        .expect("set");
     let rendered = format!("{credentials:?} {network:?}");
     assert!(!rendered.contains("correct horse"));
     assert!(!rendered.contains("99, 111, 114, 114, 101, 99, 116"));
@@ -190,6 +226,7 @@ fn p_106_debug_of_owned_network_and_credentials_redacts_passphrase() {
 #[test]
 fn p_102_network_set_cut_at_every_byte_keeps_the_previous_or_new_credentials() {
     let mut seed = SimFram::fresh();
+    seed_generator(&mut seed);
     let mut config = block_on(Configuration::read(&mut seed)).expect("read");
     let mut network = block_on(Kept::<Network, 160>::read(map::NETWORK, &mut seed)).expect("read");
     let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
@@ -208,9 +245,14 @@ fn p_102_network_set_cut_at_every_byte_keeps_the_previous_or_new_credentials() {
         body: &body[..len],
     };
     assert_eq!(
-        block_on(config.set(operation, &mut network, &mut seed))
-            .expect("ack")
-            .outcome,
+        block_on(config.set(
+            operation,
+            &mut network,
+            &mut generator_of(&mut seed),
+            &mut seed
+        ))
+        .expect("ack")
+        .outcome,
         SetConfig::Accepted
     );
     let old = *network.present().expect("old");
@@ -230,9 +272,14 @@ fn p_102_network_set_cut_at_every_byte_keeps_the_previous_or_new_credentials() {
     let mut whole = seed.clone();
     whole.reboot();
     assert_eq!(
-        block_on(config.set(operation, &mut network, &mut whole))
-            .expect("ack")
-            .outcome,
+        block_on(config.set(
+            operation,
+            &mut network,
+            &mut generator_of(&mut whole),
+            &mut whole
+        ))
+        .expect("ack")
+        .outcome,
         SetConfig::Accepted
     );
     let new = *network.present().expect("new");
@@ -242,7 +289,12 @@ fn p_102_network_set_cut_at_every_byte_keeps_the_previous_or_new_credentials() {
         let mut network =
             block_on(Kept::<Network, 160>::read(map::NETWORK, &mut part)).expect("read");
         part.cut_after(cut);
-        let _ = block_on(config.set(operation, &mut network, &mut part));
+        let _ = block_on(config.set(
+            operation,
+            &mut network,
+            &mut generator_of(&mut part),
+            &mut part,
+        ));
         part.reboot();
         let network =
             block_on(Kept::<Network, 160>::read(map::NETWORK, &mut part)).expect("recover");
@@ -251,6 +303,54 @@ fn p_102_network_set_cut_at_every_byte_keeps_the_previous_or_new_credentials() {
             "cut {cut}"
         );
     }
+}
+
+#[test]
+fn p_102_l_138_a_first_network_write_cut_at_every_byte_leaves_no_section_or_one_with_its_token() {
+    let mut seed = SimFram::fresh();
+    seed_generator(&mut seed);
+    let mut body = [0; km43::MAX_NETWORK_WRITE_BYTES];
+    let len = km43::NetworkWrite {
+        join: Some(km43::JoinWrite {
+            ssid: km43::Ssid::new("cabin").expect("ssid"),
+            psk: Some(km43::Passphrase::new("correct horse").expect("psk")),
+        }),
+        country: km43::Country::new("CA").expect("country"),
+        hostname: km43::Hostname::new("origin89").expect("host"),
+    }
+    .encode(&mut body)
+    .expect("body");
+    let operation = SetConfigOperation {
+        section: ConfigSection::Network,
+        expected_version: 0,
+        body: &body[..len],
+    };
+    let crashes = crate::crash_at_every_step(
+        &seed,
+        |part| {
+            let mut config = block_on(Configuration::read(part)).map_err(|_| ())?;
+            let mut network =
+                block_on(Kept::<Network, 160>::read(map::NETWORK, part)).map_err(|_| ())?;
+            let mut generator = generator_of(part);
+            match block_on(config.set(operation, &mut network, &mut generator, part)) {
+                Ok(ack) if ack.outcome == SetConfig::Accepted => Ok(()),
+                Ok(_) | Err(_) => Err(()),
+            }
+        },
+        |part, step| {
+            let network =
+                block_on(Kept::<Network, 160>::read(map::NETWORK, part)).expect("recover");
+            let mut generator = generator_of(part);
+            let next = block_on(generator.origin(part)).expect("the generator survives the cut");
+            if let Some(held) = network.present() {
+                assert_eq!(held.version(), 1, "step {step}");
+                let origin = held.origin().expect("a written section has its token");
+                assert_ne!(origin, next, "a token is never drawn twice, step {step}");
+            }
+        },
+    )
+    .expect("the write lands when nothing is cut");
+    assert!(crashes.steps > 0);
 }
 
 #[test]
@@ -269,7 +369,12 @@ fn p_101_unsupported_sections_and_exhausted_versions_refuse_without_writes() {
         Err(km43::ErrorCode::UnknownSection)
     );
     assert_eq!(
-        block_on(config.set(operation, &mut network, &mut part)),
+        block_on(config.set(
+            operation,
+            &mut network,
+            &mut generator_of(&mut part),
+            &mut part
+        )),
         Err(km43::ErrorCode::UnknownSection)
     );
     assert_eq!(part.bytes_written(), 0);
@@ -291,6 +396,7 @@ fn p_101_unsupported_sections_and_exhausted_versions_refuse_without_writes() {
             body: &[0xa0],
         },
         &mut network,
+        &mut generator_of(&mut part),
         &mut part,
     ))
     .expect("ack");
@@ -378,6 +484,7 @@ fn p_108_p_100_damaged_sections_read_unwritten_and_accept_only_version_zero() {
     ] {
         for malformed in [false, true] {
             let mut part = SimFram::fresh();
+            seed_generator(&mut part);
             damage_config(&mut part, section, malformed);
             let mut config = block_on(Configuration::read(&mut part)).expect("read");
             let mut network =
@@ -409,9 +516,14 @@ fn p_108_p_100_damaged_sections_read_unwritten_and_accept_only_version_zero() {
                 body,
             };
             assert_eq!(
-                block_on(config.set(operation, &mut network, &mut part))
-                    .expect("ack")
-                    .outcome,
+                block_on(config.set(
+                    operation,
+                    &mut network,
+                    &mut generator_of(&mut part),
+                    &mut part
+                ))
+                .expect("ack")
+                .outcome,
                 SetConfig::StaleVersion
             );
             assert_eq!(part.bytes_written(), 0);
@@ -422,7 +534,8 @@ fn p_108_p_100_damaged_sections_read_unwritten_and_accept_only_version_zero() {
                         ..operation
                     },
                     &mut network,
-                    &mut part
+                    &mut generator_of(&mut part),
+                    &mut part,
                 ))
                 .expect("replacement")
                 .outcome,

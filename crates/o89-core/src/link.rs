@@ -197,6 +197,27 @@ pub struct Peer {
     pub boot_id: u32,
     /// Key 7: the credential version it has cached, 0 if none.
     pub net_version: Option<u32>,
+    /// Key 9: the origin token cached with that version, none beside 0
+    /// (L-132, L-138).
+    pub net_origin: Option<km43::NetOrigin>,
+}
+
+impl Peer {
+    /// Whether `network` is owed to this peer's cache (L-133): the peer's
+    /// statement read again as the `LinkUp` it was, so the rule is
+    /// `km43`'s own and not a copy of it.
+    fn owed(&self, network: &crate::Network) -> bool {
+        network.needs_push(&LinkUp {
+            version: self.version,
+            role: Side::Comms,
+            fw: self.fw.as_str(),
+            boot_id: self.boot_id,
+            hw: self.hw.as_str(),
+            net_version: self.net_version,
+            device_id: None,
+            net_origin: self.net_origin,
+        })
+    }
 }
 
 /// How far the two versions agree (L-050, L-051).
@@ -749,7 +770,7 @@ impl Link {
             self.network_due = NetworkDue::None;
             return;
         };
-        if peer.net_version == Some(network.version())
+        if !peer.owed(&network)
             && (network.version() == 0 || self.network_due != NetworkDue::Changed)
         {
             self.network_due = NetworkDue::None;
@@ -784,23 +805,39 @@ impl Link {
             actions.push(Action::Note(Note::Malformed(LinkMessageType::NetConfigAck)));
             return;
         };
-        if self.network_sent.is_none_or(|(sent, _)| sent != req_id) {
+        let Some((_, sent)) = self.network_sent.filter(|(sent, _)| *sent == req_id) else {
             actions.push(Action::Note(Note::UnexpectedAck(
                 LinkMessageType::NetConfigAck,
             )));
             return;
-        }
+        };
         actions.push(Action::Note(Note::NetworkAnswered {
             req_id,
             outcome: verdict.outcome,
             version: verdict.version,
         }));
         self.forget_network();
-        if let Phase::Up { peer, .. } = &mut self.phase {
+        // The ack reports what flash holds (L-132, L-137) and carries no
+        // token: a stored push holds the token it was sent with, a refused
+        // or failed one keeps what the peer last stated at that version, and
+        // any other version is a cache whose token nothing here knows.
+        let settle = |peer: &mut Peer| {
+            peer.net_origin = if verdict.outcome == km43::NetConfig::Stored
+                && verdict.version == sent.version()
+            {
+                sent.origin()
+            } else if peer.net_version == Some(verdict.version) {
+                peer.net_origin
+            } else {
+                None
+            };
             peer.net_version = Some(verdict.version);
+        };
+        if let Phase::Up { peer, .. } = &mut self.phase {
+            settle(peer);
         }
         if let Some(peer) = &mut self.last_peer {
-            peer.net_version = Some(verdict.version);
+            settle(peer);
         }
         if verdict.outcome != km43::NetConfig::Stored {
             actions.push(Action::Note(Note::NetworkRefused(verdict.outcome)));
@@ -1635,6 +1672,7 @@ impl Link {
             hw: self.identity.hw.as_str(),
             net_version: None,
             device_id: self.identity.device_id,
+            net_origin: None,
         }
         .write(link_header(kind, req_id), dst)
     }
@@ -1681,6 +1719,7 @@ impl Link {
             hw,
             boot_id: theirs.boot_id,
             net_version: theirs.net_version,
+            net_origin: theirs.net_origin,
         };
         let compat = match OURS.agreed(theirs.version) {
             Ok(agreed) => Compat::Agreed(agreed),
@@ -2313,6 +2352,7 @@ mod tests {
             hw: "comms",
             net_version: Some(99),
             device_id: None,
+            net_origin: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(100)), &mut body)
         .expect("statement");
@@ -2577,14 +2617,126 @@ mod tests {
     fn network_fixture() -> crate::Network {
         let mut network = crate::Network::NONE;
         network
-            .set(crate::Credentials {
-                ssid: Text::new("cabin").expect("ssid"),
-                psk: crate::Psk::new("correct horse").expect("psk"),
-                country: crate::Country::new(*b"CA").expect("country"),
-                hostname: Text::new("origin89").expect("host"),
-            })
+            .set(
+                crate::Credentials {
+                    ssid: Text::new("cabin").expect("ssid"),
+                    psk: crate::Psk::new("correct horse").expect("psk"),
+                    country: crate::Country::new(*b"CA").expect("country"),
+                    hostname: Text::new("origin89").expect("host"),
+                },
+                ORIGIN,
+            )
             .expect("network");
         network
+    }
+
+    const ORIGIN: km43::NetOrigin = km43::NetOrigin::new([0x5A; km43::NET_ORIGIN_BYTES]);
+    const FOREIGN: km43::NetOrigin = km43::NetOrigin::new([0xC3; km43::NET_ORIGIN_BYTES]);
+
+    /// The module states its cache again, in the same boot (L-030).
+    fn cache_states(
+        link: &mut Link,
+        net_version: u32,
+        net_origin: Option<km43::NetOrigin>,
+        now: Tick,
+    ) -> Actions {
+        let mut body = [0; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: link.peer().expect("peer").boot_id,
+            hw: "comms",
+            net_version: Some(net_version),
+            device_id: None,
+            net_origin,
+        }
+        .write(link_header(LinkMessageType::LinkUp, ReqId(100)), &mut body)
+        .expect("statement");
+        link.received(
+            LinkEnvelope::decode(&body[..len]).expect("envelope"),
+            now,
+            &mut NoRows,
+        )
+    }
+
+    fn pushed(actions: &Actions) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::Send(Outgoing::NetConfig { .. })))
+    }
+
+    /// A link whose module stored version 1 of `network_fixture` and said so.
+    fn settled_on_the_fixture() -> Link {
+        let (mut link, _, push) = push_after_link_up(network_fixture());
+        let _ = network_ack(&mut link, push.req_id, km43::NetConfig::Stored, 1);
+        let peer = link.peer().expect("peer");
+        assert_eq!((peer.net_version, peer.net_origin), (Some(1), Some(ORIGIN)));
+        link
+    }
+
+    #[test]
+    fn l_133_an_equal_version_from_the_same_origin_is_not_pushed() {
+        let mut link = settled_on_the_fixture();
+        let actions = cache_states(&mut link, 1, Some(ORIGIN), at(2));
+        assert!(!pushed(&actions), "{actions:?}");
+        assert!(link.network_sent.is_none());
+    }
+
+    #[test]
+    fn l_133_an_equal_version_under_another_controllers_token_is_pushed() {
+        let mut link = settled_on_the_fixture();
+        let actions = cache_states(&mut link, 1, Some(FOREIGN), at(2));
+        assert!(pushed(&actions), "{actions:?}");
+        let (_, sent) = link.network_sent.expect("push");
+        assert!(matches!(
+            sent.change(),
+            Some(km43::NetChange::Set { version: 1, origin, .. }) if origin == ORIGIN
+        ));
+    }
+
+    #[test]
+    fn l_133_a_cache_with_no_token_under_a_written_master_is_pushed() {
+        let mut link = settled_on_the_fixture();
+        let actions = cache_states(&mut link, 1, None, at(2));
+        assert!(pushed(&actions), "{actions:?}");
+    }
+
+    #[test]
+    fn l_133_an_unwritten_master_compares_the_version_alone() {
+        let (mut link, _, push) = push_after_link_up(crate::Network::NONE);
+        let _ = network_ack(&mut link, push.req_id, km43::NetConfig::Stored, 0);
+        assert_eq!(link.peer().expect("peer").net_origin, None);
+        let actions = cache_states(&mut link, 0, None, at(2));
+        assert!(!pushed(&actions), "0 against 0: {actions:?}");
+        let actions = cache_states(&mut link, 3, Some(FOREIGN), at(3));
+        assert!(pushed(&actions), "a foreign cache: {actions:?}");
+        let (_, sent) = link.network_sent.expect("clear");
+        assert_eq!(sent.change(), Some(km43::NetChange::ClearUnwritten));
+    }
+
+    #[test]
+    fn l_137_a_failed_write_leaves_the_token_the_module_last_stated() {
+        let mut link = settled_on_the_fixture();
+        let _ = cache_states(&mut link, 1, Some(FOREIGN), at(2));
+        let (req_id, _) = link.network_sent.expect("push");
+        let _ = network_ack(&mut link, req_id, km43::NetConfig::NvsWriteFailed, 1);
+        let peer = link.peer().expect("peer");
+        assert_eq!(
+            (peer.net_version, peer.net_origin),
+            (Some(1), Some(FOREIGN)),
+            "flash still holds the other token, whatever RAM runs on"
+        );
+        let actions = cache_states(&mut link, 1, Some(FOREIGN), at(3));
+        assert!(pushed(&actions), "retried at the next LinkUp: {actions:?}");
+    }
+
+    #[test]
+    fn l_132_an_ack_at_another_version_leaves_no_token_to_trust() {
+        let (mut link, _, push) = push_after_link_up(network_fixture());
+        let _ = network_ack(&mut link, push.req_id, km43::NetConfig::NvsWriteFailed, 5);
+        let peer = link.peer().expect("peer");
+        assert_eq!((peer.net_version, peer.net_origin), (Some(5), None));
     }
 
     #[test]
@@ -2592,6 +2744,7 @@ mod tests {
         let mut link = up(at(0));
         let mut peer = *link.peer().expect("peer");
         peer.net_version = Some(1);
+        peer.net_origin = Some(ORIGIN);
         link.set_network(Some(network_fixture()));
         let mut actions = Actions::NONE;
         link.stated(
@@ -2856,6 +3009,7 @@ mod tests {
             hw: "comms",
             net_version: Some(0),
             device_id: None,
+            net_origin: None,
         }
         .write(link_header(LinkMessageType::LinkUpAck, req_id), &mut buf)
         .expect("fits");
@@ -3052,6 +3206,7 @@ mod tests {
             hw: "comms",
             net_version: Some(0),
             device_id: None,
+            net_origin: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(90)), &mut buf)
         .expect("fits");
@@ -3207,6 +3362,7 @@ mod tests {
             hw: "comms",
             net_version: Some(0),
             device_id: None,
+            net_origin: None,
         }
         .write(
             link_header(LinkMessageType::LinkUp, ReqId(req_id)),
@@ -3403,6 +3559,7 @@ mod tests {
             hw: "comms",
             net_version: Some(0),
             device_id: None,
+            net_origin: None,
         }
         .write(link_header(LinkMessageType::LinkUp, ReqId(40)), &mut buf)
         .expect("fits");

@@ -135,7 +135,8 @@ pub struct Keys {
     pub epoch_record: Kept<Epoch, EPOCH_BYTES>,
     /// The slots and the dedup table.
     pub clients: Clients,
-    /// Every challenge and every ephemeral key (P-237).
+    /// Every challenge, every ephemeral key and every network origin token
+    /// (P-237, L-138).
     pub generator: Generator,
     /// The pending invites, in RAM: every boot starts with none (P-253).
     pub invites: crate::Invites,
@@ -2643,7 +2644,7 @@ async fn set_config<F: Fram>(
     let ack = if authorised {
         match keys
             .configuration
-            .set(operation, &mut keys.network, fram)
+            .set(operation, &mut keys.network, &mut keys.generator, fram)
             .await
         {
             Ok(ack) => ack,
