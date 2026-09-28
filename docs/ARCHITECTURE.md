@@ -1172,7 +1172,11 @@ queue to the recorder, which owns the RTC and reads the newest timestamp from
 `Ring::floor` when the calendar is unknown. Each value retains its receipt tick
 and advances by the monotonic queue and scan delay before admission. A failed scan never becomes the build-time fallback. The first
 set must lie within ten Julian years of the floor; later offers may correct
-at most five seconds in either direction. The fifteen-minute acceptance limit
+at most five seconds in either direction. Before either bound and after the
+rate limit, an offer the RTC's 2000–2099 calendar cannot hold, as sent or as
+advanced, is refused `refused_implausible` (L-153); a calendar write that
+fails for a time it can hold is answered nothing, so the comms processor's
+retry can land. The fifteen-minute acceptance limit
 uses the monotonic tick and survives comms resets. Each accepted change writes
 KM43's `time set` body with the old value, new value and `ntp-via-comms` source.
 Records acquire timestamps once the calendar is known; earlier records stay
