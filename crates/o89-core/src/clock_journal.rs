@@ -202,7 +202,10 @@ impl ClockJournal {
     ///
     /// An unretained change has no marker a reset could repeat the record
     /// from, so the record that landed ends it even when the clean marker
-    /// does not read back either.
+    /// does not read back either. Were the marker stored and only its
+    /// read-back wrong, a reset repeats the record once, as any cut between
+    /// append and acknowledgement may; holding the change owed instead would
+    /// append it again on every retry.
     pub fn recorded<S: CalendarStore>(
         &mut self,
         store: &mut S,
@@ -425,6 +428,24 @@ mod tests {
                 assert_eq!(ClockJournal::load(&part).pending(), Some(change()));
             }
         }
+    }
+
+    /// The RTC refused the time and the clean marker put back after it did
+    /// not read back either: the clock is unknown now, as a reset finds it,
+    /// never the old value held in memory over a marker that says nothing
+    /// (P-267 rule 1).
+    #[test]
+    fn p_267_a_restore_that_does_not_read_back_leaves_the_clock_unknown() {
+        let (mut part, mut journal) = part(true);
+        let sets = part.sets;
+        part.cut = part.writes.saturating_add(CALENDAR_STEP);
+        assert_eq!(
+            journal.apply(&mut part, change()),
+            Err(JournalError::Calendar(()))
+        );
+        assert_eq!(part.sets, sets);
+        assert_eq!(journal, ClockJournal::UNKNOWN);
+        assert_eq!(ClockJournal::load(&part), ClockJournal::UNKNOWN);
     }
 
     /// The RTC took the time and the marker did not read back: the change
