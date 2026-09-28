@@ -24,6 +24,7 @@ use o89_core::mailbox::{
 use o89_core::{Address, Dropped, FRAM_BYTES, Fram, Refused};
 use probe_rs::probe::list::Lister;
 use probe_rs::{MemoryInterface, Permissions, Session, VectorCatchCondition};
+use zeroize::Zeroizing;
 
 /// The controller, as probe-rs names it.
 const TARGET: &str = "STM32G0B1RETx";
@@ -74,12 +75,14 @@ const LEASE_RENEW: Duration = Duration::from_secs(1);
 /// What the firmware answered.
 struct Answer {
     status: Status,
-    data: Vec<u8>,
+    /// Cleared on drop: a FRAM read of the controller key's, the
+    /// generator's or the transaction's record carries them (#242).
+    data: Zeroizing<Vec<u8>>,
 }
 
 impl Answer {
     /// The answer's data, if the status was good.
-    fn ok(self, what: &str) -> Result<Vec<u8>> {
+    fn ok(self, what: &str) -> Result<Zeroizing<Vec<u8>>> {
         match self.status {
             Status::Ok => Ok(self.data),
             Status::UnknownOp => bail!("{what}: the firmware does not know this operation"),
@@ -271,7 +274,7 @@ impl Link {
             .ok()
             .filter(|length| *length <= DATA_BYTES)
             .with_context(|| format!("an answer of {length} bytes, past the mailbox"))?;
-        let mut data = vec![0u8; length];
+        let mut data = Zeroizing::new(vec![0u8; length]);
         if length > 0 {
             core.read_8(field(offset::DATA), &mut data)?;
         }
@@ -374,6 +377,7 @@ impl Link {
         let (lo, hi) = RingPage::args(from);
         self.request(Op::ReadRing, lo, hi, &[])?
             .ok("reading the ring")
+            .map(|page| page.to_vec())
     }
 
     /// Erase the ring's oldest block, and say what that left.

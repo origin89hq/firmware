@@ -9,7 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-o89-core = { path = "../o89-core" }
+# With `zeroize`, so every copy of the controller key and the generator's
+# state the station reads or draws can be cleared (#242).
+o89-core = { path = "../o89-core", features = ["zeroize"] }
 anyhow.workspace = true
 clap.workspace = true
 # The CRC the module's bootloader recomputes over an `otadata` entry.
@@ -27,9 +29,10 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Clears the host's copies of the controller key, the generator's first state
-# and the printed secret; already in the tree through km43.
-zeroize = { version = "1", default-features = false }
+# Clears the host's copies of the controller key, the generator's state and
+# the printed secret; already in the tree through km43. `alloc` for the
+# station's reads of whole runs of the map, which hold both.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 # Terminal rendering only: no image or SVG dependencies. Host tool only.
 [dependencies.qrcode]

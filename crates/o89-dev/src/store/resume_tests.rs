@@ -3,6 +3,8 @@ use super::ledger::tests::{Scratch, exported, journaled};
 use super::*;
 use o89_core::{Address, Fram, SecretChange, Store};
 
+type Transaction = Kept<SecretChange, { o89_core::SECRET_CHANGE_BYTES }>;
+
 /// What a reboot request does to the fake part.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reboot {

@@ -1348,6 +1348,7 @@ dependencies = [
  "km43",
  "o89-link",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

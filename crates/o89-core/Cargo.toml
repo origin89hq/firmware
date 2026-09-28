@@ -12,6 +12,10 @@ publish.workspace = true
 # `defmt::Format` on every public type, for the controller's log. Off on the
 # host, where the tests read the types as Rust.
 defmt = ["dep:defmt", "km43/defmt", "o89-link/defmt"]
+# `zeroize::Zeroize` on the controller key, the generator's state and what
+# holds them, for the station, which clears its copies (#242). Only `o89-dev`
+# turns it on; the controller keeps its values in RAM and never needs it.
+zeroize = ["dep:zeroize"]
 
 [dependencies]
 # The link's mechanics, shared with the comms processor's core below both.
@@ -21,9 +25,14 @@ km43.workspace = true
 sha2.workspace = true
 embedded-storage-async.workspace = true
 defmt = { workspace = true, optional = true }
+# Already in the controller's graph through km43; the feature adds no package.
+zeroize = { version = "1", default-features = false, optional = true }
 
 [dev-dependencies]
 embassy-futures.workspace = true
+# The `zeroize` impls are built for the tests too, so they run without the
+# feature and wear no cfg but `test`.
+zeroize = { version = "1", default-features = false }
 
 [lints]
 workspace = true
