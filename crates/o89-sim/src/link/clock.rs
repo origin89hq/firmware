@@ -1,4 +1,5 @@
-//! The recorder seam for signed clock requests in the host bench.
+//! The recorder seam for clock writes in the host bench: a client's signed
+//! time here, and the calendar write an offer shares.
 use super::*;
 
 /// Recorder diagnostics only; the M5 concern records are not implemented yet.
@@ -14,7 +15,8 @@ pub(super) enum FloorOverride {
     Unarmed,
 }
 
-/// The RTC taking a client's time, or refusing a time it can hold.
+/// The RTC taking a client's or an offer's time, or refusing a time it can
+/// hold.
 #[derive(Clone, Copy)]
 pub(super) enum CalendarWrite {
     Lands,

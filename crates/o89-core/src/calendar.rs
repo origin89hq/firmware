@@ -3,6 +3,8 @@
 use crate::UnixMillis;
 
 const EPOCH_2000: u64 = 946_684_800_000;
+/// The first millisecond the calendar cannot hold: 2100-01-01T00:00:00Z.
+const EPOCH_2100: u64 = 4_102_444_800_000;
 const DAY_MS: u64 = 86_400_000;
 
 /// A calendar reading in the RTC's representable century.
@@ -32,6 +34,15 @@ fn month_days(year: u16, month: u8) -> Option<u64> {
 }
 
 impl Calendar {
+    /// Whether [`from_unix`](Self::from_unix) can convert `at`, answered in
+    /// constant time: admission decides it under the clock's critical
+    /// section, where the month walk would hold interrupts off for up to
+    /// its whole century (L-153, P-266).
+    #[must_use]
+    pub const fn holds(at: u64) -> bool {
+        EPOCH_2000 <= at && at < EPOCH_2100
+    }
+
     /// Convert milliseconds to the calendar's second precision. Refuse dates
     /// outside the hardware century rather than wrapping the year.
     #[must_use]
@@ -155,6 +166,21 @@ mod tests {
         for at in [946_684_799_999, 4_102_444_800_000, u64::MAX] {
             assert_eq!(Calendar::from_unix(UnixMillis::new(at).unwrap()), None);
         }
+    }
+
+    /// `holds` stands in for the conversion in admission, so it has to
+    /// agree with it on both sides of both edges.
+    #[test]
+    fn l_153_holds_agrees_with_the_conversion_at_both_edges() {
+        for at in [1, 946_684_799_999, 4_102_444_800_000, u64::MAX] {
+            assert!(!Calendar::holds(at));
+            assert_eq!(Calendar::from_unix(UnixMillis::new(at).unwrap()), None);
+        }
+        for at in [946_684_800_000, 1_709_164_800_000, 4_102_444_799_999] {
+            assert!(Calendar::holds(at));
+            assert!(Calendar::from_unix(UnixMillis::new(at).unwrap()).is_some());
+        }
+        assert!(!Calendar::holds(0));
     }
 
     #[test]

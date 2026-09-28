@@ -29,9 +29,9 @@ use km43::{
 };
 use o89_core::{
     Answered, BootCount, CUTS_RECORD_BYTES, Class, ClientSet, ClientWritten, CutsRecord, Keep,
-    KeepAnswer, Kept, LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake, OfferedTime,
-    Outgoing, RecentCuts, Ring, RingError, SCRATCH, Task, Tick, TimeAnswer, TimeAsked, UnixMillis,
-    WallClock, nor_map, time_expired,
+    KeepAnswer, Kept, LinkEvent, LogKnown, LogSpan, MAX_PAYLOAD, NotKept, OfferIntake,
+    OfferWritten, OfferedTime, Outgoing, RecentCuts, Ring, RingError, SCRATCH, Task, Tick,
+    TimeAnswer, TimeAsked, UnixMillis, WallClock, nor_map, time_expired,
 };
 
 use crate::fram::Lease;
@@ -679,9 +679,6 @@ fn process_offer(
         return OfferResult::Finished(None);
     }
     let now = Tick::from_millis(Instant::now().as_millis());
-    let Some(at) = offered.at(now) else {
-        return OfferResult::Finished(Some(TimeOffer::RefusedImplausible));
-    };
     let current = match calendar.read() {
         Ok(at) => at,
         Err(error) => {
@@ -689,20 +686,24 @@ fn process_offer(
             return OfferResult::Finished(None);
         }
     };
-    let change = match CLOCK.lock(|clock| clock.borrow_mut().offer(at, current, floor, now)) {
+    let change = match CLOCK.lock(|clock| clock.borrow_mut().offer(offered, current, floor, now)) {
         Ok(change) => change,
         Err(outcome) => return OfferResult::Finished(Some(outcome)),
     };
-    // `offer` refused a time the calendar cannot hold (L-153), so this write
-    // failing is not that refusal and is never answered outcome 2.
-    if let Err(error) = calendar.set(change) {
-        defmt::error!("clock: calendar write refused: {}", error);
-        return OfferResult::Finished(None);
-    }
+    let written = calendar.set(change);
     // No await between durable apply and retaining its completion. serve_time
     // refuses another offer while an audit is pending.
-    let _ = CLOCK.lock(|clock| clock.borrow_mut().applied(req_id, offered, change, now));
-    OfferResult::AwaitingAudit
+    match CLOCK.lock(|clock| {
+        clock
+            .borrow_mut()
+            .offer_written(req_id, offered, change, written, now)
+    }) {
+        OfferWritten::Applied { .. } => OfferResult::AwaitingAudit,
+        OfferWritten::Failed { error } => {
+            defmt::error!("clock: calendar write refused: {}", error);
+            OfferResult::Finished(None)
+        }
+    }
 }
 
 fn answer_client(ticket: u32, answer: TimeAnswer) {

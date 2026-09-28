@@ -45,6 +45,12 @@ impl OfferedTime {
     pub fn at(self, now: Tick) -> Option<u64> {
         self.at.checked_add(now.since(self.received)?.as_millis())
     }
+
+    /// The value as the offer carried it, before any queue delay.
+    #[must_use]
+    pub const fn sent(self) -> u64 {
+        self.at
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +127,26 @@ pub enum ClientWritten<E> {
         /// Error 7, never outcome 2: the same time may land on the next
         /// try, where one the clock cannot hold never will (P-266).
         answer: TimeAnswer,
+    },
+}
+
+/// An offer's accepted change once the adapter has tried to write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a landed write owes its audit and a failed one its release"]
+pub enum OfferWritten<E> {
+    /// The calendar holds the change and its audit is owed: `accepted` is
+    /// answered once the `time set` record lands (L-160).
+    Applied {
+        /// False when another change was already owed to the log, which
+        /// the recorder rules out before it decides.
+        retained: bool,
+    },
+    /// The RTC refused the write. Nothing is retained, L-151's window does
+    /// not start and no outcome is owed: not 2, because the same time may
+    /// land on the comms processor's retry (L-153).
+    Failed {
+        /// Why the write failed.
+        error: E,
     },
 }
 
@@ -244,7 +270,7 @@ impl WallClock {
     /// this decision (L-152, L-162).
     pub fn offer(
         &mut self,
-        at: u64,
+        offered: OfferedTime,
         current: Option<UnixMillis>,
         floor: UnixMillis,
         now: Tick,
@@ -254,10 +280,15 @@ impl WallClock {
         }
         // Neither the window nor the step cap keeps an offer inside the
         // RTC's century. Checked before the cap, whose answer sends the
-        // correction to a client `Time` that P-266 refuses too (L-153).
-        let new = UnixMillis::new(at)
-            .filter(|new| Calendar::from_unix(*new).is_some())
+        // correction to a client `Time` that P-266 refuses too, and on the
+        // value as sent as well as advanced: queue time can carry one sent
+        // before 2000 into it (L-153).
+        let new = offered
+            .at(now)
+            .filter(|at| Calendar::holds(offered.sent()) && Calendar::holds(*at))
+            .and_then(UnixMillis::new)
             .ok_or(TimeOffer::RefusedImplausible)?;
+        let at = new.as_millis();
         match current {
             Some(old) => {
                 if at.abs_diff(old.as_millis()) > OFFER_STEP {
@@ -332,7 +363,7 @@ impl WallClock {
     /// persist the same change in its calendar journal before calling this.
     /// An occupied audit slot refuses replacement, even after link loss.
     #[must_use]
-    pub fn applied(
+    fn applied(
         &mut self,
         req_id: ReqId,
         offered: OfferedTime,
@@ -349,6 +380,25 @@ impl WallClock {
             retry_at: Some(now),
         });
         true
+    }
+
+    /// Take the result of writing an offer's change to the calendar: retain
+    /// it and start L-151's window when it landed; when it failed, change
+    /// nothing and owe no outcome (L-153).
+    pub fn offer_written<E>(
+        &mut self,
+        req_id: ReqId,
+        offered: OfferedTime,
+        change: ClockChange,
+        written: Result<(), E>,
+        now: Tick,
+    ) -> OfferWritten<E> {
+        match written {
+            Ok(()) => OfferWritten::Applied {
+                retained: self.applied(req_id, offered, change, now),
+            },
+            Err(error) => OfferWritten::Failed { error },
+        }
     }
 
     /// Recover a retained calendar change after reset, without an old-link reply.
@@ -436,8 +486,7 @@ impl WallClock {
         }
         // The override has no lower bound and the RTC holds one century:
         // what the calendar cannot hold is refused before the clock moves.
-        let Some(new) = UnixMillis::new(at).filter(|new| Calendar::from_unix(*new).is_some())
-        else {
+        let Some(new) = UnixMillis::new(at).filter(|_| Calendar::holds(at)) else {
             return ClientSet::Rejected;
         };
         // A first set is not a step: there is nothing to subtract (P-115).
@@ -546,7 +595,7 @@ mod tests {
         assert_eq!(offered.at(now), Some(FLOOR + 30_000));
         for current in [None, Some(time(FLOOR + 30_000))] {
             let change = WallClock::new()
-                .offer(offered.at(now).unwrap(), current, time(FLOOR), now)
+                .offer(offered, current, time(FLOOR), now)
                 .unwrap();
             assert_eq!(change.new_value(), time(FLOOR + 30_000));
         }
@@ -555,7 +604,14 @@ mod tests {
     }
 
     fn applied(clock: &mut WallClock) -> ClockChange {
-        let change = clock.offer(FLOOR, None, time(FLOOR), Tick::ZERO).unwrap();
+        let change = clock
+            .offer(
+                OfferedTime::new(FLOOR, Tick::ZERO),
+                None,
+                time(FLOOR),
+                Tick::ZERO,
+            )
+            .unwrap();
         assert_eq!(
             clock.intake(ReqId(1), FLOOR, Tick::ZERO),
             OfferIntake::Queued
@@ -722,13 +778,23 @@ mod tests {
         let mut clock = WallClock::new();
         for at in [0, FLOOR - 1, FLOOR + PLAUSIBILITY_SPAN + 1, u64::MAX] {
             assert_eq!(
-                clock.offer(at, None, time(FLOOR), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    None,
+                    time(FLOOR),
+                    Tick::ZERO
+                ),
                 Err(TimeOffer::RefusedImplausible)
             );
         }
         for at in [FLOOR, FLOOR + PLAUSIBILITY_SPAN] {
             assert_eq!(
-                clock.offer(at, None, time(FLOOR), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    None,
+                    time(FLOOR),
+                    Tick::ZERO
+                ),
                 Ok(ClockChange {
                     old: None,
                     new: time(at),
@@ -744,13 +810,23 @@ mod tests {
         for at in [FLOOR - 5_000, FLOOR + 5_000] {
             assert!(
                 clock
-                    .offer(at, Some(time(FLOOR)), time(FLOOR + 10_000), Tick::ZERO)
+                    .offer(
+                        OfferedTime::new(at, Tick::ZERO),
+                        Some(time(FLOOR)),
+                        time(FLOOR + 10_000),
+                        Tick::ZERO
+                    )
                     .is_ok()
             );
         }
         for at in [FLOOR - 5_001, FLOOR + 5_001] {
             assert_eq!(
-                clock.offer(at, Some(time(FLOOR)), time(FLOOR), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    Some(time(FLOOR)),
+                    time(FLOOR),
+                    Tick::ZERO
+                ),
                 Err(TimeOffer::RefusedStepTooLarge)
             );
         }
@@ -762,14 +838,24 @@ mod tests {
         clock.offer_applied(Tick::from_millis(100));
         for now in [0, 100, 900_099] {
             assert_eq!(
-                clock.offer(FLOOR, None, time(FLOOR), Tick::from_millis(now)),
+                clock.offer(
+                    OfferedTime::new(FLOOR, Tick::from_millis(now)),
+                    None,
+                    time(FLOOR),
+                    Tick::from_millis(now)
+                ),
                 Err(TimeOffer::RefusedRateLimited)
             );
         }
         assert_eq!(clock.rate_refusals(), 3);
         assert!(
             clock
-                .offer(FLOOR, None, time(FLOOR), Tick::from_millis(900_100))
+                .offer(
+                    OfferedTime::new(FLOOR, Tick::from_millis(900_100)),
+                    None,
+                    time(FLOOR),
+                    Tick::from_millis(900_100)
+                )
                 .is_ok()
         );
     }
@@ -779,7 +865,12 @@ mod tests {
         let mut clock = WallClock::new();
         for old in [None, Some(time(FLOOR))] {
             let change = clock
-                .offer(FLOOR + 1, old, time(FLOOR), Tick::ZERO)
+                .offer(
+                    OfferedTime::new(FLOOR + 1, Tick::ZERO),
+                    old,
+                    time(FLOOR),
+                    Tick::ZERO,
+                )
                 .unwrap();
             assert_eq!(
                 change.record(),
@@ -798,22 +889,20 @@ mod tests {
         }
     }
 
+    /// A floor past the clock's century refuses every first set: what the
+    /// calendar can hold is below it, and what is not below it the calendar
+    /// cannot hold.
     #[test]
-    fn failed_calendar_write_does_not_start_the_limit() {
-        let mut clock = WallClock::new();
-        assert!(clock.offer(FLOOR, None, time(FLOOR), Tick::ZERO).is_ok());
-        assert!(clock.offer(FLOOR, None, time(FLOOR), Tick::ZERO).is_ok());
-        assert_eq!(clock.rate_refusals(), 0);
-    }
-
-    /// A floor near the integer limit refuses every offer the calendar can
-    /// hold as below it; the window's arithmetic does not wrap to let one in.
-    #[test]
-    fn l_140_window_near_integer_limit_does_not_wrap() {
+    fn l_140_l_153_a_floor_past_the_clock_century_refuses_every_first_set() {
         let mut clock = WallClock::new();
         for at in [1, CENTURY_START, CENTURY_END, u64::MAX] {
             assert_eq!(
-                clock.offer(at, None, time(u64::MAX - 1), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    None,
+                    time(u64::MAX - 1),
+                    Tick::ZERO
+                ),
                 Err(TimeOffer::RefusedImplausible)
             );
         }
@@ -953,29 +1042,35 @@ mod tests {
         }
     }
 
-    /// Refused, and nothing moved: the next in-range offer at the same tick
-    /// is taken, so L-151's window did not start, and the refusal was not
-    /// counted as a rate refusal.
-    fn assert_refused_implausible(
-        clock: &mut WallClock,
+    /// An offer at `at` and then one at `next`, both at the same tick, on a
+    /// fresh clock: the refusal's answer, the rate refusals it counted, and
+    /// the next offer's answer, which is taken only if the refusal moved
+    /// nothing and started no window.
+    fn refused_then(
         at: u64,
         current: Option<UnixMillis>,
         floor: UnixMillis,
         next: u64,
+    ) -> (
+        Result<ClockChange, TimeOffer>,
+        u64,
+        Result<ClockChange, TimeOffer>,
     ) {
-        assert_eq!(
-            clock.offer(at, current, floor, Tick::ZERO),
-            Err(TimeOffer::RefusedImplausible)
-        );
-        assert_eq!(clock.rate_refusals(), 0);
-        assert_eq!(
-            clock.offer(next, current, floor, Tick::ZERO),
-            Ok(ClockChange {
-                old: current,
-                new: time(next),
-                source: TimeSource::NtpViaComms,
-            })
-        );
+        let mut clock = WallClock::new();
+        let offer = |clock: &mut WallClock, at| {
+            clock.offer(OfferedTime::new(at, Tick::ZERO), current, floor, Tick::ZERO)
+        };
+        let refused = offer(&mut clock, at);
+        let refusals = clock.rate_refusals();
+        (refused, refusals, offer(&mut clock, next))
+    }
+
+    fn taken(current: Option<UnixMillis>, at: u64) -> ClockChange {
+        ClockChange {
+            old: current,
+            new: time(at),
+            source: TimeSource::NtpViaComms,
+        }
     }
 
     /// A floor in 2095 opens L-140's window to 2105, and one before 2000
@@ -985,20 +1080,22 @@ mod tests {
     fn l_153_a_first_set_outside_the_clock_century_is_refused_implausible() {
         let late = time(3_944_678_400_000);
         assert!(CENTURY_END + 1 - late.as_millis() < PLAUSIBILITY_SPAN);
-        assert_refused_implausible(
-            &mut WallClock::new(),
-            CENTURY_END + 1,
-            None,
-            late,
-            CENTURY_END,
+        assert_eq!(
+            refused_then(CENTURY_END + 1, None, late, CENTURY_END),
+            (
+                Err(TimeOffer::RefusedImplausible),
+                0,
+                Ok(taken(None, CENTURY_END))
+            )
         );
         let early = time(CENTURY_START - 1_000_000);
-        assert_refused_implausible(
-            &mut WallClock::new(),
-            CENTURY_START - 1,
-            None,
-            early,
-            CENTURY_START,
+        assert_eq!(
+            refused_then(CENTURY_START - 1, None, early, CENTURY_START),
+            (
+                Err(TimeOffer::RefusedImplausible),
+                0,
+                Ok(taken(None, CENTURY_START))
+            )
         );
     }
 
@@ -1006,19 +1103,123 @@ mod tests {
     /// first of 2000 step across the century's edge; L-153 does not.
     #[test]
     fn l_153_a_correction_across_either_century_edge_is_refused_implausible() {
-        assert_refused_implausible(
-            &mut WallClock::new(),
-            4_102_444_801_000,
-            Some(time(4_102_444_798_000)),
-            time(FLOOR),
-            CENTURY_END,
+        let late = Some(time(4_102_444_798_000));
+        assert_eq!(
+            refused_then(4_102_444_801_000, late, time(FLOOR), CENTURY_END),
+            (
+                Err(TimeOffer::RefusedImplausible),
+                0,
+                Ok(taken(late, CENTURY_END))
+            )
         );
-        assert_refused_implausible(
-            &mut WallClock::new(),
-            946_684_799_000,
-            Some(time(946_684_801_000)),
-            time(FLOOR),
-            CENTURY_START,
+        let early = Some(time(946_684_801_000));
+        assert_eq!(
+            refused_then(946_684_799_000, early, time(FLOOR), CENTURY_START),
+            (
+                Err(TimeOffer::RefusedImplausible),
+                0,
+                Ok(taken(early, CENTURY_START))
+            )
+        );
+    }
+
+    /// The range binds the value as sent: queue time that carries one sent
+    /// before 2000 into the century does not make it an offer the clock can
+    /// hold. One sent inside it and carried past 2099 is refused too.
+    #[test]
+    fn l_153_queue_time_does_not_carry_an_offer_into_or_out_of_range_unrefused() {
+        let received = Tick::ZERO;
+        let now = Tick::from_millis(2);
+        let early = Some(time(CENTURY_START + 1_000));
+        let mut clock = WallClock::new();
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(CENTURY_START - 1, received),
+                early,
+                time(FLOOR),
+                now
+            ),
+            Err(TimeOffer::RefusedImplausible)
+        );
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(CENTURY_START, received),
+                early,
+                time(FLOOR),
+                now
+            ),
+            Ok(taken(early, CENTURY_START + 2))
+        );
+        let late = Some(time(CENTURY_END - 1_000));
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(CENTURY_END - 1, received),
+                late,
+                time(FLOOR),
+                now
+            ),
+            Err(TimeOffer::RefusedImplausible)
+        );
+        assert_eq!(clock.rate_refusals(), 0);
+    }
+
+    /// An offer queued behind an accepted one and processed inside its
+    /// window is rate limited even when its queue-advanced time overflows,
+    /// and counted.
+    #[test]
+    fn l_151_l_153_a_queued_offer_whose_advance_overflows_is_still_rate_limited() {
+        let mut clock = WallClock::new();
+        clock.offer_applied(Tick::ZERO);
+        let now = Tick::from_millis(10);
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(u64::MAX, Tick::ZERO),
+                None,
+                time(FLOOR),
+                now
+            ),
+            Err(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(clock.rate_refusals(), 1);
+        let mut clock = WallClock::new();
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(u64::MAX, Tick::ZERO),
+                None,
+                time(FLOOR),
+                now
+            ),
+            Err(TimeOffer::RefusedImplausible)
+        );
+    }
+
+    /// A write the RTC refuses for a time it can hold is not L-153's
+    /// refusal: no outcome is owed, nothing is retained, and L-151's window
+    /// does not start, so the retry lands and then does start it.
+    #[test]
+    fn l_153_a_failed_calendar_write_owes_no_outcome_and_starts_nothing() {
+        let mut clock = WallClock::new();
+        let offered = OfferedTime::new(FLOOR, Tick::ZERO);
+        let change = clock
+            .offer(offered, None, time(FLOOR), Tick::ZERO)
+            .expect("in range");
+        assert_eq!(
+            clock.offer_written(ReqId(1), offered, change, Err("rtc"), Tick::ZERO),
+            OfferWritten::Failed { error: "rtc" }
+        );
+        assert!(!clock.audit_pending());
+        assert_eq!(clock.audit_due(Tick::ZERO), None);
+        let change = clock
+            .offer(offered, None, time(FLOOR), Tick::ZERO)
+            .expect("no window started");
+        assert_eq!(
+            clock.offer_written(ReqId(1), offered, change, Ok::<(), &str>(()), Tick::ZERO),
+            OfferWritten::Applied { retained: true }
+        );
+        assert_eq!(clock.audit_due(Tick::ZERO), Some(change));
+        assert_eq!(
+            clock.offer(offered, None, time(FLOOR), Tick::ZERO),
+            Err(TimeOffer::RefusedRateLimited)
         );
     }
 
@@ -1032,7 +1233,12 @@ mod tests {
             (CENTURY_START - 1, Some(time(CENTURY_START + 1_000))),
         ] {
             assert_eq!(
-                clock.offer(at, current, time(FLOOR), Tick::from_millis(1)),
+                clock.offer(
+                    OfferedTime::new(at, Tick::from_millis(1)),
+                    current,
+                    time(FLOOR),
+                    Tick::from_millis(1)
+                ),
                 Err(TimeOffer::RefusedRateLimited)
             );
         }
@@ -1047,20 +1253,30 @@ mod tests {
         let known = Some(time(CENTURY_END - 1_000));
         for at in [CENTURY_END + 10_000, u64::MAX] {
             assert_eq!(
-                clock.offer(at, known, time(FLOOR), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    known,
+                    time(FLOOR),
+                    Tick::ZERO
+                ),
                 Err(TimeOffer::RefusedImplausible)
             );
         }
         let known = Some(time(CENTURY_START + 1_000));
         for at in [0, CENTURY_START - 10_000] {
             assert_eq!(
-                clock.offer(at, known, time(FLOOR), Tick::ZERO),
+                clock.offer(
+                    OfferedTime::new(at, Tick::ZERO),
+                    known,
+                    time(FLOOR),
+                    Tick::ZERO
+                ),
                 Err(TimeOffer::RefusedImplausible)
             );
         }
         assert_eq!(
             clock.offer(
-                CENTURY_END - 10_000,
+                OfferedTime::new(CENTURY_END - 10_000, Tick::ZERO),
                 Some(time(CENTURY_END - 1_000)),
                 time(FLOOR),
                 Tick::ZERO

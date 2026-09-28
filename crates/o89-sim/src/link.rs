@@ -753,17 +753,37 @@ impl Bench {
                                 .unwrap()
                             });
                             let floor = o89_core::UnixMillis::new(1_700_000_000_000).unwrap();
-                            let outcome = match self.clock.offer(*unix_ms, current, floor, self.now)
+                            let offered = o89_core::OfferedTime::new(*unix_ms, self.now);
+                            let outcome = match self.clock.offer(offered, current, floor, self.now)
                             {
                                 Ok(change) => {
-                                    self.calendar = Some((change.new_value(), self.now));
-                                    self.clock_records.push(change.record());
-                                    self.clock.offer_applied(self.now);
-                                    km43::TimeOffer::Accepted
+                                    // The recorder seam, as for a client's
+                                    // time: the calendar write lands or is
+                                    // refused, and the audit lands at once.
+                                    let written = match self.calendar_write {
+                                        clock::CalendarWrite::Lands => Ok(()),
+                                        clock::CalendarWrite::Refused => Err(()),
+                                    };
+                                    match self
+                                        .clock
+                                        .offer_written(*req_id, offered, change, written, self.now)
+                                    {
+                                        o89_core::OfferWritten::Failed { .. } => None,
+                                        o89_core::OfferWritten::Applied { retained } => {
+                                            assert!(retained);
+                                            self.calendar = Some((change.new_value(), self.now));
+                                            self.clock_records.push(change.record());
+                                            assert!(self.clock.audit_written(self.now).is_some());
+                                            Some(km43::TimeOffer::Accepted)
+                                        }
+                                    }
                                 }
-                                Err(outcome) => outcome,
+                                Err(outcome) => Some(outcome),
                             };
-                            pending.push_back(self.endpoint.link.time_verdict(*req_id, outcome));
+                            if let Some(outcome) = outcome {
+                                pending
+                                    .push_back(self.endpoint.link.time_verdict(*req_id, outcome));
+                            }
                         }
                         Action::RecordWifi(record) => {
                             self.endpoint.link.wifi.recorded(*record, self.now);
@@ -2148,6 +2168,50 @@ fn l_153_an_offer_past_the_clock_century_is_answered_implausible_over_the_link()
     let bytes = bench
         .comms
         .offer_time(4_102_444_799_999, bench.now)
+        .expect("the peer builds it");
+    bench.feed(&bytes);
+    assert!(matches!(
+        bench.sent(is_time_verdict).last(),
+        Some((
+            _,
+            Outgoing::TimeVerdict {
+                outcome: km43::TimeOffer::Accepted,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(bench.clock_records.len(), 1);
+}
+
+/// A calendar write that fails for a time the RTC can hold is answered
+/// nothing, never outcome 2, and starts no window: the offer sent again
+/// lands.
+#[test]
+fn l_153_an_offer_whose_calendar_write_fails_is_not_answered_implausible() {
+    // Capabilities: none.
+    let mut bench = Bench::new(Capabilities::default());
+    bench.run_for(Millis::from_millis(1_000));
+    bench.calendar_write = clock::CalendarWrite::Refused;
+    let before = bench.sent(is_time_verdict).len();
+    let bytes = bench
+        .comms
+        .offer_time(1_800_000_000_000, bench.now)
+        .expect("the peer builds it");
+    bench.feed(&bytes);
+    assert_eq!(bench.sent(is_time_verdict).len(), before);
+    assert!(
+        !bench
+            .comms
+            .heard
+            .iter()
+            .any(|h| matches!(h, Heard::Other { opcode: 0xE6, .. }))
+    );
+    assert_eq!(bench.calendar, None);
+    assert!(bench.clock_records.is_empty());
+    bench.calendar_write = clock::CalendarWrite::Lands;
+    let bytes = bench
+        .comms
+        .offer_time(1_800_000_000_000, bench.now)
         .expect("the peer builds it");
     bench.feed(&bytes);
     assert!(matches!(
