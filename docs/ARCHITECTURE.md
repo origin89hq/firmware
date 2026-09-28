@@ -295,7 +295,8 @@ than send the unit out with a copy of its state beside the generator. Physical
 authorisation is the probe on the bench; the station keeps no copy of the
 state. Its own bindings of the controller key and the state, drawn or read
 back, are cleared on every return (#242); a compiler's temporary copies, the
-probe's transport buffers and the host's paging are outside that.
+slot bodies the record read fills, the probe's transport buffers and the
+host's paging are outside that.
 
 **Manufacture is one transaction.** `o89-dev store write-secret` draws the
 printed secret and, on a unit that holds neither, the controller key and the

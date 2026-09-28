@@ -78,11 +78,12 @@ impl zeroize::Zeroize for Birth {
 
 #[cfg(any(test, feature = "zeroize"))]
 impl SecretChange {
-    /// Clear every secret the variant holds, where it is, and leave the
-    /// variant: the step before [`zeroize`](zeroize::Zeroize::zeroize)
-    /// makes it `Complete`, which writes the tag and nothing else. The
-    /// fingerprint `Applied` holds is public and stays.
-    fn clear_in_place(&mut self) {
+    /// Clear every secret the variant holds, where it is, show the cleared
+    /// value to `cleared`, then become `Complete`, which writes the tag and
+    /// nothing else. [`zeroize`](zeroize::Zeroize::zeroize) is this with
+    /// nothing shown; a test shows it the payload the tag would hide. The
+    /// fingerprint `Applied` holds is public and stays until the tag.
+    fn clear_then_complete(&mut self, cleared: impl FnOnce(&Self)) {
         use zeroize::Zeroize as _;
         match self {
             Self::Complete => {}
@@ -95,6 +96,8 @@ impl SecretChange {
             Self::Applied(secret, _fingerprint) => secret.zeroize(),
             Self::Reseed(state) => state.zeroize(),
         }
+        cleared(self);
+        *self = Self::Complete;
     }
 }
 
@@ -103,8 +106,7 @@ impl SecretChange {
 #[cfg(any(test, feature = "zeroize"))]
 impl zeroize::Zeroize for SecretChange {
     fn zeroize(&mut self) {
-        self.clear_in_place();
-        *self = Self::Complete;
+        self.clear_then_complete(|_| {});
     }
 }
 
@@ -554,11 +556,20 @@ mod zeroize_tests {
         assert_eq!(birth.drbg.encode(), [0; DRBG_BYTES]);
     }
 
+    /// What `zeroize` leaves under the tag: the payload once cleared, as the
+    /// clear shows it before the variant becomes `Complete`.
+    fn cleared_payload(mut change: SecretChange) -> SecretChange {
+        let mut seen = None;
+        change.clear_then_complete(|cleared| seen = Some(*cleared));
+        assert!(matches!(change, SecretChange::Complete));
+        seen.expect("the clear shows what it cleared")
+    }
+
     #[test]
     fn a_cleared_pending_birth_clears_its_secret_key_and_state_in_place() {
-        let mut change = SecretChange::Pending(secret(), Some(birth()));
-        change.clear_in_place();
-        let SecretChange::Pending(secret, Some(birth)) = change else {
+        let SecretChange::Pending(secret, Some(birth)) =
+            cleared_payload(SecretChange::Pending(secret(), Some(birth())))
+        else {
             panic!("clearing in place keeps the variant");
         };
         assert_eq!(secret.encode(), [0; SECRET_BYTES]);
@@ -577,12 +588,11 @@ mod zeroize_tests {
 
     #[test]
     fn a_cleared_reseed_clears_its_state_in_place_then_encodes_to_zeros() {
-        let mut change = SecretChange::Reseed(state());
-        change.clear_in_place();
-        let SecretChange::Reseed(cleared) = change else {
+        let SecretChange::Reseed(cleared) = cleared_payload(SecretChange::Reseed(state())) else {
             panic!("clearing in place keeps the variant");
         };
         assert_eq!(cleared.encode(), [0; DRBG_BYTES]);
+        let mut change = SecretChange::Reseed(state());
         change.zeroize();
         assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
     }
@@ -590,13 +600,14 @@ mod zeroize_tests {
     #[test]
     fn a_cleared_applied_transaction_clears_its_secret_and_keeps_the_public_fingerprint() {
         let fingerprint = key().fingerprint();
-        let mut change = SecretChange::Applied(secret(), fingerprint);
-        change.clear_in_place();
-        let SecretChange::Applied(secret, kept) = change else {
+        let SecretChange::Applied(secret, kept) =
+            cleared_payload(SecretChange::Applied(secret(), fingerprint))
+        else {
             panic!("clearing in place keeps the variant");
         };
         assert_eq!(secret.encode(), [0; SECRET_BYTES]);
         assert_eq!(kept, fingerprint);
+        let mut change = SecretChange::Applied(secret, fingerprint);
         change.zeroize();
         assert_eq!(change.encode(), [0; SECRET_CHANGE_BYTES]);
     }

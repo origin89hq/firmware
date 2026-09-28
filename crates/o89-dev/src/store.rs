@@ -15,9 +15,10 @@
 //!
 //! Every binding here that holds the controller key or the generator's
 //! state, drawn or read back, is `Zeroizing` and cleared on every return
-//! (#242). That reaches the station's own bindings; not a compiler's
-//! temporary copy of a `Copy` value, the probe's transport buffers, or the
-//! operating system's paging.
+//! (#242), and so is each mailbox answer the link reads them in. That
+//! reaches the station's own bindings; not a compiler's temporary copy of a
+//! `Copy` value, the two slot bodies `o89-core`'s record read fills, the
+//! probe's transport buffers, or the operating system's paging.
 //!
 //! The station also keeps the public half of what it made (P-249): before a
 //! transaction is staged it journals it, for a birth the device id with the
@@ -136,6 +137,8 @@ fn show_into(
     Ok(())
 }
 
+/// A record that holds the controller key or the generator's state, or a
+/// transaction that can, is read with [`read_zeroizing`] instead.
 fn read<T: Body<N>, const N: usize>(
     link: &mut impl o89_core::Fram<Error = anyhow::Error>,
     record: o89_core::Record<N>,
