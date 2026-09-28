@@ -162,8 +162,18 @@ impl PairingReports {
 
     /// The link fell because the revisions ran out: it stays down for the
     /// rest of the boot (L-195).
-    pub(crate) fn retire(&mut self) {
+    fn retire(&mut self) {
         self.next = Revisions::Retired;
+    }
+
+    /// The link fell with the last revision used: the next link-up would
+    /// owe a report no revision is left to number, so the link stays down
+    /// for the rest of the boot as if the report had been owed now (L-195).
+    /// With revisions left, nothing changes.
+    pub(crate) fn fell(&mut self) {
+        if matches!(self.next, Revisions::Exhausted) {
+            self.retire();
+        }
     }
 
     /// Whether the link fell for want of a revision.
@@ -345,5 +355,40 @@ mod tests {
             Some(last),
             "the last is untouched"
         );
+    }
+
+    #[test]
+    fn l_195_a_fall_after_the_last_revision_retires_the_rest() {
+        let mut reports = PairingReports::new();
+        reports.skip_to(NonZeroU64::MAX);
+        reports.linked();
+        let _ = build(&mut reports, ReqId(1), at(0)).expect("the last revision");
+        assert!(!reports.retired());
+        reports.fell();
+        assert!(reports.retired());
+        assert_eq!(reports.prepare(at(0)), Err(Unbuilt::Spent));
+    }
+
+    #[test]
+    fn l_195_a_fall_with_revisions_left_retires_nothing() {
+        let mut reports = PairingReports::new();
+        reports.fell();
+        assert!(!reports.retired(), "none used");
+        reports.skip_to(NonZeroU64::MAX);
+        reports.fell();
+        assert!(!reports.retired(), "the last still unused");
+        reports.linked();
+        let last = build(&mut reports, ReqId(2), at(0)).expect("the last revision");
+        assert_eq!(last.revision(), NonZeroU64::MAX);
+    }
+
+    #[test]
+    fn l_195_a_fall_once_retired_stays_retired() {
+        let mut reports = PairingReports::new();
+        reports.retire();
+        reports.fell();
+        assert!(reports.retired());
+        reports.linked();
+        assert_eq!(reports.prepare(at(0)), Err(Unbuilt::Spent));
     }
 }
