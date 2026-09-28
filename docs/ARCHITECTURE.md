@@ -1203,7 +1203,11 @@ memory until its record lands, so a reset before then finds the calendar
 unknown and owes nothing; that record ends the change even if the clean marker
 fails too. An applied change waits for its audit append, retried at most once a
 second. No later offer or client write is applied until that audit lands, and a
-client's `accepted` waits for it. A pending audit whose marker was committed
+client's `accepted` waits for it; nothing else does. The recorder decides what
+arrives meanwhile straight away: a client's `Time` is answered error 7 whatever
+P-118's window says (P-267 rule 2), and an offer `refused_rate_limited` after
+L-151 and L-153 and before L-150, not counted under L-151 and starting no window
+(L-154). A pending audit whose marker was committed
 survives link loss and controller reset. A reset between append and journal acknowledgement may repeat
 the original audit record, without applying the change again. Acceptance is
 returned only after both writes succeed and remains replayable for the protocol's
