@@ -1,6 +1,8 @@
 //! The calendar's retained audit: five backup words, with the marker committed
 //! last. A reset before that marker leaves the clock unknown; a reset after it
 //! recovers the exact old/new values without applying the calendar again.
+//!
+//! cites: P-111, P-267
 
 use km43::TimeSource;
 
@@ -24,6 +26,8 @@ pub trait CalendarStore {
     /// Write a retained word. The journal verifies every write by reading it.
     fn write_word(&mut self, index: usize, value: u32);
     /// Set the calendar's whole seconds; the journal retains its fraction.
+    /// An error means the calendar was not changed: the journal puts the
+    /// clock it had back on the strength of it (P-267 rule 1).
     fn set_calendar(&mut self, at: UnixMillis) -> Result<(), Self::Error>;
 }
 
@@ -47,6 +51,7 @@ pub enum JournalError<E> {
 pub struct ClockJournal {
     fraction: Option<u32>,
     pending: Option<ClockChange>,
+    unretained: bool,
 }
 
 impl ClockJournal {
@@ -54,6 +59,7 @@ impl ClockJournal {
     pub const UNKNOWN: Self = Self {
         fraction: None,
         pending: None,
+        unretained: false,
     };
 
     /// Recover only a complete marker and, when pending, valid timestamps.
@@ -93,6 +99,7 @@ impl ClockJournal {
         Some(Self {
             fraction: Some(fraction),
             pending,
+            unretained: false,
         })
     }
 
@@ -108,9 +115,26 @@ impl ClockJournal {
         self.pending
     }
 
+    /// Whether the change owed to the log is held by this boot alone, its
+    /// marker not read back: a reset before its record lands finds no clock
+    /// and owes nothing.
+    #[must_use]
+    pub const fn unretained(self) -> bool {
+        self.unretained
+    }
+
     /// Invalidate, retain both timestamps, set the calendar, then commit the
     /// pending marker. Every retained write is verified. A cut leaves either
     /// the old valid state, an unknown clock, or the new recoverable audit.
+    ///
+    /// A write the calendar did not take spends nothing: the journal goes
+    /// back to the clock it had, still known, and the error is returned
+    /// (P-267 rule 1). Once the calendar has taken the time the change
+    /// stands, and a marker that does not read back still returns `Ok`
+    /// with the change pending here, so its record is owed and no other
+    /// change applies before it lands (P-267 rule 2). Until
+    /// [`recorded`](Self::recorded) commits the new clock, a reset finds
+    /// it unknown, as one at the same step would.
     pub fn apply<S: CalendarStore>(
         &mut self,
         store: &mut S,
@@ -129,34 +153,67 @@ impl ClockJournal {
                 .ok_or(JournalError::InvalidDate)?,
         )
         .map_err(|_| JournalError::InvalidDate)?;
-        put(store, 0, 0)?;
-        *self = Self::UNKNOWN;
-        let old = change.old().map_or(0, UnixMillis::as_millis);
-        write_time(store, 1, 2, old)?;
-        write_time(store, 3, 4, at.as_millis())?;
-        store.set_calendar(at).map_err(JournalError::Calendar)?;
+        if let Err(error) = Self::set(store, change, at) {
+            self.restore(store);
+            return Err(error);
+        }
         let marker = match change.source() {
             TimeSource::NtpViaComms => PENDING,
             TimeSource::Client => PENDING_CLIENT,
         };
-        put(store, 0, marker | fraction)?;
+        // The calendar moved: a marker that did not read back leaves the
+        // record owed, not the write undone.
         *self = Self {
             fraction: Some(fraction),
             pending: Some(change),
+            unretained: put(store, 0, marker | fraction).is_err(),
         };
         Ok(())
+    }
+
+    /// Everything up to and including the calendar write.
+    fn set<S: CalendarStore>(
+        store: &mut S,
+        change: ClockChange,
+        at: UnixMillis,
+    ) -> Result<(), JournalError<S::Error>> {
+        put(store, 0, 0)?;
+        let old = change.old().map_or(0, UnixMillis::as_millis);
+        write_time(store, 1, 2, old)?;
+        write_time(store, 3, 4, at.as_millis())?;
+        store.set_calendar(at).map_err(JournalError::Calendar)
+    }
+
+    /// Put back the clean marker for the clock held before a write the
+    /// calendar did not take. A marker that does not read back leaves the
+    /// clock unknown, as a reset would find it.
+    fn restore<S: CalendarStore>(&mut self, store: &mut S) {
+        let Some(fraction) = self.fraction else {
+            return;
+        };
+        if put(store, 0, CLEAN | fraction).is_err() {
+            *self = Self::UNKNOWN;
+        }
     }
 
     /// Clear the pending marker only after the log append succeeded. A cut
     /// between append and acknowledgement can repeat the record after reset,
     /// but never loses it or applies the clock a second time.
+    ///
+    /// An unretained change has no marker a reset could repeat the record
+    /// from, so the record that landed ends it even when the clean marker
+    /// does not read back either.
     pub fn recorded<S: CalendarStore>(
         &mut self,
         store: &mut S,
     ) -> Result<(), JournalError<S::Error>> {
         let fraction = self.fraction.ok_or(JournalError::InvalidDate)?;
-        put(store, 0, CLEAN | fraction)?;
+        let cleaned = put(store, 0, CLEAN | fraction);
+        if !self.unretained {
+            cleaned?;
+        }
         self.pending = None;
+        self.unretained = false;
         Ok(())
     }
 }
@@ -201,7 +258,11 @@ mod tests {
         words: [u32; CLOCK_BACKUP_WORDS],
         calendar: Option<UnixMillis>,
         writes: usize,
+        /// Power lost at this step: it and every later one do not happen.
         cut: usize,
+        /// This one step fails, a word reading back other than written,
+        /// and the part carries on.
+        fail: Option<usize>,
         sets: usize,
     }
     impl Part {
@@ -211,13 +272,14 @@ mod tests {
                 calendar: None,
                 writes: 0,
                 cut,
+                fail: None,
                 sets: 0,
             }
         }
         fn step(&mut self) -> bool {
             let before = self.writes;
             self.writes = self.writes.saturating_add(1);
-            before < self.cut
+            before < self.cut && self.fail != Some(before)
         }
     }
     impl CalendarStore for Part {
@@ -226,8 +288,11 @@ mod tests {
             self.words.get(index).copied()
         }
         fn write_word(&mut self, index: usize, value: u32) {
+            let step = self.writes;
             if self.step() {
                 self.words[index] = value;
+            } else if self.fail == Some(step) {
+                self.words[index] = !value;
             }
         }
         fn set_calendar(&mut self, at: UnixMillis) -> Result<(), ()> {
@@ -247,22 +312,149 @@ mod tests {
         )
     }
 
+    /// Steps in a write that lands: the invalidation, four timestamp
+    /// words, the calendar, then the marker.
+    const CALENDAR_STEP: usize = 5;
+    const MARKER_STEP: usize = 6;
+    const WRITE_STEPS: usize = 7;
+    /// The fraction of the clock a part holds before `change()`.
+    const KEPT_FRACTION: u32 = 456;
+
+    /// A part whose clock was never set, its marker neither clean nor
+    /// pending, or one known at `KEPT_FRACTION` with its record landed.
+    fn part(known: bool) -> (Part, ClockJournal) {
+        let mut part = Part::new(usize::MAX);
+        let mut journal = ClockJournal::UNKNOWN;
+        if known {
+            let first = ClockChange::recovered(
+                None,
+                UnixMillis::new(1_799_999_999_456).unwrap(),
+                TimeSource::Client,
+            );
+            journal
+                .apply(&mut part, first)
+                .expect("the part takes the first set");
+            journal.recorded(&mut part).expect("its record lands");
+            assert_eq!(journal.fraction(), Some(KEPT_FRACTION));
+        } else {
+            part.words[0] = u32::MAX;
+        }
+        assert_eq!(ClockJournal::load(&part), journal);
+        (part, journal)
+    }
+
+    /// A reset at every step of a write, from a clock never set and from
+    /// one known. Either the calendar kept its time, the write is an error
+    /// the controller answers busy, and a reboot finds the old clock or
+    /// none; or the calendar took the new time, the change stands, and a
+    /// reboot finds it owed to the log or no clock at all. Never a moved
+    /// calendar under a clean marker: that is a change whose record is
+    /// lost (P-267).
     #[test]
-    fn every_cut_before_commit_leaves_unknown_or_recoverable_audit() {
-        for cut in 0..=7 {
-            let mut part = Part::new(cut);
-            let mut journal = ClockJournal::UNKNOWN;
-            let result = journal.apply(&mut part, change());
-            let recovered = ClockJournal::load(&part);
-            if cut == 7 {
-                assert_eq!(result, Ok(()));
-                assert_eq!(recovered.pending(), Some(change()));
-                assert_eq!(recovered.fraction(), Some(123));
-                assert_eq!(part.calendar, Some(change().new_value()));
-            } else {
-                assert!(result.is_err());
-                assert_eq!(recovered, ClockJournal::UNKNOWN);
+    fn p_267_a_reset_at_every_step_keeps_the_old_clock_or_owes_the_change() {
+        for known in [false, true] {
+            for step in 0..=WRITE_STEPS {
+                let (mut part, mut journal) = part(known);
+                let before = journal;
+                let sets = part.sets;
+                part.cut = part.writes.saturating_add(step);
+                let result = journal.apply(&mut part, change());
+                let rebooted = ClockJournal::load(&part);
+                if part.sets > sets {
+                    assert_eq!(result, Ok(()), "known {known} step {step}");
+                    assert_eq!(
+                        journal.pending(),
+                        Some(change()),
+                        "known {known} step {step}"
+                    );
+                    assert_eq!(part.calendar, Some(change().new_value()));
+                    assert!(
+                        rebooted == ClockJournal::UNKNOWN
+                            || (rebooted.pending() == Some(change())
+                                && rebooted.fraction() == Some(123)),
+                        "known {known} step {step}: {rebooted:?}"
+                    );
+                } else {
+                    assert!(result.is_err(), "known {known} step {step}");
+                    assert!(
+                        journal == before || journal == ClockJournal::UNKNOWN,
+                        "known {known} step {step}: {journal:?}"
+                    );
+                    assert!(
+                        rebooted == before || rebooted == ClockJournal::UNKNOWN,
+                        "known {known} step {step}: {rebooted:?}"
+                    );
+                }
+                if step == WRITE_STEPS {
+                    assert_eq!(rebooted.pending(), Some(change()), "known {known}");
+                }
             }
+        }
+    }
+
+    /// A write the RTC did not take, whichever step before it failed,
+    /// spends nothing: the clock stays known at its old fraction, now and
+    /// across a reset, a clock never set stays unknown rather than taking
+    /// a default, and the same change lands on the next try (P-267 rule 1).
+    #[test]
+    fn p_267_a_write_the_rtc_did_not_take_keeps_the_clock_it_had() {
+        for known in [true, false] {
+            for step in 0..=CALENDAR_STEP {
+                let (mut part, mut journal) = part(known);
+                let before = journal;
+                let sets = part.sets;
+                part.fail = Some(part.writes.saturating_add(step));
+                let failed = if step == CALENDAR_STEP {
+                    JournalError::Calendar(())
+                } else {
+                    JournalError::Verify
+                };
+                assert_eq!(
+                    journal.apply(&mut part, change()),
+                    Err(failed),
+                    "known {known} step {step}"
+                );
+                assert_eq!(journal, before, "known {known} step {step}");
+                assert_eq!(
+                    ClockJournal::load(&part),
+                    before,
+                    "known {known} step {step}"
+                );
+                assert_eq!(part.sets, sets, "known {known} step {step}");
+                assert_eq!(journal.apply(&mut part, change()), Ok(()));
+                assert_eq!(ClockJournal::load(&part).pending(), Some(change()));
+            }
+        }
+    }
+
+    /// The RTC took the time and the marker did not read back: the change
+    /// stands and its record is owed (P-267 rule 2). The journal holds it,
+    /// so no other change lands first, and the record's acknowledgement
+    /// commits the new clock. Until then only this boot holds it: a reset
+    /// finds no clock, as a reset at the same step would.
+    #[test]
+    fn p_267_a_marker_that_does_not_read_back_after_the_rtc_took_the_time_owes_the_record() {
+        for known in [true, false] {
+            let (mut part, mut journal) = part(known);
+            part.fail = Some(part.writes.saturating_add(MARKER_STEP));
+            assert_eq!(journal.apply(&mut part, change()), Ok(()), "known {known}");
+            assert_eq!(part.calendar, Some(change().new_value()));
+            assert_eq!(journal.pending(), Some(change()));
+            assert_eq!(journal.fraction(), Some(123));
+            assert!(journal.unretained());
+            assert_eq!(ClockJournal::load(&part), ClockJournal::UNKNOWN);
+            let sets = part.sets;
+            assert_eq!(
+                journal.apply(&mut part, change()),
+                Err(JournalError::Pending)
+            );
+            assert_eq!(part.sets, sets);
+            journal
+                .recorded(&mut part)
+                .expect("the acknowledgement lands");
+            let rebooted = ClockJournal::load(&part);
+            assert_eq!(rebooted.pending(), None);
+            assert_eq!(rebooted.fraction(), Some(123));
         }
     }
 
@@ -283,11 +475,9 @@ mod tests {
                 let mut journal = ClockJournal::UNKNOWN;
                 let result = journal.apply(&mut part, change);
                 let rebooted = ClockJournal::load(&part);
-                if result.is_ok() {
-                    assert_eq!(rebooted.pending(), Some(change), "{source:?} cut {cut}");
-                    let Some(pending) = rebooted.pending() else {
-                        panic!("a change owed to the log");
-                    };
+                if let Some(pending) = rebooted.pending() {
+                    assert_eq!(result, Ok(()), "{source:?} cut {cut}");
+                    assert_eq!(pending, change, "{source:?} cut {cut}");
                     assert_eq!(
                         pending.record(),
                         km43::ControllerRecord::TimeSet {
@@ -299,7 +489,30 @@ mod tests {
                 } else {
                     assert_eq!(rebooted, ClockJournal::UNKNOWN, "{source:?} cut {cut}");
                 }
+                if cut == 7 {
+                    assert_eq!(rebooted.pending(), Some(change), "{source:?}");
+                }
             }
+        }
+    }
+
+    /// The retained words stop taking writes once the RTC has taken the
+    /// time and stay that way. The record that lands meets the change's
+    /// obligation although no clean marker reads back: nothing retained
+    /// could repeat it after a reset, so holding the change owed would
+    /// only append the same record again every retry (P-267 rule 2).
+    #[test]
+    fn p_267_a_record_landed_under_a_lasting_fault_ends_the_owed_change() {
+        for known in [true, false] {
+            let (mut part, mut journal) = part(known);
+            part.cut = part.writes.saturating_add(MARKER_STEP);
+            assert_eq!(journal.apply(&mut part, change()), Ok(()), "known {known}");
+            assert!(journal.unretained());
+            assert_eq!(journal.recorded(&mut part), Ok(()), "known {known}");
+            assert_eq!(journal.pending(), None);
+            assert!(!journal.unretained());
+            assert_eq!(journal.fraction(), Some(123));
+            assert_eq!(ClockJournal::load(&part), ClockJournal::UNKNOWN);
         }
     }
 

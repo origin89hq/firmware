@@ -1186,10 +1186,18 @@ The RTC adapter admits reads and writes only with a ready LSE source, for
 2000–2099. Its five TAMP backup words hold a format marker, the fractional
 millisecond offset (the HAL sets whole seconds), and an unfinished change's old
 and new values. The marker is invalidated before a calendar write and committed
-after it; interruption before commit leaves the calendar unknown. An applied
-change waits for its audit append, retried at most once a second. No later offer
-is applied until that audit lands. The pending audit survives link loss and
-controller reset. A reset between append and journal acknowledgement may repeat
+after it; interruption before commit leaves the calendar unknown. A write the
+RTC does not take puts the clean marker back, so the clock stays known at the
+value it had and a client's `Time` is answered error 7 with its override
+unspent and P-118's window unstarted (P-267). Once the RTC has taken the time
+the change stands even when its marker does not read back: the override is
+spent, P-118's window runs from the write, and the change is held owed in
+memory until its record lands, so a reset before then finds the calendar
+unknown and owes nothing; that record ends the change even if the clean marker
+fails too. An applied change waits for its audit append, retried at most once a
+second. No later offer or client write is applied until that audit lands, and a
+client's `accepted` waits for it. A pending audit whose marker was committed
+survives link loss and controller reset. A reset between append and journal acknowledgement may repeat
 the original audit record, without applying the change again. Acceptance is
 returned only after both writes succeed and remains replayable for the protocol's
 three 500 ms attempts, keyed by request ID and original value. Link loss or
