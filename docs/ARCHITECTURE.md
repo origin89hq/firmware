@@ -1151,10 +1151,17 @@ Every controller `LinkUp` carries the device secret's `device_id` as key 8
 (KM43 L-035), the one fact about the controller the comms processor keeps:
 it names the controller in the mDNS advertisement and nothing reads it
 otherwise. A boot without a secret has nothing to state, so its link stays
-down on purpose: no `LinkUp` goes out, the module's is left unanswered, and
-the ladder does not cut (F-039). A boot whose L-195 revisions are spent is
-down on purpose too, and differs in one thing: it still answers the
-module's `LinkUp`, because it has a statement to answer with.
+down on purpose, and so does a boot whose L-195 revisions are spent,
+including one whose link fell for any reason after its last revision was
+used. Either way the controller is silent on the link for the rest of the
+boot (KM43 L-115): no `LinkUp` goes out, and no request of the module's is
+answered, not even with an error, heartbeats included, because any answer
+restarts the module's timer and keeps it routing clients to a side that
+refuses them. The ladder does not cut, and a reboot of the module changes
+nothing (F-039). A fall for want of a revision, or a module reboot or bench
+take after the last one, records no `comms link lost`; a genuine L-110 loss
+records its own before the silence. `EnterDownload` still goes out, on its
+own path.
 A connection the comms processor announces is refused as not yet linked
 before the `LinkUp` exchange and otherwise goes to the session layer's rows
 (above). A frame from the comms processor that is not four elements is

@@ -394,9 +394,12 @@ pub enum Note {
     PeerRefused(Option<u16>),
     /// A `LinkUp` claiming to be a controller.
     WrongRole,
-    /// A `LinkUp` left unanswered: without a `device_id` this side has no
-    /// statement to answer with (L-035).
-    NoDeviceId,
+    /// A link-local frame left unanswered, and unrefused, because the link
+    /// is held down for the rest of the boot: no `device_id` to state
+    /// (L-035), or every pairing-report revision spent (L-195). Any answer
+    /// would restart the comms processor's timer and keep it linked to a
+    /// side that refuses every frame (L-115).
+    HeldDown,
 }
 
 /// A frame to put on the wire, described rather than encoded so the
@@ -953,6 +956,7 @@ impl Link {
         self.requests.forget();
         self.beats.forget();
         let _ = self.pairing.forget();
+        self.pairing.fell();
         self.cut_pending = false;
         actions
     }
@@ -1004,6 +1008,13 @@ impl Link {
             // session or a request id is a client's frame, and goes to the
             // intake like one.
             actions.push(Action::Note(Note::PeerRefused(Self::error_code(envelope))));
+            return actions;
+        }
+        if self.held_down() {
+            // Not even an error: every answer is one the comms processor's
+            // timer counts (L-115). `EnterDownload` is the bench's, on its
+            // own path, and never waits on this.
+            actions.push(Action::Note(Note::HeldDown));
             return actions;
         }
         let kind = match arriving(envelope.opcode(), Side::Controller, envelope.session()) {
@@ -1449,7 +1460,7 @@ impl Link {
         let notice = match self.pairing.prepare(now) {
             Ok(notice) => notice,
             Err(Unbuilt::Spent) => {
-                self.pairing.retire();
+                // The fall retires what is left (L-195).
                 self.down(DropReason::RevisionsSpent, now, rows, actions);
                 return;
             }
@@ -1730,10 +1741,8 @@ impl Link {
         Some((peer, compat))
     }
 
-    /// A `LinkUp` from the peer: answered with ours and recorded, or, with
-    /// no `device_id` to state, left unanswered, because an acknowledgement
-    /// is a statement and one without key 8 is one the module must refuse
-    /// (L-035).
+    /// A `LinkUp` from the peer: answered with ours and recorded. Held
+    /// down, [`Link::received`] has dropped it before this (L-115).
     fn statement_received(
         &mut self,
         envelope: LinkEnvelope<'_>,
@@ -1741,16 +1750,11 @@ impl Link {
         rows: &mut impl Rows,
         actions: &mut Actions,
     ) {
-        if self.identity.device_id.is_none() {
-            actions.push(Action::Note(Note::NoDeviceId));
-            return;
-        }
         let req_id = envelope.req_id();
         match LinkUp::decode(envelope) {
             Ok(theirs) => {
                 if let Some((peer, compat)) = Self::accept(&theirs, actions) {
-                    actions.push(Action::Send(Outgoing::LinkUpAck { req_id }));
-                    self.stated(peer, compat, now, rows, actions);
+                    self.stated(peer, compat, req_id, now, rows, actions);
                 }
             }
             Err(_) => actions.push(Action::Note(Note::Malformed(LinkMessageType::LinkUp))),
@@ -1760,12 +1764,14 @@ impl Link {
     /// The peer stated itself of its own accord (L-030): recorded and
     /// answered, and never a link (L-033). A changed `boot_id` is a peer that
     /// rebooted: every connection goes (L-041), and the link with them,
-    /// because the new boot has answered nothing of ours. Unlinked, this side
-    /// states itself at once.
+    /// because the new boot has answered nothing of ours; with the last
+    /// revision used, that fall is for the boot and the statement goes
+    /// unanswered (L-115, L-195). Unlinked, this side states itself at once.
     fn stated(
         &mut self,
         peer: Peer,
         compat: Compat,
+        req_id: ReqId,
         now: Tick,
         rows: &mut impl Rows,
         actions: &mut Actions,
@@ -1778,7 +1784,13 @@ impl Link {
             // The common way down: every connection drops, and no answer to
             // a beat of the old boot counts (L-041, L-100).
             self.down(DropReason::CommsRebooted, now, rows, actions);
-        } else if let Phase::Up {
+        }
+        if self.held_down() {
+            actions.push(Action::Note(Note::HeldDown));
+            return;
+        }
+        actions.push(Action::Send(Outgoing::LinkUpAck { req_id }));
+        if let Phase::Up {
             peer: known,
             compat: agreed,
             ..
@@ -1862,6 +1874,9 @@ impl Link {
             next_linkup: Some(now),
         };
         self.drop_rows(why, rows, actions);
+        // With the last revision used, no link-up can owe its report: down
+        // is down for the boot, whatever took it there (L-195).
+        self.pairing.fell();
     }
 
     /// Every connection goes, and every close asked for with it: there is
@@ -2750,6 +2765,7 @@ mod tests {
         link.stated(
             peer,
             link.compat().expect("compat"),
+            ReqId(9),
             at(1),
             &mut NoRows,
             &mut actions,
@@ -3565,7 +3581,7 @@ mod tests {
         .expect("fits");
         let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
         let answered = link.received(envelope, at(10), &mut NoRows);
-        assert_eq!(only(&answered), Some(Action::Note(Note::NoDeviceId)));
+        assert_eq!(only(&answered), Some(Action::Note(Note::HeldDown)));
         assert!(!link.is_up());
     }
 
@@ -3585,5 +3601,361 @@ mod tests {
             .map(|now| link.tick(at(now), false, &mut NoRows))
             .any(|ticked| ticked.iter().any(|a| *a == Action::CutRail));
         assert!(cut, "no cut by sixty seconds of silence");
+    }
+
+    /// A comms processor's statement under `boot_id`, as a request.
+    fn statement(boot_id: u32, req_id: u32) -> ([u8; 256], usize) {
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id,
+            hw: "comms",
+            net_version: Some(0),
+            device_id: None,
+            net_origin: None,
+        }
+        .write(
+            link_header(LinkMessageType::LinkUp, ReqId(req_id)),
+            &mut buf,
+        )
+        .expect("fits");
+        (buf, len)
+    }
+
+    /// Every link-local request the comms processor makes of the
+    /// controller, each with a body that reads, under `req_id`.
+    fn comms_requests(req_id: u32) -> [(LinkMessageType, [u8; 256], usize); 7] {
+        fn body(
+            kind: LinkMessageType,
+            req_id: u32,
+            write: impl FnOnce(km43::LinkHeader, &mut [u8]) -> Result<usize, LinkError>,
+        ) -> (LinkMessageType, [u8; 256], usize) {
+            let mut buf = [0u8; 256];
+            let len = write(link_header(kind, ReqId(req_id)), &mut buf).expect("fits");
+            (kind, buf, len)
+        }
+        let (bytes, len) = statement(0xB007, req_id);
+        [
+            (LinkMessageType::LinkUp, bytes, len),
+            body(LinkMessageType::Heartbeat, req_id, |header, dst| {
+                Heartbeat {
+                    uptime_s: 30,
+                    conns: 0,
+                }
+                .write(header, dst)
+            }),
+            body(LinkMessageType::ClientConnected, req_id, |header, dst| {
+                ClientUp {
+                    conn: 1,
+                    transport: km43::LinkTransport::Ble,
+                    peer: "aa:bb:cc:dd:ee:ff",
+                }
+                .write(header, dst)
+            }),
+            body(
+                LinkMessageType::ClientDisconnected,
+                req_id,
+                |header, dst| {
+                    ClientDown {
+                        conn: 1,
+                        reason: km43::DisconnectReason::ClosedByClient,
+                    }
+                    .write(header, dst)
+                },
+            ),
+            body(LinkMessageType::TimeOffer, req_id, |header, dst| {
+                ClockOffer {
+                    unix_ms: 1_790_000_000_000,
+                    source: 1,
+                    accuracy_ms: 20,
+                    server: "pool.ntp.org",
+                }
+                .write(header, dst)
+            }),
+            body(LinkMessageType::WifiScanResult, req_id, |header, dst| {
+                km43::ScanResult {
+                    scan: NonZeroU32::MIN,
+                    list: None,
+                }
+                .write(header, dst)
+            }),
+            body(LinkMessageType::WifiState, req_id, |header, dst| {
+                km43::RadioReport {
+                    version: 0,
+                    radio: km43::Radio::Off,
+                }
+                .write(header, dst)
+            }),
+        ]
+    }
+
+    /// A link that used its last revision, and fell at 110 ms when the
+    /// window changed and the next report had none: what the fall asked.
+    fn spent() -> (Link, Actions) {
+        let mut link = up(at(0));
+        link.pairing.skip_to(core::num::NonZeroU64::MAX);
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("the last");
+        assert!(acknowledge(&mut link, req_id, u64::MAX, at(20)).is_empty());
+        link.pairing_window(Some(at(120_100)), at(100));
+        let fell = link.tick(at(110), false, &mut NoRows);
+        assert!(link.revisions_spent() && !link.is_up(), "{fell:?}");
+        (link, fell)
+    }
+
+    /// Whether `actions` holds a frame, a cut, or a ladder or link record:
+    /// anything a link held down must never ask for.
+    fn breaks_silence(actions: &Actions) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Send(_)
+                    | Action::CutRail
+                    | Action::OfferTime { .. }
+                    | Action::Log(
+                        LinkEvent::LinkLost
+                            | LinkEvent::PowerCycled { .. }
+                            | LinkEvent::Unrecoverable { .. }
+                    )
+            )
+        })
+    }
+
+    /// Every request of the comms processor's is dropped with a note and
+    /// nothing else: no answer, no error, no row touched.
+    fn assert_every_request_unanswered(link: &mut Link, now: Tick) {
+        let mut rows = Held(0);
+        for (kind, bytes, len) in comms_requests(70) {
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+            let answered = link.received(envelope, now, &mut rows);
+            assert_eq!(
+                only(&answered),
+                Some(Action::Note(Note::HeldDown)),
+                "{kind:?}"
+            );
+            assert_eq!(rows.0, 0, "{kind:?} reached the rows");
+            assert!(!link.is_up(), "{kind:?} linked");
+        }
+    }
+
+    #[test]
+    fn l_115_a_spent_controller_answers_no_link_local_request_not_even_with_an_error() {
+        let (mut link, _) = spent();
+        assert_every_request_unanswered(&mut link, at(200));
+    }
+
+    #[test]
+    fn l_115_without_a_device_id_no_request_is_answered_heartbeats_included() {
+        let mut link = without_device_id();
+        let _ = link.module_settled(at(0));
+        assert_every_request_unanswered(&mut link, at(10));
+    }
+
+    #[test]
+    fn l_195_new_comms_boots_never_relink_a_spent_controller_nor_reopen_its_window() {
+        let (mut link, _) = spent();
+        for (start, boot_id) in [(1_000, 0xB001), (21_000, 0xB002), (41_000, 0xB003)] {
+            let _ = link.module_settled(at(start));
+            let (bytes, len) = statement(boot_id, 80);
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+            let answered = link.received(envelope, at(start.saturating_add(10)), &mut NoRows);
+            assert_eq!(only(&answered), Some(Action::Note(Note::HeldDown)));
+            let (_, bytes, len) = comms_requests(81)[1];
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+            let beat = link.received(envelope, at(start.saturating_add(20)), &mut NoRows);
+            assert_eq!(only(&beat), Some(Action::Note(Note::HeldDown)));
+            // The panel opens its window again: nothing tells the module.
+            link.pairing_window(Some(at(start.saturating_add(120_000))), at(start));
+            for now in (start.saturating_add(100)..start.saturating_add(20_000)).step_by(100) {
+                let ticked = link.tick(at(now), false, &mut NoRows);
+                assert!(!breaks_silence(&ticked), "{ticked:?} at {now}");
+            }
+            assert!(!link.is_up() && link.revisions_spent());
+        }
+        // A controller reboot is a fresh link, and it states itself again.
+        let mut rebooted = Link::new(identity(), Tick::ZERO);
+        let settled = rebooted.module_settled(at(0));
+        assert!(
+            settled
+                .iter()
+                .any(|a| matches!(a, Action::Send(Outgoing::LinkUp { .. })))
+        );
+    }
+
+    #[test]
+    fn l_115_exhaustion_while_linked_logs_no_link_lost_and_nothing_after_it() {
+        let (mut link, fell) = spent();
+        assert!(
+            fell.iter()
+                .any(|a| *a == Action::DropConnections(DropReason::RevisionsSpent))
+        );
+        assert!(!breaks_silence(&fell), "{fell:?}");
+        // Far past the six seconds of L-110 and the sixty of L-111, the
+        // module talking all along and reset once.
+        for now in (200..400_000).step_by(100) {
+            if now == 90_000 {
+                let settled = link.module_settled(at(now));
+                assert!(!breaks_silence(&settled), "{settled:?}");
+            }
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(!breaks_silence(&ticked), "{ticked:?} at {now}");
+            if now % 2_000 == 0 {
+                let (_, bytes, len) = comms_requests(90)[1];
+                let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+                let beat = link.received(envelope, at(now), &mut NoRows);
+                assert!(!breaks_silence(&beat), "{beat:?} at {now}");
+            }
+        }
+    }
+
+    #[test]
+    fn l_115_exhaustion_reached_while_down_logs_only_the_loss_before_it() {
+        let mut link = up(at(0));
+        link.pairing.skip_to(core::num::NonZeroU64::MAX);
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("the last");
+        assert!(acknowledge(&mut link, req_id, u64::MAX, at(20)).is_empty());
+        assert!(!link.revisions_spent(), "still linked, nothing owed");
+        // The module goes quiet: the link is lost while L-110 still
+        // applies, and that loss is its own record.
+        let mut lost = Actions::NONE;
+        for now in (100..=7_000).step_by(100) {
+            for action in &link.tick(at(now), false, &mut NoRows) {
+                lost.push(*action);
+            }
+        }
+        let losses = lost
+            .iter()
+            .filter(|a| **a == Action::Log(LinkEvent::LinkLost))
+            .count();
+        assert_eq!(losses, 1, "{lost:?}");
+        // Down with no revision left: spent, and silent from here on.
+        assert!(!link.is_up() && link.revisions_spent());
+        assert!(
+            !lost
+                .iter()
+                .any(|a| matches!(a, Action::Send(Outgoing::LinkUp { .. }))),
+            "{lost:?}"
+        );
+        assert_every_request_unanswered(&mut link, at(7_100));
+        for now in (7_200..300_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(!breaks_silence(&ticked), "{ticked:?} at {now}");
+        }
+    }
+
+    #[test]
+    fn l_195_a_comms_reboot_after_the_last_revision_goes_unanswered() {
+        let mut link = up(at(0));
+        link.pairing.skip_to(core::num::NonZeroU64::MAX);
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("the last");
+        assert!(acknowledge(&mut link, req_id, u64::MAX, at(20)).is_empty());
+        // The module restates the boot it linked under: answered, still up.
+        let same = restate(&mut link, OURS, 30, at(30));
+        assert!(
+            same.iter()
+                .any(|a| matches!(a, Action::Send(Outgoing::LinkUpAck { .. })))
+        );
+        assert!(link.is_up());
+        // Another boot: the link falls, for the boot, unanswered.
+        let (bytes, len) = statement(0xB007, 31);
+        let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+        let rebooted = link.received(envelope, at(40), &mut NoRows);
+        assert!(
+            rebooted
+                .iter()
+                .any(|a| *a == Action::DropConnections(DropReason::CommsRebooted))
+        );
+        assert!(!breaks_silence(&rebooted), "{rebooted:?}");
+        assert!(!link.is_up() && link.revisions_spent());
+    }
+
+    #[test]
+    fn l_133_no_network_push_goes_while_held_down_whatever_the_module_answers() {
+        let (mut link, _) = spent();
+        link.set_network(Some(network_fixture()));
+        let _ = link.module_settled(at(1_000));
+        // An answer to a statement this side never sent this boot, as a
+        // replaying or confused module would: it links nothing.
+        let mut buf = [0u8; 256];
+        let len = LinkUp {
+            version: OURS,
+            role: Side::Comms,
+            fw: "0.1.0+g89abcdef",
+            boot_id: 0xB007,
+            hw: "comms",
+            net_version: Some(0),
+            device_id: None,
+            net_origin: None,
+        }
+        .write(link_header(LinkMessageType::LinkUpAck, ReqId(1)), &mut buf)
+        .expect("fits");
+        let envelope = LinkEnvelope::decode(&buf[..len]).expect("an envelope");
+        let answered = link.received(envelope, at(1_010), &mut NoRows);
+        assert_eq!(only(&answered), Some(Action::Note(Note::HeldDown)));
+        assert!(!link.is_up());
+        for now in (1_100..30_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(!breaks_silence(&ticked), "{ticked:?} at {now}");
+        }
+    }
+
+    #[test]
+    fn l_195_a_bench_take_after_the_last_revision_ends_linking_for_the_boot() {
+        let mut link = up(at(0));
+        link.pairing.skip_to(core::num::NonZeroU64::MAX);
+        let (req_id, _) = report(&link.tick(at(10), false, &mut NoRows)).expect("the last");
+        assert!(acknowledge(&mut link, req_id, u64::MAX, at(20)).is_empty());
+        // The bench takes the module into its ROM, and gives it back.
+        let taken = link.module_taken(&mut NoRows);
+        assert!(!breaks_silence(&taken), "{taken:?}");
+        assert!(link.revisions_spent());
+        let settled = link.module_settled(at(1_000));
+        assert!(!breaks_silence(&settled), "{settled:?}");
+        for now in (1_100..100_000).step_by(100) {
+            let ticked = link.tick(at(now), false, &mut NoRows);
+            assert!(!breaks_silence(&ticked), "{ticked:?} at {now}");
+        }
+        assert!(!link.is_up());
+    }
+
+    /// The other side of the silence: with its `device_id` and revisions
+    /// left, the controller answers the module's statement and beats, and
+    /// before the link is up still refuses what needs it with 258.
+    #[test]
+    fn l_115_a_controller_not_held_down_answers_as_before() {
+        let mut link = Link::new(identity(), Tick::ZERO);
+        let _ = link.module_settled(at(0));
+        let mut answers = [None; 7];
+        for ((kind, bytes, len), answer) in comms_requests(70).into_iter().zip(&mut answers) {
+            let envelope = LinkEnvelope::decode(&bytes[..len]).expect("an envelope");
+            let actions = link.received(envelope, at(10), &mut NoRows);
+            *answer = actions.iter().find_map(|a| {
+                if let Action::Send(outgoing) = a {
+                    Some(*outgoing)
+                } else {
+                    None
+                }
+            });
+            assert!(answer.is_some(), "{kind:?} unanswered: {actions:?}");
+        }
+        let refused = Some(Outgoing::Refuse {
+            code: LinkErrorCode::BeforeLinkUp,
+        });
+        assert_eq!(
+            answers,
+            [
+                Some(Outgoing::LinkUpAck { req_id: ReqId(70) }),
+                Some(Outgoing::HeartbeatAck { req_id: ReqId(70) }),
+                Some(Outgoing::ClientUpAck {
+                    req_id: ReqId(70),
+                    outcome: ClientConnected::RefusedLinkNotUp
+                }),
+                refused,
+                refused,
+                refused,
+                refused,
+            ]
+        );
     }
 }

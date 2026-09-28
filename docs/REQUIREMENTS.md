@@ -249,11 +249,12 @@ visible. The module is powered as on every boot: on revision A a rail kept
 off and switched on at a later boot is what F-005 forbids. A boot without a
 device secret has a `boot_id` and still no statement, because every
 controller `LinkUp` carries the secret's `device_id` (KM43 L-035): the link
-stays down for the boot, a `LinkUp` from the module is left unanswered, and
-the ladder does not cut a module whose silence a cycle would not cure
+stays down for the boot, no request of the module's is answered, its
+`LinkUp` and heartbeats included (L-115), and the ladder does not cut a
+module whose silence a cycle would not cure
 ([origin89hq/km43#127](https://github.com/origin89hq/km43/issues/127)).
 Download requests are still served.
-Source: KM43 L-040, L-035, [#3][plan] §4.2. M3.
+Source: KM43 L-040, L-035, L-115, [#3][plan] §4.2. M3.
 
 ## Sessions and provisioning
 
