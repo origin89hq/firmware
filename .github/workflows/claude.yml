@@ -37,7 +37,7 @@ jobs:
           path: .origin89/engineering
           sparse-checkout: skills
           persist-credentials: false
-      - uses: anthropics/claude-code-action@19dda84776b3518d98b8798e591daee763049ed3 # v1.0.220
+      - uses: anthropics/claude-code-action@cfc3eb22bfed5c26ef66e3223c982af27e4524de # v1.0.231
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           branch_prefix: ${{ github.actor }}/
