@@ -949,6 +949,9 @@ async fn serve_time(
     let now = Tick::from_millis(Instant::now().as_millis());
     // One attempt at an owed record. What arrives while it is still owed
     // is decided now and refused, never held for it (P-267 rule 2, L-154).
+    // A turn whose append landed serves nothing else: the answer it may
+    // have published fills the client's one-deep queue until the session
+    // takes it.
     if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
         && append_record(ring, scratch, change.record(), calendar.now())
             .await
@@ -983,6 +986,7 @@ async fn serve_time(
                 defmt::error!("clock: audit journal acknowledgement failed: {}", error);
             }
         }
+        return;
     }
     if let Ok((asked, received)) = CLIENT_TIME.try_receive() {
         serve_client(
@@ -1003,6 +1007,20 @@ async fn serve_time(
     if let Ok((epoch, req_id, offered)) = TIME.try_receive()
         && epoch == generation()
     {
+        // Answered before the calendar is read, so a read fault while a
+        // record is owed cannot leave the offer unanswered (L-154). The
+        // tick is read again: the offer may have arrived during the append.
+        let now = Tick::from_millis(Instant::now().as_millis());
+        if let Some(outcome) = CLOCK.lock(|clock| clock.borrow_mut().owed_offer(offered, now)) {
+            if TIME_ANSWER
+                .try_send((epoch, req_id, Some(outcome)))
+                .is_err()
+            {
+                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                defmt::warn!("clock: reply queue full");
+            }
+            return;
+        }
         let floor = match calendar.read() {
             Ok(Some(current)) => Some(current), // Known-clock admission does not use the floor.
             Ok(None) => recover_floor(ring, scratch, cuts, fram).await,

@@ -302,6 +302,39 @@ impl WallClock {
         floor: UnixMillis,
         now: Tick,
     ) -> Result<ClockChange, TimeOffer> {
+        let new = self.admitted(offered, now)?;
+        let at = new.as_millis();
+        match current {
+            Some(old) => {
+                if at.abs_diff(old.as_millis()) > OFFER_STEP {
+                    return Err(TimeOffer::RefusedStepTooLarge);
+                }
+            }
+            None => {
+                if at < floor.as_millis() || at.abs_diff(floor.as_millis()) > PLAUSIBILITY_SPAN {
+                    return Err(TimeOffer::RefusedImplausible);
+                }
+            }
+        }
+        Ok(ClockChange {
+            old: current,
+            new,
+            source: TimeSource::NtpViaComms,
+        })
+    }
+
+    /// An offer's answer while a `time set` record is owed, decided with no
+    /// reading of the RTC so that a read fault cannot leave it unanswered:
+    /// L-151's refusal, counted, or L-153's, or else L-154's. `None` when
+    /// nothing is owed, deciding and counting nothing.
+    pub fn owed_offer(&mut self, offered: OfferedTime, now: Tick) -> Option<TimeOffer> {
+        self.audit.as_ref()?;
+        self.admitted(offered, now).err()
+    }
+
+    /// The refusals that need no RTC reading, in the protocol's order:
+    /// L-151's, counted, then L-153's, then L-154's.
+    fn admitted(&mut self, offered: OfferedTime, now: Tick) -> Result<UnixMillis, TimeOffer> {
         if self.refuse_rate_limited(now) {
             return Err(TimeOffer::RefusedRateLimited);
         }
@@ -322,24 +355,7 @@ impl WallClock {
         if self.audit.is_some() {
             return Err(TimeOffer::RefusedRateLimited);
         }
-        let at = new.as_millis();
-        match current {
-            Some(old) => {
-                if at.abs_diff(old.as_millis()) > OFFER_STEP {
-                    return Err(TimeOffer::RefusedStepTooLarge);
-                }
-            }
-            None => {
-                if at < floor.as_millis() || at.abs_diff(floor.as_millis()) > PLAUSIBILITY_SPAN {
-                    return Err(TimeOffer::RefusedImplausible);
-                }
-            }
-        }
-        Ok(ClockChange {
-            old: current,
-            new,
-            source: TimeSource::NtpViaComms,
-        })
+        Ok(new)
     }
 
     /// Reserve a request until its answer is taken. Storage work and queued
@@ -1795,6 +1811,52 @@ mod tests {
             );
             assert_eq!(clock.rate_refusals(), 0);
         }
+    }
+
+    /// The owed-record answer needs no reading of the RTC: the recorder
+    /// asks before it reads the calendar, so a read fault while a record
+    /// is owed still answers `refused_rate_limited`, after L-151 and L-153
+    /// as `offer` orders them. With nothing owed it decides nothing and
+    /// counts nothing (L-154).
+    #[test]
+    fn l_154_an_offer_while_a_record_is_owed_is_refused_without_reading_the_rtc() {
+        let mut free = WallClock::new();
+        assert_eq!(
+            free.owed_offer(OfferedTime::new(BELOW, Tick::ZERO), Tick::ZERO),
+            None
+        );
+        free.offer_applied(Tick::ZERO);
+        let inside = Tick::from_millis(1_000);
+        assert_eq!(
+            free.owed_offer(OfferedTime::new(BELOW, inside), inside),
+            None
+        );
+        assert_eq!(free.rate_refusals(), 0);
+
+        let now = Tick::from_millis(5_000);
+        let (_, _, mut clock, change) = owed(Fault::None, now);
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(BELOW + 1_000, now), now),
+            Some(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(CENTURY_END + 1, now), now),
+            Some(TimeOffer::RefusedImplausible)
+        );
+        assert_eq!(clock.rate_refusals(), 0);
+        assert_eq!(
+            clock.audit_due(now.after(AUDIT_RETRY).unwrap()),
+            Some(change)
+        );
+
+        let mut limited = WallClock::new();
+        limited.offer_applied(Tick::ZERO);
+        let (_, _, mut clock, _) = owed_by(limited, Fault::None, now);
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(BELOW + 1_000, now), now),
+            Some(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(clock.rate_refusals(), 1);
     }
 
     /// An offer inside L-151's window while a record is owed gets L-151's
