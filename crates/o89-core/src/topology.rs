@@ -629,10 +629,7 @@ impl Topology {
             .flatten()
             .find(|bus| bus.bus == device.bus)
             .ok_or(TopologyError::NoSuchBus(device.bus))?;
-        let addressed = matches!(
-            bus.transport,
-            Transport::Rs485 | Transport::Can | Transport::Ip
-        );
+        let addressed = bus.transport.addressed();
         let clash = device.addr.is_some_and(|addr| {
             self.devices.iter().flatten().any(|held| {
                 held.device.bus == device.bus && held.device.addr.is_some_and(|other| other == addr)
@@ -1081,6 +1078,69 @@ pub(crate) mod tests {
                 ],
             )
             .expect("distinct buses");
+    }
+
+    #[test]
+    fn p_202_a_device_without_an_address_is_refused_on_every_addressed_transport_and_only_there() {
+        for (transport, addressed) in [
+            (Transport::Rs485, true),
+            (Transport::Can, true),
+            (Transport::Ip, true),
+            (Transport::Onewire, true),
+            (Transport::VeDirect, false),
+            (Transport::LocalIo, false),
+            (Transport::Internal, false),
+        ] {
+            let mut topology = site(0);
+            let rev = topology.rev();
+            let outcome = topology.apply(
+                TopologyChangeReason::ConfigWrite,
+                &[bus(2, transport), device(2, 2, None, None)],
+            );
+            if addressed {
+                assert_eq!(outcome, Err(TopologyError::Address(2)), "{transport:?}");
+                assert_eq!(topology.rev(), rev, "{transport:?}");
+                assert_eq!(topology.count(RowKind::Bus), 1, "{transport:?}");
+            } else {
+                assert!(outcome.is_ok(), "{transport:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn p_202_two_1_wire_probes_are_told_apart_by_rom_code_and_a_repeated_code_is_refused() {
+        let first = [0x28, 0xff, 0x4c, 0x1a, 0x61, 0x16, 0x04, 0xd3];
+        let second = [0x28, 0xff, 0x9b, 0x2e, 0x61, 0x16, 0x04, 0x7a];
+        let probe = |dev: u16, rom: &[u8]| {
+            Descriptor::Device(SiteDevice {
+                dev,
+                bus: 2,
+                addr: Some(DeviceAddress::new(rom).expect("a ROM code fits")),
+                product: Product(0x0101),
+                dialect: Dialect(0x0001),
+                role: DeviceRole(0x0001),
+                parent: None,
+            })
+        };
+        let mut topology = site(0);
+        topology
+            .apply(
+                TopologyChangeReason::ConfigWrite,
+                &[
+                    bus(2, Transport::Onewire),
+                    probe(2, &first),
+                    probe(3, &second),
+                ],
+            )
+            .expect("two ROM codes on one bus");
+        assert_eq!(topology.count(RowKind::Device), 3);
+        let rev = topology.rev();
+        assert_eq!(
+            topology.apply(TopologyChangeReason::ConfigWrite, &[probe(4, &first)]),
+            Err(TopologyError::Address(4))
+        );
+        assert_eq!(topology.rev(), rev);
+        assert_eq!(topology.count(RowKind::Device), 3);
     }
 
     #[test]
