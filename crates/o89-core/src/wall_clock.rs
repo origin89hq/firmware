@@ -3,7 +3,7 @@
 //! The recorder supplies the newest timestamp from `Ring::floor`. A failed
 //! scan is not an empty ring and must never become the build-time fallback.
 //!
-//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-153, L-160, L-162, P-111, P-215, P-266
+//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-153, L-160, L-162, P-111, P-215, P-266, P-267
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
@@ -119,8 +119,9 @@ pub enum ClientWritten<E> {
         /// the recorder rules out before it decides.
         retained: bool,
     },
-    /// The RTC or the retained words refused the write. Nothing is
-    /// retained, no P-118 window starts and the override is not spent.
+    /// The RTC or the retained words refused the write before the RTC
+    /// took it. The clock stays as it was, still known when it was, no
+    /// P-118 window starts and the override is not spent (P-267).
     Failed {
         /// Why the write failed.
         error: E,
@@ -1334,12 +1335,27 @@ mod tests {
         Calendar,
         /// A retained word does not read back: the time is not stored.
         Storage,
+        /// The RTC takes the time and no retained word written after it
+        /// reads back: the change's marker is not stored.
+        Marker,
     }
 
     struct Part {
         words: [u32; crate::CLOCK_BACKUP_WORDS],
         fault: Fault,
         calendar: Option<UnixMillis>,
+        taken: bool,
+    }
+
+    impl Part {
+        fn new(fault: Fault) -> Self {
+            Self {
+                words: [0; crate::CLOCK_BACKUP_WORDS],
+                fault,
+                calendar: None,
+                taken: false,
+            }
+        }
     }
 
     impl crate::CalendarStore for Part {
@@ -1348,17 +1364,21 @@ mod tests {
             self.words.get(index).copied()
         }
         fn write_word(&mut self, index: usize, value: u32) {
-            if let (Some(word), Fault::None | Fault::Calendar) =
-                (self.words.get_mut(index), self.fault)
-            {
+            let stored = match self.fault {
+                Fault::None | Fault::Calendar => true,
+                Fault::Storage => false,
+                Fault::Marker => !self.taken,
+            };
+            if let (Some(word), true) = (self.words.get_mut(index), stored) {
                 *word = value;
             }
         }
         fn set_calendar(&mut self, at: UnixMillis) -> Result<(), ()> {
             match self.fault {
                 Fault::Calendar => Err(()),
-                Fault::None | Fault::Storage => {
+                Fault::None | Fault::Storage | Fault::Marker => {
                     self.calendar = Some(at);
+                    self.taken = true;
                     Ok(())
                 }
             }
@@ -1383,11 +1403,7 @@ mod tests {
             (Fault::Storage, crate::JournalError::Verify),
         ] {
             let mut clock = WallClock::new();
-            let mut part = Part {
-                words: [0; crate::CLOCK_BACKUP_WORDS],
-                fault,
-                calendar: None,
-            };
+            let mut part = Part::new(fault);
             let mut journal = crate::ClockJournal::UNKNOWN;
             let written = journal.apply(&mut part, change);
             assert_eq!(
@@ -1413,6 +1429,199 @@ mod tests {
             assert_eq!(part.calendar, Some(time(at)));
             assert_eq!(clock.audit_due(Tick::ZERO), Some(change));
             assert!(clock.client_rate_limited(Tick::ZERO));
+        }
+    }
+
+    /// The clock a part holds before a client's write: known, its record
+    /// landed, with a fraction a lost marker could not fake.
+    const KEPT: u64 = FLOOR + 456;
+    /// Below the floor and more than an hour back from `KEPT`: accepted
+    /// only on the armed override.
+    const BELOW: u64 = FLOOR - 7_200_000 + 789;
+
+    fn known(fault: Fault) -> (Part, crate::ClockJournal) {
+        let mut part = Part::new(Fault::None);
+        let mut journal = crate::ClockJournal::UNKNOWN;
+        let first = ClockChange::recovered(None, time(KEPT), TimeSource::NtpViaComms);
+        journal
+            .apply(&mut part, first)
+            .expect("the part takes the first set");
+        journal.recorded(&mut part).expect("its record lands");
+        part.fault = fault;
+        part.taken = false;
+        (part, journal)
+    }
+
+    fn overriding() -> ClockChange {
+        let ClientSet::Set {
+            change,
+            stepped,
+            overridden,
+        } = WallClock::client(BELOW, Some(time(KEPT)), time(FLOOR), true)
+        else {
+            panic!("accepted on the override");
+        };
+        assert!(stepped && overridden);
+        change
+    }
+
+    /// The RTC refuses a time it can hold, or the retained words refuse
+    /// it first: error 7 and never outcome 2 (#238), and nothing spent.
+    /// The clock is still known at the value it had, now and across a
+    /// reset, P-118's window has not started, and the armed override is
+    /// still there for the next write, which is the one that spends it.
+    #[test]
+    fn p_267_a_write_the_rtc_did_not_take_is_busy_and_spends_nothing() {
+        let change = overriding();
+        for (fault, error) in [
+            (Fault::Calendar, crate::JournalError::Calendar(())),
+            (Fault::Storage, crate::JournalError::Verify),
+        ] {
+            let (mut part, mut journal) = known(fault);
+            let kept = journal;
+            let mut clock = WallClock::new();
+            let written = journal.apply(&mut part, change);
+            assert_eq!(
+                clock.client_written(change, true, written, Tick::ZERO),
+                ClientWritten::Failed {
+                    error,
+                    answer: TimeAnswer::Busy
+                }
+            );
+            assert_eq!(journal, kept);
+            assert_eq!(journal.fraction(), Some(456));
+            assert_eq!(crate::ClockJournal::load(&part), kept);
+            assert_eq!(part.calendar, Some(time(KEPT)));
+            assert!(!clock.audit_pending());
+            assert!(!clock.client_rate_limited(Tick::ZERO));
+            part.fault = Fault::None;
+            let now = Tick::from_millis(1_000);
+            let written = journal.apply(&mut part, change);
+            assert_eq!(
+                clock.client_written(change, true, written, now),
+                ClientWritten::Applied {
+                    spend_override: true,
+                    retained: true
+                }
+            );
+            assert_eq!(part.calendar, Some(time(BELOW)));
+            assert!(clock.client_rate_limited(now));
+        }
+    }
+
+    /// The RTC took the time and its marker did not read back: the change
+    /// stands with its record owed, not a busy write with the RTC moved.
+    /// The override is spent, P-118's window runs from the write, and the
+    /// audit is due (P-267 rule 2).
+    #[test]
+    fn p_267_a_marker_that_does_not_read_back_after_the_rtc_took_the_time_owes_the_record() {
+        let change = overriding();
+        let (mut part, mut journal) = known(Fault::Marker);
+        let mut clock = WallClock::new();
+        let now = Tick::from_millis(5_000);
+        let written = journal.apply(&mut part, change);
+        assert_eq!(
+            clock.client_written(change, true, written, now),
+            ClientWritten::Applied {
+                spend_override: true,
+                retained: true
+            }
+        );
+        assert_eq!(part.calendar, Some(time(BELOW)));
+        assert_eq!(journal.pending(), Some(change));
+        assert!(clock.client_rate_limited(now));
+        assert!(!clock.client_rate_limited(now.after(CLIENT_INTERVAL).unwrap()));
+        assert_eq!(clock.audit_due(now), Some(change));
+    }
+
+    /// A client's change with its record owed, whether the first append
+    /// or the change's marker failed: the RTC moved, the override spent,
+    /// the audit's first attempt taken and not landed.
+    fn owed(fault: Fault, now: Tick) -> (Part, crate::ClockJournal, WallClock, ClockChange) {
+        let change = overriding();
+        let (mut part, mut journal) = known(fault);
+        let mut clock = WallClock::new();
+        let written = journal.apply(&mut part, change);
+        assert_eq!(
+            clock.client_written(change, true, written, now),
+            ClientWritten::Applied {
+                spend_override: true,
+                retained: true
+            }
+        );
+        // The append fails: neither `recorded` nor `audit_written` runs.
+        assert_eq!(clock.audit_due(now), Some(change));
+        (part, journal, clock, change)
+    }
+
+    /// The `time set` append fails and the change stands: the clock stays
+    /// moved, the rate limit runs from the write and not from the record,
+    /// and outcome 1 is owed to nobody until a retry lands (P-267 rule 2).
+    #[test]
+    fn p_267_an_owed_record_holds_outcome_one_until_a_retried_append_lands() {
+        let now = Tick::from_millis(5_000);
+        for fault in [Fault::None, Fault::Marker] {
+            let (mut part, mut journal, mut clock, change) = owed(fault, now);
+            assert!(clock.audit_pending());
+            assert_eq!(part.calendar, Some(time(BELOW)));
+            assert_eq!(journal.pending(), Some(change));
+            let early = now.after(Millis::from_millis(999)).unwrap();
+            assert_eq!(clock.audit_due(early), None);
+            let retry = now.after(AUDIT_RETRY).unwrap();
+            assert_eq!(clock.audit_due(retry), Some(change));
+            // A marker fault lasts: the record still ends the audit.
+            journal
+                .recorded(&mut part)
+                .expect("the retried append lands");
+            assert_eq!(clock.audit_written(retry), Some(Answered::Client));
+            assert!(!clock.audit_pending());
+            assert_eq!(journal.fraction(), Some(789));
+            let rebooted = crate::ClockJournal::load(&part);
+            match fault {
+                Fault::Marker => assert_eq!(rebooted, crate::ClockJournal::UNKNOWN),
+                Fault::None | Fault::Calendar | Fault::Storage => {
+                    assert_eq!(rebooted.pending(), None);
+                    assert_eq!(rebooted.fraction(), Some(789));
+                }
+            }
+            let window = now.after(CLIENT_INTERVAL).unwrap();
+            assert!(clock.client_rate_limited(Tick::from_millis(window.as_millis() - 1)));
+            assert!(!clock.client_rate_limited(window));
+        }
+    }
+
+    /// While the record is owed, a later client `Time`, past P-118's
+    /// window, and a `TimeOffer` inside L-150's step are both decided and
+    /// neither moves the clock: two changes with one record owed are two
+    /// records that could land in either order (P-267 rule 2). What either
+    /// is answered is km43#187's and not asserted here.
+    #[test]
+    fn p_267_while_a_record_is_owed_no_other_clock_change_is_applied() {
+        let now = Tick::from_millis(5_000);
+        for fault in [Fault::None, Fault::Marker] {
+            let (mut part, mut journal, mut clock, change) = owed(fault, now);
+            part.fault = Fault::None;
+            let later = now.after(CLIENT_INTERVAL).unwrap();
+            assert!(!clock.client_rate_limited(later));
+            let ClientSet::Set { change: client, .. } =
+                WallClock::client(FLOOR + 60_000, Some(time(BELOW)), time(FLOOR), false)
+            else {
+                panic!("a client time the rules accept");
+            };
+            let offered = OfferedTime::new(BELOW + 1_000, later);
+            let offer = clock
+                .offer(offered, Some(time(BELOW)), time(FLOOR), later)
+                .expect("an offer inside the step");
+            assert!(!clock.ready_for_offer(later));
+            for other in [client, offer] {
+                assert_eq!(
+                    journal.apply(&mut part, other),
+                    Err(crate::JournalError::Pending)
+                );
+                assert_eq!(part.calendar, Some(time(BELOW)));
+                assert_eq!(journal.pending(), Some(change));
+            }
+            assert_eq!(clock.audit_due(later), Some(change));
         }
     }
 

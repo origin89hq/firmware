@@ -107,7 +107,13 @@ impl CalendarClock {
             .device
             .as_mut()
             .ok_or(JournalError::Calendar(CalendarError::UntrustedSource))?;
-        self.journal.apply(device, change)
+        self.journal.apply(device, change)?;
+        if self.journal.unretained() {
+            defmt::error!(
+                "clock: calendar moved and its marker did not read back; a reset before the record lands loses the change"
+            );
+        }
+        Ok(())
     }
 
     pub fn recorded(&mut self) -> Result<(), JournalError<CalendarError>> {
