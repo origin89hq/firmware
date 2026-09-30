@@ -691,8 +691,8 @@ fn process_offer(
         Err(outcome) => return OfferResult::Finished(Some(outcome)),
     };
     let written = calendar.set(change);
-    // No await between durable apply and retaining its completion. serve_time
-    // refuses another offer while an audit is pending.
+    // No await between durable apply and retaining its completion. The clock
+    // refuses another offer while an audit is pending (L-154).
     match CLOCK.lock(|clock| {
         clock
             .borrow_mut()
@@ -740,8 +740,10 @@ async fn serve_client(
     if !asked.authorised {
         return answer_client(asked.ticket, refused(Time::Unauthorised, current));
     }
-    if CLOCK.lock(|clock| clock.borrow().client_rate_limited(now)) {
-        return answer_client(asked.ticket, TimeAnswer::Busy);
+    // An owed record or P-118's window: error 7 now, before the floor scan.
+    if let Err(busy) = CLOCK.lock(|clock| clock.borrow().client_admitted(now)) {
+        defmt::warn!("clock: a client time refused busy: {}", busy);
+        return answer_client(asked.ticket, busy.answer());
     }
     let Some(floor) = recover_floor(ring, scratch, cuts, fram).await else {
         return answer_client(asked.ticket, TimeAnswer::Busy);
@@ -945,42 +947,43 @@ async fn serve_time(
         return;
     };
     let now = Tick::from_millis(Instant::now().as_millis());
-    if CLOCK.lock(|clock| clock.borrow().audit_pending()) {
-        if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
-            && append_record(ring, scratch, change.record(), calendar.now())
-                .await
-                .is_ok()
-        {
-            match calendar.recorded() {
-                Ok(()) => {
-                    let now = Tick::from_millis(Instant::now().as_millis());
-                    match CLOCK.lock(|clock| clock.borrow_mut().audit_written(now)) {
-                        Some(Answered::Offer(req_id)) => {
-                            if TIME_ANSWER
-                                .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
-                                .is_err()
-                            {
-                                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
-                                defmt::warn!(
-                                    "clock: reply queue full; acceptance retained for retry"
-                                );
-                            }
+    // One attempt at an owed record. What arrives while it is still owed
+    // is decided now and refused, never held for it (P-267 rule 2, L-154).
+    // A turn whose append landed serves nothing else: the answer it may
+    // have published fills the client's one-deep queue until the session
+    // takes it.
+    if let Some(change) = CLOCK.lock(|clock| clock.borrow_mut().audit_due(now))
+        && append_record(ring, scratch, change.record(), calendar.now())
+            .await
+            .is_ok()
+    {
+        match calendar.recorded() {
+            Ok(()) => {
+                let now = Tick::from_millis(Instant::now().as_millis());
+                match CLOCK.lock(|clock| clock.borrow_mut().audit_written(now)) {
+                    Some(Answered::Offer(req_id)) => {
+                        if TIME_ANSWER
+                            .try_send((generation(), req_id, Some(TimeOffer::Accepted)))
+                            .is_err()
+                        {
+                            CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                            defmt::warn!("clock: reply queue full; acceptance retained for retry");
                         }
-                        Some(Answered::Client) => {
-                            if let Some((ticket, at)) = client_waiting.take() {
-                                answer_client(
-                                    ticket,
-                                    TimeAck::new(Time::Accepted, Some(at))
-                                        .map_or(TimeAnswer::Busy, TimeAnswer::Ack),
-                                );
-                            }
-                        }
-                        None => {}
                     }
+                    Some(Answered::Client) => {
+                        if let Some((ticket, at)) = client_waiting.take() {
+                            answer_client(
+                                ticket,
+                                TimeAck::new(Time::Accepted, Some(at))
+                                    .map_or(TimeAnswer::Busy, TimeAnswer::Ack),
+                            );
+                        }
+                    }
+                    None => {}
                 }
-                Err(error) => {
-                    defmt::error!("clock: audit journal acknowledgement failed: {}", error);
-                }
+            }
+            Err(error) => {
+                defmt::error!("clock: audit journal acknowledgement failed: {}", error);
             }
         }
         return;
@@ -1004,6 +1007,20 @@ async fn serve_time(
     if let Ok((epoch, req_id, offered)) = TIME.try_receive()
         && epoch == generation()
     {
+        // Answered before the calendar is read, so a read fault while a
+        // record is owed cannot leave the offer unanswered (L-154). The
+        // tick is read again: the offer may have arrived during the append.
+        let now = Tick::from_millis(Instant::now().as_millis());
+        if let Some(outcome) = CLOCK.lock(|clock| clock.borrow_mut().owed_offer(offered, now)) {
+            if TIME_ANSWER
+                .try_send((epoch, req_id, Some(outcome)))
+                .is_err()
+            {
+                CLOCK.lock(|clock| clock.borrow_mut().finished(req_id));
+                defmt::warn!("clock: reply queue full");
+            }
+            return;
+        }
         let floor = match calendar.read() {
             Ok(Some(current)) => Some(current), // Known-clock admission does not use the floor.
             Ok(None) => recover_floor(ring, scratch, cuts, fram).await,

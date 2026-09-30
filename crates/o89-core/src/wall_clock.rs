@@ -3,7 +3,7 @@
 //! The recorder supplies the newest timestamp from `Ring::floor`. A failed
 //! scan is not an empty ring and must never become the build-time fallback.
 //!
-//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-153, L-160, L-162, P-111, P-215, P-266, P-267
+//! cites: L-014, L-140, L-141, L-142, L-150, L-151, L-152, L-153, L-154, L-160, L-162, P-111, P-215, P-266, P-267
 
 use km43::{ControllerRecord, MAX_INFLIGHT, ReqId, TimeOffer, TimeSource};
 
@@ -103,6 +103,28 @@ pub enum ClientSet {
     Rejected,
     /// Outcome 4: below the floor with no override armed (P-114).
     NeedsButton,
+}
+
+/// Why a client's signed `Time` is answered error 7 before it executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a refusal nobody answers is a client left to time out"]
+pub enum ClientBusy {
+    /// A `time set` record is owed: no other clock change until it lands,
+    /// and the refusal is sent now rather than held (P-267 rule 2).
+    RecordOwed,
+    /// Inside the fifteen minutes after the last one accepted (P-118).
+    RateLimited,
+}
+
+impl ClientBusy {
+    /// Error 7 for either reason: the client's answer says not now.
+    #[must_use]
+    pub const fn answer(self) -> TimeAnswer {
+        match self {
+            Self::RecordOwed | Self::RateLimited => TimeAnswer::Busy,
+        }
+    }
 }
 
 /// A client's accepted `Time` once the adapter has tried to write it.
@@ -266,6 +288,10 @@ impl WallClock {
     /// `floor` is the newest timestamped record, or the build timestamp only
     /// after a successful scan found none (L-140–L-142).
     ///
+    /// While a `time set` record is owed the answer is
+    /// `refused_rate_limited`, after L-151 and L-153 and before L-150, not
+    /// counted and starting no window (L-154).
+    ///
     /// This does not move the clock. Call `offer_applied` only after the
     /// adapter successfully sets it. No peer accuracy or source claim enters
     /// this decision (L-152, L-162).
@@ -276,19 +302,7 @@ impl WallClock {
         floor: UnixMillis,
         now: Tick,
     ) -> Result<ClockChange, TimeOffer> {
-        if self.refuse_rate_limited(now) {
-            return Err(TimeOffer::RefusedRateLimited);
-        }
-        // Neither the window nor the step cap keeps an offer inside the
-        // RTC's century. Checked before the cap, whose answer sends the
-        // correction to a client `Time` that P-266 refuses too, and on the
-        // value as sent as well as advanced: queue time can carry one sent
-        // before 2000 into it (L-153).
-        let new = offered
-            .at(now)
-            .filter(|at| Calendar::holds(offered.sent()) && Calendar::holds(*at))
-            .and_then(UnixMillis::new)
-            .ok_or(TimeOffer::RefusedImplausible)?;
+        let new = self.admitted(offered, now)?;
         let at = new.as_millis();
         match current {
             Some(old) => {
@@ -307,6 +321,41 @@ impl WallClock {
             new,
             source: TimeSource::NtpViaComms,
         })
+    }
+
+    /// An offer's answer while a `time set` record is owed, decided with no
+    /// reading of the RTC so that a read fault cannot leave it unanswered:
+    /// L-151's refusal, counted, or L-153's, or else L-154's. `None` when
+    /// nothing is owed, deciding and counting nothing.
+    pub fn owed_offer(&mut self, offered: OfferedTime, now: Tick) -> Option<TimeOffer> {
+        self.audit.as_ref()?;
+        self.admitted(offered, now).err()
+    }
+
+    /// The refusals that need no RTC reading, in the protocol's order:
+    /// L-151's, counted, then L-153's, then L-154's.
+    fn admitted(&mut self, offered: OfferedTime, now: Tick) -> Result<UnixMillis, TimeOffer> {
+        if self.refuse_rate_limited(now) {
+            return Err(TimeOffer::RefusedRateLimited);
+        }
+        // Neither the window nor the step cap keeps an offer inside the
+        // RTC's century. Checked before the cap, whose answer sends the
+        // correction to a client `Time` that P-266 refuses too, and on the
+        // value as sent as well as advanced: queue time can carry one sent
+        // before 2000 into it (L-153).
+        let new = offered
+            .at(now)
+            .filter(|at| Calendar::holds(offered.sent()) && Calendar::holds(*at))
+            .and_then(UnixMillis::new)
+            .ok_or(TimeOffer::RefusedImplausible)?;
+        // Before the step cap, whose answer points at a client `Time` that
+        // P-267 refuses too while the record is owed. Not L-151's refusal:
+        // nobody exceeded a rate, and its window starts only on a landed
+        // change (L-154).
+        if self.audit.is_some() {
+            return Err(TimeOffer::RefusedRateLimited);
+        }
+        Ok(new)
     }
 
     /// Reserve a request until its answer is taken. Storage work and queued
@@ -422,12 +471,14 @@ impl WallClock {
         self.audit.is_some()
     }
 
-    /// Queued work also waits for a late audit's reply-cache horizon. This
-    /// prevents an older queued request from evicting a completed acceptance.
+    /// Whether a queued offer can be decided now. It waits for a late
+    /// audit's reply-cache horizon, so an older queued request cannot evict
+    /// a completed acceptance, but never for an owed record: `offer` refuses
+    /// it straight away then and completes nothing (L-154).
     #[must_use]
     pub fn ready_for_offer(&self, now: Tick) -> bool {
-        self.audit.is_none()
-            && self
+        self.audit.is_some()
+            || self
                 .completed
                 .is_none_or(|done| done.expires.is_some_and(|until| now >= until))
     }
@@ -512,6 +563,20 @@ impl WallClock {
             now.since(last)
                 .is_none_or(|elapsed| elapsed < CLIENT_INTERVAL)
         })
+    }
+
+    /// Whether a client's signed `Time` may execute now: error 7 while a
+    /// `time set` record is owed, whatever P-118's window says (P-267 rule
+    /// 2), and inside that window (P-118). Decided before the floor scan
+    /// and the clock is never moved for either.
+    pub fn client_admitted(&self, now: Tick) -> Result<(), ClientBusy> {
+        if self.audit.is_some() {
+            return Err(ClientBusy::RecordOwed);
+        }
+        if self.client_rate_limited(now) {
+            return Err(ClientBusy::RateLimited);
+        }
+        Ok(())
     }
 
     /// Retain a client's applied change until its audit is durable, and
@@ -1538,9 +1603,17 @@ mod tests {
     /// or the change's marker failed: the RTC moved, the override spent,
     /// the audit's first attempt taken and not landed.
     fn owed(fault: Fault, now: Tick) -> (Part, crate::ClockJournal, WallClock, ClockChange) {
+        owed_by(WallClock::new(), fault, now)
+    }
+
+    /// The same, on a clock that already carries its own state.
+    fn owed_by(
+        mut clock: WallClock,
+        fault: Fault,
+        now: Tick,
+    ) -> (Part, crate::ClockJournal, WallClock, ClockChange) {
         let change = overriding();
         let (mut part, mut journal) = known(fault);
-        let mut clock = WallClock::new();
         let written = journal.apply(&mut part, change);
         assert_eq!(
             clock.client_written(change, true, written, now),
@@ -1590,11 +1663,11 @@ mod tests {
         }
     }
 
-    /// While the record is owed, a later client `Time`, past P-118's
-    /// window, and a `TimeOffer` inside L-150's step are both decided and
-    /// neither moves the clock: two changes with one record owed are two
-    /// records that could land in either order (P-267 rule 2). What either
-    /// is answered is km43#187's and not asserted here.
+    /// While the record is owed, the calendar's journal refuses a second
+    /// change too, a client's past P-118's window or an offer's inside
+    /// L-150's step, whatever the decisions above it say: two changes with
+    /// one record owed are two records that could land in either order
+    /// (P-267 rule 2).
     #[test]
     fn p_267_while_a_record_is_owed_no_other_clock_change_is_applied() {
         let now = Tick::from_millis(5_000);
@@ -1608,11 +1681,11 @@ mod tests {
             else {
                 panic!("a client time the rules accept");
             };
-            let offered = OfferedTime::new(BELOW + 1_000, later);
-            let offer = clock
-                .offer(offered, Some(time(BELOW)), time(FLOOR), later)
-                .expect("an offer inside the step");
-            assert!(!clock.ready_for_offer(later));
+            let offer = ClockChange::recovered(
+                Some(time(BELOW)),
+                time(BELOW + 1_000),
+                TimeSource::NtpViaComms,
+            );
             for other in [client, offer] {
                 assert_eq!(
                     journal.apply(&mut part, other),
@@ -1622,6 +1695,244 @@ mod tests {
                 assert_eq!(journal.pending(), Some(change));
             }
             assert_eq!(clock.audit_due(later), Some(change));
+        }
+    }
+
+    /// A signed client `Time` that arrives while the record is owed, past
+    /// P-118's window, is error 7 before it executes, and nothing moves:
+    /// not the calendar, not the owed change, not P-118's window, and the
+    /// audit still retries the same record (P-267 rule 2).
+    #[test]
+    fn p_267_a_client_time_while_a_record_is_owed_gets_busy_and_changes_nothing() {
+        let now = Tick::from_millis(5_000);
+        for fault in [Fault::None, Fault::Marker] {
+            let (part, journal, mut clock, change) = owed(fault, now);
+            let later = now.after(CLIENT_INTERVAL).unwrap();
+            assert!(!clock.client_rate_limited(later));
+            let busy = clock.client_admitted(later).unwrap_err();
+            assert_eq!(busy, ClientBusy::RecordOwed);
+            assert_eq!(busy.answer(), TimeAnswer::Busy);
+            // Inside P-118's window the owed record still names the refusal.
+            assert_eq!(clock.client_admitted(now), Err(ClientBusy::RecordOwed));
+            assert_eq!(part.calendar, Some(time(BELOW)));
+            assert_eq!(journal.pending(), Some(change));
+            assert!(!clock.client_rate_limited(later));
+            assert_eq!(clock.audit_due(later), Some(change));
+        }
+    }
+
+    /// Inside P-118's window with nothing owed the answer is the same
+    /// error 7 for the window's reason, and past it the client is admitted.
+    #[test]
+    fn p_118_a_client_time_inside_the_window_is_busy_for_the_rate() {
+        let mut clock = WallClock::new();
+        assert_eq!(clock.client_admitted(Tick::ZERO), Ok(()));
+        let ClientSet::Set { change, .. } = WallClock::client(FLOOR, None, time(FLOOR), false)
+        else {
+            panic!("accepted");
+        };
+        assert!(clock.client_applied(change, Tick::ZERO));
+        assert_eq!(clock.audit_written(Tick::ZERO), Some(Answered::Client));
+        let inside = Tick::from_millis(CLIENT_INTERVAL.as_millis() - 1);
+        let busy = clock.client_admitted(inside).unwrap_err();
+        assert_eq!(busy, ClientBusy::RateLimited);
+        assert_eq!(busy.answer(), TimeAnswer::Busy);
+        assert_eq!(
+            clock.client_admitted(Tick::ZERO.after(CLIENT_INTERVAL).unwrap()),
+            Ok(())
+        );
+    }
+
+    /// While the record is owed an offer is `refused_rate_limited` when it
+    /// is decided, whether it would correct inside L-150's step or past
+    /// it, and the clock stays: not counted under L-151 and its window not
+    /// started, so the first offer after the record lands is decided on
+    /// the ordinary rules (L-154).
+    #[test]
+    fn l_154_an_offer_while_a_record_is_owed_is_refused_rate_limited_and_leaves_the_l_151_window_untouched()
+     {
+        let now = Tick::from_millis(5_000);
+        for fault in [Fault::None, Fault::Marker] {
+            let (mut part, mut journal, mut clock, change) = owed(fault, now);
+            let later = now.after(Millis::from_millis(2_000)).unwrap();
+            // The clock reads as known while its record is owed, so the
+            // recorder decides against it with no floor scan first.
+            assert_eq!(journal.fraction(), Some(789));
+            assert!(clock.ready_for_offer(later));
+            for at in [BELOW + 1_000, BELOW + OFFER_STEP + 1] {
+                assert_eq!(
+                    clock.offer(
+                        OfferedTime::new(at, later),
+                        Some(time(BELOW)),
+                        time(FLOOR),
+                        later
+                    ),
+                    Err(TimeOffer::RefusedRateLimited)
+                );
+            }
+            assert_eq!(clock.rate_refusals(), 0);
+            assert_eq!(part.calendar, Some(time(BELOW)));
+            assert_eq!(journal.pending(), Some(change));
+            // L-153 comes first: a time the clock can never hold is
+            // implausible whether or not a record is owed, and not counted.
+            assert_eq!(
+                clock.offer(
+                    OfferedTime::new(CENTURY_END + 1, later),
+                    Some(time(BELOW)),
+                    time(FLOOR),
+                    later
+                ),
+                Err(TimeOffer::RefusedImplausible)
+            );
+            assert_eq!(clock.rate_refusals(), 0);
+            // The record lands in the same tick; the next offer is the
+            // ordinary rules', not a rate nobody exceeded.
+            journal
+                .recorded(&mut part)
+                .expect("the retried append lands");
+            assert_eq!(clock.audit_written(later), Some(Answered::Client));
+            let next = OfferedTime::new(BELOW + 1_000, later);
+            assert_eq!(
+                clock.offer(next, Some(time(BELOW)), time(FLOOR), later),
+                Ok(ClockChange::recovered(
+                    Some(time(BELOW)),
+                    time(BELOW + 1_000),
+                    TimeSource::NtpViaComms
+                ))
+            );
+            assert_eq!(
+                clock.offer(
+                    OfferedTime::new(BELOW + OFFER_STEP + 1, later),
+                    Some(time(BELOW)),
+                    time(FLOOR),
+                    later
+                ),
+                Err(TimeOffer::RefusedStepTooLarge)
+            );
+            assert_eq!(clock.rate_refusals(), 0);
+        }
+    }
+
+    /// The owed-record answer needs no reading of the RTC: the recorder
+    /// asks before it reads the calendar, so a read fault while a record
+    /// is owed still answers `refused_rate_limited`, after L-151 and L-153
+    /// as `offer` orders them. With nothing owed it decides nothing and
+    /// counts nothing (L-154).
+    #[test]
+    fn l_154_an_offer_while_a_record_is_owed_is_refused_without_reading_the_rtc() {
+        let mut free = WallClock::new();
+        assert_eq!(
+            free.owed_offer(OfferedTime::new(BELOW, Tick::ZERO), Tick::ZERO),
+            None
+        );
+        free.offer_applied(Tick::ZERO);
+        let inside = Tick::from_millis(1_000);
+        assert_eq!(
+            free.owed_offer(OfferedTime::new(BELOW, inside), inside),
+            None
+        );
+        assert_eq!(free.rate_refusals(), 0);
+
+        let now = Tick::from_millis(5_000);
+        let (_, _, mut clock, change) = owed(Fault::None, now);
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(BELOW + 1_000, now), now),
+            Some(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(CENTURY_END + 1, now), now),
+            Some(TimeOffer::RefusedImplausible)
+        );
+        assert_eq!(clock.rate_refusals(), 0);
+        assert_eq!(
+            clock.audit_due(now.after(AUDIT_RETRY).unwrap()),
+            Some(change)
+        );
+
+        let mut limited = WallClock::new();
+        limited.offer_applied(Tick::ZERO);
+        let (_, _, mut clock, _) = owed_by(limited, Fault::None, now);
+        assert_eq!(
+            clock.owed_offer(OfferedTime::new(BELOW + 1_000, now), now),
+            Some(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(clock.rate_refusals(), 1);
+    }
+
+    /// An offer inside L-151's window while a record is owed gets L-151's
+    /// refusal, which comes first and is counted, and the window it meets
+    /// is the one the last accepted offer started (L-151, L-154).
+    #[test]
+    fn l_151_l_154_an_offer_inside_the_window_while_a_record_is_owed_is_counted() {
+        let mut limited = WallClock::new();
+        limited.offer_applied(Tick::ZERO);
+        let now = Tick::from_millis(5_000);
+        let (_, _, mut clock, change) = owed_by(limited, Fault::None, now);
+        let inside = Tick::from_millis(OFFER_INTERVAL.as_millis() - 1);
+        for (at, counted) in [(BELOW + 1_000, 1), (CENTURY_END + 1, 2)] {
+            assert_eq!(
+                clock.offer(
+                    OfferedTime::new(at, inside),
+                    Some(time(BELOW)),
+                    time(FLOOR),
+                    inside
+                ),
+                Err(TimeOffer::RefusedRateLimited)
+            );
+            assert_eq!(clock.rate_refusals(), counted);
+        }
+        // Past L-151's window with the record still owed: L-154's, uncounted.
+        let past = Tick::ZERO.after(OFFER_INTERVAL).unwrap();
+        assert_eq!(
+            clock.offer(
+                OfferedTime::new(BELOW + 1_000, past),
+                Some(time(BELOW)),
+                time(FLOOR),
+                past
+            ),
+            Err(TimeOffer::RefusedRateLimited)
+        );
+        assert_eq!(clock.rate_refusals(), 2);
+        assert_eq!(clock.audit_due(past), Some(change));
+    }
+
+    /// Once the record lands both doors open on their ordinary rules: a
+    /// client `Time` past P-118's window is admitted and decided, and an
+    /// offer inside L-150's step is accepted (P-267, L-154).
+    #[test]
+    fn p_267_l_154_a_client_time_and_an_offer_are_answered_normally_once_the_record_lands() {
+        let now = Tick::from_millis(5_000);
+        for fault in [Fault::None, Fault::Marker] {
+            let (mut part, mut journal, mut clock, _) = owed(fault, now);
+            let later = now.after(CLIENT_INTERVAL).unwrap();
+            assert_eq!(clock.client_admitted(later), Err(ClientBusy::RecordOwed));
+            journal
+                .recorded(&mut part)
+                .expect("the retried append lands");
+            assert_eq!(clock.audit_written(later), Some(Answered::Client));
+            assert_eq!(clock.client_admitted(later), Ok(()));
+            let offer = clock
+                .offer(
+                    OfferedTime::new(BELOW + 1_000, later),
+                    Some(time(BELOW)),
+                    time(FLOOR),
+                    later,
+                )
+                .expect("an offer inside the step once the record landed");
+            part.fault = Fault::None;
+            let written = journal.apply(&mut part, offer);
+            assert_eq!(
+                clock.offer_written(
+                    ReqId(1),
+                    OfferedTime::new(BELOW + 1_000, later),
+                    offer,
+                    written,
+                    later
+                ),
+                OfferWritten::Applied { retained: true }
+            );
+            assert_eq!(part.calendar, Some(time(BELOW + 1_000)));
+            assert_eq!(clock.rate_refusals(), 0);
         }
     }
 
@@ -1652,7 +1963,6 @@ mod tests {
         assert!(clock.client_applied(change, Tick::ZERO));
         // One audit at a time: another change waits for this one.
         assert!(!clock.client_applied(change, Tick::ZERO));
-        assert!(!clock.ready_for_offer(Tick::ZERO));
         assert_eq!(clock.audit_due(Tick::ZERO), Some(change));
         // A lost link cancels offers' replies and not a client's.
         clock.cancel_pending();
