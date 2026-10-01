@@ -147,6 +147,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bt-hci"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f63b3d6f0ef006d9b87a075705d6c142b03681ad34090659647f0e227c1c667f"
+dependencies = [
+ "bt-hci-transport",
+ "btuuid",
+ "embassy-sync 0.8.0",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "futures-intrusive",
+ "heapless 0.9.3",
+]
+
+[[package]]
 name = "bt-hci-transport"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1144,7 +1159,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50247f4e91000fc87661e77254126c74acc4535f822ee247f7778807202dc938"
 dependencies = [
  "allocator-api2",
- "bt-hci",
+ "bt-hci 0.9.0",
  "bt-hci-transport",
  "docsplay",
  "document-features",
@@ -1810,7 +1825,7 @@ dependencies = [
 name = "o89-comms"
 version = "0.0.0"
 dependencies = [
- "bt-hci",
+ "bt-hci 0.9.0",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
@@ -2584,11 +2599,11 @@ dependencies = [
 
 [[package]]
 name = "trouble-host"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb9fe2be24000037431b036ba244cdb1d26f40e1719548553fb43c3fc62d496b"
+checksum = "19a566cc37ceaff5cc2a6ff8cc02debd1ee6b95d59ced8830d005da8b080cbe9"
 dependencies = [
- "bt-hci",
+ "bt-hci 0.10.1",
  "embassy-futures",
  "embassy-sync 0.8.0",
  "embassy-time",
