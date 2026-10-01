@@ -84,7 +84,7 @@ embassy-sync.workspace = true
 # TrouBLE 0.7 uses bt-hci 0.9, matching the pinned radio Transport; 0.8 uses 0.10.
 # Static pools only: no central, security/bonding, log or global allocator.
 trouble-host = { version = "=0.7.0", default-features = false, features = ["peripheral", "gatt", "default-packet-pool"] }
-bt-hci = "=0.9.0"
+bt-hci = "=0.10.1"
 
 [lints]
 workspace = true
