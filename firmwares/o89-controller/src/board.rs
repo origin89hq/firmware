@@ -5,11 +5,9 @@
 //! same table with the sources, and the gate holds the two together. No
 //! other file names a pin: what a task owns it is handed from [`Board`].
 //!
-//! A pin no task takes yet is still here, with the milestone that takes it
-//! on its `expect`: the day the pin is read, the expectation fails the
-//! build and the marker comes off. That keeps the table whole from the
-//! first image and makes the list of what is still unconfigured a list the
-//! compiler checks.
+//! Every pin in the table is taken by a task; a pin a later milestone took
+//! with nothing reading it would carry an `expect(dead_code)` naming it,
+//! and the day it was read the expectation would fail the build.
 //!
 //! Left alone on purpose, and not in [`Board`]: `PA13` and `PA14` are the
 //! probe's and are never reconfigured on revision A (F-012); `PF0`, `PF1`,
@@ -29,6 +27,8 @@
 use embassy_stm32::peripherals as p;
 use embassy_stm32::{Peri, PeripheralType, Peripherals};
 use o89_core::Revision;
+#[cfg(feature = "buses")]
+use o89_drivers::adc::{Divider, Loop};
 
 /// The board this image is built for.
 pub const REVISION: Revision = Revision::A;
@@ -44,6 +44,26 @@ pub const RS485_2_TX: usize = 10;
 /// RS-485 #3 transmit on `GPIOA`.
 pub const RS485_3_TX: usize = 0;
 
+/// `AIN_HOUSE` on ADC1's input 8.
+#[cfg(feature = "buses")]
+pub const HOUSE_CHANNEL: u8 = 8;
+/// `AIN_START` on ADC1's input 9.
+#[cfg(feature = "buses")]
+pub const START_CHANNEL: u8 = 9;
+/// `AIN_TANK` on ADC1's input 10.
+#[cfg(feature = "buses")]
+pub const TANK_CHANNEL: u8 = 10;
+
+/// The bank voltage's divider, 100 kΩ over 10 kΩ (`A-29`): ÷11.
+#[cfg(feature = "buses")]
+pub const HOUSE_DIVIDER: Option<Divider> = Divider::new(100_000, 10_000);
+/// The start battery's divider, the same (`A-29`).
+#[cfg(feature = "buses")]
+pub const START_DIVIDER: Option<Divider> = Divider::new(100_000, 10_000);
+/// The tank sender's loop across R46, 150 Ω (`A-27`).
+#[cfg(feature = "buses")]
+pub const TANK_LOOP: Option<Loop> = Loop::new(150);
+
 /// One RS-485 channel: the USART and its two pins.
 pub struct Rs485<U, T, R>
 where
@@ -52,27 +72,94 @@ where
     R: PeripheralType + 'static,
 {
     /// The USART instance.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub usart: Peri<'static, U>,
     /// Transmit, which idles high (F-002).
     pub tx: Peri<'static, T>,
     /// Receive.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub rx: Peri<'static, R>,
 }
 
-/// One VE.Direct port: receive only, the pull-up off by default (F-051).
-pub struct VeDirect<U, R>
+/// One VE.Direct port: receive only, the pull-up off unless the port is
+/// configured for a 3.3 V product (F-051), and the DMA channel its
+/// receiver fills a ring through.
+pub struct VeDirect<U, R, D>
 where
     U: PeripheralType + 'static,
     R: PeripheralType + 'static,
+    D: PeripheralType + 'static,
 {
     /// The LPUART instance.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub usart: Peri<'static, U>,
     /// Receive, through 1 kΩ, on connector pin 3 on revision A.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub rx: Peri<'static, R>,
+    /// The receiver's DMA channel.
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub dma: Peri<'static, D>,
+}
+
+/// The ADC's three inputs.
+pub struct AdcPins {
+    /// `AIN_HOUSE`, PB0: the bank voltage.
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub house: Peri<'static, p::PB0>,
+    /// `AIN_START`, PB1: the start battery.
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub start: Peri<'static, p::PB1>,
+    /// `AIN_TANK`, PB2: the tank sender's 4–20 mA.
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub tank: Peri<'static, p::PB2>,
 }
 
 /// USART1, the module's UART0 (origin89hq/hardware#13).
@@ -152,21 +239,51 @@ pub struct Board {
     pub rs485_3: Rs485<p::USART4, p::PA0, p::PA1>,
 
     /// FDCAN1 on CN5.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub fdcan1: Peri<'static, p::FDCAN1>,
     /// CAN receive.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub can_rx: Peri<'static, p::PB8>,
     /// CAN transmit.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub can_tx: Peri<'static, p::PB9>,
 
     /// VE.Direct 1 on CN6.
-    #[expect(dead_code, reason = "taken in M5, the site")]
-    pub vedirect_1: VeDirect<p::LPUART1, p::PC0>,
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub vedirect_1: VeDirect<p::LPUART1, p::PC0, p::DMA1_CH1>,
     /// VE.Direct 2 on CN7.
-    #[expect(dead_code, reason = "taken in M5, the site")]
-    pub vedirect_2: VeDirect<p::LPUART2, p::PC1>,
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub vedirect_2: VeDirect<p::LPUART2, p::PC1, p::DMA1_CH2>,
 
     /// The FRAM's I2C. Blocking, no DMA: see `fram.rs`.
     pub i2c2: Peri<'static, p::I2C2>,
@@ -187,21 +304,33 @@ pub struct Board {
     pub nor_mosi: Peri<'static, NorMosi>,
 
     /// `OW_DATA_F`: the 1-Wire bus, bit-banged.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub onewire: Peri<'static, p::PC4>,
 
     /// The ADC.
-    #[expect(dead_code, reason = "taken in M5, the site")]
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
     pub adc1: Peri<'static, p::ADC1>,
-    /// `AIN_HOUSE`: the bank voltage.
-    #[expect(dead_code, reason = "taken in M5, the site")]
-    pub ain_house: Peri<'static, p::PB0>,
-    /// `AIN_START`: the start battery.
-    #[expect(dead_code, reason = "taken in M5, the site")]
-    pub ain_start: Peri<'static, p::PB1>,
-    /// `AIN_TANK`: the tank sender's 4–20 mA.
-    #[expect(dead_code, reason = "taken in M5, the site")]
-    pub ain_tank: Peri<'static, p::PB2>,
+    /// Its inputs.
+    #[cfg_attr(
+        not(feature = "buses"),
+        expect(
+            dead_code,
+            reason = "taken by the bus tasks, built with the `buses` feature (#196)"
+        )
+    )]
+    pub ain: AdcPins,
 
     /// `SEL_AUTO`, pulled up, switch to ground.
     pub sel_auto: Peri<'static, p::PB12>,
@@ -247,10 +376,12 @@ impl Board {
             vedirect_1: VeDirect {
                 usart: p.LPUART1,
                 rx: p.PC0,
+                dma: p.DMA1_CH1,
             },
             vedirect_2: VeDirect {
                 usart: p.LPUART2,
                 rx: p.PC1,
+                dma: p.DMA1_CH2,
             },
             i2c2: p.I2C2,
             fram_scl: p.PB13,
@@ -262,9 +393,11 @@ impl Board {
             nor_mosi: p.PA7,
             onewire: p.PC4,
             adc1: p.ADC1,
-            ain_house: p.PB0,
-            ain_start: p.PB1,
-            ain_tank: p.PB2,
+            ain: AdcPins {
+                house: p.PB0,
+                start: p.PB1,
+                tank: p.PB2,
+            },
             sel_auto: p.PB12,
             sel_manual: p.PB15,
             module: Module {

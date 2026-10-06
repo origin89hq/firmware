@@ -35,6 +35,9 @@ lint:
     cargo clippy --locked {{firmwares}} -p o89-comms --target {{riscv}} --features no-window -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features frames -- -D warnings
     cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features no-flow -- -D warnings
+    # The bus tasks (#196), checked though the default image does not link
+    # them yet: they need static RAM the image does not have.
+    cargo clippy --locked {{firmwares}} -p o89-controller --target {{cortex}} --features buses -- -D warnings
 
 # The host suite, including the compile-fail doctests.
 test:

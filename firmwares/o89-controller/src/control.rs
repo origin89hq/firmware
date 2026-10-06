@@ -92,7 +92,8 @@ pub struct Held {
     pub run: Output<'static>,
     /// `KICK`.
     pub kick: Output<'static>,
-    /// The three RS-485 transmit lines, until each bus takes its own.
+    /// The three RS-485 transmit lines, while no bus task takes them.
+    #[cfg(not(feature = "buses"))]
     pub rs485_tx: [Output<'static>; 3],
 }
 

@@ -36,9 +36,19 @@ no-flow = ["frames"]
 # words and resetting. For chasing a panic at the bench, and nothing else: a
 # bench run that proves the panic path runs without it.
 panic-probe = ["dep:panic-probe"]
+# One task per bus (#196): the RS-485, VE.Direct, CAN, 1-Wire and ADC
+# tasks and the ports they own. Off until the image has the static RAM
+# they take, which the default image does not have yet; `just lint` checks
+# it all the same.
+buses = ["dep:o89-drivers", "dep:embedded-can", "o89-core/buses"]
 
 [dependencies]
-o89-core = { path = "../../crates/o89-core", features = ["defmt"] }
+# Without its `buses` section until this crate's own `buses` feature asks
+# for it: the record does not fit the default image's RAM yet (#196).
+o89-core = { path = "../../crates/o89-core", default-features = false, features = ["defmt"] }
+# The device dialects and the site's plan, behind the seams this crate
+# fills; with the bus tasks only.
+o89-drivers = { path = "../../crates/o89-drivers", features = ["defmt"], optional = true }
 # The frames bench reads the number a worst-case frame carries; the same
 # module that stamps it on the other side.
 o89-link = { path = "../../crates/o89-link", optional = true }
@@ -58,6 +68,9 @@ embassy-sync = { workspace = true, features = ["defmt"] }
 embassy-futures.workspace = true
 static_cell.workspace = true
 embedded-io-async.workspace = true
+# The identifiers FDCAN hands frames back with; the release the pinned
+# embassy-stm32 implements.
+embedded-can = { version = "=0.4.1", optional = true }
 
 # The part. `memory-x` is off on purpose: it would emit the part's 512 KB,
 # and the budget is one slot less the bootloader. See memory.x.

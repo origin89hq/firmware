@@ -26,8 +26,14 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "buses")]
+mod adc;
 mod agreement;
 mod board;
+#[cfg(feature = "buses")]
+mod buses;
+#[cfg(feature = "buses")]
+mod can;
 mod clock;
 #[expect(
     unsafe_code,
@@ -45,6 +51,8 @@ mod last_words;
 mod link;
 mod mailbox;
 mod nor;
+#[cfg(feature = "buses")]
+mod onewire;
 mod panic;
 mod pvd;
 mod rail;
@@ -52,6 +60,8 @@ mod recorder;
 mod reset;
 mod rtc;
 mod selector;
+#[cfg(feature = "buses")]
+mod serial;
 mod site;
 #[expect(
     unsafe_code,
@@ -324,11 +334,15 @@ async fn main(spawner: Spawner) {
     });
 
     // 7. Every output this image drives, to its declared fail state. Held
-    // by the control tick for the life of the part; a bus takes its
-    // transmit line from there when it comes up.
+    // by the control tick for the life of the part. With the bus tasks
+    // built, the RS-485 transmit lines stay high from the first statement
+    // until their UARTs take them at 9c, where every channel is configured
+    // whether or not a device is on it (F-002); without them, the control
+    // tick holds them high for the life of the part.
     let held = control::Held {
         run: Output::new(b.gen_run, driven(Line::Run), Speed::Low),
         kick: Output::new(b.gen_kick, driven(Line::Kick), Speed::Low),
+        #[cfg(not(feature = "buses"))]
         rs485_tx: [
             Output::new(b.rs485_1.tx, driven(Line::Rs485Tx(Bus::One)), Speed::Low),
             Output::new(b.rs485_2.tx, driven(Line::Rs485Tx(Bus::Two)), Speed::Low),
@@ -388,6 +402,15 @@ async fn main(spawner: Spawner) {
     // and the part itself to both, a transfer at a time.
     // The worker holds the controller key and the label, and nothing else
     // on this side does (P-235).
+    // The buses and devices as the section on the part says, built before
+    // the section moves to the link task; a section the plan refuses runs
+    // no device at all rather than some of them.
+    #[cfg(feature = "buses")]
+    let plan = store
+        .as_ref()
+        .map_or(o89_drivers::plan::Plan::EMPTY, |store| {
+            site::plan(&store.configuration)
+        });
     let (keys, cuts, worker) = match store {
         Some(Store {
             secret,
@@ -396,14 +419,25 @@ async fn main(spawner: Spawner) {
             epoch: epoch_record,
             clients,
             budgets,
-            configuration,
+            #[cfg_attr(
+                not(feature = "buses"),
+                expect(
+                    unused_mut,
+                    reason = "the section's check is set only with the bus tasks"
+                )
+            )]
+            mut configuration,
             network,
             cuts,
             boots,
             ..
         }) => (
             Some(Keys {
-                configuration,
+                configuration: {
+                    #[cfg(feature = "buses")]
+                    configuration.check_buses_with(o89_drivers::plan::BUSES_CHECK);
+                    configuration
+                },
                 network,
                 secret: secret.present().copied(),
                 controller: controller.present().map(ControllerKey::public),
@@ -434,8 +468,12 @@ async fn main(spawner: Spawner) {
     };
     let fram = fram::share(fram);
 
-    // 9. The one site the reading plane reads, at its boot revision, before
-    // the link can answer a client out of it or the recorder announce it.
+    // 9. The one site the reading plane reads, at its boot revision with
+    // the configured buses, devices and signals, before the link can answer
+    // a client out of it or the recorder announce it.
+    #[cfg(feature = "buses")]
+    let site = site::boot(&plan);
+    #[cfg(not(feature = "buses"))]
     let site = site::boot();
 
     // 9a. The link, which builds its UART only once the rail task says the
@@ -465,6 +503,25 @@ async fn main(spawner: Spawner) {
     } else {
         defmt::error!("the recorder did not spawn; the watchdog will reset the part");
     }
+
+    // 9c. One task per bus, each writing the site (#196): the RS-485
+    // UARTs take their transmit lines here.
+    #[cfg(feature = "buses")]
+    buses::start(
+        buses::Peripherals {
+            rs485_1: b.rs485_1,
+            rs485_2: b.rs485_2,
+            rs485_3: b.rs485_3,
+            vedirect_1: b.vedirect_1,
+            vedirect_2: b.vedirect_2,
+            can: (b.fdcan1, b.can_rx, b.can_tx),
+            onewire: b.onewire,
+            adc: (b.adc1, b.ain),
+        },
+        &plan,
+        site,
+        tasks,
+    );
 
     // 10. The control tick, 1 Hz, holding every output.
     supervisor::check_in(Task::Control);

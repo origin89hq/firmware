@@ -501,6 +501,20 @@ fn compiled_sources(repo: &Repo) -> Result<Compiled> {
     compiled.read(&repo_root, &repo_root, &host)?;
     compiled.read(&repo_root, &repo_root, &cross::compile(repo)?)?;
     compiled.read(&repo_root, &firmware_root, &images::compile(repo)?)?;
+    // The controller's bus tasks (#196), behind a feature the default image
+    // does not take until it has their static RAM: checked, so the files
+    // only that feature compiles are compiled by the gate too.
+    let mut buses = repo.cargo();
+    buses
+        .args(["check", "--locked", "--manifest-path"])
+        .arg(repo.firmware_manifest())
+        .args(["-p", "o89-controller", "--target", crate::repo::CORTEX_M0])
+        .args(["--features", "buses"]);
+    compiled.read(
+        &repo_root,
+        &firmware_root,
+        &artifacts(&mut buses, "cargo check -p o89-controller --features buses")?,
+    )?;
     Ok(compiled)
 }
 

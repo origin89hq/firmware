@@ -1863,10 +1863,12 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync 0.8.0",
  "embassy-time",
+ "embedded-can",
  "embedded-io-async 0.7.0",
  "embedded-storage-async",
  "km43",
  "o89-core",
+ "o89-drivers",
  "o89-link",
  "panic-probe",
  "portable-atomic",
@@ -1884,6 +1886,16 @@ dependencies = [
  "km43",
  "o89-link",
  "sha2",
+]
+
+[[package]]
+name = "o89-drivers"
+version = "0.0.0"
+dependencies = [
+ "crc",
+ "defmt",
+ "km43",
+ "o89-core",
 ]
 
 [[package]]
