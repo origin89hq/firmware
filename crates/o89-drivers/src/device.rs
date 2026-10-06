@@ -9,17 +9,19 @@
 //! refusal is there so that a mistake costs one poll and not a reading
 //! written under somebody else's signal.
 
-use km43::{ComponentRole, Id, SignalDomain};
-use o89_core::{Millis, Readings, SignalError, Tick};
+use km43::{ComponentRole, Id, SignalDomain, Validity};
+use o89_core::{Heard, Millis, Readings, SignalError, Tick};
 
 use crate::dialect::{DecodeError, Kind, RegisterMap};
 use crate::ds18b20::{Conversion, Probe, ProbeError, ProbeRead};
 use crate::epever::{self, Charger};
 use crate::modbus::{self, Address, ModbusError, RECEIVE_BYTES, Timing};
 use crate::port::{Can, Listener, OneWire, Rs485};
+use crate::pylontech::FrameError;
 use crate::pylontech::{self, Pylontech, ReadError};
 use crate::pzem;
 use crate::vedirect::{self, Channels, Field, Frame, ListenError, Parser};
+use crate::vendor::DeclaredError;
 use crate::vendor::{Report, VendorError};
 
 /// The kinds of line a device can be on.
@@ -182,6 +184,122 @@ pub enum DeviceError<E> {
     Can(ReadError<E>),
     /// A probe read failed.
     Probe(ProbeError<E>),
+}
+
+impl<E> DeviceError<E> {
+    /// What the failure says of the device: silent when nothing came back
+    /// in time, faulty when something did and was refused, and nothing at
+    /// all when the failure is the line's, the store's or the adapter's,
+    /// or another node's frame on a shared bus.
+    #[must_use]
+    pub const fn heard(&self) -> Option<Heard> {
+        match self {
+            Self::WrongBus(_) => None,
+            Self::Poll(error) => poll_heard(error),
+            Self::Vendor(error) => match error {
+                VendorError::Poll(error) => poll_heard(error),
+                VendorError::Conditions(error)
+                | VendorError::Declared {
+                    error: DeclaredError::Read(error),
+                    ..
+                } => modbus_heard(error),
+                VendorError::Declared {
+                    error: DeclaredError::Decode(_),
+                    ..
+                }
+                | VendorError::Condition(_) => Some(Heard::Faulty),
+                VendorError::Declared {
+                    error: DeclaredError::Store(_),
+                    ..
+                } => None,
+            },
+            Self::Listen(error) => match error {
+                ListenError::Silent => Some(Heard::Silent),
+                ListenError::Line(_) => Some(Heard::Faulty),
+                ListenError::Adapter => None,
+            },
+            Self::Can(error) => match error {
+                ReadError::Port(crate::port::PortFault::Timeout) => Some(Heard::Silent),
+                ReadError::Frame(FrameError::Length { .. } | FrameError::Signature) => {
+                    Some(Heard::Faulty)
+                }
+                ReadError::Port(crate::port::PortFault::Line(_))
+                | ReadError::Frame(FrameError::Unknown(_))
+                | ReadError::Store(_) => None,
+            },
+            Self::Probe(error) => match error {
+                ProbeError::Line(_)
+                | ProbeError::Early
+                | ProbeError::Expired
+                | ProbeError::Store(_)
+                | ProbeError::Quality(_) => None,
+            },
+        }
+    }
+}
+
+const fn poll_heard<E>(error: &PollError<E>) -> Option<Heard> {
+    match error {
+        PollError::Modbus { error, .. } => modbus_heard(error),
+        PollError::Decode { .. } => Some(Heard::Faulty),
+        PollError::Store(_) | PollError::Signals => None,
+    }
+}
+
+/// A Modbus exchange's failure, as presence: a reply that never began is
+/// silence; one that arrived and was refused is a device answering
+/// badly. A missing echo is the bus, not the device.
+const fn modbus_heard<E>(error: &ModbusError<E>) -> Option<Heard> {
+    match error {
+        ModbusError::Timeout => Some(Heard::Silent),
+        ModbusError::Reply(_) => Some(Heard::Faulty),
+        ModbusError::Echo | ModbusError::Port(_) | ModbusError::Adapter => None,
+    }
+}
+
+/// How long a bus must stay quiet after an exchange before the next one
+/// discards what the port holds: a response bound after one that heard
+/// nothing, so a reply later than the bound but inside twice it lands
+/// before that discard and is dropped by it, rather than taken for the next
+/// exchange's own; nothing after any other outcome.
+#[must_use]
+pub fn quiet_after<T, E>(result: &Result<T, DeviceError<E>>, timing: Timing) -> Millis {
+    match result.as_ref().err().and_then(DeviceError::heard) {
+        Some(Heard::Silent) => timing.response,
+        Some(Heard::Answered | Heard::Faulty) | None => Millis::ZERO,
+    }
+}
+
+/// What a probe read says of the probe.
+#[must_use]
+pub const fn probe_heard(read: &ProbeRead) -> Heard {
+    match read {
+        ProbeRead::Wrote(seen) => match seen.quality().validity_of() {
+            Validity::Absent => Heard::Silent,
+            Validity::Ok => Heard::Answered,
+            Validity::Stale
+            | Validity::OutOfRange
+            | Validity::SensorFault
+            | Validity::Initialising
+            | Validity::Unsupported
+            | Validity::Reset
+            | Validity::UnnamedState => Heard::Faulty,
+        },
+        ProbeRead::Crc { .. } | ProbeRead::Failing(_) => Heard::Faulty,
+    }
+}
+
+/// What a VE.Direct burst says of the product: a verified block is an
+/// answer; only refused ones are a product answering badly.
+#[must_use]
+pub const fn vedirect_heard(heard: &vedirect::Heard) -> Option<Heard> {
+    if heard.blocks > 0 {
+        Some(Heard::Answered)
+    } else if heard.refused > 0 {
+        Some(Heard::Faulty)
+    } else {
+        None
+    }
 }
 
 impl Device {
@@ -1009,6 +1127,61 @@ mod tests {
         assert_eq!(
             (volts.value(), volts.q.provenance_of()),
             (Some(100_000), Provenance::Measured)
+        );
+    }
+
+    #[test]
+    fn f_050_a_bus_stays_quiet_a_response_bound_after_an_exchange_that_heard_nothing() {
+        let silent: Result<(), DeviceError<u8>> = Err(DeviceError::Poll(PollError::Modbus {
+            block: 0,
+            error: ModbusError::Timeout,
+        }));
+        assert_eq!(quiet_after(&silent, TIMING), TIMING.response);
+        let refused = DeviceError::<u8>::Poll(PollError::Modbus {
+            block: 0,
+            error: ModbusError::Reply(ReplyError::Crc),
+        });
+        assert_eq!(quiet_after(&Err::<(), _>(refused), TIMING), Millis::ZERO);
+        assert_eq!(refused.heard(), Some(Heard::Faulty));
+        let echo = DeviceError::<u8>::Poll(PollError::Modbus {
+            block: 0,
+            error: ModbusError::Echo,
+        });
+        assert_eq!(echo.heard(), None);
+
+        assert_eq!(
+            quiet_after(&Ok::<(), DeviceError<u8>>(()), TIMING),
+            Millis::ZERO
+        );
+    }
+
+    #[test]
+    fn a_failure_says_silent_faulty_or_nothing_of_the_device() {
+        assert_eq!(
+            DeviceError::<u8>::Listen(ListenError::Silent).heard(),
+            Some(Heard::Silent)
+        );
+        assert_eq!(
+            DeviceError::<u8>::Listen(ListenError::Line(3)).heard(),
+            Some(Heard::Faulty)
+        );
+        assert_eq!(
+            DeviceError::<u8>::Can(ReadError::Port(crate::port::PortFault::Timeout)).heard(),
+            Some(Heard::Silent)
+        );
+        // Another node's frame on the bus says nothing of the BMS.
+        let other = crate::port::CanId::standard(0x305).unwrap();
+        assert_eq!(
+            DeviceError::<u8>::Can(ReadError::Frame(FrameError::Unknown(other))).heard(),
+            None
+        );
+        assert_eq!(DeviceError::<u8>::WrongBus(BusKind::Can).heard(), None);
+        assert_eq!(DeviceError::<u8>::Probe(ProbeError::Early).heard(), None);
+        let absent = o89_core::Observation::missing(Validity::Absent).unwrap();
+        assert_eq!(probe_heard(&ProbeRead::Wrote(absent)), Heard::Silent);
+        assert_eq!(
+            probe_heard(&ProbeRead::Crc { consecutive: 1 }),
+            Heard::Faulty
         );
     }
 }

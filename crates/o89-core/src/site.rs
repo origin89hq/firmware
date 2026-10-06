@@ -330,6 +330,29 @@ impl Site {
         Ok(())
     }
 
+    /// What a poll of device `dev` heard, as the presence it moves the
+    /// device to: answering is online, answering with errors degraded, and
+    /// silence offline once it has been seen, while a device that has never
+    /// answered stays never seen rather than reading as one that went away.
+    pub fn heard(&mut self, dev: u16, heard: Heard) -> Result<Presence, SiteError> {
+        let seen = self
+            .presence
+            .iter()
+            .flatten()
+            .find(|seen| seen.dev == dev)
+            .ok_or(SiteError::UnknownDevice(dev))?;
+        let next = match (heard, seen.held) {
+            (Heard::Answered, _) => Presence::Online,
+            (Heard::Faulty, _) => Presence::Degraded,
+            (Heard::Silent, Presence::NeverSeen) => Presence::NeverSeen,
+            (Heard::Silent, Presence::Online | Presence::Degraded | Presence::Offline) => {
+                Presence::Offline
+            }
+        };
+        self.presence(dev, next)?;
+        Ok(next)
+    }
+
     /// A source says `report` holds.
     pub fn observe(&mut self, report: ConcernReport, now: Tick) -> Result<Id, SiteError> {
         self.concerns
@@ -687,6 +710,18 @@ impl Site {
             .flatten()
             .find(|announced| announced.sig == sig)
     }
+}
+
+/// What one poll of a device heard of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Heard {
+    /// It answered, and every reading came through.
+    Answered,
+    /// It answered, and something in the answer was refused.
+    Faulty,
+    /// Nothing came back in time.
+    Silent,
 }
 
 /// A poll's writes, held until the bus task hands them to the site in one
@@ -1510,5 +1545,20 @@ mod tests {
             Err(SignalError::TickBehind(sig(1)))
         );
         assert_eq!(staged.admits(sig(1), at(2)), Ok(()));
+    }
+
+    #[test]
+    fn a_device_never_heard_stays_never_seen_and_one_heard_goes_offline_on_silence() {
+        let mut site = site(1);
+        assert_eq!(site.heard(1, Heard::Silent), Ok(Presence::NeverSeen));
+        assert_eq!(site.heard(1, Heard::Faulty), Ok(Presence::Degraded));
+        assert_eq!(site.heard(1, Heard::Answered), Ok(Presence::Online));
+        assert_eq!(site.heard(1, Heard::Silent), Ok(Presence::Offline));
+        assert_eq!(site.heard(1, Heard::Silent), Ok(Presence::Offline));
+        assert_eq!(site.heard(1, Heard::Answered), Ok(Presence::Online));
+        assert_eq!(
+            site.heard(2, Heard::Answered),
+            Err(SiteError::UnknownDevice(2))
+        );
     }
 }
