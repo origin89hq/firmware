@@ -748,6 +748,66 @@ whose ring never opened answers a `ReadLog` with an empty page and refuses a
 `Subscribe`, since no event could reach it. A `Hello` otherwise reports
 the last extent published, which it promises nothing from.
 
+### Buses and devices from configuration
+
+What is wired to the controller is KM43's `0x0003 buses and devices`
+section: the settings of the board's buses and each device on them by
+product, dialect, bus and address (P-261 to P-265). The buses are the
+board's eight, numbered as the inventory lists them: bus 0 the controller's
+own inputs, 1 to 3 the RS-485 channels, 4 and 5 the VE.Direct ports, 6 CAN
+and 7 the 1-Wire line (`o89-core`'s `Connector`). The section is one A/B
+record with the next device id in it, so neither lands without the other
+(P-262), and a record of another layout, version 0, or a body km43 does not
+read is no section. Every write is checked first by km43 and then by the
+firmware's own plan, `o89-drivers`' `plan`, against the section it would
+store; the boot builds the site from the section with the same plan, so an
+accepted section is one the boot can build, and one the plan refuses runs
+no device rather than some. Beside km43's refusals the plan refuses a bus
+carrying more devices than its task holds (eight per RS-485 channel, eight
+probes, one VE.Direct product per port, one BMS on CAN), a product its
+dialect's driver does not read, an address the driver cannot use, an option
+value it cannot honour, devices on one serial bus whose dialects run it
+differently with no bus entry to settle it, and a site whose signals or
+components do not fit the store. VE.Direct text and Pylontech CAN have
+dialects and no product rows yet, so a device of either is refused until
+KM43 allocates one (origin89hq/km43#196); their drivers and poll entries are
+in place behind the refusal.
+
+**A device's ids come from its `dev`.** Its components and signals are
+derived from its dialect and are not configurable (P-263), and they take ids
+from a block of sixteen numbered from the `dev`: the first is `dev × 16 + 1`.
+An edit that keeps a device keeps its ids and the history filed under them;
+a `dev` past 4094 has no block and is refused. The controller's own inputs
+are `dev 0`'s, on bus 0, with the dialect `no protocol` and the role
+`controller`: the bank and the start battery behind their dividers and the
+tank's 4–20 mA loop, each a component and a signal. Two devices whose
+signal ids overlap are refused when the section is built, so no signal has
+two writers whose alternating writes would restart its unchanged run and
+hide a hung instrument.
+
+**A bus task polls; the site decides what it heard.** Each task owns its
+port and its devices, polls each at its period through its kind of bus's
+entry on `Device`, stages what the poll wrote and hands it to the site in
+one call (`Site::commit`), with what the poll heard of the device, which
+`Site::heard` turns into its presence: answering is online, answering with
+errors degraded, silence offline once it has been seen. An RS-485 burst ends
+at the channel's inter-frame gap, three and a half characters or 1.75 ms
+above 19200 bit/s (`o89-drivers`' `serial`), and an exchange that heard
+nothing leaves the bus quiet for a response bound before the next one, so a
+reply later than the bound and inside twice it is dropped by the next
+exchange's discard; a reply later than that is that exchange's, as far as
+any port can tell. The bound is 500 ms for every dialect: neither the EPEVER
+nor the PZEM documents the drivers cite state a response time, so it is an
+assumption the bench measures per device. The 1-Wire line masks interrupts
+only for the phases a device's timing is sampled inside, a one's low and a
+read's sample, and yields after every slot.
+
+A section a client writes is stored at once and built into the site at the
+next boot. The bus tasks and their ports are built only with the
+controller's `buses` feature: the default image does not have the static
+RAM they take, nor the record's, so it answers the section `UnknownSection`
+and runs no bus.
+
 ### Behaviours: parameters, not an engine
 
 A general rule engine on the MCU means an AST, an encoder, a validator,
