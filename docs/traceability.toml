@@ -89,8 +89,8 @@
 # Partial evidence is not a conformance claim; M4/#11 exits remain open.
 # 6: new sessions::conformance::p_019_unknown_get_config_key_is_accepted_but_duplicate_key_is_malformed
 #    and p_019_unknown_command_discriminant_is_refused_without_spending_a_counter.
-#    Readings are answered (#195); mixed known/vendor Readings waits on a
-#    vendor-range metric kind, which the descriptor table refuses today.
+#    Readings are answered (#195), and the descriptor table describes a
+#    vendor-range kind (#207); no test reads mixed known/vendor Readings yet.
 # 7: existing sessions::l_061_a_ninth_transport_is_refused_over_the_wire_and_no_row_is_evicted
 #    and p_051_eight_bad_macs_inside_a_minute_close_the_connection_over_the_wire;
 #    core session::p_051_eight_failures_inside_a_minute_shed_the_connection_and_a_hello_resets_nothing,

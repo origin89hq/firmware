@@ -20,13 +20,13 @@
 //! and the digest rides on the last page of a kind (P-148, P-208).
 //!
 //! cites: P-005, P-145, P-146, P-147, P-148, P-149, P-187, P-198, P-200,
-//! P-202, P-205, P-207, P-213
+//! P-202, P-204, P-205, P-207, P-213
 
 use km43::{
     ComponentRole, DeviceRole, Dialect, Direction, EnumSpace, Id, InventoryBody, InventoryError,
     InventoryOutcome, MAX_ADDR, MAX_TOPOLOGY_DEPTH, MeasurementPoint, MetricKind, Page, Product,
     ReadInventory, Row, RowKind, Sel, Shape, SignalDomain, TopoDigest, TopologyChangeReason,
-    TopologyChanged, Transport, Value, Vtype,
+    TopologyChanged, Transport, Unit, Value, VendorNamespace, Vtype,
 };
 
 use crate::signals::{Limits, SIGNAL_SLOTS};
@@ -174,10 +174,21 @@ pub struct SiteComponent {
     pub index: Option<u16>,
 }
 
+/// What the registry cannot answer for a vendor-range `kind`, so the row
+/// does: keys 14 to 16 of a `SignalRow` (P-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct VendorQuantity {
+    /// Key 14: what the value is measured in.
+    pub unit: Unit,
+    /// Key 15: the power of ten the value is scaled by, so -3 with
+    /// [`Unit::Volt`] is a value in millivolts.
+    pub scale: i8,
+    /// Key 16: whose numbering `kind` is drawn from.
+    pub vns: VendorNamespace,
+}
+
 /// A `SignalRow` for a scalar, as a driver declares it.
-///
-/// No vendor-range `kind` yet: its unit, scale and namespace would have to
-/// ride on the row (P-204), and no driver on this controller declares one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SiteSignal {
@@ -200,6 +211,9 @@ pub struct SiteSignal {
     pub dir: Option<Direction>,
     /// Key 13, required exactly when `vtype` is an enum or flags.
     pub esp: Option<EnumSpace>,
+    /// Keys 14 to 16, required exactly when `kind` is in the vendor range
+    /// `0xF000`–`0xFFFF` (P-204). Not part of P-207's identity.
+    pub vendor: Option<VendorQuantity>,
     /// How long its reading stays current in the store; not on the wire.
     pub limits: Limits,
 }
@@ -242,8 +256,12 @@ pub enum TopologyError {
     Address(u16),
     /// A signal whose identity tuple another signal already has (P-207).
     Collides(Id),
-    /// A vendor-range metric kind, which this table cannot describe yet.
+    /// A vendor-range metric kind declared without its unit, scale and
+    /// namespace (P-204).
     VendorKind(Id),
+    /// A metric kind below the vendor range declared with a unit, scale and
+    /// namespace, which the registry already answers for (P-204).
+    KnownKindVendor(Id),
     /// KM43 refused the row the declaration makes.
     Row(InventoryError),
     /// The revision is at the top of its range.
@@ -709,8 +727,10 @@ impl Topology {
         {
             return Err(TopologyError::NoSuchComponent(cmp.get()));
         }
-        if signal.kind.0 >= VENDOR_KINDS {
-            return Err(TopologyError::VendorKind(signal.sig));
+        match (signal.kind.0 >= VENDOR_KINDS, signal.vendor) {
+            (true, None) => return Err(TopologyError::VendorKind(signal.sig)),
+            (false, Some(_)) => return Err(TopologyError::KnownKindVendor(signal.sig)),
+            (true, Some(_)) | (false, None) => {}
         }
         if self.signals().any(|held| same_identity(held, &signal)) {
             return Err(TopologyError::Collides(signal.sig));
@@ -725,7 +745,8 @@ impl Topology {
 const VENDOR_KINDS: u16 = 0xF000;
 
 /// P-207's identity; every signal here is a scalar, so `shape` agrees
-/// across all of them.
+/// across all of them. A vendor kind's unit, scale and namespace are not in
+/// it: they move the digest as bytes of the row (P-148).
 fn same_identity(a: &SiteSignal, b: &SiteSignal) -> bool {
     a.dev == b.dev
         && a.cmp == b.cmp
@@ -820,9 +841,15 @@ fn signal_values(signal: &SiteSignal) -> [Value<'static>; 18] {
         Value::Absent,
         Value::Absent,
         signal.esp.map_or(Value::Absent, |esp| Value::U16(esp.0)),
-        Value::Absent,
-        Value::Absent,
-        Value::Absent,
+        signal
+            .vendor
+            .map_or(Value::Absent, |vendor| Value::U8(vendor.unit as u8)),
+        signal
+            .vendor
+            .map_or(Value::Absent, |vendor| Value::I8(vendor.scale)),
+        signal
+            .vendor
+            .map_or(Value::Absent, |vendor| Value::U16(vendor.vns.0)),
         Value::Absent,
         Value::Absent,
     ]
@@ -872,6 +899,7 @@ pub(crate) mod tests {
             point: Some(MeasurementPoint(sig)),
             dir: None,
             esp: None,
+            vendor: None,
             limits: limits(),
         })
     }
@@ -1415,5 +1443,195 @@ pub(crate) mod tests {
         assert_eq!(usize::from(reported.components), SITE_COMPONENTS);
         assert_eq!((reported.params, reported.series_elements), (0, 0));
         assert_eq!(usize::from(reported.concerns), crate::CONCERN_ROWS);
+    }
+
+    /// A vendor's own voltage on `dev`: `kind` in EPEVER's numbering, the
+    /// value in volts times ten to `scale`, told apart by `point`.
+    fn vendor(sig: u16, dev: u16, kind: u16, scale: i8) -> Descriptor {
+        let mut declared = signal(sig, dev);
+        if let Descriptor::Signal(signal) = &mut declared {
+            signal.kind = MetricKind(kind);
+            signal.vendor = Some(VendorQuantity {
+                unit: Unit::Volt,
+                scale,
+                vns: VendorNamespace::EPEVER,
+            });
+        }
+        declared
+    }
+
+    /// The bytes of the `at`th signal row of the first page, as a client
+    /// receives them.
+    fn signal_row(topology: &Topology, at: usize, dst: &mut [u8; km43::MAX_ROW_BYTES]) -> usize {
+        let (_, (body, len)) = read(topology, 0, RowKind::Signal.number(), 0);
+        let mut reader = CborReader::new(&body[..len]);
+        let pairs = reader.map().expect("a map");
+        for _ in 0..pairs {
+            if reader.key().expect("a key") == 3 {
+                let n = reader.array().expect("rows");
+                for i in 0..n {
+                    let row = reader.raw().expect("a row");
+                    if i == at {
+                        dst[..row.len()].copy_from_slice(row);
+                        return row.len();
+                    }
+                }
+            } else {
+                reader.skip().expect("skips");
+            }
+        }
+        panic!("no signal row {at}");
+    }
+
+    /// **A vendor's own kind goes out with the unit, scale and namespace the
+    /// registry cannot give it** (P-204): keys 14 to 16 on the row, read back
+    /// by a client's decoder, beside a known kind that carries none of them.
+    #[test]
+    fn p_204_a_vendor_kind_is_held_with_keys_14_to_16_beside_a_known_kind_without_them() {
+        let mut topology = site(1);
+        topology
+            .apply(
+                TopologyChangeReason::ConfigWrite,
+                &[vendor(2, 1, 0xF001, -3)],
+            )
+            .expect("a vendor kind with its unit, scale and namespace");
+        let mut bytes = [0u8; km43::MAX_ROW_BYTES];
+
+        let len = signal_row(&topology, 0, &mut bytes);
+        let mut slots = km43::RowSlots::new();
+        let known = slots
+            .decode(RowKind::Signal, &bytes[..len])
+            .expect("a client reads it");
+        assert_eq!(known.get(4), Some(Value::U16(MetricKind::DC_VOLTAGE.0)));
+        for key in [14, 15, 16] {
+            assert_eq!(known.get(key), None, "key {key} on a known kind");
+        }
+
+        let len = signal_row(&topology, 1, &mut bytes);
+        let mut slots = km43::RowSlots::new();
+        let own = slots
+            .decode(RowKind::Signal, &bytes[..len])
+            .expect("a client reads it");
+        assert_eq!(own.get(4), Some(Value::U16(0xF001)));
+        assert_eq!(own.get(14), Some(Value::U8(Unit::Volt as u8)));
+        assert_eq!(own.get(15), Some(Value::I8(-3)));
+        assert_eq!(own.get(16), Some(Value::U16(VendorNamespace::EPEVER.0)));
+    }
+
+    /// Both ends of the vendor range and both ends of `i8` go out unchanged:
+    /// a range check off by one or a scale written unsigned shows up here.
+    #[test]
+    fn p_204_the_ends_of_the_vendor_range_and_of_a_scale_reach_the_row_unchanged() {
+        for (kind, scale) in [(0xF000, i8::MIN), (0xFFFF, i8::MAX), (0xF000, 0)] {
+            let mut topology = site(0);
+            topology
+                .apply(
+                    TopologyChangeReason::ConfigWrite,
+                    &[vendor(1, 1, kind, scale)],
+                )
+                .expect("a vendor kind at the edge");
+            let mut bytes = [0u8; km43::MAX_ROW_BYTES];
+            let len = signal_row(&topology, 0, &mut bytes);
+            let mut slots = km43::RowSlots::new();
+            let row = slots
+                .decode(RowKind::Signal, &bytes[..len])
+                .expect("a client reads it");
+            assert_eq!(row.get(4), Some(Value::U16(kind)), "{kind:#x}");
+            assert_eq!(row.get(15), Some(Value::I8(scale)), "{kind:#x} {scale}");
+        }
+    }
+
+    /// **A vendor kind without its unit is a number nobody can read**, so the
+    /// batch is refused whole, at the top of the range as at its bottom.
+    #[test]
+    fn p_204_a_vendor_kind_declared_without_its_unit_scale_and_namespace_is_refused() {
+        for kind in [0xF000, 0xFFFF] {
+            let mut topology = site(1);
+            let (rev, digest) = (topology.rev(), topology.digest());
+            let mut bare = signal(2, 1);
+            if let Descriptor::Signal(signal) = &mut bare {
+                signal.kind = MetricKind(kind);
+            }
+            assert_eq!(
+                topology.apply(TopologyChangeReason::ConfigWrite, &[signal(3, 1), bare]),
+                Err(TopologyError::VendorKind(Id::new(2).expect("non-zero"))),
+                "{kind:#x}"
+            );
+            assert_eq!((topology.rev(), topology.digest()), (rev, digest));
+            assert!(!topology.has_signal(Id::new(3).expect("non-zero")));
+        }
+    }
+
+    /// **A known kind carrying its own unit is a second answer to what the
+    /// number is in** (P-204): refused, up to the last kind below the range.
+    #[test]
+    fn p_204_a_known_kind_declared_with_a_unit_scale_and_namespace_is_refused() {
+        for kind in [MetricKind::DC_VOLTAGE.0, 0xEFFF] {
+            let mut topology = site(1);
+            let (rev, digest) = (topology.rev(), topology.digest());
+            assert_eq!(
+                topology.apply(TopologyChangeReason::ConfigWrite, &[vendor(2, 1, kind, -3)]),
+                Err(TopologyError::KnownKindVendor(
+                    Id::new(2).expect("non-zero")
+                )),
+                "{kind:#x}"
+            );
+            assert_eq!((topology.rev(), topology.digest()), (rev, digest));
+        }
+    }
+
+    /// The unit, scale and namespace are not P-207's identity: two vendor
+    /// signals that differ only in them measure the same thing and collide.
+    /// They are bytes of the row, so P-148's digest moves with each.
+    #[test]
+    fn p_207_p_148_a_vendor_quantity_is_outside_the_identity_and_inside_the_digest() {
+        let mut topology = site(0);
+        topology
+            .apply(
+                TopologyChangeReason::ConfigWrite,
+                &[vendor(1, 1, 0xF001, -3)],
+            )
+            .expect("one vendor signal");
+        let mut twin = vendor(2, 1, 0xF001, 0);
+        if let Descriptor::Signal(signal) = &mut twin {
+            signal.point = Some(MeasurementPoint(1));
+            signal.vendor = Some(VendorQuantity {
+                unit: Unit::Ampere,
+                scale: 0,
+                vns: VendorNamespace::VICTRON,
+            });
+        }
+        assert_eq!(
+            topology.apply(TopologyChangeReason::ConfigWrite, &[twin]),
+            Err(TopologyError::Collides(Id::new(2).expect("non-zero")))
+        );
+
+        let held = |declared: Descriptor| {
+            let mut topology = site(0);
+            topology
+                .apply(TopologyChangeReason::ConfigWrite, &[declared])
+                .expect("one vendor signal");
+            topology.digest()
+        };
+        let base = held(vendor(1, 1, 0xF001, -3));
+        assert_eq!(base, held(vendor(1, 1, 0xF001, -3)), "same rows");
+        assert_ne!(base, held(vendor(1, 1, 0xF001, -2)), "scale");
+        let mut other = vendor(1, 1, 0xF001, -3);
+        if let Descriptor::Signal(signal) = &mut other {
+            signal.vendor = Some(VendorQuantity {
+                unit: Unit::Ampere,
+                scale: -3,
+                vns: VendorNamespace::EPEVER,
+            });
+        }
+        assert_ne!(base, held(other), "unit");
+        if let Descriptor::Signal(signal) = &mut other {
+            signal.vendor = Some(VendorQuantity {
+                unit: Unit::Volt,
+                scale: -3,
+                vns: VendorNamespace::VICTRON,
+            });
+        }
+        assert_ne!(base, held(other), "vns");
     }
 }

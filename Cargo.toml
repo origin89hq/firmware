@@ -99,12 +99,14 @@ indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 
 [patch.crates-io]
-# km43 at the refusal of a time offer the clock cannot hold
-# (origin89hq/km43#186, L-153, #245 here), past the client time's
-# (#181, P-266, #238 here), the network origin token (#175, #234 here) and
-# the 0.8.1 release, with the counters' `reset` validity, the vendor-fault
-# and dialect allocations, the buses and devices body and its received
-# topology, the held-down record and silence, the failed client write and
-# the reseed, lockout and comms no-downgrade wording between.
-# The patch goes when a release carries #186.
-km43 = { git = "https://github.com/origin89hq/km43", rev = "14cc384b3b948174267c88e20794727794d173bb" }
+# km43 at a row's `scale` typed as `i8` (origin89hq/km43#195, P-204, #207
+# here), past the refusal of a time offer the clock cannot hold (#186, L-153,
+# #245 here), the client time's (#181, P-266, #238 here), the network origin
+# token (#175, #234 here) and the 0.8.1 release, with the counters' `reset`
+# validity, the vendor-fault and dialect allocations, the buses and devices
+# body and its received topology, the held-down record and silence, the
+# failed client write and the reseed, lockout and comms no-downgrade wording
+# between. It also carries L-154 and P-267's answers while a `time set`
+# record is owed (#187), which #261 here implements.
+# The patch goes when a release carries #195.
+km43 = { git = "https://github.com/origin89hq/km43", rev = "c2f5a444e56d1e64917b974e6b1bf57ea0856856" }
