@@ -55,6 +55,10 @@ pub enum Line {
     ModuleRail,
     /// The receive pull-up of one VE.Direct port.
     VeDirectPullUp(Port),
+    /// FDCAN1's transmit line into the CAN transceiver.
+    CanTx,
+    /// The 1-Wire data line, which the controller only ever pulls low.
+    OneWire,
     /// The status and fault lamps, seen as one lamp.
     Lamp,
 }
@@ -74,6 +78,10 @@ pub enum FailState {
     On,
     /// Off: nothing is pulled up.
     Off,
+    /// Released, high-impedance, and held at its idle level by a pull-up
+    /// on the board: never driven high, and driven low only for the length
+    /// of a bit by running firmware.
+    Released,
     /// Whatever the board leaves it through reset; no hazard.
     LeftToTheBoard,
 }
@@ -95,6 +103,7 @@ impl Line {
             ) => FailState::InputOrLow,
             (Line::ModuleRail, Revision::A | Revision::B) => FailState::On,
             (Line::VeDirectPullUp(_), Revision::A | Revision::B) => FailState::Off,
+            (Line::CanTx | Line::OneWire, Revision::A | Revision::B) => FailState::Released,
             (Line::Lamp, Revision::A | Revision::B) => FailState::LeftToTheBoard,
         }
     }
@@ -176,6 +185,8 @@ mod tests {
             (Line::ModuleRail, FailState::On),
             (Line::VeDirectPullUp(Port::One), FailState::Off),
             (Line::VeDirectPullUp(Port::Two), FailState::Off),
+            (Line::CanTx, FailState::Released),
+            (Line::OneWire, FailState::Released),
             (Line::Lamp, FailState::LeftToTheBoard),
         ];
         for (line, declared) in architecture {

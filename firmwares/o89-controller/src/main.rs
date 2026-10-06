@@ -92,6 +92,7 @@ const fn driven(line: Line) -> Level {
         FailState::DrivenLow
         | FailState::InputOrLow
         | FailState::Off
+        | FailState::Released
         | FailState::LeftToTheBoard => Level::Low,
     }
 }
