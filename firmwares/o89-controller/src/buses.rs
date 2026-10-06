@@ -247,8 +247,13 @@ pub async fn onewire(
             }
             Err(error) => defmt::warn!("onewire: no conversion: {}", error),
         }
-        check_in(Task::OneWire);
-        Timer::after(duration(period)).await;
+        // A period may be longer than the task's window, so the wait is
+        // turns, each checked in: at most the period over a turn of them.
+        let due = Uptime.now().after(period);
+        while due.is_some_and(|due| Uptime.now() < due) {
+            check_in(Task::OneWire);
+            Timer::after(TURN).await;
+        }
     }
 }
 

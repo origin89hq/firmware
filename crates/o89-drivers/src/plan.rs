@@ -517,6 +517,19 @@ impl Plan {
                 }
             }
         }
+        // km43 refused a chain that loops or runs too deep; one left over
+        // here is named rather than dropped, which would leave its signals
+        // on a device the batch never adds and the boot refusing all of it.
+        if let Some(left) = self
+            .devices
+            .iter()
+            .zip(placed)
+            .find_map(|(planned, done)| planned.filter(|_| !done))
+        {
+            return Err(PlanError::Section(ConfigError::ParentNotListed(
+                left.row.parent.unwrap_or(left.dev),
+            )));
+        }
         for input in LocalInput::ALL {
             let cmp = input.signal().ok_or(PlanError::DevPastIds(0))?;
             rows.push(Descriptor::Component(SiteComponent {
@@ -1409,5 +1422,36 @@ mod tests {
         );
         let section = accepted(&[pzem_dc(&[1])], &[]).unwrap();
         assert_eq!((BUSES_CHECK.plan)(&section), Ok(()));
+    }
+
+    #[test]
+    fn p_187_a_sub_device_whose_parent_has_a_higher_dev_is_added_after_it() {
+        // First write: a meter, dev 1, and a charger, dev 2.
+        let first = accepted(&[pzem_dc(&[1]), epever(1, &[1])], &[]).unwrap();
+        // Second: the meter edited to sit under the charger.
+        let mut child = pzem_dc(&[1]);
+        child.dev = DevId::new(1).ok();
+        child.parent = DevId::new(2).ok();
+        let mut parent = epever(1, &[1]);
+        parent.dev = DevId::new(2).ok();
+        let mut write = BusesAndDevicesWrite::EMPTY;
+        write.push_device(child).unwrap();
+        write.push_device(parent).unwrap();
+        let next = DevAllocator::resume(DevId::new(3).ok());
+        let section = write.accept(&RULES, &first, next).unwrap().section;
+        let plan = Plan::new(&section).unwrap();
+        let (out, len) = rows(&plan);
+        let order: [Option<u16>; 3] = core::array::from_fn(|at| {
+            out[..len]
+                .iter()
+                .filter_map(|row| match row {
+                    Descriptor::Device(device) => Some(device.dev),
+                    Descriptor::Bus(_) | Descriptor::Component(_) | Descriptor::Signal(_) => None,
+                })
+                .nth(at)
+        });
+        assert_eq!(order, [Some(0), Some(2), Some(1)]);
+        let site = site(&plan);
+        assert!(site.topology().has_device(1));
     }
 }
