@@ -22,8 +22,7 @@ use crate::{Body, Malformed};
 /// The record's layout. A record of another layout is not read.
 const FORMAT: u8 = 1;
 
-/// Format, version, the next device id, length, then the body.
-pub const BUSES_RECORD_BYTES: usize = 1 + 4 + 2 + 2 + MAX_BUSES_AND_DEVICES_BYTES;
+pub use crate::map::BUSES_RECORD_BYTES;
 
 /// What the firmware checks a section against beyond what km43 can.
 #[derive(Debug, Clone, Copy)]

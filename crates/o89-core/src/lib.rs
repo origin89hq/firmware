@@ -36,6 +36,7 @@ mod agreement;
 mod body;
 mod boot_count;
 mod budget;
+#[cfg(feature = "buses")]
 mod buses;
 mod calendar;
 mod clients;
@@ -91,6 +92,7 @@ pub use agreement::{Agreement, Done, HANDSHAKE_ANSWER, HANDSHAKE_FRAME, Job, Rep
 pub use body::*;
 pub use boot_count::*;
 pub use budget::*;
+#[cfg(feature = "buses")]
 pub use buses::{BUSES_RECORD_BYTES, BusesCheck, BusesRecord};
 pub use calendar::*;
 pub use clients::*;

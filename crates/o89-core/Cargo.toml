@@ -9,6 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
+# `0x0003 buses and devices`: the section, its record held in RAM and its
+# `GetConfig` and `SetConfig`. On by default; the controller turns it off
+# until its image has the static RAM the record takes (#196), and answers
+# the section `UnknownSection` as before.
+default = ["buses"]
+buses = []
 # `defmt::Format` on every public type, for the controller's log. Off on the
 # host, where the tests read the types as Rust.
 defmt = ["dep:defmt", "km43/defmt", "o89-link/defmt"]

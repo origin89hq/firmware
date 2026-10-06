@@ -10,7 +10,6 @@
 
 use crate::boot_count::BOOT_COUNT_BYTES;
 use crate::budget::BUDGET_BYTES;
-use crate::buses::BUSES_RECORD_BYTES;
 use crate::clients::{KEY_RECORD_BYTES, MARK_BYTES, SLOTS};
 use crate::dedup::COMMANDS_BYTES;
 use crate::drbg::DRBG_BYTES;
@@ -159,6 +158,11 @@ const BUDGET_5: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD5"), BUDGET_4.end(
 const BUDGET_6: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD6"), BUDGET_5.end());
 const BUDGET_7: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD7"), BUDGET_6.end());
 const BUDGET_8: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD8"), BUDGET_7.end());
+
+/// The buses and devices record: layout, version, the next device id,
+/// length, then the body. Reserved whether or not the image serves the
+/// section, so the map is one map.
+pub const BUSES_RECORD_BYTES: usize = 1 + 4 + 2 + 2 + km43::MAX_BUSES_AND_DEVICES_BYTES;
 
 /// `0x0003 buses and devices` with the next device id it will give, one
 /// record so neither can land without the other (P-102, P-262). Last, so

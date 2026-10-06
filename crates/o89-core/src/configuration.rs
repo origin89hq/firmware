@@ -1,6 +1,7 @@
 //! Versioned configuration sections. Every accepted write commits its inactive
 //! slot before publishing the new RAM value (P-100 to P-103).
 use crate::body::{Reader, Writer};
+#[cfg(feature = "buses")]
 use crate::buses::{self, BUSES_RECORD_BYTES, BusesCheck, BusesRecord};
 use crate::{Body, Fram, Generator, Held, Kept, Malformed, NETWORK_BYTES, Network, map};
 use km43::{
@@ -15,12 +16,16 @@ pub const BEHAVIOUR_RECORD_BYTES: usize = 5 + km43::MAX_BEHAVIOUR_BYTES;
 
 /// The widest body any section answers with: the network's or the buses
 /// and devices'.
+#[cfg(feature = "buses")]
 pub const MAX_SECTION_READ_BYTES: usize =
     if km43::MAX_NETWORK_READ_BYTES > km43::MAX_BUSES_AND_DEVICES_BYTES {
         km43::MAX_NETWORK_READ_BYTES
     } else {
         km43::MAX_BUSES_AND_DEVICES_BYTES
     };
+/// The widest body any section answers with: the network's.
+#[cfg(not(feature = "buses"))]
+pub const MAX_SECTION_READ_BYTES: usize = km43::MAX_NETWORK_READ_BYTES;
 
 /// Canonical CBOR, bounded by its section schema; oversized bodies are refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +67,7 @@ type Identity = Kept<Section<{ km43::MAX_IDENTITY_BYTES }>, IDENTITY_RECORD_BYTE
 type Behaviour = Kept<Section<{ km43::MAX_BEHAVIOUR_BYTES }>, BEHAVIOUR_RECORD_BYTES>;
 
 /// The buses and devices record.
+#[cfg(feature = "buses")]
 pub type Buses = Kept<BusesRecord, BUSES_RECORD_BYTES>;
 
 /// The currently implemented section records; the network stays the master copy.
@@ -71,9 +77,11 @@ pub struct Configuration {
     frost: Behaviour,
     schedule: Behaviour,
     load_shed: Behaviour,
+    #[cfg(feature = "buses")]
     buses: Buses,
     /// What a buses and devices write is checked against; none, and the
     /// section is not served.
+    #[cfg(feature = "buses")]
     buses_check: Option<BusesCheck>,
 }
 
@@ -86,19 +94,23 @@ impl Configuration {
             frost: Kept::read(map::FROST_CONFIG.prefix(), fram).await?,
             schedule: Kept::read(map::SCHEDULE_CONFIG.prefix(), fram).await?,
             load_shed: Kept::read(map::LOAD_SHED_CONFIG.prefix(), fram).await?,
+            #[cfg(feature = "buses")]
             buses: Kept::read(map::BUSES_CONFIG, fram).await?,
+            #[cfg(feature = "buses")]
             buses_check: None,
         })
     }
 
     /// Serve `0x0003 buses and devices`, checking every write against
     /// `check` as well as against km43's rules.
+    #[cfg(feature = "buses")]
     pub fn check_buses_with(&mut self, check: BusesCheck) {
         self.buses_check = Some(check);
     }
 
     /// The buses and devices section as the boot read it, or as the last
     /// accepted write left it.
+    #[cfg(feature = "buses")]
     #[must_use]
     pub const fn buses(&self) -> &Buses {
         &self.buses
@@ -131,6 +143,7 @@ impl Configuration {
                     )
                 }
             },
+            #[cfg(feature = "buses")]
             ConfigSection::BusesAndDevices => {
                 if self.buses_check.is_none() {
                     return Err(ErrorCode::UnknownSection);
@@ -140,6 +153,8 @@ impl Configuration {
                     Held::Present(record) => (record.version(), Some(record.body())),
                 }
             }
+            #[cfg(not(feature = "buses"))]
+            ConfigSection::BusesAndDevices => return Err(ErrorCode::UnknownSection),
             ConfigSection::Channels | ConfigSection::Cloud => {
                 return Err(ErrorCode::UnknownSection);
             }
@@ -170,7 +185,10 @@ impl Configuration {
                 self.load_shed.present().map_or(0, |value| value.version)
             }
             ConfigSection::Network => network.present().map_or(0, Network::version),
+            #[cfg(feature = "buses")]
             ConfigSection::BusesAndDevices => self.buses.present().map_or(0, BusesRecord::version),
+            #[cfg(not(feature = "buses"))]
+            ConfigSection::BusesAndDevices => 0,
             ConfigSection::Channels | ConfigSection::Cloud => 0,
         }
     }
@@ -240,7 +258,10 @@ impl Configuration {
                     .map_err(|_| ErrorCode::BusyRetry)?;
                 Ok(ack(operation, next.version(), SetConfig::Accepted))
             }
+            #[cfg(feature = "buses")]
             ConfigSection::BusesAndDevices => self.set_buses(operation, fram).await,
+            #[cfg(not(feature = "buses"))]
+            ConfigSection::BusesAndDevices => Err(ErrorCode::UnknownSection),
             ConfigSection::Channels | ConfigSection::Cloud => Err(ErrorCode::UnknownSection),
         }
     }
@@ -248,6 +269,7 @@ impl Configuration {
     /// A buses and devices write: the version first (P-100), then km43's
     /// checks and the firmware's, then the record with the next device id
     /// in it, or nothing (P-102, P-262).
+    #[cfg(feature = "buses")]
     async fn set_buses<F: Fram>(
         &mut self,
         operation: SetConfigOperation<'_>,
@@ -636,193 +658,6 @@ mod tests {
                 let answer = ConfigAnswer::decode(&bytes[..len]).expect("answer");
                 assert_eq!((answer.version(), answer.body()), (1, Some(operation.body)));
             }
-        }
-    }
-
-    mod buses_and_devices {
-        use super::*;
-        use km43::{
-            Addr, BoardBus, BusesAndDevicesWrite, ConfigError, DevId, DeviceEntry, DeviceOptions,
-            DeviceRole, Dialect, DialectRule, Product, SiteRules, Transport,
-        };
-
-        const BUSES: [BoardBus; 1] = [BoardBus {
-            bus: 2,
-            transport: Transport::Rs485,
-        }];
-        const DIALECTS: [DialectRule<'static>; 1] = [DialectRule {
-            dialect: Dialect::PZEM_DC,
-            transports: &[Transport::Rs485],
-            options: &[],
-            min_poll_ms: 0,
-        }];
-        static RULES: SiteRules<'static> = SiteRules {
-            buses: &BUSES,
-            dialects: &DIALECTS,
-            max_devices: 4,
-            max_topology_depth: 4,
-        };
-
-        #[expect(
-            clippy::unnecessary_wraps,
-            reason = "the check's signature, which a refusing check needs"
-        )]
-        fn accept(_: &km43::BusesAndDevicesRead<'_>) -> Result<(), ConfigError> {
-            Ok(())
-        }
-
-        fn checked(part: &mut Part) -> Configuration {
-            let mut config = block_on(Configuration::read(part)).expect("config");
-            config.check_buses_with(BusesCheck {
-                rules: &RULES,
-                plan: accept,
-            });
-            config
-        }
-
-        fn body(addrs: &[u8], bus: u8, out: &mut [u8]) -> usize {
-            let mut write = BusesAndDevicesWrite::EMPTY;
-            for addr in addrs {
-                write
-                    .push_device(DeviceEntry {
-                        dev: None,
-                        bus,
-                        addr: Some(Addr::new(core::slice::from_ref(addr)).expect("addr")),
-                        product: Product::PZEM_017,
-                        dialect: Dialect::PZEM_DC,
-                        role: DeviceRole::ENERGY_METER,
-                        parent: None,
-                        options: DeviceOptions::NONE,
-                    })
-                    .expect("room");
-            }
-            write.encode(out).expect("encodes")
-        }
-
-        fn set(expected_version: u32, body: &[u8]) -> SetConfigOperation<'_> {
-            SetConfigOperation {
-                section: ConfigSection::BusesAndDevices,
-                expected_version,
-                body,
-            }
-        }
-
-        fn write(
-            config: &mut Configuration,
-            part: &mut Part,
-            operation: SetConfigOperation<'_>,
-        ) -> Result<SetConfigAck, ErrorCode> {
-            let mut network = block_on(Kept::read(map::NETWORK, part)).expect("network");
-            let mut generator = seeded(part);
-            block_on(config.set(operation, &mut network, &mut generator, part))
-        }
-
-        fn read(config: &Configuration, part: &mut Part) -> (u32, Option<[u8; 64]>, usize) {
-            let network = block_on(Kept::read(map::NETWORK, part)).expect("network");
-            let mut bytes = [0; km43::CONFIG_HEADER_BYTES + MAX_SECTION_READ_BYTES];
-            let len = config
-                .answer(ConfigSection::BusesAndDevices, &network, &mut bytes)
-                .expect("answered");
-            let answer = ConfigAnswer::decode(&bytes[..len]).expect("answer");
-            let body = answer.body().map(|body| {
-                let mut out = [0; 64];
-                out[..body.len()].copy_from_slice(body);
-                out
-            });
-            (answer.version(), body, answer.body().map_or(0, <[u8]>::len))
-        }
-
-        #[expect(
-            clippy::large_stack_arrays,
-            reason = "The host fixture models bounded FRAM without an allocator."
-        )]
-        fn blank() -> Part {
-            Part([0; crate::FRAM_BYTES])
-        }
-
-        /// Whether the section's record is byte for byte what `before` held.
-        fn untouched(part: &Part, before: &[u8; crate::FRAM_BYTES]) -> bool {
-            let record =
-                usize::from(map::BUSES_CONFIG.start().0)..usize::from(map::BUSES_CONFIG.end().0);
-            part.0[record.clone()] == before[record]
-        }
-
-        #[test]
-        fn the_section_is_unknown_until_the_firmware_checks_it() {
-            let mut part = damaged_part(false);
-            let mut config = block_on(Configuration::read(&mut part)).expect("config");
-            let mut out = [0; 64];
-            let len = body(&[1], 2, &mut out);
-            assert_eq!(
-                write(&mut config, &mut part, set(0, &out[..len])),
-                Err(ErrorCode::UnknownSection)
-            );
-            let network = block_on(Kept::read(map::NETWORK, &mut part)).expect("network");
-            let mut bytes = [0; 64];
-            assert_eq!(
-                config.answer(ConfigSection::BusesAndDevices, &network, &mut bytes),
-                Err(ErrorCode::UnknownSection)
-            );
-        }
-
-        #[test]
-        fn p_100_an_empty_site_then_a_valid_one_are_stored_and_read_back_after_a_reboot() {
-            let mut part = blank();
-            let mut config = checked(&mut part);
-            assert_eq!(read(&config, &mut part), (0, None, 0));
-            let mut out = [0; 64];
-            let len = body(&[], 2, &mut out);
-            let ack = write(&mut config, &mut part, set(0, &out[..len])).expect("ack");
-            assert_eq!((ack.version, ack.outcome), (1, SetConfig::Accepted));
-            let len = body(&[1, 2], 2, &mut out);
-            let ack = write(&mut config, &mut part, set(1, &out[..len])).expect("ack");
-            assert_eq!((ack.version, ack.outcome), (2, SetConfig::Accepted));
-            let rebooted = checked(&mut part);
-            let (version, held, held_len) = read(&rebooted, &mut part);
-            assert_eq!(version, 2);
-            let held = held.expect("a body");
-            let section = km43::BusesAndDevicesRead::decode(&held[..held_len]).expect("read");
-            let devs: [u16; 2] = {
-                let mut devs = [0; 2];
-                for (slot, device) in devs.iter_mut().zip(section.devices()) {
-                    *slot = device.dev.get();
-                }
-                devs
-            };
-            assert_eq!(devs, [1, 2]);
-            assert_eq!(
-                rebooted
-                    .buses()
-                    .present()
-                    .map(|record| record.allocator().next()),
-                Some(DevId::new(3).ok())
-            );
-        }
-
-        #[test]
-        fn p_100_a_write_at_an_unknown_version_is_refused_and_stores_nothing() {
-            let mut part = blank();
-            let mut config = checked(&mut part);
-            let mut out = [0; 64];
-            let len = body(&[1], 2, &mut out);
-            let before = part.0;
-            let ack = write(&mut config, &mut part, set(7, &out[..len])).expect("ack");
-            assert_eq!((ack.version, ack.outcome), (0, SetConfig::StaleVersion));
-            assert!(untouched(&part, &before));
-        }
-
-        #[test]
-        fn p_265_an_invalid_write_is_refused_and_stores_nothing() {
-            let mut part = blank();
-            let mut config = checked(&mut part);
-            let mut out = [0; 64];
-            // A device on a bus the board does not have.
-            let len = body(&[1], 3, &mut out);
-            let before = part.0;
-            let ack = write(&mut config, &mut part, set(0, &out[..len])).expect("ack");
-            assert_eq!((ack.version, ack.outcome), (0, SetConfig::Invalid));
-            assert!(untouched(&part, &before));
-            assert_eq!(read(&config, &mut part), (0, None, 0));
         }
     }
 }

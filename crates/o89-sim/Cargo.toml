@@ -18,6 +18,9 @@ embedded-storage-async.workspace = true
 km43.workspace = true
 
 [dev-dependencies]
+# The check the controller hands the configuration for `0x0003`, so the
+# section is simulated against the plan that ships (`src/buses.rs`).
+o89-drivers = { path = "../o89-drivers" }
 # Canonical traces from the same exact protocol pin; parser stays on the host.
 km43 = { workspace = true, features = ["vectors"] }
 serde_json = "=1.0.151"

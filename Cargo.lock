@@ -1406,6 +1406,7 @@ dependencies = [
  "o89-comms-core",
  "o89-comms-net",
  "o89-core",
+ "o89-drivers",
  "serde_json",
 ]
 

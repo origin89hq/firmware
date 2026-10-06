@@ -46,6 +46,8 @@ pub use fram::*;
 pub use nor::*;
 
 #[cfg(test)]
+mod buses;
+#[cfg(test)]
 mod configuration;
 
 #[cfg(test)]
