@@ -35,7 +35,7 @@ use km43::{
 
 use crate::concern_table::{ConcernError, ConcernRecord, ConcernReport, ConcernTable, Latch};
 use crate::record::MAX_PAYLOAD;
-use crate::signals::{Observation, SignalError, SiteSignals};
+use crate::signals::{Observation, Readings, SignalError, SiteSignals};
 use crate::tick::Tick;
 use crate::topology::{Descriptor, SITE_DEVICES, SITE_SIGNALS, Topology, TopologyError};
 
@@ -295,6 +295,24 @@ impl Site {
     /// What `sig`'s source said at `now`.
     pub fn write(&mut self, sig: Id, now: Tick, seen: Observation) -> Result<(), SiteError> {
         self.signals.write(sig, now, seen).map_err(SiteError::Store)
+    }
+
+    /// Take every write `staged` holds, in the order they were staged, or
+    /// none: each is checked against the store before the first lands, so
+    /// a batch naming a signal the store does not hold, or older than the
+    /// signal's last write, moves nothing. Says how many landed.
+    pub fn commit<const N: usize>(&mut self, staged: &Staged<N>) -> Result<usize, SiteError> {
+        for (sig, now, _) in staged.writes() {
+            self.signals.sample(sig, now).map_err(SiteError::Store)?;
+        }
+        let mut landed = 0usize;
+        for (sig, now, seen) in staged.writes() {
+            self.signals
+                .write(sig, now, seen)
+                .map_err(SiteError::Store)?;
+            landed = landed.saturating_add(1);
+        }
+        Ok(landed)
     }
 
     /// Device `dev` is now `presence`.
@@ -668,6 +686,83 @@ impl Site {
             .iter_mut()
             .flatten()
             .find(|announced| announced.sig == sig)
+    }
+}
+
+/// A poll's writes, held until the bus task hands them to the site in one
+/// call ([`Site::commit`]), so the site is never held across a poll's
+/// awaits.
+///
+/// `N` writes and no more: one past it is refused as [`SignalError::Full`],
+/// which the poll reports, and nothing staged before it is dropped. A
+/// signal staged twice must not go back in time, so a commit that checks
+/// each write against the store first can take the whole batch or none.
+#[derive(Debug, Clone)]
+pub struct Staged<const N: usize> {
+    writes: [Option<(Id, Tick, Observation)>; N],
+    len: usize,
+}
+
+impl<const N: usize> Default for Staged<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Staged<N> {
+    /// Nothing staged.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            writes: [None; N],
+            len: 0,
+        }
+    }
+
+    /// How many writes are staged.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing is staged.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Drop every staged write, for the next poll.
+    pub fn clear(&mut self) {
+        self.writes = [None; N];
+        self.len = 0;
+    }
+
+    /// The staged writes, in the order they were made.
+    pub fn writes(&self) -> impl Iterator<Item = (Id, Tick, Observation)> + '_ {
+        self.writes.iter().take(self.len).flatten().copied()
+    }
+}
+
+impl<const N: usize> Readings for Staged<N> {
+    fn write(&mut self, sig: Id, now: Tick, seen: Observation) -> Result<(), SignalError> {
+        self.admits(sig, now)?;
+        let slot = self.writes.get_mut(self.len).ok_or(SignalError::Full)?;
+        *slot = Some((sig, now, seen));
+        self.len = self.len.saturating_add(1);
+        Ok(())
+    }
+
+    /// Only what the batch itself can say: a write older than one already
+    /// staged for the same signal. Whether the store holds the signal is
+    /// [`Site::commit`]'s to check.
+    fn admits(&self, sig: Id, now: Tick) -> Result<(), SignalError> {
+        if self
+            .writes()
+            .any(|(staged, at, _)| staged == sig && now < at)
+        {
+            return Err(SignalError::TickBehind(sig));
+        }
+        Ok(())
     }
 }
 
@@ -1348,5 +1443,72 @@ mod tests {
         assert_eq!((record.cid, record.state), (cid, ConcernState::Cleared));
         site.committed(&cleared.token, 2);
         assert_eq!(site.concerns().state(cid), None, "free once it landed");
+    }
+
+    #[test]
+    fn a_staged_poll_lands_whole_in_the_order_it_was_staged() {
+        let mut site = site(2);
+        let mut staged = Staged::<4>::new();
+        assert!(staged.is_empty());
+        staged.write(sig(1), at(1), reading(10)).expect("staged");
+        staged.write(sig(2), at(1), reading(20)).expect("staged");
+        staged.write(sig(1), at(2), reading(11)).expect("staged");
+        assert_eq!(site.commit(&staged), Ok(3));
+        let first = site.signals().sample(sig(1), at(2)).expect("held");
+        let second = site.signals().sample(sig(2), at(2)).expect("held");
+        assert_eq!((first.value(), second.value()), (Some(11), Some(20)));
+        staged.clear();
+        assert_eq!((staged.len(), site.commit(&staged)), (0, Ok(0)));
+    }
+
+    #[test]
+    fn a_staged_write_naming_a_signal_the_site_does_not_hold_moves_nothing() {
+        let mut site = site(1);
+        let mut staged = Staged::<2>::new();
+        staged.write(sig(1), at(1), reading(10)).expect("staged");
+        staged.write(sig(9), at(1), reading(90)).expect("staged");
+        assert_eq!(
+            site.commit(&staged),
+            Err(SiteError::Store(SignalError::Unknown(sig(9))))
+        );
+        // The write before it did not land either.
+        let held = site.signals().sample(sig(1), at(1)).expect("held");
+        assert_eq!(held.value(), None);
+    }
+
+    #[test]
+    fn a_staged_write_older_than_the_site_s_last_moves_nothing() {
+        let mut site = site(2);
+        site.write(sig(2), at(5), reading(20)).expect("written");
+        let mut staged = Staged::<2>::new();
+        staged.write(sig(1), at(4), reading(10)).expect("staged");
+        staged.write(sig(2), at(4), reading(21)).expect("staged");
+        assert_eq!(
+            site.commit(&staged),
+            Err(SiteError::Store(SignalError::TickBehind(sig(2))))
+        );
+        assert_eq!(
+            site.signals().sample(sig(1), at(5)).expect("held").value(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_full_batch_refuses_the_next_write_and_keeps_what_it_holds() {
+        let mut staged = Staged::<1>::new();
+        staged.write(sig(1), at(1), reading(10)).expect("staged");
+        assert_eq!(
+            staged.write(sig(2), at(1), reading(20)),
+            Err(SignalError::Full)
+        );
+        assert_eq!(staged.len(), 1);
+        // A signal staged twice never goes back in time.
+        let mut staged = Staged::<2>::new();
+        staged.write(sig(1), at(2), reading(10)).expect("staged");
+        assert_eq!(
+            staged.write(sig(1), at(1), reading(11)),
+            Err(SignalError::TickBehind(sig(1)))
+        );
+        assert_eq!(staged.admits(sig(1), at(2)), Ok(()));
     }
 }

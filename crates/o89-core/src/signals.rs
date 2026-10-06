@@ -381,6 +381,33 @@ impl<const N: usize> Signals<N> {
     }
 }
 
+/// Where a driver writes what it read.
+///
+/// The store itself in a host test; on the controller, a [`Staged`] batch
+/// that the bus task hands to the one site in a single call, because the
+/// site is never held across the awaits of a poll.
+///
+/// [`Staged`]: crate::Staged
+pub trait Readings {
+    /// Record what `sig`'s source said at `now`.
+    fn write(&mut self, sig: Id, now: Tick, seen: Observation) -> Result<(), SignalError>;
+
+    /// Refuse, as [`Readings::write`] would, a write of `sig` at `now` that
+    /// cannot be taken, without taking one. A writer that must land several
+    /// signals together asks this of each first.
+    fn admits(&self, sig: Id, now: Tick) -> Result<(), SignalError>;
+}
+
+impl<const N: usize> Readings for Signals<N> {
+    fn write(&mut self, sig: Id, now: Tick, seen: Observation) -> Result<(), SignalError> {
+        Self::write(self, sig, now, seen)
+    }
+
+    fn admits(&self, sig: Id, now: Tick) -> Result<(), SignalError> {
+        self.sample(sig, now).map(|_| ())
+    }
+}
+
 /// A value a behaviour may act on, with the provenance it was accepted at.
 ///
 /// Only [`Signals::current`] makes one, so holding one is the proof that the
