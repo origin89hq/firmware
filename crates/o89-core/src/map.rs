@@ -10,6 +10,7 @@
 
 use crate::boot_count::BOOT_COUNT_BYTES;
 use crate::budget::BUDGET_BYTES;
+use crate::buses::BUSES_RECORD_BYTES;
 use crate::clients::{KEY_RECORD_BYTES, MARK_BYTES, SLOTS};
 use crate::dedup::COMMANDS_BYTES;
 use crate::drbg::DRBG_BYTES;
@@ -159,8 +160,12 @@ const BUDGET_6: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD6"), BUDGET_5.end(
 const BUDGET_7: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD7"), BUDGET_6.end());
 const BUDGET_8: Record<BUDGET_BYTES> = Record::at(magic(*b"BUD8"), BUDGET_7.end());
 
+/// `0x0003 buses and devices` with the next device id it will give, one
+/// record so neither can land without the other (P-102, P-262). Last, so
+/// adding it moved no record before it.
+pub const BUSES_CONFIG: Record<BUSES_RECORD_BYTES> = Record::at(magic(*b"BUSD"), BUDGET_8.end());
 /// The first address nothing in the map uses.
-pub const END: Address = BUDGET_8.end();
+pub const END: Address = BUSES_CONFIG.end();
 
 // The budget: the whole map, both slots of every record, inside the part.
 const _: () = assert!((END.0 as usize) <= FRAM_BYTES);
@@ -197,8 +202,12 @@ mod tests {
             2 * slot_bytes(crate::SECRET_CHANGE_BYTES)
         );
         assert_eq!(
-            usize::from(END.0) - usize::from(SECRET_CHANGE.end().0),
+            usize::from(BUDGET_8.end().0) - usize::from(SECRET_CHANGE.end().0),
             SLOTS * 2 * slot_bytes(BUDGET_BYTES)
+        );
+        assert_eq!(
+            usize::from(END.0) - usize::from(BUDGET_8.end().0),
+            2 * slot_bytes(BUSES_RECORD_BYTES)
         );
         assert_eq!(
             usize::from(GENERATION_MARK_1.end().0) - usize::from(NETWORK.end().0),
@@ -259,6 +268,7 @@ mod tests {
             magic(*b"BUD6"),
             magic(*b"BUD7"),
             magic(*b"BUD8"),
+            magic(*b"BUSD"),
         ];
         for (i, a) in magics.iter().enumerate() {
             // Never zero: zero is a slot's magic while a record lands over

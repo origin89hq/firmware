@@ -3243,7 +3243,7 @@ fn config_answer(
     if private(request.section) && !allows(mask, km43::ClientCapability::READ_PRIVATE) {
         return sealed_error(to, binding, ErrorCode::RoleNotPermitted, dst);
     }
-    let mut body = [0; km43::CONFIG_HEADER_BYTES + km43::MAX_NETWORK_READ_BYTES];
+    let mut body = [0; km43::CONFIG_HEADER_BYTES + crate::MAX_SECTION_READ_BYTES];
     let len = match keys
         .configuration
         .answer(request.section, &keys.network, &mut body)
