@@ -599,9 +599,14 @@ publishes `unsupported` until the caller declares how that unit sends it,
 and its raw words come back beside the poll either way.
 A VE.Direct text block has no register map, and holds its fields to the same
 rule: battery voltage, battery current and panel power publish as `measured`
-at their kinds' scales, and a field KM43 has no metric for, such as the
-charge state or a yield, stays a typed value on the decoded block and is
-never written as a signal.
+at their kinds' scales, the charge state as the `reported` charge-stage
+member that names it, and the yields as `counted` DC energy. A charge state
+KM43 has no member for publishes `unnamed_state` with no value and its raw
+code goes to a concern (P-164); a yield below the last total published since
+boot publishes `reset` with its value (P-259), which the driver judges with
+the store's `Counter` because the store does not keep totals. The error is
+never a signal: each code maps to its exact condition, or to `vendor fault`
+with the Victron code, at a severity per code in the driver's table.
 
 **A hung instrument is not a steady site.** A channel stops being true two
 ways, and only one looks like it. The bus goes quiet and nothing is written;

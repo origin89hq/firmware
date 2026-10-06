@@ -21,19 +21,25 @@
 //! protocol's limit, not something the parser can recover.
 //!
 //! A verified [`Frame`] keeps the raw text of each field the controller
-//! reads. [`publish`] writes the battery voltage, battery current and panel
-//! power into the store with the provenance their kinds carry. The charge
-//! state, error and yields stay typed values on the frame: KM43 has no
-//! metric for them yet (origin89hq/km43#2 and origin89hq/km43#3), so they
-//! are never written as signals.
+//! reads. [`publish`] writes the battery voltage, battery current, panel
+//! power, charge state and yields into the store with the provenance their
+//! kinds carry. A charge state is a KM43 charge-stage member where one
+//! names it, and `unnamed_state` with its raw code raised otherwise
+//! (P-164); a yield is a DC energy total in Wh, `reset` when it falls
+//! (P-259). The error is never a signal: [`VendorError::raise`] gives the
+//! concern it is, its condition, severity and Victron code. Raising it in
+//! the concern table is the device's, with the subject the site gives it.
 //!
 //! Nothing here can transmit: the driver reads through a
 //! [`Listener`](crate::port::Listener), which has no send. The self-test's
 //! line settings, 19200 8N1, are the controller port's to configure, with
 //! the pull-up policy per revision (F-051).
 
-use km43::{Condition, Id, Provenance, SignalDomain, Validity, VendorCode, VendorNamespace};
-use o89_core::{Millis, Observation, SignalError, Signals, Tick};
+use km43::{
+    ChargeStage, Condition, Dialect, Id, Provenance, Severity, SignalDomain, Validity, VendorCode,
+    VendorNamespace,
+};
+use o89_core::{Counter, Millis, Observation, SignalError, Signals, Tick};
 
 use crate::dialect::{Kind, Plausible};
 use crate::port::{Burst, Ended, Listener, PortFault};
@@ -55,6 +61,9 @@ pub const HEX_BYTES: usize = 128;
 /// What [`listen`] receives into, per call. A block longer than this spans
 /// several receives, which the parser joins.
 pub const BURST_BYTES: usize = 64;
+
+/// The KM43 dialect a VE.Direct text port speaks.
+pub const DIALECT: Dialect = Dialect::VE_DIRECT_TEXT;
 
 /// The label of the field that ends every block.
 const CHECKSUM: &[u8] = b"Checksum";
@@ -277,6 +286,56 @@ impl ChargeState {
             Self::Unlisted(code) => code,
         }
     }
+
+    /// The KM43 charge stage this state is, where one names it without
+    /// loss (origin89hq/km43#3). Every other state, a repeated absorption
+    /// or an auto equalize included, is `None`, never a nearest guess: it
+    /// publishes `unnamed_state` and [`ChargeState::raise`] carries its code.
+    #[must_use]
+    pub const fn stage(self) -> Option<ChargeStage> {
+        match self {
+            Self::Off => Some(ChargeStage::Off),
+            Self::Fault => Some(ChargeStage::Fault),
+            Self::Bulk => Some(ChargeStage::Bulk),
+            Self::Absorption => Some(ChargeStage::Absorption),
+            Self::Float => Some(ChargeStage::Float),
+            Self::Storage => Some(ChargeStage::Storage),
+            Self::Equalize => Some(ChargeStage::Equalise),
+            Self::LowPower
+            | Self::Inverting
+            | Self::PowerSupply
+            | Self::StartingUp
+            | Self::RepeatedAbsorption
+            | Self::AutoEqualize
+            | Self::BatterySafe
+            | Self::ExternalControl
+            | Self::Unlisted(_) => None,
+        }
+    }
+
+    /// The code as KM43 carries it beside a concern: verbatim, in
+    /// Victron's namespace.
+    #[must_use]
+    pub fn vendor_code(self) -> VendorCode {
+        VendorCode {
+            raw: u32::from(self.code()),
+            vns: VendorNamespace::VICTRON,
+        }
+    }
+
+    /// The concern this state raises: none for a stage KM43 names, and an
+    /// `unnamed_state` at `info` carrying the raw code for one it does not
+    /// (P-164).
+    pub fn raise(self) -> Raise {
+        match self.stage() {
+            Some(_) => Raise::Nothing,
+            None => Raise::Concern(Concern {
+                cond: Condition::UNNAMED_STATE,
+                sev: Severity::Info,
+                code: self.vendor_code(),
+            }),
+        }
+    }
 }
 
 /// The error code, as the protocol document's `ERR` table lists it.
@@ -368,37 +427,50 @@ impl VendorError {
         }
     }
 
-    /// The concern this error is, where the registry names it exactly:
-    /// a battery or panel voltage too high is over voltage, the charger or
-    /// its terminals too hot is over temperature, the charger's over
-    /// current is charge over current. Every other fault is
-    /// [`Raise::Unmapped`], never a nearest guess.
-    pub const fn raise(self) -> Raise {
-        match self {
-            Self::None => Raise::Nothing,
+    /// The concern this error is, with its Victron code always beside it.
+    ///
+    /// The condition is the one the registry names exactly: a battery or
+    /// panel voltage too high is over voltage, the charger or its terminals
+    /// too hot is over temperature, the charger's over current is charge
+    /// over current. Every other fault is `vendor fault`
+    /// (origin89hq/km43#156), never a nearest guess.
+    ///
+    /// The severity is this table's, per code (origin89hq/km43#156):
+    /// `protection` where the charger stops to protect itself or the bank,
+    /// `fault` where something is broken, an unlisted code included,
+    /// `warning` for a limit or a link that degrades charging, and `info`
+    /// for code 19, which the document says to ignore.
+    pub fn raise(self) -> Raise {
+        let (cond, sev) = match self {
+            Self::None => return Raise::Nothing,
             Self::BatteryVoltageTooHigh | Self::InputVoltageTooHigh => {
-                Raise::Condition(Condition::OVER_VOLTAGE)
+                (Condition::OVER_VOLTAGE, Severity::Protection)
             }
             Self::ChargerTemperatureTooHigh | Self::TerminalsOverheated => {
-                Raise::Condition(Condition::OVER_TEMPERATURE)
+                (Condition::OVER_TEMPERATURE, Severity::Protection)
             }
-            Self::ChargerOverCurrent => Raise::Condition(Condition::CHARGE_OVER_CURRENT),
-            Self::ChargerCurrentReversed
-            | Self::BulkTimeLimitExceeded
-            | Self::CurrentSensorIssue
-            | Self::ConverterIssue
-            | Self::InputCurrentTooHigh
+            Self::ChargerOverCurrent => (Condition::CHARGE_OVER_CURRENT, Severity::Protection),
+            Self::InputCurrentTooHigh
             | Self::InputShutdownBatteryVoltage
-            | Self::InputShutdownCurrentWhileOff
-            | Self::LostCommunication
-            | Self::SynchronisedChargingConfiguration
+            | Self::InputShutdownCurrentWhileOff => (Condition::VENDOR_FAULT, Severity::Protection),
+            Self::CurrentSensorIssue
+            | Self::ConverterIssue
             | Self::BmsConnectionLost
-            | Self::NetworkMisconfigured
             | Self::FactoryCalibrationLost
             | Self::InvalidFirmware
             | Self::UserSettingsInvalid
-            | Self::Unlisted(_) => Raise::Unmapped,
-        }
+            | Self::Unlisted(_) => (Condition::VENDOR_FAULT, Severity::Fault),
+            Self::BulkTimeLimitExceeded
+            | Self::LostCommunication
+            | Self::SynchronisedChargingConfiguration
+            | Self::NetworkMisconfigured => (Condition::VENDOR_FAULT, Severity::Warning),
+            Self::ChargerCurrentReversed => (Condition::VENDOR_FAULT, Severity::Info),
+        };
+        Raise::Concern(Concern {
+            cond,
+            sev,
+            code: self.vendor_code(),
+        })
     }
 
     /// The code on the wire.
@@ -430,18 +502,30 @@ impl VendorError {
     }
 }
 
-/// What an error asks the controller to raise, in KM43's concern registry.
+/// What an `ERR` or a `CS` asks the controller to raise, in KM43's concern
+/// registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[must_use = "an error the device reports is a concern nobody raised"]
 pub enum Raise {
-    /// `ERR 0`: nothing, and a concern the product had open clears.
+    /// `ERR 0`, or a stage KM43 names: nothing, and a concern the product
+    /// had open from the same field clears.
     Nothing,
-    /// An error the registry has an exact condition for.
-    Condition(Condition),
-    /// A fault the registry has no exact condition for; its
-    /// [`VendorError::vendor_code`] is all there is to carry.
-    Unmapped,
+    /// A concern, which the device raises under the subject the site gives
+    /// it.
+    Concern(Concern),
+}
+
+/// A concern as the product reports it, short of its subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Concern {
+    /// The normalised condition.
+    pub cond: Condition,
+    /// Its band, which decides admission (P-169).
+    pub sev: Severity,
+    /// The product's own code, verbatim.
+    pub code: VendorCode,
 }
 
 /// An energy the product counted, in its own unit of 0.01 kWh.
@@ -822,127 +906,264 @@ impl Parser {
 
 /// The store signals a port's readings publish as, each chosen by the
 /// configuration; a field with no signal is not written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every field but `ERR` can have one: an error is a concern
+/// ([`VendorError::raise`]), never a reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Channels {
-    battery_voltage: Option<Id>,
-    battery_current: Option<Id>,
-    panel_power: Option<Id>,
+pub struct Assignment {
+    /// `V`.
+    pub battery_voltage: Option<Id>,
+    /// `I`.
+    pub battery_current: Option<Id>,
+    /// `PPV`.
+    pub panel_power: Option<Id>,
+    /// `CS`.
+    pub charge_state: Option<Id>,
+    /// `H19`.
+    pub yield_total: Option<Id>,
+    /// `H20`.
+    pub yield_today: Option<Id>,
+    /// `H22`.
+    pub yield_yesterday: Option<Id>,
 }
 
+/// An [`Assignment`] with no two fields on one signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Channels(Assignment);
+
 impl Channels {
-    /// The signals for `V`, `I` and `PPV`, or `None` when two of them are the
-    /// same signal. Keeping them apart from other devices' signals is the
+    /// The assignment, or `None` when two fields are on the same signal.
+    /// Keeping them apart from other devices' signals is the
     /// configuration's to check.
     #[must_use]
-    pub fn new(
-        battery_voltage: Option<Id>,
-        battery_current: Option<Id>,
-        panel_power: Option<Id>,
-    ) -> Option<Self> {
-        let clash = |a: Option<Id>, b: Option<Id>| a.is_some() && a == b;
-        if clash(battery_voltage, battery_current)
-            || clash(battery_voltage, panel_power)
-            || clash(battery_current, panel_power)
-        {
-            return None;
-        }
-        Some(Self {
-            battery_voltage,
-            battery_current,
-            panel_power,
-        })
+    pub fn new(assignment: Assignment) -> Option<Self> {
+        let channels = Self(assignment);
+        let clash = PUBLISHED.iter().enumerate().any(|(at, a)| {
+            PUBLISHED.iter().skip(at.saturating_add(1)).any(|b| {
+                let sig = channels.signal(a.field);
+                sig.is_some() && sig == channels.signal(b.field)
+            })
+        });
+        (!clash).then_some(channels)
     }
 
     /// The signal `field` publishes as; `None` when unassigned, and always
-    /// for the fields that are never written.
+    /// for `ERR`.
     #[must_use]
     pub const fn signal(&self, field: Field) -> Option<Id> {
         match field {
-            Field::BatteryVoltage => self.battery_voltage,
-            Field::BatteryCurrent => self.battery_current,
-            Field::PanelPower => self.panel_power,
-            Field::ChargeState
-            | Field::Error
-            | Field::YieldTotal
-            | Field::YieldToday
-            | Field::YieldYesterday => None,
+            Field::BatteryVoltage => self.0.battery_voltage,
+            Field::BatteryCurrent => self.0.battery_current,
+            Field::PanelPower => self.0.panel_power,
+            Field::ChargeState => self.0.charge_state,
+            Field::YieldTotal => self.0.yield_total,
+            Field::YieldToday => self.0.yield_today,
+            Field::YieldYesterday => self.0.yield_yesterday,
+            Field::Error => None,
         }
     }
 }
 
-/// A field written to the store: its kind, the provenance it carries, and
-/// the factor that brings the vendor's unit to the kind's registry scale.
+/// What one port publishes: its [`Channels`], and the last total published
+/// for each yield since boot, which P-259's judgement needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Publisher {
+    channels: Channels,
+    /// `H19`, `H20` and `H22`, in that order.
+    totals: [Counter; 3],
+}
+
+impl Publisher {
+    /// A port publishing through `channels`, with no total published yet.
+    #[must_use]
+    pub const fn new(channels: Channels) -> Self {
+        Self {
+            channels,
+            totals: [Counter::NEW; 3],
+        }
+    }
+
+    /// The signals it publishes as.
+    #[must_use]
+    pub const fn channels(&self) -> &Channels {
+        &self.channels
+    }
+
+    /// The counter behind a yield; `None` for a field that is no total.
+    fn total(&mut self, field: Field) -> Option<&mut Counter> {
+        let at = match field {
+            Field::YieldTotal => 0,
+            Field::YieldToday => 1,
+            Field::YieldYesterday => 2,
+            Field::BatteryVoltage
+            | Field::BatteryCurrent
+            | Field::PanelPower
+            | Field::ChargeState
+            | Field::Error => return None,
+        };
+        self.totals.get_mut(at)
+    }
+}
+
+/// How a field's text becomes the kind's integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    /// A present value in the vendor's unit, ten to `decade` of the kind's
+    /// unit, within the range the vendor documents.
+    Gauge {
+        decade: i8,
+        plausible: Option<Plausible>,
+    },
+    /// A running total in the vendor's unit, ten to `decade` of the kind's
+    /// unit, judged against the last one published (P-259).
+    Total { decade: i8 },
+    /// `CS`, as a KM43 charge-stage member (P-164).
+    Stage,
+}
+
+/// A field written to the store: its kind over its domain, the provenance
+/// it carries, and how its text becomes the kind's integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Published {
     field: Field,
     kind: Kind,
+    domain: SignalDomain,
     provenance: Provenance,
-    /// The vendor's decimal exponent in the kind's unit.
-    decade: i8,
-    /// The range the vendor documents, at the kind's scale.
-    plausible: Option<Plausible>,
+    encoding: Encoding,
 }
 
-/// The fields [`publish`] writes. Each is a value the product's instrument
-/// reads directly, so `measured`, which its kind must accept (F-052): a row
-/// that breaks [`Published::admissible`] fails the build.
-const PUBLISHED: [Published; 3] = [
+/// The fields [`publish`] writes, each with the provenance its kind
+/// accepts over its domain (F-052): a row that breaks
+/// [`Published::admissible`] fails the build.
+///
+/// `V`, `I` and `PPV` are what the product's instrument reads, so
+/// `measured`. `CS` is the state the charger says it is in, so `reported`.
+/// The yields are totals the product keeps, so `counted`; the document
+/// gives them in 0.01 kWh, ten times the kind's Wh. `H19` is the total the
+/// user can reset, so since reset and not lifetime.
+const PUBLISHED: [Published; 7] = [
     Published {
         field: Field::BatteryVoltage,
         kind: Kind::DcVoltage,
+        domain: SignalDomain::Live,
         provenance: Provenance::Measured,
-        decade: -3,
-        // Unsigned on an MPPT (HEX protocol rev 18, 0xEDD5 `un16`) but
-        // signed on a BMV (BMV-7xx HEX protocol, 0xED8D `sn16`): the text
-        // field does not say which product sent it, so no bound here.
-        plausible: None,
+        encoding: Encoding::Gauge {
+            decade: -3,
+            // Unsigned on an MPPT (HEX protocol rev 18, 0xEDD5 `un16`) but
+            // signed on a BMV (BMV-7xx HEX protocol, 0xED8D `sn16`): the
+            // text field does not say which product sent it, so no bound.
+            plausible: None,
+        },
     },
     Published {
         field: Field::BatteryCurrent,
         kind: Kind::DcCurrent,
+        domain: SignalDomain::Live,
         provenance: Provenance::Measured,
-        decade: -3,
-        // Signed: a battery discharges.
-        plausible: None,
+        encoding: Encoding::Gauge {
+            decade: -3,
+            // Signed: a battery discharges.
+            plausible: None,
+        },
     },
     Published {
         field: Field::PanelPower,
         kind: Kind::DcPower,
+        domain: SignalDomain::Live,
         provenance: Provenance::Measured,
-        decade: 0,
-        // Only MPPT chargers send `PPV`, and their panel power is unsigned
-        // (HEX protocol rev 18, 0xEDBC `un32`).
-        plausible: Some(Plausible {
-            low: 0,
-            high: i32::MAX,
-        }),
+        encoding: Encoding::Gauge {
+            decade: 0,
+            // Only MPPT chargers send `PPV`, and their panel power is
+            // unsigned (HEX protocol rev 18, 0xEDBC `un32`).
+            plausible: Some(Plausible {
+                low: 0,
+                high: i32::MAX,
+            }),
+        },
+    },
+    Published {
+        field: Field::ChargeState,
+        kind: Kind::ChargeStage,
+        domain: SignalDomain::Live,
+        provenance: Provenance::Reported,
+        encoding: Encoding::Stage,
+    },
+    Published {
+        field: Field::YieldTotal,
+        kind: Kind::DcEnergy,
+        domain: SignalDomain::SinceReset,
+        provenance: Provenance::Counted,
+        encoding: Encoding::Total { decade: 1 },
+    },
+    Published {
+        field: Field::YieldToday,
+        kind: Kind::DcEnergy,
+        domain: SignalDomain::Today,
+        provenance: Provenance::Counted,
+        encoding: Encoding::Total { decade: 1 },
+    },
+    Published {
+        field: Field::YieldYesterday,
+        kind: Kind::DcEnergy,
+        domain: SignalDomain::Yesterday,
+        provenance: Provenance::Counted,
+        encoding: Encoding::Total { decade: 1 },
     },
 ];
 
 // A table typo is a build error, never a reading published as
 // `out_of_range` at runtime.
 const _: () = {
-    let [voltage, current, power] = PUBLISHED;
+    let [voltage, current, power, state, total, today, yesterday] = PUBLISHED;
     assert!(voltage.admissible() && current.admissible() && power.admissible());
+    assert!(state.admissible());
+    assert!(total.admissible() && today.admissible() && yesterday.admissible());
 };
 
 impl Published {
-    /// Whether the row's kind carries its provenance over a live value,
-    /// its decade is at or above the kind's scale, within the nine decades
-    /// a rescale can span, and its range is not empty.
+    /// Whether the row's kind carries its provenance over its domain, and
+    /// its encoding fits the kind: a decade at or above the kind's scale,
+    /// within the nine decades a rescale can span, a range that is not
+    /// empty, and a stage only for the charge-stage kind.
     const fn admissible(self) -> bool {
-        let scale = self.kind.scale();
-        let range = match self.plausible {
-            Some(range) => range.low <= range.high,
-            None => true,
+        let encoding = match self.encoding {
+            Encoding::Gauge { decade, plausible } => {
+                let range = match plausible {
+                    Some(range) => range.low <= range.high,
+                    None => true,
+                };
+                self.decade_fits(decade) && range
+            }
+            Encoding::Total { decade } => self.decade_fits(decade),
+            Encoding::Stage => matches!(self.kind, Kind::ChargeStage),
         };
-        self.kind
-            .accepts(SignalDomain::Live)
-            .contains(self.provenance)
-            && self.decade >= scale
-            && self.decade.abs_diff(scale) <= 9
-            && range
+        self.kind.accepts(self.domain).contains(self.provenance) && encoding
+    }
+
+    /// Whether `decade` is at or above the kind's scale, within the nine
+    /// decades a rescale can span.
+    const fn decade_fits(self, decade: i8) -> bool {
+        let scale = self.kind.scale();
+        decade >= scale && decade.abs_diff(scale) <= 9
+    }
+
+    /// `value`, in ten to `decade` of the kind's unit, at the kind's scale;
+    /// `None` past `i32`.
+    fn scaled(self, value: i64, decade: i8) -> Option<i32> {
+        let scale = self.kind.scale();
+        // `admissible` holds every published decade at or above its kind's
+        // scale, at build time.
+        let factor = if decade >= scale {
+            10i64.checked_pow(u32::from(decade.abs_diff(scale)))
+        } else {
+            None
+        };
+        factor
+            .and_then(|factor| value.checked_mul(factor))
+            .and_then(|scaled| i32::try_from(scaled).ok())
     }
 
     /// What the frame says about this field, or `None` when it carried no
@@ -951,40 +1172,54 @@ impl Published {
     /// A field present in a verified block always writes, so a value the
     /// product withdrew never leaves the last one current: a number too
     /// large for `i64` or for `i32` at the kind's scale, or outside the
-    /// range the vendor documents, is `out_of_range` (P-185), and text that is no number is `sensor_fault`, the product
-    /// reporting the reading bad. Victron documents `---` as a no-value
-    /// pattern only for fields this driver does not publish.
-    fn observe(self, frame: &Frame) -> Option<(Observation, Option<Malformed>)> {
+    /// range the vendor documents, is `out_of_range` (P-185), and text that
+    /// is no number is `sensor_fault`, the product reporting the reading
+    /// bad. Victron documents `---` as a no-value pattern only for fields
+    /// this driver does not publish. A total is judged by `total` (P-259);
+    /// a charge state with no KM43 member is `unnamed_state` (P-164).
+    fn observe(
+        self,
+        frame: &Frame,
+        total: Option<Counter>,
+    ) -> Option<(Observation, Option<Malformed>)> {
         let value = match frame.integer(self.field)? {
             Ok(value) => value,
-            Err(malformed) => {
-                let validity = match malformed.why {
-                    Unreadable::NotANumber => Validity::SensorFault,
-                    Unreadable::OutOfRange => Validity::OutOfRange,
-                };
-                return Some((Observation::missing(validity).ok()?, Some(malformed)));
-            }
+            Err(malformed) => return Some((unreadable(malformed)?, Some(malformed))),
         };
-        // `admissible` holds every published decade at or above its kind's
-        // scale, at build time.
-        let factor = if self.decade >= self.kind.scale() {
-            10i64.checked_pow(u32::from(self.decade.abs_diff(self.kind.scale())))
-        } else {
-            None
-        };
-        let scaled = factor
-            .and_then(|factor| value.checked_mul(factor))
-            .and_then(|scaled| i32::try_from(scaled).ok())
-            .filter(|&value| self.plausible.is_none_or(|range| range.holds(value)));
-        let seen = match scaled {
-            Some(value) => Observation::value(value, self.provenance),
-            None => Observation::missing(Validity::OutOfRange),
+        let seen = match self.encoding {
+            Encoding::Gauge { decade, plausible } => match self
+                .scaled(value, decade)
+                .filter(|&value| plausible.is_none_or(|range| range.holds(value)))
+            {
+                Some(value) => Observation::value(value, self.provenance),
+                None => Observation::missing(Validity::OutOfRange),
+            },
+            Encoding::Total { decade } => match (self.scaled(value, decade), total) {
+                (Some(value), Some(counter)) => counter.judge(value, self.provenance),
+                (None, _) | (_, None) => Observation::missing(Validity::OutOfRange),
+            },
+            Encoding::Stage => match u8::try_from(value).map(ChargeState::from_code) {
+                Ok(state) => match state.stage() {
+                    Some(member) => Observation::value(i32::from(member as u8), self.provenance),
+                    None => Observation::missing(Validity::UnnamedState),
+                },
+                Err(_) => Observation::missing(Validity::OutOfRange),
+            },
         };
         // KM43 refuses only a value without a provenance, which
         // `admissible` rules out, or a missing validity that carries one,
-        // which neither arm builds.
+        // which no arm builds.
         Some((seen.ok()?, None))
     }
+}
+
+/// What a field whose text is not its number publishes: no value, and why.
+fn unreadable(malformed: Malformed) -> Option<Observation> {
+    let validity = match malformed.why {
+        Unreadable::NotANumber => Validity::SensorFault,
+        Unreadable::OutOfRange => Validity::OutOfRange,
+    };
+    Observation::missing(validity).ok()
 }
 
 /// Why a field of a verified frame did not publish a reading.
@@ -1010,16 +1245,19 @@ pub struct Written {
     pub first: Option<PublishError>,
 }
 
-/// Write the frame's `V`, `I` and `PPV` into `store` at `now`, each to its
-/// signal in `channels`, with the provenance its kind carries.
+/// Write the frame's `V`, `I`, `PPV`, `CS` and yields into `store` at
+/// `now`, each to its signal in `publisher`'s channels, with the provenance
+/// its kind carries.
 ///
 /// A field the frame did not carry, or that has no signal, is not written:
 /// a product sends its fields over several blocks. A field it carried
-/// always writes, a reading or the reason there is none. Every field is
-/// tried, and every write the store accepts stands.
+/// always writes, a reading or the reason there is none. A yield the store
+/// accepts becomes the last total its next reading is judged against. Every
+/// field is tried, and every write the store accepts stands. `ERR` is not
+/// written; [`Frame::error`] and [`VendorError::raise`] say what it raises.
 pub fn publish<const N: usize>(
     frame: &Frame,
-    channels: &Channels,
+    publisher: &mut Publisher,
     now: Tick,
     store: &mut Signals<N>,
 ) -> Written {
@@ -1028,15 +1266,19 @@ pub fn publish<const N: usize>(
         first: None,
     };
     for published in PUBLISHED {
-        let Some(sig) = channels.signal(published.field) else {
+        let Some(sig) = publisher.channels.signal(published.field) else {
             continue;
         };
-        let Some((seen, malformed)) = published.observe(frame) else {
+        let total = publisher.total(published.field).map(|counter| *counter);
+        let Some((seen, malformed)) = published.observe(frame, total) else {
             continue;
         };
         match store.write(sig, now, seen) {
             Ok(()) => {
                 written.count = written.count.saturating_add(1);
+                if let Some(counter) = publisher.total(published.field) {
+                    counter.published(seen);
+                }
                 if let Some(malformed) = malformed {
                     written
                         .first
@@ -1086,9 +1328,9 @@ pub enum ListenError<E> {
 }
 
 /// Receive one burst from `port`, waiting at most `within` for its first
-/// byte, and parse it: each verified block's `V`, `I` and `PPV` are written
-/// into `store` at `now` through `channels`, and every verified block is
-/// handed to `on_block`, in order, for its typed fields.
+/// byte, and parse it: each verified block is published into `store` at
+/// `now` through `publisher` ([`publish`]), and handed to `on_block`, in
+/// order, for its typed fields and what its `ERR` and `CS` raise.
 ///
 /// One receive per call, so the caller's loop sets the pace. A block spread
 /// over several bursts is joined by `parser`, which the caller keeps for
@@ -1106,7 +1348,7 @@ pub async fn listen<L: Listener, const N: usize>(
     port: &mut L,
     parser: &mut Parser,
     within: Millis,
-    channels: &Channels,
+    publisher: &mut Publisher,
     now: Tick,
     store: &mut Signals<N>,
     mut on_block: impl FnMut(&Frame),
@@ -1142,7 +1384,7 @@ pub async fn listen<L: Listener, const N: usize>(
             None => {}
             Some(Ok(frame)) => {
                 heard.blocks = heard.blocks.saturating_add(1);
-                let written = publish(frame, channels, now, store);
+                let written = publish(frame, publisher, now, store);
                 heard.written = heard.written.saturating_add(written.count);
                 if let Some(error) = written.first {
                     heard.unwritten.get_or_insert(error);
@@ -1343,7 +1585,7 @@ mod tests {
         bad.buf[last] ^= 0x01;
         let mut stream = Bytes::new();
         stream.push(TAIL).push(bad.get());
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let mut port = Chunked::new(stream.get(), BURST_BYTES);
         let mut parser = Parser::new();
         let mut refused = 0usize;
@@ -1352,7 +1594,7 @@ mod tests {
                 &mut port,
                 &mut parser,
                 WAIT,
-                &channels,
+                &mut channels,
                 Tick::ZERO,
                 &mut store,
                 |_| {},
@@ -1707,30 +1949,98 @@ mod tests {
     }
 
     #[test]
-    fn only_the_errors_the_registry_names_exactly_raise_a_condition() {
-        let exact = [
-            (2, Condition::OVER_VOLTAGE),
-            (17, Condition::OVER_TEMPERATURE),
-            (18, Condition::CHARGE_OVER_CURRENT),
-            (26, Condition::OVER_TEMPERATURE),
-            (33, Condition::OVER_VOLTAGE),
+    fn every_error_raises_its_exact_condition_or_vendor_fault_at_its_table_s_severity() {
+        use Severity::{Fault, Info, Protection, Warning};
+        // Victron's VE.Direct Protocol 3.34 `ERR` table, with this driver's
+        // severity per code, written out rather than derived.
+        let table = [
+            (2, Condition::OVER_VOLTAGE, Protection),
+            (17, Condition::OVER_TEMPERATURE, Protection),
+            (18, Condition::CHARGE_OVER_CURRENT, Protection),
+            (19, Condition::VENDOR_FAULT, Info),
+            (20, Condition::VENDOR_FAULT, Warning),
+            (21, Condition::VENDOR_FAULT, Fault),
+            (26, Condition::OVER_TEMPERATURE, Protection),
+            (28, Condition::VENDOR_FAULT, Fault),
+            (33, Condition::OVER_VOLTAGE, Protection),
+            (34, Condition::VENDOR_FAULT, Protection),
+            (38, Condition::VENDOR_FAULT, Protection),
+            (39, Condition::VENDOR_FAULT, Protection),
+            (65, Condition::VENDOR_FAULT, Warning),
+            (66, Condition::VENDOR_FAULT, Warning),
+            (67, Condition::VENDOR_FAULT, Fault),
+            (68, Condition::VENDOR_FAULT, Warning),
+            (116, Condition::VENDOR_FAULT, Fault),
+            (117, Condition::VENDOR_FAULT, Fault),
+            (119, Condition::VENDOR_FAULT, Fault),
         ];
         for code in 0..=u8::MAX {
             let error = VendorError::from_code(code);
-            let expected = match exact.iter().find(|(c, _)| *c == code) {
-                Some((_, condition)) => Raise::Condition(*condition),
+            let expected = match table.iter().find(|(c, _, _)| *c == code) {
+                Some(&(_, cond, sev)) => Raise::Concern(Concern {
+                    cond,
+                    sev,
+                    code: VendorCode {
+                        raw: u32::from(code),
+                        vns: VendorNamespace::VICTRON,
+                    },
+                }),
                 None if code == 0 => Raise::Nothing,
-                None => Raise::Unmapped,
+                // A code the document does not list is still a fault the
+                // product reports, and is admitted in the fault band.
+                None => Raise::Concern(Concern {
+                    cond: Condition::VENDOR_FAULT,
+                    sev: Fault,
+                    code: VendorCode {
+                        raw: u32::from(code),
+                        vns: VendorNamespace::VICTRON,
+                    },
+                }),
             };
             assert_eq!(error.raise(), expected, "{code}");
-            assert_eq!(
-                error.vendor_code(),
-                VendorCode {
-                    raw: u32::from(code),
-                    vns: VendorNamespace::VICTRON
-                }
-            );
         }
+    }
+
+    #[test]
+    fn p_164_every_state_km43_names_is_its_stage_and_every_other_raises_its_code() {
+        let named = [
+            (0, ChargeStage::Off),
+            (2, ChargeStage::Fault),
+            (3, ChargeStage::Bulk),
+            (4, ChargeStage::Absorption),
+            (5, ChargeStage::Float),
+            (6, ChargeStage::Storage),
+            (7, ChargeStage::Equalise),
+        ];
+        for code in 0..=u8::MAX {
+            let state = ChargeState::from_code(code);
+            if let Some(&(_, stage)) = named.iter().find(|(c, _)| *c == code) {
+                assert_eq!(state.stage(), Some(stage), "{code}");
+                assert_eq!(state.raise(), Raise::Nothing, "{code}");
+            } else {
+                // Repeated absorption, auto equalize, external control
+                // and unlisted codes alike: never a nearest member.
+                assert_eq!(state.stage(), None, "{code}");
+                assert_eq!(
+                    state.raise(),
+                    Raise::Concern(Concern {
+                        cond: Condition::UNNAMED_STATE,
+                        sev: Severity::Info,
+                        code: VendorCode {
+                            raw: u32::from(code),
+                            vns: VendorNamespace::VICTRON,
+                        },
+                    }),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_dialect_is_km43_s_ve_direct_text() {
+        assert_eq!(DIALECT, Dialect::VE_DIRECT_TEXT);
+        assert_eq!(DIALECT, Dialect(0x000b));
     }
 
     #[test]
@@ -1755,15 +2065,27 @@ mod tests {
 
     const WAIT: Millis = Millis::from_millis(1_500);
 
-    fn site() -> (Signals<4>, Channels, [Id; 3]) {
+    /// A port publishing `V`, `I` and `PPV` only.
+    fn vip(v: Option<Id>, i: Option<Id>, ppv: Option<Id>) -> Publisher {
+        Publisher::new(
+            Channels::new(Assignment {
+                battery_voltage: v,
+                battery_current: i,
+                panel_power: ppv,
+                ..Assignment::default()
+            })
+            .expect("distinct signals"),
+        )
+    }
+
+    fn site() -> (Signals<4>, Publisher, [Id; 3]) {
         let ids = [10, 11, 12].map(|n| Id::new(n).unwrap());
         let mut store = Signals::<4>::new();
         let limits = Limits::new(Millis::from_millis(10_000), None).unwrap();
         for id in ids {
             store.register(id, limits).unwrap();
         }
-        let channels = Channels::new(Some(ids[0]), Some(ids[1]), Some(ids[2])).unwrap();
-        (store, channels, ids)
+        (store, vip(Some(ids[0]), Some(ids[1]), Some(ids[2])), ids)
     }
 
     fn mppt() -> Frame {
@@ -1774,32 +2096,133 @@ mod tests {
 
     #[test]
     fn f_052_every_published_field_declares_a_provenance_its_kind_accepts() {
-        for published in PUBLISHED {
+        use Encoding::{Gauge, Stage, Total};
+        // Each row as the protocol document and KM43 give it, written out.
+        let expect = [
+            (
+                Field::BatteryVoltage,
+                SignalDomain::Live,
+                Provenance::Measured,
+                km43::Unit::Volt,
+                Some(-3),
+            ),
+            (
+                Field::BatteryCurrent,
+                SignalDomain::Live,
+                Provenance::Measured,
+                km43::Unit::Ampere,
+                Some(-3),
+            ),
+            (
+                Field::PanelPower,
+                SignalDomain::Live,
+                Provenance::Measured,
+                km43::Unit::Watt,
+                Some(0),
+            ),
+            (
+                Field::ChargeState,
+                SignalDomain::Live,
+                Provenance::Reported,
+                km43::Unit::None,
+                None,
+            ),
+            (
+                Field::YieldTotal,
+                SignalDomain::SinceReset,
+                Provenance::Counted,
+                km43::Unit::WattHour,
+                Some(1),
+            ),
+            (
+                Field::YieldToday,
+                SignalDomain::Today,
+                Provenance::Counted,
+                km43::Unit::WattHour,
+                Some(1),
+            ),
+            (
+                Field::YieldYesterday,
+                SignalDomain::Yesterday,
+                Provenance::Counted,
+                km43::Unit::WattHour,
+                Some(1),
+            ),
+        ];
+        assert_eq!(PUBLISHED.len(), expect.len());
+        for (published, (field, domain, provenance, unit, decade)) in
+            PUBLISHED.into_iter().zip(expect)
+        {
+            assert_eq!(published.field, field);
+            assert_eq!(published.domain, domain, "{field:?}");
+            assert_eq!(published.provenance, provenance, "{field:?}");
+            assert_eq!(published.kind.unit(), unit, "{field:?}");
             assert!(
-                published
-                    .kind
-                    .accepts(SignalDomain::Live)
-                    .contains(published.provenance),
-                "{published:?}"
+                published.kind.accepts(domain).contains(provenance),
+                "{field:?}"
             );
-            assert!(published.decade >= published.kind.scale(), "{published:?}");
-            assert_eq!(
-                published.kind.unit(),
-                match published.field {
-                    Field::BatteryVoltage => km43::Unit::Volt,
-                    Field::BatteryCurrent => km43::Unit::Ampere,
-                    Field::PanelPower => km43::Unit::Watt,
-                    other => panic!("{other:?} is not published"),
-                }
-            );
+            assert!(published.admissible(), "{field:?}");
+            let got = match published.encoding {
+                Gauge { decade, .. } | Total { decade } => Some(decade),
+                Stage => None,
+            };
+            assert_eq!(got, decade, "{field:?}");
         }
+        // The error is a concern, never a row.
+        assert!(PUBLISHED.iter().all(|row| row.field != Field::Error));
+    }
+
+    #[test]
+    fn f_052_a_row_whose_kind_refuses_its_provenance_or_encoding_is_inadmissible() {
+        let [_, _, _, stage, total, ..] = PUBLISHED;
+        // A yield claimed as measured, or published live.
+        assert!(
+            !Published {
+                provenance: Provenance::Measured,
+                ..total
+            }
+            .admissible()
+        );
+        assert!(
+            !Published {
+                domain: SignalDomain::Live,
+                ..total
+            }
+            .admissible()
+        );
+        // A total in a unit finer than the kind's Wh.
+        assert!(
+            !Published {
+                encoding: Encoding::Total { decade: -1 },
+                ..total
+            }
+            .admissible()
+        );
+        // A stage counted, or decoded as a stage into a kind that is none.
+        assert!(
+            !Published {
+                provenance: Provenance::Counted,
+                ..stage
+            }
+            .admissible()
+        );
+        assert!(
+            !Published {
+                kind: Kind::DcEnergy,
+                domain: SignalDomain::Today,
+                provenance: Provenance::Counted,
+                ..stage
+            }
+            .admissible()
+        );
+        assert!(total.admissible() && stage.admissible());
     }
 
     #[test]
     fn f_052_a_verified_block_writes_v_i_and_ppv_as_measured_at_their_kinds_scales() {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         assert_eq!(
-            publish(&mppt(), &channels, Tick::ZERO, &mut store),
+            publish(&mppt(), &mut channels, Tick::ZERO, &mut store),
             Written {
                 count: 3,
                 first: None
@@ -1812,27 +2235,27 @@ mod tests {
             assert_eq!(sample.q.provenance_of(), Provenance::Measured);
             assert_eq!(sample.q.validity_of(), Validity::Ok);
         }
-        // Charge state, error and yields are not signals.
+        // Only the fields with a signal are written.
         assert_eq!(store.len(), 3);
     }
 
     #[test]
     fn a_field_with_no_signal_or_missing_from_the_block_is_not_written() {
         let (mut store, _, ids) = site();
-        let only_voltage = Channels::new(Some(ids[0]), None, None).unwrap();
+        let mut only_voltage = vip(Some(ids[0]), None, None);
         assert_eq!(
-            publish(&mppt(), &only_voltage, Tick::ZERO, &mut store),
+            publish(&mppt(), &mut only_voltage, Tick::ZERO, &mut store),
             Written {
                 count: 1,
                 first: None
             }
         );
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let mut stream = Bytes::new();
         stream.push(TAIL).push(block(&[(b"I", b"700")]).get());
         let only_current = frame(outcomes(stream.get()).0[0].as_ref());
         assert_eq!(
-            publish(&only_current, &channels, Tick::ZERO, &mut store),
+            publish(&only_current, &mut channels, Tick::ZERO, &mut store),
             Written {
                 count: 1,
                 first: None
@@ -1847,7 +2270,7 @@ mod tests {
 
     #[test]
     fn a_panel_power_past_the_kind_s_scale_is_out_of_range_with_no_value() {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         // 214 748 364 W is 2 147 483 640 at 0.1 W, which fits; one more
         // does not.
         for (watts, expected) in [
@@ -1857,7 +2280,7 @@ mod tests {
             let mut stream = Bytes::new();
             stream.push(TAIL).push(block(&[(b"PPV", watts)]).get());
             let got = frame(outcomes(stream.get()).0[0].as_ref());
-            let written = publish(&got, &channels, Tick::ZERO, &mut store);
+            let written = publish(&got, &mut channels, Tick::ZERO, &mut store);
             assert_eq!(written.count, 1);
             assert_eq!(written.first, None);
             let sample = store.sample(ids[2], Tick::ZERO).unwrap();
@@ -1870,7 +2293,7 @@ mod tests {
 
     #[test]
     fn a_negative_panel_power_is_out_of_range_and_a_negative_voltage_is_not() {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         for (fields, id, expected) in [
             (&[(&b"PPV"[..], &b"-1"[..])][..], ids[2], None),
             (&[(b"PPV", b"0")], ids[2], Some(0)),
@@ -1880,7 +2303,7 @@ mod tests {
             let mut stream = Bytes::new();
             stream.push(TAIL).push(block(fields).get());
             let got = frame(outcomes(stream.get()).0[0].as_ref());
-            let written = publish(&got, &channels, Tick::ZERO, &mut store);
+            let written = publish(&got, &mut channels, Tick::ZERO, &mut store);
             assert_eq!((written.count, written.first), (1, None), "{fields:?}");
             let sample = store.sample(id, Tick::ZERO).unwrap();
             assert_eq!(sample.value(), expected, "{fields:?}");
@@ -1892,14 +2315,14 @@ mod tests {
 
     #[test]
     fn a_malformed_value_is_written_without_a_value_and_the_rest_are_written() {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let mut stream = Bytes::new();
         stream
             .push(TAIL)
             .push(block(&[(b"V", b"13.2"), (b"I", b"10"), (b"PPV", b"5")]).get());
         let got = frame(outcomes(stream.get()).0[0].as_ref());
         assert_eq!(
-            publish(&got, &channels, Tick::ZERO, &mut store),
+            publish(&got, &mut channels, Tick::ZERO, &mut store),
             Written {
                 count: 3,
                 first: Some(PublishError::Malformed(Malformed {
@@ -1918,17 +2341,22 @@ mod tests {
     /// A good `V` at tick 0, then a verified block with `V` as `text` at
     /// tick 1: what the signal says at tick 1.
     fn after_good_voltage(text: &[u8]) -> (Option<i32>, Validity) {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let good = block(&[(b"V", b"13250")]);
         let then = block(&[(b"V", text)]);
         let mut stream = Bytes::new();
         stream.push(TAIL).push(good.get()).push(then.get());
         let (seen, n) = outcomes(stream.get());
         assert_eq!(n, 2);
-        let first = publish(&frame(seen[0].as_ref()), &channels, Tick::ZERO, &mut store);
+        let first = publish(
+            &frame(seen[0].as_ref()),
+            &mut channels,
+            Tick::ZERO,
+            &mut store,
+        );
         assert_eq!(first.count, 1);
         let later = Tick::ZERO.after(Millis::from_millis(1_000)).unwrap();
-        let _ = publish(&frame(seen[1].as_ref()), &channels, later, &mut store);
+        let _ = publish(&frame(seen[1].as_ref()), &mut channels, later, &mut store);
         let sample = store.sample(ids[0], later).unwrap();
         (sample.value(), sample.q.validity_of())
     }
@@ -1953,7 +2381,7 @@ mod tests {
 
     #[test]
     fn a_block_without_a_field_leaves_its_reading_and_a_bad_checksum_leaves_all() {
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let with_v = block(&[(b"V", b"13250"), (b"I", b"100")]);
         let without_v = block(&[(b"I", b"200")]);
         let mut bad = block(&[(b"V", b"1"), (b"I", b"1")]);
@@ -1969,7 +2397,12 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(seen[2], Some(Err(Refused::Checksum)));
         for outcome in &seen[..2] {
-            let written = publish(&frame(outcome.as_ref()), &channels, Tick::ZERO, &mut store);
+            let written = publish(
+                &frame(outcome.as_ref()),
+                &mut channels,
+                Tick::ZERO,
+                &mut store,
+            );
             assert_eq!(written.first, None);
         }
         assert_eq!(
@@ -1983,9 +2416,9 @@ mod tests {
     fn a_signal_the_store_does_not_hold_is_a_store_error() {
         let (mut store, _, ids) = site();
         let stranger = Id::new(99).unwrap();
-        let channels = Channels::new(Some(stranger), Some(ids[1]), None).unwrap();
+        let mut channels = vip(Some(stranger), Some(ids[1]), None);
         assert_eq!(
-            publish(&mppt(), &channels, Tick::ZERO, &mut store),
+            publish(&mppt(), &mut channels, Tick::ZERO, &mut store),
             Written {
                 count: 1,
                 first: Some(PublishError::Store(SignalError::Unknown(stranger)))
@@ -1997,17 +2430,386 @@ mod tests {
         );
     }
 
+    /// A store and a port with every field that can have a signal on one,
+    /// in [`SIGNALLED`] order from signal 10.
+    fn every_field() -> (Signals<8>, Publisher, [Id; 7]) {
+        let ids = [10, 11, 12, 13, 14, 15, 16].map(|n| Id::new(n).unwrap());
+        let mut store = Signals::<8>::new();
+        let limits = Limits::new(Millis::from_millis(10_000), None).unwrap();
+        let mut assignment = Assignment::default();
+        for (field, id) in SIGNALLED.into_iter().zip(ids) {
+            store.register(id, limits).unwrap();
+            assignment = on(assignment, field, id);
+        }
+        let publisher = Publisher::new(Channels::new(assignment).unwrap());
+        (store, publisher, ids)
+    }
+
+    /// One verified block of `fields`, built by hand.
+    fn one(fields: &[(&[u8], &[u8])]) -> Frame {
+        let mut stream = Bytes::new();
+        stream.push(TAIL).push(block(fields).get());
+        frame(outcomes(stream.get()).0[0].as_ref())
+    }
+
+    fn reading(store: &Signals<8>, id: Id, now: Tick) -> (Option<i32>, Validity, Provenance) {
+        let sample = store.sample(id, now).unwrap();
+        (
+            sample.value(),
+            sample.q.validity_of(),
+            sample.q.provenance_of(),
+        )
+    }
+
+    fn tick(seconds: u64) -> Tick {
+        Tick::ZERO
+            .after(Millis::from_secs(seconds).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn f_052_a_verified_block_writes_every_field_at_its_kind_s_scale_and_provenance() {
+        use Provenance::{Counted, Measured, Reported};
+        let (mut store, mut publisher, ids) = every_field();
+        assert_eq!(
+            publish(&mppt(), &mut publisher, Tick::ZERO, &mut store),
+            Written {
+                count: 7,
+                first: None
+            }
+        );
+        let expect = [
+            (Some(13_250), Measured),
+            (Some(-1_500), Measured),
+            (Some(480), Measured),
+            // `CS 3`, bulk, is KM43's member 2.
+            (Some(ChargeStage::Bulk as i32), Reported),
+            // `H19 10345`, `H20 12`, `H22 34`, in 0.01 kWh, as Wh.
+            (Some(103_450), Counted),
+            (Some(120), Counted),
+            (Some(340), Counted),
+        ];
+        for (id, (value, provenance)) in ids.into_iter().zip(expect) {
+            assert_eq!(
+                reading(&store, id, Tick::ZERO),
+                (value, Validity::Ok, provenance),
+                "{id:?}"
+            );
+        }
+        // `ERR` is never a signal: nothing else was registered or written.
+        assert_eq!(store.len(), 7);
+    }
+
+    #[test]
+    fn p_164_a_charge_state_km43_does_not_name_publishes_unnamed_state_with_no_value() {
+        let (mut store, mut publisher, ids) = every_field();
+        let cs = ids[3];
+        let _ = publish(&one(&[(b"CS", b"5")]), &mut publisher, tick(0), &mut store);
+        assert_eq!(
+            reading(&store, cs, tick(0)),
+            (
+                Some(ChargeStage::Float as i32),
+                Validity::Ok,
+                Provenance::Reported
+            )
+        );
+        // 247, auto equalize, then 8, which the document does not list: the
+        // float before it is withdrawn, and no number is left to render.
+        for (n, code) in [(1, &b"247"[..]), (2, b"8")] {
+            let got = one(&[(b"CS", code)]);
+            let written = publish(&got, &mut publisher, tick(n), &mut store);
+            assert_eq!((written.count, written.first), (1, None), "{code:?}");
+            assert_eq!(
+                reading(&store, cs, tick(n)),
+                (None, Validity::UnnamedState, Provenance::None),
+                "{code:?}"
+            );
+            // The raw code goes to the concern instead.
+            let state = got.charge_state().unwrap().unwrap();
+            assert!(matches!(
+                state.raise(),
+                Raise::Concern(Concern { cond: Condition::UNNAMED_STATE, code: VendorCode { raw, .. }, .. })
+                    if raw == u32::from(state.code())
+            ));
+        }
+    }
+
+    #[test]
+    fn a_charge_state_that_is_no_code_is_out_of_range_or_a_sensor_fault() {
+        let (mut store, mut publisher, ids) = every_field();
+        // A number past a code is out of range, as a panel power past its
+        // kind is; text that is no number is the product's fault, and says so.
+        let malformed = Some(PublishError::Malformed(Malformed {
+            field: Field::ChargeState,
+            why: Unreadable::NotANumber,
+        }));
+        for (text, validity, first) in [
+            (&b"256"[..], Validity::OutOfRange, None),
+            (b"-1", Validity::OutOfRange, None),
+            (b"---", Validity::SensorFault, malformed),
+            (b"3.0", Validity::SensorFault, malformed),
+        ] {
+            let _ = publish(&one(&[(b"CS", b"3")]), &mut publisher, tick(0), &mut store);
+            let written = publish(&one(&[(b"CS", text)]), &mut publisher, tick(1), &mut store);
+            assert_eq!((written.count, written.first), (1, first), "{text:?}");
+            assert_eq!(
+                reading(&store, ids[3], tick(1)),
+                (None, validity, Provenance::None),
+                "{text:?}"
+            );
+        }
+        // 255 is a code, unlisted: unnamed, not out of range.
+        let _ = publish(
+            &one(&[(b"CS", b"255")]),
+            &mut publisher,
+            tick(2),
+            &mut store,
+        );
+        assert_eq!(reading(&store, ids[3], tick(2)).1, Validity::UnnamedState);
+    }
+
+    #[test]
+    fn p_259_a_yield_that_falls_publishes_reset_with_its_new_total() {
+        let (mut store, mut publisher, ids) = every_field();
+        let today = ids[5];
+        // Evening, then the first block after midnight.
+        let _ = publish(
+            &one(&[(b"H20", b"412")]),
+            &mut publisher,
+            tick(0),
+            &mut store,
+        );
+        assert_eq!(
+            reading(&store, today, tick(0)),
+            (Some(4_120), Validity::Ok, Provenance::Counted)
+        );
+        let _ = publish(&one(&[(b"H20", b"0")]), &mut publisher, tick(1), &mut store);
+        assert_eq!(
+            reading(&store, today, tick(1)),
+            (Some(0), Validity::Reset, Provenance::Counted)
+        );
+        // The new day goes on as `ok`, an unchanged total included.
+        for (n, text, wh) in [(2, &b"0"[..], 0), (3, b"1", 10), (4, b"1", 10)] {
+            let _ = publish(&one(&[(b"H20", text)]), &mut publisher, tick(n), &mut store);
+            assert_eq!(
+                reading(&store, today, tick(n)),
+                (Some(wh), Validity::Ok, Provenance::Counted)
+            );
+        }
+        // Each yield is judged against its own last total.
+        let _ = publish(
+            &one(&[(b"H19", b"900"), (b"H22", b"50")]),
+            &mut publisher,
+            tick(5),
+            &mut store,
+        );
+        let _ = publish(
+            &one(&[(b"H19", b"901"), (b"H22", b"40")]),
+            &mut publisher,
+            tick(6),
+            &mut store,
+        );
+        assert_eq!(reading(&store, ids[4], tick(6)).1, Validity::Ok);
+        assert_eq!(
+            reading(&store, ids[6], tick(6)),
+            (Some(400), Validity::Reset, Provenance::Counted)
+        );
+    }
+
+    #[test]
+    fn a_yield_at_the_kind_s_limit_is_read_and_one_past_it_is_out_of_range() {
+        let (mut store, mut publisher, ids) = every_field();
+        let total = ids[4];
+        // 214 748 364 × 0.01 kWh is 2 147 483 640 Wh, which fits an i32.
+        let _ = publish(
+            &one(&[(b"H19", b"214748364")]),
+            &mut publisher,
+            tick(0),
+            &mut store,
+        );
+        assert_eq!(
+            reading(&store, total, tick(0)),
+            (Some(2_147_483_640), Validity::Ok, Provenance::Counted)
+        );
+        for (n, text) in [
+            (1, &b"214748365"[..]),
+            (2, b"99999999999999999999"),
+            (3, b"-1"),
+        ] {
+            let _ = publish(&one(&[(b"H19", text)]), &mut publisher, tick(n), &mut store);
+            assert_eq!(
+                reading(&store, total, tick(n)),
+                (None, Validity::OutOfRange, Provenance::None),
+                "{text:?}"
+            );
+        }
+        // None of those became the last total: the next honest one is
+        // judged against 2 147 483 640.
+        let _ = publish(
+            &one(&[(b"H19", b"214748364")]),
+            &mut publisher,
+            tick(4),
+            &mut store,
+        );
+        assert_eq!(reading(&store, total, tick(4)).1, Validity::Ok);
+        let _ = publish(&one(&[(b"H19", b"0")]), &mut publisher, tick(5), &mut store);
+        assert_eq!(
+            reading(&store, total, tick(5)),
+            (Some(0), Validity::Reset, Provenance::Counted)
+        );
+    }
+
+    #[test]
+    fn a_yield_the_store_refuses_is_not_the_last_total() {
+        let (mut store, mut publisher, ids) = every_field();
+        let today = ids[5];
+        let _ = publish(
+            &one(&[(b"H20", b"100")]),
+            &mut publisher,
+            tick(5),
+            &mut store,
+        );
+        // A tick behind the last write: the store refuses and keeps 1 000 Wh.
+        let refused = publish(&one(&[(b"H20", b"7")]), &mut publisher, tick(4), &mut store);
+        assert_eq!(
+            refused,
+            Written {
+                count: 0,
+                first: Some(PublishError::Store(SignalError::TickBehind(today)))
+            }
+        );
+        assert_eq!(
+            reading(&store, today, tick(5)),
+            (Some(1_000), Validity::Ok, Provenance::Counted)
+        );
+        // So 50 Wh is still below what was published.
+        let _ = publish(&one(&[(b"H20", b"5")]), &mut publisher, tick(6), &mut store);
+        assert_eq!(
+            reading(&store, today, tick(6)),
+            (Some(50), Validity::Reset, Provenance::Counted)
+        );
+    }
+
+    #[test]
+    fn a_yield_that_is_no_number_withdraws_the_last_and_keeps_it_as_the_last_total() {
+        let (mut store, mut publisher, ids) = every_field();
+        let today = ids[5];
+        let _ = publish(
+            &one(&[(b"H20", b"100")]),
+            &mut publisher,
+            tick(0),
+            &mut store,
+        );
+        let written = publish(
+            &one(&[(b"H20", b"---")]),
+            &mut publisher,
+            tick(1),
+            &mut store,
+        );
+        assert_eq!(
+            written.first,
+            Some(PublishError::Malformed(Malformed {
+                field: Field::YieldToday,
+                why: Unreadable::NotANumber
+            }))
+        );
+        assert_eq!(
+            reading(&store, today, tick(1)),
+            (None, Validity::SensorFault, Provenance::None)
+        );
+        let _ = publish(
+            &one(&[(b"H20", b"99")]),
+            &mut publisher,
+            tick(2),
+            &mut store,
+        );
+        assert_eq!(reading(&store, today, tick(2)).1, Validity::Reset);
+    }
+
+    #[test]
+    fn an_error_in_a_block_writes_nothing_and_raises_its_concern() {
+        let (mut store, mut publisher, ids) = every_field();
+        // Built by hand: an MPPT stopped on a panel voltage too high.
+        let got = one(&[(b"CS", b"2"), (b"ERR", b"33")]);
+        let written = publish(&got, &mut publisher, Tick::ZERO, &mut store);
+        assert_eq!(
+            written,
+            Written {
+                count: 1,
+                first: None
+            }
+        );
+        assert_eq!(
+            reading(&store, ids[3], Tick::ZERO),
+            (
+                Some(ChargeStage::Fault as i32),
+                Validity::Ok,
+                Provenance::Reported
+            )
+        );
+        assert_eq!(
+            got.error().unwrap().unwrap().raise(),
+            Raise::Concern(Concern {
+                cond: Condition::OVER_VOLTAGE,
+                sev: Severity::Protection,
+                code: VendorCode {
+                    raw: 33,
+                    vns: VendorNamespace::VICTRON
+                },
+            })
+        );
+        for id in [ids[0], ids[1], ids[2], ids[4], ids[5], ids[6]] {
+            assert_eq!(
+                reading(&store, id, Tick::ZERO).1,
+                Validity::Initialising,
+                "{id:?}"
+            );
+        }
+    }
+
+    /// `assignment` with `field` on `sig`.
+    fn on(mut assignment: Assignment, field: Field, sig: Id) -> Assignment {
+        let slot = match field {
+            Field::BatteryVoltage => &mut assignment.battery_voltage,
+            Field::BatteryCurrent => &mut assignment.battery_current,
+            Field::PanelPower => &mut assignment.panel_power,
+            Field::ChargeState => &mut assignment.charge_state,
+            Field::YieldTotal => &mut assignment.yield_total,
+            Field::YieldToday => &mut assignment.yield_today,
+            Field::YieldYesterday => &mut assignment.yield_yesterday,
+            Field::Error => panic!("ERR has no signal"),
+        };
+        *slot = Some(sig);
+        assignment
+    }
+
+    const SIGNALLED: [Field; 7] = [
+        Field::BatteryVoltage,
+        Field::BatteryCurrent,
+        Field::PanelPower,
+        Field::ChargeState,
+        Field::YieldTotal,
+        Field::YieldToday,
+        Field::YieldYesterday,
+    ];
+
     #[test]
     fn two_fields_on_one_signal_are_refused() {
         let [a, b] = [1, 2].map(|n| Id::new(n).unwrap());
-        assert_eq!(Channels::new(Some(a), Some(a), None), None);
-        assert_eq!(Channels::new(Some(a), None, Some(a)), None);
-        assert_eq!(Channels::new(None, Some(b), Some(b)), None);
-        let fine = Channels::new(Some(a), Some(b), None).unwrap();
-        assert_eq!(fine.signal(Field::BatteryVoltage), Some(a));
-        assert_eq!(fine.signal(Field::PanelPower), None);
-        assert_eq!(fine.signal(Field::ChargeState), None);
-        assert!(Channels::new(None, None, None).is_some());
+        for (at, first) in SIGNALLED.into_iter().enumerate() {
+            for second in SIGNALLED.into_iter().skip(at + 1) {
+                let both = on(on(Assignment::default(), first, a), second, a);
+                assert_eq!(Channels::new(both), None, "{first:?} {second:?}");
+                let apart = on(on(Assignment::default(), first, a), second, b);
+                let fine = Channels::new(apart).expect("distinct");
+                assert_eq!(fine.signal(first), Some(a));
+                assert_eq!(fine.signal(second), Some(b));
+            }
+        }
+        let none = Channels::new(Assignment::default()).expect("nothing assigned");
+        for field in Field::ALL {
+            assert_eq!(none.signal(field), None, "{field:?}");
+        }
     }
 
     // The port.
@@ -2079,7 +2881,7 @@ mod tests {
         port: &mut Chunked<'_>,
         parser: &mut Parser,
         store: &mut Signals<4>,
-        channels: &Channels,
+        channels: &mut Publisher,
     ) -> (usize, usize, usize) {
         let (mut blocks, mut refused, mut written) = (0usize, 0usize, 0usize);
         for _ in 0..4096 {
@@ -2118,11 +2920,11 @@ mod tests {
             .push(bad.get())
             .push(MPPT);
         for chunk in 1..=BURST_BYTES + 1 {
-            let (mut store, channels, ids) = site();
+            let (mut store, mut channels, ids) = site();
             let mut port = Chunked::new(stream.get(), chunk);
             let mut parser = Parser::new();
             assert_eq!(
-                drain(&mut port, &mut parser, &mut store, &channels),
+                drain(&mut port, &mut parser, &mut store, &mut channels),
                 (2, 1, 6),
                 "bursts of {chunk}"
             );
@@ -2140,7 +2942,7 @@ mod tests {
         let mut port = Chunked::new(stream.get(), 16);
         port.at = 64;
         port.fault = Some(PortFault::Timeout);
-        let (mut store, channels, _) = site();
+        let (mut store, mut channels, _) = site();
         let mut parser = Parser::new();
         let mut blocks = 0usize;
         let mut silences = 0usize;
@@ -2149,7 +2951,7 @@ mod tests {
                 &mut port,
                 &mut parser,
                 WAIT,
-                &channels,
+                &mut channels,
                 Tick::ZERO,
                 &mut store,
                 |_| {},
@@ -2169,7 +2971,7 @@ mod tests {
         let mut port = Chunked::new(stream.get(), 16);
         port.at = 64;
         port.fault = Some(PortFault::Line(7));
-        let (mut store, channels, _) = site();
+        let (mut store, mut channels, _) = site();
         let mut parser = Parser::new();
         let mut blocks = 0usize;
         let mut errors = 0usize;
@@ -2178,7 +2980,7 @@ mod tests {
                 &mut port,
                 &mut parser,
                 WAIT,
-                &channels,
+                &mut channels,
                 Tick::ZERO,
                 &mut store,
                 |_| {},
@@ -2219,7 +3021,7 @@ mod tests {
             let mut port = Chunked::new(stream.get(), 16);
             port.at = 64;
             port.lie = Some(lie);
-            let (mut store, channels, _) = site();
+            let (mut store, mut channels, _) = site();
             let mut parser = Parser::new();
             let mut blocks = 0usize;
             let mut adapter = 0usize;
@@ -2228,7 +3030,7 @@ mod tests {
                     &mut port,
                     &mut parser,
                     WAIT,
-                    &channels,
+                    &mut channels,
                     Tick::ZERO,
                     &mut store,
                     |_| {},
@@ -2261,7 +3063,7 @@ mod tests {
         // One burst for both blocks, and a burst ending between them.
         for chunk in [BURST_BYTES, first_ends] {
             let mut port = Chunked::new(TWO_BLOCKS, chunk);
-            let (mut store, channels, ids) = site();
+            let (mut store, mut channels, ids) = site();
             let mut parser = Parser::new();
             let mut frames = [None; 4];
             let mut n = 0usize;
@@ -2271,7 +3073,7 @@ mod tests {
                     &mut port,
                     &mut parser,
                     WAIT,
-                    &channels,
+                    &mut channels,
                     Tick::ZERO,
                     &mut store,
                     |frame| {
@@ -2307,13 +3109,13 @@ mod tests {
             .push(TAIL)
             .push(block(&[(b"V", b"13.2"), (b"I", b"10"), (b"PPV", b"5")]).get());
         let mut port = Chunked::new(stream.get(), BURST_BYTES);
-        let (mut store, channels, ids) = site();
+        let (mut store, mut channels, ids) = site();
         let mut parser = Parser::new();
         let heard = block_on(listen(
             &mut port,
             &mut parser,
             WAIT,
-            &channels,
+            &mut channels,
             Tick::ZERO,
             &mut store,
             |_| {},
