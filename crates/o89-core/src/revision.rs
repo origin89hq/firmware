@@ -23,7 +23,7 @@
 //! `o89-controller/memory.x`, the bootloader's `APPLICATION` and the gate's
 //! budget in `xtask/src/images.rs`, and a revision B board gets its own.
 //!
-//! cites: F-005, F-012, F-014
+//! cites: F-005, F-012, F-014, F-051
 
 use crate::Millis;
 
@@ -89,6 +89,16 @@ pub enum StopMode {
     Allowed,
 }
 
+/// What a VE.Direct port's receive pin carries inside the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum VeDirectInput {
+    /// No pull: the product, or the board's isolator, drives the line.
+    Floating,
+    /// The pin's internal pull-up to 3.3 V, which holds an idle line high.
+    PullUp,
+}
+
 /// The longest a rail cycle may leave the module off on revision A.
 const REVISION_A_LONGEST_OFF: Millis = Millis::from_millis(5_000);
 
@@ -148,6 +158,29 @@ impl Revision {
         }
     }
 
+    /// What a VE.Direct receive pin carries for a product whose port runs at
+    /// 3.3 V (`three_volt`) or not (F-051).
+    ///
+    /// Revision A wires the connector straight to the pin through 1 kΩ, and
+    /// Victron's MPPTs drive 5 V: the pin sustains that only with its
+    /// pull-up off, so the pull-up is on only for a port configured for a
+    /// 3.3 V product (origin89hq/hardware#27). Revision B puts an isolator
+    /// with a fail-safe-high output in front of each port, which drives the
+    /// line whatever the product, so no pull-up is taken on either.
+    #[must_use]
+    pub const fn vedirect_input(self, three_volt: bool) -> VeDirectInput {
+        match self {
+            Self::A => {
+                if three_volt {
+                    VeDirectInput::PullUp
+                } else {
+                    VeDirectInput::Floating
+                }
+            }
+            Self::B => VeDirectInput::Floating,
+        }
+    }
+
     /// Whether any code may enter a stop mode.
     #[must_use]
     pub const fn stop_mode(self) -> StopMode {
@@ -199,5 +232,17 @@ mod tests {
     fn f_014_the_rail_is_off_through_a_reset_on_a_and_on_through_one_on_b() {
         assert_eq!(Revision::A.rail_through_reset(), RailThroughReset::Off);
         assert_eq!(Revision::B.rail_through_reset(), RailThroughReset::On);
+    }
+
+    #[test]
+    fn f_051_revision_a_pulls_a_vedirect_pin_up_only_for_a_3v3_product() {
+        assert_eq!(Revision::A.vedirect_input(false), VeDirectInput::Floating);
+        assert_eq!(Revision::A.vedirect_input(true), VeDirectInput::PullUp);
+    }
+
+    #[test]
+    fn f_051_revision_b_takes_no_pull_up_behind_its_isolator() {
+        assert_eq!(Revision::B.vedirect_input(false), VeDirectInput::Floating);
+        assert_eq!(Revision::B.vedirect_input(true), VeDirectInput::Floating);
     }
 }
