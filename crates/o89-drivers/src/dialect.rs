@@ -157,6 +157,8 @@ pub enum Kind {
     DcPower,
     /// `0x0104`, % at −1.
     StateOfCharge,
+    /// `0x0106`, Wh at 0: a running total, counted one way (P-259).
+    DcEnergy,
     /// `0x0201`, V at −1.
     AcVoltage,
     /// `0x0202`, A at −3.
@@ -171,6 +173,8 @@ pub enum Kind {
     Temperature,
     /// `0x0401`, % at −1.
     TankLevel,
+    /// `0x0704`, a member of the charge-stage space, with no unit.
+    ChargeStage,
 }
 
 impl Kind {
@@ -182,6 +186,7 @@ impl Kind {
             Self::DcCurrent => MetricKind::DC_CURRENT,
             Self::DcPower => MetricKind::DC_POWER,
             Self::StateOfCharge => MetricKind::STATE_OF_CHARGE,
+            Self::DcEnergy => MetricKind::DC_ENERGY,
             Self::AcVoltage => MetricKind::AC_VOLTAGE,
             Self::AcCurrent => MetricKind::AC_CURRENT,
             Self::AcPower => MetricKind::AC_POWER,
@@ -189,6 +194,7 @@ impl Kind {
             Self::AcEnergy => MetricKind::AC_ENERGY,
             Self::Temperature => MetricKind::TEMPERATURE,
             Self::TankLevel => MetricKind::TANK_LEVEL,
+            Self::ChargeStage => MetricKind::CHARGE_STAGE,
         }
     }
 
@@ -201,8 +207,9 @@ impl Kind {
             Self::DcPower | Self::AcPower => Unit::Watt,
             Self::StateOfCharge | Self::TankLevel => Unit::Percent,
             Self::AcFrequency => Unit::Hertz,
-            Self::AcEnergy => Unit::WattHour,
+            Self::DcEnergy | Self::AcEnergy => Unit::WattHour,
             Self::Temperature => Unit::DegreeCelsius,
+            Self::ChargeStage => Unit::None,
         }
     }
 
@@ -219,12 +226,13 @@ impl Kind {
             | Self::Temperature
             | Self::TankLevel => -1,
             Self::AcFrequency => -2,
-            Self::AcEnergy => 0,
+            Self::DcEnergy | Self::AcEnergy | Self::ChargeStage => 0,
         }
     }
 
     /// The range the kind's meaning allows at its registry scale, whatever
-    /// the device: a percentage is 0 to 100 %. `None` where the bound
+    /// the device: a percentage is 0 to 100 %, a charge stage one of KM43's
+    /// members. `None` where the bound
     /// depends on the device, such as a current or a temperature; a cell
     /// narrows those from its vendor's documentation with
     /// [`Cell::plausible`].
@@ -232,6 +240,10 @@ impl Kind {
     pub const fn intrinsic(self) -> Option<Plausible> {
         match self {
             Self::StateOfCharge | Self::TankLevel => Some(Plausible { low: 0, high: 1000 }),
+            Self::ChargeStage => Some(Plausible {
+                low: km43::ChargeStage::Off as i32,
+                high: km43::ChargeStage::Fault as i32,
+            }),
             Self::DcVoltage
             | Self::DcCurrent
             | Self::DcPower
@@ -239,6 +251,7 @@ impl Kind {
             | Self::AcCurrent
             | Self::AcPower
             | Self::AcFrequency
+            | Self::DcEnergy
             | Self::AcEnergy
             | Self::Temperature => None,
         }
@@ -250,7 +263,8 @@ impl Kind {
     /// limits. A total over a window is `counted`, for the kinds that
     /// accumulate. A present value is `measured` for what an instrument reads
     /// directly; a state of charge is never measured, only counted or
-    /// estimated. No cell is `derived`, which is this controller's own
+    /// estimated, and a charge stage is the state the charger says it is in,
+    /// so `reported`. No cell is `derived`, which is this controller's own
     /// arithmetic, or `commanded`, which is not an observation.
     #[must_use]
     pub const fn accepts(self, domain: SignalDomain) -> ProvenanceSet {
@@ -262,7 +276,7 @@ impl Kind {
             | SignalDomain::SinceReset
             | SignalDomain::Today
             | SignalDomain::Yesterday => match self {
-                Self::AcEnergy => ProvenanceSet::of(&[Provenance::Counted]),
+                Self::DcEnergy | Self::AcEnergy => ProvenanceSet::of(&[Provenance::Counted]),
                 Self::DcVoltage
                 | Self::DcCurrent
                 | Self::DcPower
@@ -272,13 +286,26 @@ impl Kind {
                 | Self::AcPower
                 | Self::AcFrequency
                 | Self::Temperature
-                | Self::TankLevel => ProvenanceSet::EMPTY,
+                | Self::TankLevel
+                | Self::ChargeStage => ProvenanceSet::EMPTY,
             },
             SignalDomain::Live | SignalDomain::Max | SignalDomain::Min => match self {
                 Self::StateOfCharge => {
                     ProvenanceSet::of(&[Provenance::Counted, Provenance::Estimated])
                 }
-                Self::AcEnergy => ProvenanceSet::EMPTY,
+                // A stage has no order, so no greatest or least one.
+                Self::ChargeStage => match domain {
+                    SignalDomain::Live => ProvenanceSet::of(&[Provenance::Reported]),
+                    SignalDomain::Max
+                    | SignalDomain::Min
+                    | SignalDomain::Lifetime
+                    | SignalDomain::SinceReset
+                    | SignalDomain::Today
+                    | SignalDomain::Yesterday
+                    | SignalDomain::LimitUpper
+                    | SignalDomain::LimitLower => ProvenanceSet::EMPTY,
+                },
+                Self::DcEnergy | Self::AcEnergy => ProvenanceSet::EMPTY,
                 Self::DcVoltage
                 | Self::DcCurrent
                 | Self::DcPower
@@ -728,11 +755,12 @@ pub(crate) mod tests {
     use km43::METRIC_UNITS;
     use o89_core::{ChargeSource, Limits, Millis, Signals, Tick};
 
-    const EVERY_KIND: [Kind; 11] = [
+    const EVERY_KIND: [Kind; 13] = [
         Kind::DcVoltage,
         Kind::DcCurrent,
         Kind::DcPower,
         Kind::StateOfCharge,
+        Kind::DcEnergy,
         Kind::AcVoltage,
         Kind::AcCurrent,
         Kind::AcPower,
@@ -740,6 +768,7 @@ pub(crate) mod tests {
         Kind::AcEnergy,
         Kind::Temperature,
         Kind::TankLevel,
+        Kind::ChargeStage,
     ];
 
     const EVERY_DOMAIN: [SignalDomain; 9] = [
@@ -798,6 +827,7 @@ pub(crate) mod tests {
                 Unit::Percent => "%",
                 Unit::Hertz => "Hz",
                 Unit::DegreeCelsius => "°C",
+                Unit::None => "—",
                 other => panic!("{kind:?} publishes {other:?}, which no kind here uses"),
             };
             assert_eq!((row.1, row.2), (symbol, kind.scale()), "{kind:?}");
@@ -813,6 +843,18 @@ pub(crate) mod tests {
                     }),
                     "{kind:?}"
                 );
+            } else if kind == Kind::ChargeStage {
+                // Off, 1, to fault, 7: every member and nothing else.
+                assert_eq!(kind.intrinsic(), Some(Plausible { low: 1, high: 7 }));
+                for raw in 0..=u8::MAX {
+                    let member = km43::ChargeStage::try_from(raw).is_ok();
+                    assert_eq!(
+                        kind.intrinsic()
+                            .is_some_and(|range| range.holds(i32::from(raw))),
+                        member,
+                        "{raw}"
+                    );
+                }
             } else {
                 assert_eq!(kind.intrinsic(), None, "{kind:?}");
             }
@@ -860,6 +902,32 @@ pub(crate) mod tests {
             Kind::AcEnergy.accepts(SignalDomain::Live),
             ProvenanceSet::EMPTY
         );
+        for window in [
+            SignalDomain::Lifetime,
+            SignalDomain::SinceReset,
+            SignalDomain::Today,
+            SignalDomain::Yesterday,
+        ] {
+            assert_eq!(
+                Kind::DcEnergy.accepts(window),
+                ProvenanceSet::of(&[Provenance::Counted]),
+                "{window:?}"
+            );
+            assert_eq!(Kind::ChargeStage.accepts(window), ProvenanceSet::EMPTY);
+        }
+        assert_eq!(
+            Kind::DcEnergy.accepts(SignalDomain::Live),
+            ProvenanceSet::EMPTY
+        );
+        // A charger states its stage; nothing measures or counts one, and
+        // a stage has no greatest or least.
+        assert_eq!(
+            Kind::ChargeStage.accepts(SignalDomain::Live),
+            ProvenanceSet::of(&[Provenance::Reported])
+        );
+        for unordered in [SignalDomain::Max, SignalDomain::Min] {
+            assert_eq!(Kind::ChargeStage.accepts(unordered), ProvenanceSet::EMPTY);
+        }
     }
 
     const VOLTS: Cell = cell(

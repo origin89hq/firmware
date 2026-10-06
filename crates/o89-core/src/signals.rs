@@ -18,7 +18,7 @@
 //! [`ProvenanceSet`] it acts on, and [`ChargeSource`] is the generator's
 //! charge-source rule as that set.
 //!
-//! cites: P-004, P-196
+//! cites: P-004, P-196, P-259
 
 use km43::{Id, Provenance, QualityError, Sample, SignalQuality, Validity};
 
@@ -72,6 +72,16 @@ impl Observation {
         })
     }
 
+    /// A total below the last one published for its counter, which KM43
+    /// carries with its value (P-259). Only [`Counter::judge`] builds one,
+    /// so no driver can claim a restart the controller did not judge.
+    fn restarted(total: i32, provenance: Provenance) -> Result<Self, QualityError> {
+        Ok(Self {
+            q: SignalQuality::carrying(Validity::Reset, provenance)?,
+            value: Some(total),
+        })
+    }
+
     /// The quality as KM43 spells it.
     #[must_use]
     pub const fn quality(self) -> SignalQuality {
@@ -82,6 +92,53 @@ impl Observation {
     #[must_use]
     pub const fn reading(self) -> Option<i32> {
         self.value
+    }
+}
+
+/// One counter signal's last published total since boot: what P-259's
+/// judgement needs, kept by the driver that publishes the signal.
+///
+/// A counter counts up from zero. A total below the last one published is a
+/// restart, a PV yield at midnight or a meter after a power cut, and
+/// publishes as `reset` with its value; a negative total is a decode fault,
+/// publishes `out_of_range` with no value and is never the last total. The
+/// first total since boot has nothing to be below and is `ok`. A restart
+/// while the controller was down is not seen, which P-259 accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Counter {
+    last: Option<i32>,
+}
+
+impl Counter {
+    /// A counter nothing has been published for since boot.
+    pub const NEW: Self = Self { last: None };
+
+    /// The observation that publishes `total` from `provenance`.
+    ///
+    /// Refuses [`Provenance::None`], as [`Observation::value`] does.
+    pub fn judge(self, total: i32, provenance: Provenance) -> Result<Observation, QualityError> {
+        if total < 0 {
+            return Observation::missing(Validity::OutOfRange);
+        }
+        match self.last {
+            Some(last) if total < last => Observation::restarted(total, provenance),
+            Some(_) | None => Observation::value(total, provenance),
+        }
+    }
+
+    /// Record that the store accepted `seen` for this counter. A value
+    /// becomes the last total; no value leaves the last total as it was.
+    pub const fn published(&mut self, seen: Observation) {
+        if let Some(total) = seen.value {
+            self.last = Some(total);
+        }
+    }
+
+    /// The last total published since boot, if any.
+    #[must_use]
+    pub const fn last(self) -> Option<i32> {
+        self.last
     }
 }
 
@@ -320,8 +377,10 @@ impl<const N: usize> Signals<N> {
     /// `sig`'s value for a behaviour that acts only on a current reading from
     /// one of `accepts`.
     ///
-    /// Refuses no value, a stale value, and a value from a provenance outside
-    /// the set, each as itself, so a behaviour can say which it met.
+    /// Accepts a value that is `ok`, or `reset`, a counter's restart total
+    /// (P-259). Refuses no value, a stale value, and a value from a
+    /// provenance outside the set, each as itself, so a behaviour can say
+    /// which it met.
     pub fn current(
         &self,
         sig: Id,
@@ -335,12 +394,11 @@ impl<const N: usize> Signals<N> {
         };
         let provenance = sample.q.provenance_of();
         match validity {
-            Validity::Ok => {}
+            // A counter's restart is a current total, the first of a new run
+            // (P-259).
+            Validity::Ok | Validity::Reset => {}
             Validity::Stale => return Err(Ineligible::Stale(provenance)),
-            // A counter's restart (P-259), which `Observation` cannot build:
-            // nothing here writes a counter yet.
-            Validity::Reset
-            | Validity::Initialising
+            Validity::Initialising
             | Validity::Unsupported
             | Validity::SensorFault
             | Validity::OutOfRange
@@ -605,8 +663,8 @@ mod tests {
             Observation::missing(Validity::Stale),
             Err(QualityError::ValueOmitted(Validity::Stale))
         );
-        // A counter's restart carries its new reading (P-259), and nothing
-        // here writes one yet, so the store never holds a `reset`.
+        // A counter's restart carries its new reading (P-259), and only
+        // `Counter::judge` builds one.
         assert_eq!(
             Observation::missing(Validity::Reset),
             Err(QualityError::ValueOmitted(Validity::Reset))
@@ -926,5 +984,125 @@ mod tests {
         ]);
         assert!(!all.contains(Provenance::None));
         assert!(!ProvenanceSet::EMPTY.contains(Provenance::Measured));
+    }
+
+    fn counted(total: i32) -> Observation {
+        Observation::value(total, Provenance::Counted).expect("a counted total")
+    }
+
+    /// Judge `total`, write it, and record it as published when the store
+    /// took it, as a driver does.
+    fn count(store: &mut Signals<4>, counter: &mut Counter, now: u64, total: i32) -> Sample {
+        let seen = counter.judge(total, Provenance::Counted).expect("legal");
+        store.write(sig(1), at(now), seen).expect("written");
+        counter.published(seen);
+        store.sample(sig(1), at(now)).expect("a sample")
+    }
+
+    #[test]
+    fn p_259_a_total_below_the_last_published_is_reset_with_its_value() {
+        let mut store = store_with(None);
+        let mut counter = Counter::NEW;
+        // The first total since boot has nothing to be below.
+        let first = count(&mut store, &mut counter, 0, 1_200);
+        assert_eq!(
+            (first.value(), first.q.validity_of()),
+            (Some(1_200), Validity::Ok)
+        );
+        // Midnight: the day's yield starts again.
+        let restart = count(&mut store, &mut counter, 1_000, 10);
+        assert_eq!(restart.value(), Some(10));
+        assert_eq!(restart.q.validity_of(), Validity::Reset);
+        assert_eq!(restart.q.provenance_of(), Provenance::Counted);
+        assert_eq!(restart.age(), None);
+        // The run goes on from there as `ok`, including at zero.
+        let on = count(&mut store, &mut counter, 2_000, 20);
+        assert_eq!((on.value(), on.q.validity_of()), (Some(20), Validity::Ok));
+        let zero = count(&mut store, &mut counter, 3_000, 0);
+        assert_eq!(
+            (zero.value(), zero.q.validity_of()),
+            (Some(0), Validity::Reset)
+        );
+    }
+
+    #[test]
+    fn p_259_an_equal_or_higher_total_is_never_reset() {
+        let mut counter = Counter::NEW;
+        counter.published(counted(500));
+        for total in [500, 501, i32::MAX] {
+            assert_eq!(
+                counter.judge(total, Provenance::Counted),
+                Ok(counted(total)),
+                "{total}"
+            );
+        }
+        assert_eq!(
+            counter
+                .judge(499, Provenance::Counted)
+                .map(|seen| seen.quality().validity_of()),
+            Ok(Validity::Reset)
+        );
+    }
+
+    #[test]
+    fn p_259_a_negative_total_is_out_of_range_and_never_the_last_total() {
+        let mut store = store_with(None);
+        let mut counter = Counter::NEW;
+        let _ = count(&mut store, &mut counter, 0, 900);
+        let negative = count(&mut store, &mut counter, 1_000, -1);
+        assert_eq!(negative.value(), None);
+        assert_eq!(negative.q.validity_of(), Validity::OutOfRange);
+        assert_eq!(counter.last(), Some(900));
+        // So the next honest reading is judged against 900, not against -1.
+        let after = count(&mut store, &mut counter, 2_000, 950);
+        assert_eq!(
+            (after.value(), after.q.validity_of()),
+            (Some(950), Validity::Ok)
+        );
+        let below = count(&mut store, &mut counter, 3_000, 5);
+        assert_eq!(below.q.validity_of(), Validity::Reset);
+        // A negative first total is no last total either.
+        let mut fresh = Counter::NEW;
+        assert_eq!(
+            fresh.judge(i32::MIN, Provenance::Counted),
+            Observation::missing(Validity::OutOfRange)
+        );
+        fresh.published(Observation::missing(Validity::OutOfRange).expect("legal"));
+        assert_eq!(fresh.last(), None);
+    }
+
+    #[test]
+    fn p_259_a_counter_refuses_a_total_with_no_provenance() {
+        let mut counter = Counter::NEW;
+        assert_eq!(
+            counter.judge(1, Provenance::None),
+            Err(QualityError::CarryingWithoutProvenance)
+        );
+        counter.published(counted(10));
+        assert_eq!(
+            counter.judge(1, Provenance::None),
+            Err(QualityError::CarryingWithoutProvenance)
+        );
+    }
+
+    #[test]
+    fn p_259_a_reset_total_is_a_current_reading_a_behaviour_may_act_on() {
+        let mut store = store_with(None);
+        let mut counter = Counter::NEW;
+        let _ = count(&mut store, &mut counter, 0, 300);
+        let _ = count(&mut store, &mut counter, 1_000, 7);
+        let counted_only = ProvenanceSet::of(&[Provenance::Counted]);
+        let eligible = store
+            .current(sig(1), at(1_000), counted_only)
+            .expect("current");
+        assert_eq!(
+            (eligible.value(), eligible.provenance()),
+            (7, Provenance::Counted)
+        );
+        // And it goes stale like any other value once the bus goes quiet.
+        assert_eq!(
+            store.current(sig(1), at(62_000), counted_only),
+            Err(Ineligible::Stale(Provenance::Counted))
+        );
     }
 }
