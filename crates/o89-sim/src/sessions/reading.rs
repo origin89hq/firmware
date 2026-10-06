@@ -63,6 +63,7 @@ fn charger(signals: u16) -> Vec<Descriptor> {
             point: Some(km43::MeasurementPoint(n)),
             dir: None,
             esp: None,
+            vendor: None,
             limits: Limits::new(Millis::from_millis(60_000), None).expect("a limit"),
         })
     }));
