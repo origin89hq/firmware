@@ -19,9 +19,11 @@ pub mod ds18b20;
 pub mod epever;
 pub mod modbus;
 pub mod onewire;
+pub mod plan;
 pub mod port;
 pub mod pylontech;
 pub mod pzem;
+pub mod serial;
 pub mod vedirect;
 mod vendor;
 

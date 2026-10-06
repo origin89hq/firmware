@@ -46,7 +46,7 @@
 //! cites: F-053
 
 use km43::{Id, Provenance, QualityError, SignalDomain, Validity};
-use o89_core::{Clock, Millis, Observation, SignalError, Signals, Tick};
+use o89_core::{Clock, Millis, Observation, Readings, SignalError, Tick};
 
 use crate::dialect::{Kind, Plausible};
 use crate::onewire::{self, Rom};
@@ -374,12 +374,12 @@ impl Probe {
     /// writes nothing and leaves the count as it was. Reading the same
     /// conversion again writes at the same tick, so it never makes a
     /// reading younger than it is.
-    pub async fn read<W: OneWire, const N: usize>(
+    pub async fn read<W: OneWire, R: Readings>(
         &mut self,
         line: &mut W,
         conversion: &Conversion,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<ProbeRead, ProbeError<W::Error>> {
         if now < conversion.ready {
             return Err(ProbeError::Early);
@@ -411,10 +411,10 @@ impl Probe {
 
     /// Record at `now` that nothing answered on the probe's line, after
     /// [`ConvertError::Absent`]: `absent` and no value, never 0 °C.
-    pub fn absent<const N: usize>(
+    pub fn absent<R: Readings>(
         &mut self,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<Observation, SignalError> {
         let seen = Observation::missing(Validity::Absent).map_err(SignalError::Quality)?;
         self.crc_failures = 0;
@@ -448,6 +448,7 @@ mod tests {
     use embassy_futures::block_on;
     use km43::Sample;
     use o89_core::Limits;
+    use o89_core::Signals;
 
     /// A 12-bit scratchpad around `raw`, with the datasheet's power-on
     /// alarm and reserved bytes and its CRC. Built by hand.

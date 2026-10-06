@@ -36,7 +36,7 @@
 //! cites: F-050, F-052
 
 use km43::{ComponentRole, Dialect, Id, Provenance, SignalDomain, Unit};
-use o89_core::{Signals, Tick};
+use o89_core::{Readings, Tick};
 
 use crate::dialect::{Block, Cell, Kind, RegisterMap, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Read, Registers, Timing};
@@ -334,12 +334,12 @@ impl Charger {
     /// [`VendorError::Declared`] with its register. The poll stops at the
     /// first failure, and what it wrote before stands; a failed status read
     /// leaves every signal written and the words unknown.
-    pub async fn poll<P: Rs485, const N: usize>(
+    pub async fn poll<P: Rs485, R: Readings>(
         &self,
         port: &mut P,
         timing: Timing,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<Report<Words>, VendorError<P::Error>> {
         let signal = |cell| self.signal(cell);
         let mut buf = [0u8; RECEIVE_BYTES];
@@ -419,6 +419,7 @@ mod tests {
     use crate::modbus::{Exception, FRAME_BYTES, ModbusError, ReplyError, parse};
     use embassy_futures::block_on;
     use km43::Validity;
+    use o89_core::Signals;
     use o89_core::{ChargeSource, Ineligible, Limits, Millis};
 
     const FIRST: u16 = 60;

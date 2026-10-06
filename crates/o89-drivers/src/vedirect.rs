@@ -33,7 +33,7 @@
 //! the pull-up policy per revision (F-051).
 
 use km43::{Condition, Id, Provenance, SignalDomain, Validity, VendorCode, VendorNamespace};
-use o89_core::{Millis, Observation, SignalError, Signals, Tick};
+use o89_core::{Millis, Observation, Readings, SignalError, Tick};
 
 use crate::dialect::{Kind, Plausible};
 use crate::port::{Burst, Ended, Listener, PortFault};
@@ -1017,11 +1017,11 @@ pub struct Written {
 /// a product sends its fields over several blocks. A field it carried
 /// always writes, a reading or the reason there is none. Every field is
 /// tried, and every write the store accepts stands.
-pub fn publish<const N: usize>(
+pub fn publish<R: Readings>(
     frame: &Frame,
     channels: &Channels,
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
 ) -> Written {
     let mut written = Written {
         count: 0,
@@ -1102,13 +1102,13 @@ pub enum ListenError<E> {
 /// cannot see. A caller that knows the product changed, or that waits past
 /// several block intervals with nothing heard, calls
 /// [`Parser::resynchronise`].
-pub async fn listen<L: Listener, const N: usize>(
+pub async fn listen<L: Listener, R: Readings>(
     port: &mut L,
     parser: &mut Parser,
     within: Millis,
     channels: &Channels,
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
     mut on_block: impl FnMut(&Frame),
 ) -> Result<Heard, ListenError<L::Error>> {
     let mut buf = [0u8; BURST_BYTES];
@@ -1164,6 +1164,7 @@ mod tests {
     use core::future::{Future, ready};
     use embassy_futures::block_on;
     use o89_core::Limits;
+    use o89_core::Signals;
 
     /// A block built by hand in the shape of an MPPT charger's, from the
     /// field table of Victron's VE.Direct Protocol 3.34; not a capture. Its

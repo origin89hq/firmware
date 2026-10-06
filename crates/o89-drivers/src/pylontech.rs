@@ -42,7 +42,7 @@
 //! cites: F-052, P-185, P-196
 
 use km43::{Id, Provenance, SignalDomain, Validity};
-use o89_core::{Millis, Observation, SignalError, Signals, Tick};
+use o89_core::{Millis, Observation, Readings, SignalError, Tick};
 
 use crate::dialect::Kind;
 use crate::port::{Can, CanFrame, CanId, PortFault};
@@ -767,15 +767,15 @@ impl Pylontech {
     /// All or nothing: every signal is checked against the store before the
     /// first is written, so a store that does not hold one, or holds a write
     /// later than `now`, refuses the whole frame.
-    pub fn record<const N: usize>(
+    pub fn record<R: Readings>(
         &self,
         frame: &Frame,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<usize, SignalError> {
         let seen = frame.observations(self.version, self.direction)?;
         for (channel, _) in seen.iter().flatten() {
-            let _ = store.sample(self.signal(*channel), now)?;
+            store.admits(self.signal(*channel), now)?;
         }
         let mut written = 0usize;
         for (channel, observation) in seen.iter().flatten() {
@@ -791,12 +791,12 @@ impl Pylontech {
     /// A timeout, a line fault and a refused frame write nothing. The
     /// writes carry `now`, read before the wait, so a frame that arrives
     /// later reads at most `within` older than it is, never younger.
-    pub async fn read<P: Can, const N: usize>(
+    pub async fn read<P: Can, R: Readings>(
         &self,
         port: &mut P,
         within: Millis,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<Heard, ReadError<P::Error>> {
         let received = port.receive(within).await.map_err(ReadError::Port)?;
         let frame = Frame::decode(&received).map_err(ReadError::Frame)?;
@@ -813,6 +813,7 @@ mod tests {
     use super::*;
     use core::future::{Future, ready};
     use embassy_futures::block_on;
+    use o89_core::Signals;
     use o89_core::{ChargeSource, Ineligible, Limits as SignalLimits};
 
     const MAX_AGE: u64 = 10_000;

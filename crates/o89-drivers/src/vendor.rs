@@ -10,7 +10,7 @@
 //! cites: F-052
 
 use km43::{Id, Validity};
-use o89_core::{Observation, SignalError, Signals, Tick};
+use o89_core::{Observation, Readings, SignalError, Tick};
 
 use crate::dialect::{Block, DecodeError};
 use crate::modbus::{ModbusError, Registers};
@@ -131,13 +131,13 @@ pub(crate) fn low_first(registers: &Registers<'_>, register: u16) -> Result<u32,
 /// publishes as `signal(n)`; say how many were written.
 ///
 /// Stops at the first cell that fails; what it wrote before stands.
-pub(crate) fn publish<E, const N: usize>(
+pub(crate) fn publish<E, R: Readings>(
     block: &Block,
     registers: &Registers<'_>,
     from: usize,
     signal: impl Fn(usize) -> Option<Id>,
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
 ) -> Result<usize, PollError<E>> {
     let mut written = 0usize;
     for seen in block.decode(registers) {
@@ -169,12 +169,12 @@ pub(crate) fn fits(first: Id, count: usize) -> bool {
 /// Write the one reading whose representation the caller declared: the one
 /// cell of `declared` decoded from `registers`, or `unsupported` and no
 /// value when nothing was declared. It publishes as `signal`.
-pub(crate) fn publish_declared<E, const N: usize>(
+pub(crate) fn publish_declared<E, R: Readings>(
     declared: Option<&Block>,
     registers: &Registers<'_>,
     signal: Id,
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
 ) -> Result<(), DeclaredError<E>> {
     let seen = match declared.and_then(|block| block.decode(registers).next()) {
         Some(seen) => seen.map_err(DeclaredError::Decode)?,

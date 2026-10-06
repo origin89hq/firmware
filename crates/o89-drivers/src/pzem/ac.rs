@@ -29,7 +29,7 @@
 //! cites: F-050, F-052
 
 use km43::{Id, Provenance, SignalDomain, Unit};
-use o89_core::{Signals, Tick};
+use o89_core::{Readings, Tick};
 
 use crate::dialect::{Block, Cell, Kind, Plausible, Sign, Span};
 use crate::modbus::{self, Address, Function, RECEIVE_BYTES, Registers, Timing};
@@ -237,12 +237,12 @@ impl Meter {
     ///
     /// One exchange, bounded by `timing`. A reply holding a word the manual
     /// does not define writes nothing.
-    pub async fn poll<P: Rs485, const N: usize>(
+    pub async fn poll<P: Rs485, R: Readings>(
         &self,
         port: &mut P,
         timing: Timing,
         now: Tick,
-        store: &mut Signals<N>,
+        store: &mut R,
     ) -> Result<Report<Words>, VendorError<P::Error>> {
         let block = self.model.block();
         let mut buf = [0u8; RECEIVE_BYTES];
@@ -266,6 +266,7 @@ mod tests {
     use crate::modbus::{ModbusError, ReplyError};
     use embassy_futures::block_on;
     use km43::Validity;
+    use o89_core::Signals;
     use o89_core::{Limits, Millis, ProvenanceSet};
 
     fn id(n: u16) -> Id {

@@ -2,17 +2,25 @@
 //!
 //! A closed set, so an enum: a dialect lands as a variant, and every match
 //! that has to answer for it stops compiling until it does. A bus task owns
-//! its port and calls the poll entry for its kind of bus. Every device today
-//! is on RS-485; the first device on another bus brings its own entry and a
-//! refusal of devices on the wrong one, which configuration checks against
-//! [`Device::bus`] before either runs.
+//! its port and calls the entry for its kind of bus: [`Device::poll_rs485`],
+//! [`Device::listen_vedirect`], [`Device::read_can`] and
+//! [`Device::read_probe`]. Each refuses a device that is not on its kind of
+//! bus, which configuration has already kept off it ([`crate::plan::Plan`]); the
+//! refusal is there so that a mistake costs one poll and not a reading
+//! written under somebody else's signal.
 
-use km43::Id;
-use o89_core::{SignalError, Signals, Tick};
+use km43::{ComponentRole, Id, SignalDomain};
+use o89_core::{Millis, Readings, SignalError, Tick};
 
-use crate::dialect::{DecodeError, RegisterMap};
+use crate::dialect::{DecodeError, Kind, RegisterMap};
+use crate::ds18b20::{Conversion, Probe, ProbeError, ProbeRead};
+use crate::epever::{self, Charger};
 use crate::modbus::{self, Address, ModbusError, RECEIVE_BYTES, Timing};
-use crate::port::Rs485;
+use crate::port::{Can, Listener, OneWire, Rs485};
+use crate::pylontech::{self, Pylontech, ReadError};
+use crate::pzem;
+use crate::vedirect::{self, Channels, Field, Frame, ListenError, Parser};
+use crate::vendor::{Report, VendorError};
 
 /// The kinds of line a device can be on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +28,8 @@ use crate::port::Rs485;
 pub enum BusKind {
     /// An RS-485 byte port.
     Rs485,
+    /// A VE.Direct port the controller only listens on.
+    VeDirect,
     /// A CAN port.
     Can,
     /// A 1-Wire line.
@@ -84,8 +94,20 @@ impl ModbusDevice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Device {
-    /// A Modbus RTU server described by a register map.
+    /// A Modbus RTU server described by a register map alone.
     Modbus(ModbusDevice),
+    /// An EPEVER B-series charge controller.
+    Epever(Charger),
+    /// A PZEM-003 or PZEM-017 DC meter.
+    PzemDc(pzem::dc::Meter),
+    /// A PZEM-014 or PZEM-016 AC meter.
+    PzemAc(pzem::ac::Meter),
+    /// A Victron product's VE.Direct text port.
+    VeDirect(Channels),
+    /// A Pylontech-class BMS on CAN.
+    Pylontech(Pylontech),
+    /// A DS18B20 probe on the 1-Wire line.
+    Ds18b20(Probe),
 }
 
 /// Why a poll stopped.
@@ -128,39 +150,367 @@ pub struct Polled {
     pub written: usize,
 }
 
+/// What a vendor said beside an RS-485 poll's readings, which no signal
+/// carries: a charge stage, an alarm, a raw word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Conditions {
+    /// A device whose map is all it reads.
+    None,
+    /// An EPEVER's status and raw words.
+    Epever(epever::Words),
+    /// A PZEM DC meter's raw words and alarms.
+    PzemDc(pzem::dc::Words),
+    /// A PZEM AC meter's power factor and alarm.
+    PzemAc(pzem::ac::Words),
+}
+
+/// Why a device's entry wrote nothing, or stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[must_use = "a failed read is a device whose readings were not refreshed"]
+pub enum DeviceError<E> {
+    /// The device is on this kind of bus, not the one the entry reads.
+    WrongBus(BusKind),
+    /// A register map's poll failed.
+    Poll(PollError<E>),
+    /// A vendor dialect's poll failed.
+    Vendor(VendorError<E>),
+    /// A VE.Direct port was silent or faulted.
+    Listen(ListenError<E>),
+    /// A CAN read failed.
+    Can(ReadError<E>),
+    /// A probe read failed.
+    Probe(ProbeError<E>),
+}
+
 impl Device {
     /// The kind of bus it is on.
     #[must_use]
     pub const fn bus(&self) -> BusKind {
         match self {
-            Self::Modbus(_) => BusKind::Rs485,
+            Self::Modbus(_) | Self::Epever(_) | Self::PzemDc(_) | Self::PzemAc(_) => BusKind::Rs485,
+            Self::VeDirect(_) => BusKind::VeDirect,
+            Self::Pylontech(_) => BusKind::Can,
+            Self::Ds18b20(_) => BusKind::OneWire,
         }
     }
 
-    /// Read the device over an RS-485 port and write every cell into
-    /// `store` at `now`, with its declared provenance.
+    /// The signal its `index`th reading publishes as, in the order
+    /// [`Device::layout`] describes them; `None` past the last.
+    #[must_use]
+    pub fn signal(&self, index: usize) -> Option<Id> {
+        match self {
+            Self::Modbus(device) => device.signal(index),
+            Self::Epever(charger) => charger.signal(index),
+            Self::PzemDc(meter) => meter.signal(index),
+            Self::PzemAc(meter) => meter.signal(index),
+            Self::VeDirect(channels) => VEDIRECT_FIELDS
+                .get(index)
+                .and_then(|field| channels.signal(*field)),
+            Self::Pylontech(bms) => pylontech::Channel::ALL
+                .get(index)
+                .map(|channel| bms.signal(*channel)),
+            Self::Ds18b20(probe) => (index == 0).then_some(probe.signal()),
+        }
+    }
+
+    /// What each of its signals is, in its numbering: kind, window, and
+    /// the part of the device it describes. The ids are
+    /// [`Device::signal`]'s.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        let mut layout = Layout::EMPTY;
+        match self {
+            Self::Modbus(device) => {
+                for cell in device.map.cells() {
+                    layout.push(Described::whole(cell.kind, cell.domain));
+                }
+            }
+            Self::Epever(_) => {
+                for cell in epever::MAP.cells() {
+                    let part = epever::ROLES
+                        .iter()
+                        .find(|(register, _)| *register == cell.register)
+                        .map(|(_, role)| *role);
+                    layout.push(Described {
+                        kind: cell.kind,
+                        domain: cell.domain,
+                        part,
+                    });
+                }
+                layout.push(Described::of(
+                    Kind::StateOfCharge,
+                    SignalDomain::Live,
+                    ComponentRole::BATTERY_BANK,
+                ));
+                layout.push(Described::of(
+                    Kind::DcCurrent,
+                    SignalDomain::Live,
+                    ComponentRole::BATTERY_BANK,
+                ));
+            }
+            Self::PzemDc(_) => {
+                for cell in pzem::dc::MAP.cells() {
+                    layout.push(Described::whole(cell.kind, cell.domain));
+                }
+            }
+            Self::PzemAc(_) => {
+                for cell in pzem::ac::PZEM_016.cells() {
+                    layout.push(Described::whole(cell.kind, cell.domain));
+                }
+            }
+            Self::VeDirect(_) => {
+                for field in VEDIRECT_FIELDS {
+                    let (kind, part) = match field {
+                        Field::BatteryVoltage => (Kind::DcVoltage, ComponentRole::BATTERY_BANK),
+                        Field::BatteryCurrent => (Kind::DcCurrent, ComponentRole::BATTERY_BANK),
+                        Field::PanelPower
+                        | Field::ChargeState
+                        | Field::Error
+                        | Field::YieldTotal
+                        | Field::YieldToday
+                        | Field::YieldYesterday => (Kind::DcPower, ComponentRole::MPPT_TRACKER),
+                    };
+                    layout.push(Described::of(kind, SignalDomain::Live, part));
+                }
+            }
+            Self::Pylontech(_) => {
+                for channel in pylontech::Channel::ALL {
+                    layout.push(Described::whole(channel.kind(), channel.domain()));
+                }
+            }
+            Self::Ds18b20(_) => {
+                layout.push(Described::whole(Kind::Temperature, SignalDomain::Live));
+            }
+        }
+        layout
+    }
+
+    /// Read the device over an RS-485 port and write what it says into
+    /// `store` at `now`, with each reading's declared provenance; the
+    /// vendor's words beside them come back in the report.
     ///
-    /// Each block is one exchange bounded by `timing`; the poll stops at the
-    /// first failure.
-    pub async fn poll_rs485<P: Rs485, const N: usize>(
+    /// Each exchange is bounded by `timing`; the poll stops at the first
+    /// failure.
+    pub async fn poll_rs485<P: Rs485, R: Readings>(
         &self,
         port: &mut P,
         timing: Timing,
         now: Tick,
-        store: &mut Signals<N>,
-    ) -> Result<Polled, PollError<P::Error>> {
+        store: &mut R,
+    ) -> Result<Report<Conditions>, DeviceError<P::Error>> {
         match self {
-            Self::Modbus(device) => poll_modbus(device, port, timing, now, store).await,
+            Self::Modbus(device) => poll_modbus(device, port, timing, now, store)
+                .await
+                .map(|polled| Report {
+                    polled,
+                    conditions: Conditions::None,
+                })
+                .map_err(DeviceError::Poll),
+            Self::Epever(charger) => charger
+                .poll(port, timing, now, store)
+                .await
+                .map(|report| Report {
+                    polled: report.polled,
+                    conditions: Conditions::Epever(report.conditions),
+                })
+                .map_err(DeviceError::Vendor),
+            Self::PzemDc(meter) => meter
+                .poll(port, timing, now, store)
+                .await
+                .map(|report| Report {
+                    polled: report.polled,
+                    conditions: Conditions::PzemDc(report.conditions),
+                })
+                .map_err(DeviceError::Vendor),
+            Self::PzemAc(meter) => meter
+                .poll(port, timing, now, store)
+                .await
+                .map(|report| Report {
+                    polled: report.polled,
+                    conditions: Conditions::PzemAc(report.conditions),
+                })
+                .map_err(DeviceError::Vendor),
+            Self::VeDirect(_) | Self::Pylontech(_) | Self::Ds18b20(_) => {
+                Err(DeviceError::WrongBus(self.bus()))
+            }
+        }
+    }
+
+    /// Hear one burst on a VE.Direct port, at most `within` for its first
+    /// byte, and write each verified block's readings into `store` at `now`;
+    /// every verified block goes to `on_block` for what no signal carries.
+    pub async fn listen_vedirect<L: Listener, R: Readings>(
+        &self,
+        port: &mut L,
+        parser: &mut Parser,
+        within: Millis,
+        now: Tick,
+        store: &mut R,
+        on_block: impl FnMut(&Frame),
+    ) -> Result<vedirect::Heard, DeviceError<L::Error>> {
+        match self {
+            Self::VeDirect(channels) => {
+                vedirect::listen(port, parser, within, channels, now, store, on_block)
+                    .await
+                    .map_err(DeviceError::Listen)
+            }
+            Self::Modbus(_)
+            | Self::Epever(_)
+            | Self::PzemDc(_)
+            | Self::PzemAc(_)
+            | Self::Pylontech(_)
+            | Self::Ds18b20(_) => Err(DeviceError::WrongBus(self.bus())),
+        }
+    }
+
+    /// Wait at most `within` for a BMS's next frame and write it into
+    /// `store` at `now`.
+    pub async fn read_can<P: Can, R: Readings>(
+        &self,
+        port: &mut P,
+        within: Millis,
+        now: Tick,
+        store: &mut R,
+    ) -> Result<pylontech::Heard, DeviceError<P::Error>> {
+        match self {
+            Self::Pylontech(bms) => bms
+                .read(port, within, now, store)
+                .await
+                .map_err(DeviceError::Can),
+            Self::Modbus(_)
+            | Self::Epever(_)
+            | Self::PzemDc(_)
+            | Self::PzemAc(_)
+            | Self::VeDirect(_)
+            | Self::Ds18b20(_) => Err(DeviceError::WrongBus(self.bus())),
+        }
+    }
+
+    /// Read a probe's share of `conversion` at `now` and write it into
+    /// `store` at the tick the conversion finished.
+    pub async fn read_probe<W: OneWire, R: Readings>(
+        &mut self,
+        line: &mut W,
+        conversion: &Conversion,
+        now: Tick,
+        store: &mut R,
+    ) -> Result<ProbeRead, DeviceError<W::Error>> {
+        let bus = self.bus();
+        match self {
+            Self::Ds18b20(probe) => probe
+                .read(line, conversion, now, store)
+                .await
+                .map_err(DeviceError::Probe),
+            Self::Modbus(_)
+            | Self::Epever(_)
+            | Self::PzemDc(_)
+            | Self::PzemAc(_)
+            | Self::VeDirect(_)
+            | Self::Pylontech(_) => Err(DeviceError::WrongBus(bus)),
         }
     }
 }
 
-async fn poll_modbus<P: Rs485, const N: usize>(
+/// The VE.Direct fields a port publishes, in the order its signals are
+/// numbered.
+pub const VEDIRECT_FIELDS: [Field; 3] = [
+    Field::BatteryVoltage,
+    Field::BatteryCurrent,
+    Field::PanelPower,
+];
+
+/// The most signals one device publishes: an EPEVER's map, its state of
+/// charge and its battery current.
+pub const DEVICE_SIGNALS: usize = epever::Charger::SIGNALS;
+
+const _: () = {
+    assert!(pylontech::CHANNELS <= DEVICE_SIGNALS);
+    assert!(pzem::ac::Meter::SIGNALS <= DEVICE_SIGNALS);
+    assert!(VEDIRECT_FIELDS.len() <= DEVICE_SIGNALS);
+};
+
+/// What one of a device's signals is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Described {
+    /// Its kind.
+    pub kind: Kind,
+    /// Its window.
+    pub domain: SignalDomain,
+    /// The part of the device it describes, or `None` for the device as a
+    /// whole.
+    pub part: Option<ComponentRole>,
+}
+
+impl Described {
+    const fn whole(kind: Kind, domain: SignalDomain) -> Self {
+        Self {
+            kind,
+            domain,
+            part: None,
+        }
+    }
+
+    const fn of(kind: Kind, domain: SignalDomain, part: ComponentRole) -> Self {
+        Self {
+            kind,
+            domain,
+            part: Some(part),
+        }
+    }
+}
+
+/// A device's signals, described, at most [`DEVICE_SIGNALS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Layout {
+    signals: [Option<Described>; DEVICE_SIGNALS],
+    len: usize,
+}
+
+impl Layout {
+    const EMPTY: Self = Self {
+        signals: [None; DEVICE_SIGNALS],
+        len: 0,
+    };
+
+    /// Add one. Every device's count is held at or under the capacity at
+    /// compile time above, so none is dropped; one that were would be a
+    /// device whose layout is short, which the plan's per-device test
+    /// catches.
+    fn push(&mut self, described: Described) {
+        if let Some(slot) = self.signals.get_mut(self.len) {
+            *slot = Some(described);
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    /// How many signals.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The signals, in the device's numbering.
+    pub fn iter(&self) -> impl Iterator<Item = &Described> {
+        self.signals.iter().take(self.len).flatten()
+    }
+}
+
+async fn poll_modbus<P: Rs485, R: Readings>(
     device: &ModbusDevice,
     port: &mut P,
     timing: Timing,
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
 ) -> Result<Polled, PollError<P::Error>> {
     let mut cell = 0usize;
     let mut buf = [0u8; RECEIVE_BYTES];
@@ -191,6 +541,7 @@ mod tests {
     use crate::modbus::{Function, ReplyError};
     use embassy_futures::block_on;
     use km43::{Dialect, Provenance, SignalDomain, Validity};
+    use o89_core::Signals;
     use o89_core::{ChargeSource, Ineligible, Limits, Millis};
 
     /// Two blocks built by hand for these tests; not a vendor's map.
@@ -284,7 +635,8 @@ mod tests {
 
         let polled =
             block_on(device().poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store)).unwrap();
-        assert_eq!(polled, Polled { written: 3 });
+        assert_eq!(polled.polled, Polled { written: 3 });
+        assert_eq!(polled.conditions, Conditions::None);
 
         let volts = store.sample(id(20), Tick::ZERO).unwrap();
         assert_eq!(
@@ -327,7 +679,11 @@ mod tests {
             let bursts: [&[u8]; 2] = [&echo, &frame[..len]];
             let mut port = Scripted::new(&bursts);
             let polled = block_on(soc.poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store));
-            assert_eq!(polled, Ok(Polled { written: 1 }), "{raw}");
+            assert_eq!(
+                polled.map(|report| report.polled),
+                Ok(Polled { written: 1 }),
+                "{raw}"
+            );
 
             let eligible = store.current(id(30), Tick::ZERO, ChargeSource::CountedOnly.accepts());
             match expected {
@@ -359,10 +715,10 @@ mod tests {
 
         assert_eq!(
             block_on(device().poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store)),
-            Err(PollError::Modbus {
+            Err(DeviceError::Poll(PollError::Modbus {
                 block: 1,
                 error: ModbusError::Reply(ReplyError::Crc)
-            })
+            }))
         );
         assert_eq!(
             store.sample(id(20), Tick::ZERO).unwrap().value(),
@@ -389,10 +745,10 @@ mod tests {
         let later = Tick::from_millis(60_001);
         assert_eq!(
             block_on(device().poll_rs485(&mut port, TIMING, later, &mut store)),
-            Err(PollError::Modbus {
+            Err(DeviceError::Poll(PollError::Modbus {
                 block: 0,
                 error: ModbusError::Timeout
-            })
+            }))
         );
         let volts = store.sample(id(20), later).unwrap();
         assert_eq!(volts.q.validity_of(), Validity::Stale);
@@ -408,13 +764,17 @@ mod tests {
         let mut store = Signals::<4>::new();
         assert_eq!(
             block_on(device().poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store)),
-            Err(PollError::Store(SignalError::Unknown(id(20))))
+            Err(DeviceError::Poll(PollError::Store(SignalError::Unknown(
+                id(20)
+            ))))
         );
     }
 
     #[test]
     fn a_device_s_signals_are_consecutive_and_refused_past_the_top_of_the_range() {
-        let Device::Modbus(device) = device();
+        let Device::Modbus(device) = device() else {
+            panic!("a register-map device");
+        };
         assert_eq!(
             device.bus_signals(),
             [Some(id(20)), Some(id(21)), Some(id(22)), None]
@@ -440,5 +800,215 @@ mod tests {
                 self.signal(3),
             ]
         }
+    }
+
+    /// One device of every kind, built by hand on signals from 100.
+    fn every_kind() -> [Device; 7] {
+        let address = Address::new(1).unwrap();
+        [
+            device(),
+            Device::Epever(
+                Charger::new(
+                    address,
+                    id(100),
+                    epever::StateOfCharge::Unsupported,
+                    epever::BatteryCurrent::Unsupported,
+                )
+                .unwrap(),
+            ),
+            Device::PzemDc(pzem::dc::Meter::new(address, id(110))),
+            Device::PzemAc(
+                pzem::ac::Meter::new(address, id(120), pzem::ac::Model::Pzem016).unwrap(),
+            ),
+            Device::VeDirect(Channels::new(Some(id(130)), Some(id(131)), Some(id(132))).unwrap()),
+            Device::Pylontech(
+                Pylontech::new(
+                    id(140),
+                    pylontech::Version::V13,
+                    pylontech::CurrentDirection::Unknown,
+                )
+                .unwrap(),
+            ),
+            Device::Ds18b20(Probe::new(valid_rom(), id(150)).unwrap()),
+        ]
+    }
+
+    /// A DS18B20 ROM code whose CRC holds, computed here.
+    fn valid_rom() -> crate::onewire::Rom {
+        let mut bytes = [0x28, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0];
+        bytes[7] = crate::onewire::crc8(&bytes[..7]);
+        crate::onewire::Rom::new(bytes).unwrap()
+    }
+
+    /// A line that answers nothing; nothing here should reach it.
+    struct Untouched;
+
+    impl Rs485 for Untouched {
+        type Error = u8;
+        fn discard(&mut self) -> impl core::future::Future<Output = Result<(), u8>> {
+            core::future::ready(Err(1))
+        }
+        fn send(&mut self, _: &[u8]) -> impl core::future::Future<Output = Result<(), u8>> {
+            core::future::ready(Err(1))
+        }
+        fn receive(
+            &mut self,
+            _: &mut [u8],
+            _: Millis,
+        ) -> impl core::future::Future<Output = Result<crate::port::Burst, crate::port::PortFault<u8>>>
+        {
+            core::future::ready(Err(crate::port::PortFault::Line(1)))
+        }
+    }
+
+    impl Listener for Untouched {
+        type Error = u8;
+        fn receive(
+            &mut self,
+            _: &mut [u8],
+            _: Millis,
+        ) -> impl core::future::Future<Output = Result<crate::port::Burst, crate::port::PortFault<u8>>>
+        {
+            core::future::ready(Err(crate::port::PortFault::Line(1)))
+        }
+    }
+
+    impl Can for Untouched {
+        type Error = u8;
+        fn send(
+            &mut self,
+            _: &crate::port::CanFrame,
+        ) -> impl core::future::Future<Output = Result<(), u8>> {
+            core::future::ready(Err(1))
+        }
+        fn receive(
+            &mut self,
+            _: Millis,
+        ) -> impl core::future::Future<Output = Result<crate::port::CanFrame, crate::port::PortFault<u8>>>
+        {
+            core::future::ready(Err(crate::port::PortFault::Line(1)))
+        }
+    }
+
+    impl OneWire for Untouched {
+        type Error = u8;
+        fn reset(
+            &mut self,
+        ) -> impl core::future::Future<Output = Result<crate::port::Presence, u8>> {
+            core::future::ready(Err(1))
+        }
+        fn write_bit(&mut self, _: bool) -> impl core::future::Future<Output = Result<(), u8>> {
+            core::future::ready(Err(1))
+        }
+        fn read_bit(&mut self) -> impl core::future::Future<Output = Result<bool, u8>> {
+            core::future::ready(Err(1))
+        }
+    }
+
+    #[test]
+    fn every_entry_refuses_a_device_on_another_kind_of_bus_without_touching_its_line() {
+        let mut store = Signals::<4>::new();
+        let conversion = ready_conversion();
+        for mut device in every_kind() {
+            let bus = device.bus();
+            let refused =
+                |error: Option<DeviceError<u8>>| error == Some(DeviceError::WrongBus(bus));
+            let rs485 = block_on(device.poll_rs485(&mut Untouched, TIMING, Tick::ZERO, &mut store));
+            let mut parser = Parser::new();
+            let heard = block_on(device.listen_vedirect(
+                &mut Untouched,
+                &mut parser,
+                Millis::from_millis(1),
+                Tick::ZERO,
+                &mut store,
+                |_| {},
+            ));
+            let can = block_on(device.read_can(
+                &mut Untouched,
+                Millis::from_millis(1),
+                Tick::ZERO,
+                &mut store,
+            ));
+            let probe =
+                block_on(device.read_probe(&mut Untouched, &conversion, Tick::ZERO, &mut store));
+            // A device's own entry reaches its line, which fails; every
+            // other entry refuses it first.
+            assert_eq!(refused(rs485.err()), bus != BusKind::Rs485, "{device:?}");
+            assert_eq!(refused(heard.err()), bus != BusKind::VeDirect, "{device:?}");
+            assert_eq!(refused(can.err()), bus != BusKind::Can, "{device:?}");
+            assert_eq!(refused(probe.err()), bus != BusKind::OneWire, "{device:?}");
+        }
+    }
+
+    /// A conversion whose window holds `Tick::ZERO`.
+    fn ready_conversion() -> Conversion {
+        // The only way to make one is a line that showed a conversion.
+        struct Converting(u8);
+        impl OneWire for Converting {
+            type Error = u8;
+            fn reset(
+                &mut self,
+            ) -> impl core::future::Future<Output = Result<crate::port::Presence, u8>> {
+                core::future::ready(Ok(crate::port::Presence::Present))
+            }
+            fn write_bit(&mut self, _: bool) -> impl core::future::Future<Output = Result<(), u8>> {
+                core::future::ready(Ok(()))
+            }
+            fn read_bit(&mut self) -> impl core::future::Future<Output = Result<bool, u8>> {
+                self.0 = self.0.saturating_add(1);
+                core::future::ready(Ok(false))
+            }
+        }
+        struct Zero;
+        impl o89_core::Clock for Zero {
+            fn now(&self) -> Tick {
+                Tick::ZERO
+            }
+        }
+        block_on(crate::ds18b20::convert_all(&mut Converting(0), &Zero)).unwrap()
+    }
+
+    #[test]
+    fn a_device_s_layout_describes_exactly_the_signals_it_publishes() {
+        let sizes = [3, 9, 1, 5, 3, 8, 1];
+        for (device, size) in every_kind().into_iter().zip(sizes) {
+            let layout = device.layout();
+            assert_eq!(layout.len(), size, "{device:?}");
+            assert!(!layout.is_empty());
+            for index in 0..size {
+                assert!(device.signal(index).is_some(), "{device:?} {index}");
+            }
+            assert_eq!(device.signal(size), None, "{device:?}");
+        }
+        // An EPEVER's battery cells describe the bank; its PV ones the
+        // tracker.
+        let charger = every_kind()[1].layout();
+        let parts: [Option<ComponentRole>; 9] =
+            core::array::from_fn(|at| charger.iter().nth(at).and_then(|described| described.part));
+        assert_eq!(parts[0], Some(ComponentRole::MPPT_TRACKER));
+        assert_eq!(parts[6], Some(ComponentRole::BATTERY_BANK));
+        assert_eq!(parts[8], Some(ComponentRole::BATTERY_BANK));
+    }
+
+    #[test]
+    fn f_052_a_pzem_dc_polled_as_a_device_writes_its_voltage_and_hands_back_its_words() {
+        let address = Address::new(1).unwrap();
+        let meter = Device::PzemDc(pzem::dc::Meter::new(address, id(40)));
+        let echo = pzem::dc::MAP.blocks[0].read(address).encode();
+        let (reply, len) =
+            crate::modbus::tests::register_reply(1, 0x04, &[0x2710, 0x0064, 0x03E8, 0, 0, 0, 0, 0]);
+        let bursts: [&[u8]; 2] = [&echo, &reply[..len]];
+        let mut port = Scripted::new(&bursts);
+        let mut store = Signals::<1>::new();
+        let limits = Limits::new(Millis::from_millis(60_000), None).unwrap();
+        store.register(id(40), limits).unwrap();
+        let report = block_on(meter.poll_rs485(&mut port, TIMING, Tick::ZERO, &mut store)).unwrap();
+        assert_eq!(report.polled, Polled { written: 1 });
+        assert!(matches!(report.conditions, Conditions::PzemDc(_)));
+        let volts = store.sample(id(40), Tick::ZERO).unwrap();
+        assert_eq!(
+            (volts.value(), volts.q.provenance_of()),
+            (Some(100_000), Provenance::Measured)
+        );
     }
 }

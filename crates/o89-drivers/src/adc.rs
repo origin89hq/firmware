@@ -29,7 +29,7 @@
 //! board module; the tests use board A's (`docs/BOARD-A.md`) as fixtures.
 
 use km43::{Id, Provenance, QualityError, SignalDomain, Validity};
-use o89_core::{Observation, SignalError, Signals, Tick};
+use o89_core::{Observation, Readings, SignalError, Tick};
 
 use crate::dialect::Kind;
 use crate::port::{AdcInput, Counts, Sampler};
@@ -370,12 +370,12 @@ pub struct Sampled {
 
 /// Convert the reference and every input, [`SAMPLES`] times each, and write
 /// each input into `store` at `now`.
-pub async fn read<S: Sampler, const N: usize>(
+pub async fn read<S: Sampler, R: Readings>(
     sampler: &mut S,
     cal: VrefintCal,
     inputs: &[Input],
     now: Tick,
-    store: &mut Signals<N>,
+    store: &mut R,
 ) -> Result<Sampled, AdcError<S::Error>> {
     let reference = average(sampler, AdcInput::Reference).await?;
     if reference.clipped {
@@ -438,6 +438,7 @@ mod tests {
     use core::future::{Future, ready};
     use embassy_futures::block_on;
     use km43::Sample;
+    use o89_core::Signals;
     use o89_core::{Limits, Millis};
 
     /// A sampler returning fixed counts per input, built by hand.
