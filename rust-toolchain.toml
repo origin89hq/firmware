@@ -3,7 +3,7 @@
 # it on the first cargo command, so nothing here is repeated in CI. `llvm-tools`
 # is what measures an image: the gate reads the `.bin`, not the ELF.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 profile = "minimal"
 components = ["clippy", "rustfmt", "llvm-tools"]
 targets = ["thumbv6m-none-eabi", "riscv32imac-unknown-none-elf"]
